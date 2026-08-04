@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#111313" />
+    <meta name="description" content="Cadence is a local-first music review workspace." />
+    <title>Cadence — local track review</title>
+    <link rel="stylesheet" href="styles.css?v=20260801-track-controls-recovery" />
+    <script type="module" src="app.js?v=20260803-session-persist" defer></script>
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="site-brand" href="./" aria-label="Cadence home"><span>PORTALSURFER</span><b>/</b><strong>CADENCE</strong></a>
+      <div class="site-header-actions"><span class="header-status"><i></i> LOCAL WORKSPACE</span><button class="header-button" id="headerUploadButton" type="button"><span>↓</span> IMPORT TRACK</button><button class="header-button icon-only" id="aboutButton" type="button" aria-label="About Cadence">?</button></div>
+    </header>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Track library">
+        <div class="brand-lockup">
+          <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span><span></span></div>
+          <div><p class="eyebrow">private studio</p><h1>cadence</h1></div>
+        </div>
+        <button class="upload-button" id="uploadButton" type="button"><span class="plus-icon">+</span><span>Import tracks</span><kbd>U</kbd></button>
+        <input id="fileInput" class="visually-hidden" type="file" accept="audio/*,.mp3,.wav,.m4a,.aac,.flac,.ogg" multiple />
+        <div class="library-heading"><div><p class="section-label">Your library</p><p class="muted" id="librarySummary">0 tracks · local only</p></div><button class="icon-button small" id="clearSearchButton" type="button" title="Clear search" aria-label="Clear search">×</button></div>
+        <label class="search-field" for="searchInput"><span>⌕</span><input id="searchInput" type="search" placeholder="Search tracks" autocomplete="off" /><kbd>/</kbd></label>
+        <div class="library-filters" aria-label="Track filters">
+          <button class="filter-chip is-active" data-library-filter="all" aria-pressed="true" type="button">All <span id="allCount">0</span></button>
+          <button class="filter-chip" data-library-filter="needs-review" aria-pressed="false" type="button">Needs review <span id="needsReviewCount">0</span></button>
+          <button class="filter-chip" data-library-filter="clear" aria-pressed="false" type="button">Clear <span id="clearCount">0</span></button>
+        </div>
+        <div class="track-list" id="trackList" aria-live="polite"></div>
+        <div class="sidebar-footer"><div class="local-badge"><span class="status-dot"></span> Stored on this device</div><p>Files never leave your browser.</p></div>
+      </aside>
+
+      <main class="main-content">
+        <header class="topbar"><div class="breadcrumb"><span>Workspace</span><span class="breadcrumb-slash">/</span><strong>Review desk</strong></div><div class="topbar-actions"><span class="save-state" id="saveState"><span class="save-dot"></span> All changes saved</span><button class="avatar" type="button" aria-label="Local profile">PS</button></div></header>
+        <section class="content-grid">
+          <div class="review-column">
+            <div class="review-header" id="reviewHeader"></div>
+            <section class="player-card" aria-label="Track player">
+              <div class="player-topline"><div class="now-playing-copy"><span class="live-indicator"><span></span> Listening room</span><p id="playerContext">Select a track to begin</p></div></div>
+              <div class="waveform-stage" id="waveformStage" aria-label="Track timeline">
+                <div class="waveform-headerline"><div class="zone-label"><span>01</span> WAVEFORM / TOP TO PLAY</div><div class="zone-label comment-zone-label"><span>02</span> BOTTOM TO COMMENT</div></div>
+                <div class="waveform" id="waveform" role="group" aria-label="Track waveform; drag the upper half to seek and release to play, use the lower half to place a comment" tabindex="0"><div class="waveform-bars" id="waveformBars"></div><div class="playback-line" id="playbackLine" aria-hidden="true"><span></span></div><div class="comment-rail" id="commentRail"><div class="comment-rail-label">COMMENTS / CLICK TO PIN</div><div class="comment-rail-line"></div><div class="comment-markers" id="commentMarkers"></div><div class="comment-preview-dot" id="commentPreviewDot" hidden aria-hidden="true"><span></span></div></div><div class="timeline-cursor" id="timelineCursor" aria-hidden="true"><span></span></div><div class="waveform-hover-time" id="waveformHoverTime" aria-hidden="true"></div></div>
+                <form class="note-composer timeline-composer" id="noteComposer" hidden><div class="composer-time"><span class="pin-icon">⌖</span><strong id="draftTime">00:00</strong><span id="composerMode">captured point</span></div><label class="visually-hidden" for="noteInput">Review note</label><textarea id="noteInput" rows="2" maxlength="500" placeholder="What needs attention at this moment?"></textarea><div class="composer-footer"><span class="composer-hint">Enter to save · Esc to cancel</span><div class="composer-actions"><button class="ghost-button" id="cancelNoteButton" type="button">Cancel</button><button class="primary-button compact" type="submit">Save note</button></div></div></form>
+              </div>
+              <div class="transport-row"><button class="play-button" id="playButton" type="button" aria-label="Play track" disabled><span class="play-glyph">▶</span></button><div class="time-readout"><span id="currentTime">00:00</span><span class="time-divider">/</span><span id="durationTime">00:00</span></div><input id="seekInput" class="seek-input" type="range" min="0" max="0" value="0" step="0.01" aria-label="Track position" disabled /><button class="volume-button" id="volumeButton" type="button" aria-label="Mute track" disabled>⌁</button><input id="volumeInput" class="volume-input" type="range" min="0" max="1" value="0.8" step="0.01" aria-label="Volume" disabled /></div>
+              <audio id="audioPlayer" preload="metadata"></audio>
+              <div class="audio-unavailable" id="audioUnavailable" hidden><span class="warning-icon">!</span><div><strong>This is a preview record</strong><p>Import the actual audio file to start listening and leave notes here.</p></div></div>
+            </section>
+            <div class="review-workspace">
+              <div class="notes-heading"><div><p class="section-label">Review notes</p><h2>Make the next pass count.</h2></div><button class="primary-button" id="addNoteButton" type="button" disabled><span>＋</span> Add at current time <kbd>N</kbd></button></div>
+              <div class="notes-toolbar"><div class="note-tabs" aria-label="Review note filters"><button class="note-tab is-active" data-note-filter="open" type="button" aria-pressed="true">Open <span id="openNoteCount">0</span></button><button class="note-tab" data-note-filter="all" type="button" aria-pressed="false">All <span id="allNoteCount">0</span></button><button class="note-tab" data-note-filter="done" type="button" aria-pressed="false">Done <span id="doneNoteCount">0</span></button></div><span class="notes-hint">Top half seeks · bottom half pins</span></div>
+              <div class="notes-list" id="notesList" aria-live="polite"></div>
+            </div>
+          </div>
+          <aside class="insights-column" aria-label="Track details"><div class="insights-card track-details-card" id="trackDetails"></div><div class="insights-card loudness-card" id="loudnessCard" aria-label="Live and integrated K-weighted loudness meter"><div class="teaser-topline"><p class="section-label">Loudness / K-weighted</p><span class="loudness-zone" id="loudnessZone">NO SIGNAL</span></div><div class="loudness-live-readout"><div><span>SHORT TERM / 3 SEC</span><strong id="loudnessLiveValue">—</strong></div><em id="loudnessLiveStatus">PAUSED</em></div><div class="loudness-live-integrated-readout"><span>INTEGRATED / LIVE</span><strong id="loudnessIntegratedLiveValue">—</strong><span>LUFS</span></div><div class="loudness-file-readout"><span>FILE INTEGRATED</span><strong id="loudnessValue">—</strong><span>LUFS</span></div><div class="loudness-meter" aria-hidden="true"><div class="loudness-meter-track"></div><div class="loudness-marker" id="loudnessMarker"></div><div class="loudness-live-marker" id="loudnessLiveMarker"></div></div><div class="loudness-scale" aria-hidden="true"><span>-24</span><span>-18</span><span>-12</span><span>-9</span><span>-6</span><span>-3</span><span>0</span></div><div class="loudness-marker-key" aria-hidden="true"><span><i class="live-key"></i> SHORT TERM</span><span><i class="file-key"></i> FILE</span></div><div class="loudness-zones"><span><i class="zone-soft"></i> TOO SOFT</span><span><i class="zone-headroom"></i> MIX HEADROOM</span><span><i class="zone-target"></i> TECHNO -7/-6</span><span><i class="zone-hot"></i> HOT / CLIP RISK</span></div><p class="loudness-hint" id="loudnessHint">Short-term (3 sec) and live integrated loudness are measured before the audition gain. The file reading stays fixed when volume or mute changes.</p></div><div class="insights-card planner-teaser"><div class="teaser-topline"><p class="section-label">Next up</p><span class="coming-soon">Coming soon</span></div><h3>Shape the release path.</h3><p>Once the notes are clear, move every track through a visual board built for finishing.</p><div class="mini-board" aria-hidden="true"><div><span>To mix</span><b>2</b></div><div><span>In progress</span><b>1</b></div><div><span>Ready</span><b>4</b></div></div><button class="text-button" id="plannerButton" type="button">Preview planner <span>→</span></button></div><div class="insights-card shortcut-card"><p class="section-label">Quick keys</p><div class="shortcut-row"><span><kbd>Space</kbd> Play / pause</span><span><kbd>N</kbd> New note</span></div><div class="shortcut-row"><span><kbd>←</kbd> <kbd>→</kbd> Nudge</span><span><kbd>/</kbd> Search</span></div></div></aside>
+        </section>
+        <div class="toast" id="toast" role="status" aria-live="polite"></div>
+      </main>
+    </div>
+    <footer class="site-footer"><div><strong>CADENCE</strong><span>LOCAL TRACK REVIEW WORKSPACE</span></div><div><span>FILES STAY ON THIS DEVICE</span><b>PORTALSURFER © 2026</b></div></footer>
+    <div class="drop-overlay" id="dropOverlay" hidden><div class="drop-overlay-card"><span class="drop-icon">↓</span><strong>Drop tracks to import</strong><span>Audio stays on this device.</span></div></div>
+  </body>
+</html>

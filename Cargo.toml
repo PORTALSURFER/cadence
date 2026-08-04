@@ -1,0 +1,14 @@
+[package]
+name = "cadence-native"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Native Cadence track review workspace built with Radiant"
+
+[dependencies]
+radiant = { git = "https://github.com/PORTALSURFER/radiant", rev = "09dbd94057dcab1588696e8d17252d868c4d5c68" }
+libc = "0.2.189"
+rodio = { version = "0.22.2", features = ["symphonia-all"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+symphonia = { version = "0.5.5", features = ["all"] }
