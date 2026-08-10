@@ -30,7 +30,8 @@ const MAX_DISPLAY_BAR_COUNT: usize = 512;
 const BAR_PITCH: f32 = 4.0;
 const BAR_GAP: f32 = 0.0;
 const REFERENCE_DRAG_THRESHOLD: f32 = 4.0;
-pub const REFERENCE_START_HIT_SLOP: f32 = 10.0;
+const TIMELINE_START_HIT_SLOP: f32 = 10.0;
+pub const REFERENCE_START_HIT_SLOP: f32 = TIMELINE_START_HIT_SLOP;
 const EXTREMA_DISPLAY_BAND_INDEX: usize = 0;
 const RMS_DISPLAY_BAND_INDEX: usize = 1;
 
@@ -95,6 +96,59 @@ impl WaveformColors {
             note_hover_outline: theme.text_primary,
             cursor: theme.highlight_orange_soft,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TimelineSurface {
+    start_hit_slop: f32,
+}
+
+impl TimelineSurface {
+    fn new() -> Self {
+        Self {
+            start_hit_slop: REFERENCE_START_HIT_SLOP,
+        }
+    }
+
+    fn plot_bounds(self, bounds: Rect) -> Rect {
+        if !bounds.is_finite() {
+            return bounds;
+        }
+        let start_x = (bounds.min.x + self.start_hit_slop).min(bounds.max.x);
+        Rect::from_min_max(Point::new(start_x, bounds.min.y), bounds.max)
+    }
+
+    fn start_edge_contains(self, bounds: Rect, position: Point) -> bool {
+        let plot_bounds = self.plot_bounds(bounds);
+        position.y >= bounds.min.y
+            && position.y <= bounds.max.y
+            && position.x >= bounds.min.x
+            && position.x < plot_bounds.min.x
+    }
+
+    fn interactive_contains(self, bounds: Rect, position: Point) -> bool {
+        if !bounds.is_finite() {
+            return false;
+        }
+        self.plot_bounds(bounds).contains(position) || self.start_edge_contains(bounds, position)
+    }
+
+    fn ratio_at(self, bounds: Rect, position: Point) -> f32 {
+        let plot_bounds = self.plot_bounds(bounds);
+        let width = plot_bounds.width();
+        if !plot_bounds.is_finite() || !position.x.is_finite() || width <= 0.0 {
+            return 0.0;
+        }
+        clamp_ratio((position.x - plot_bounds.min.x) / width)
+    }
+
+    fn x_at(self, bounds: Rect, ratio: f32) -> f32 {
+        let plot_bounds = self.plot_bounds(bounds);
+        if !plot_bounds.is_finite() {
+            return 0.0;
+        }
+        plot_bounds.x_for_ratio(clamp_ratio(ratio))
     }
 }
 
@@ -227,7 +281,6 @@ pub fn reference_view_with_comments<Message: 'static>(
 ) -> ui::View<Message> {
     ui::custom_widget_mapped(
         ReferenceWaveformWidget::new(waveform, cursor_ratio, loop_selection)
-            .with_start_hit_slop(REFERENCE_START_HIT_SLOP)
             .with_note_ratios(note_ratios)
             .with_draft_ratio(draft_ratio)
             .with_external_hovered_note_ratio(hovered_note_ratio)
@@ -240,6 +293,7 @@ pub fn reference_view_with_comments<Message: 'static>(
 #[derive(Clone, Debug)]
 struct WaveformWidget {
     common: WidgetCommon,
+    timeline: TimelineSurface,
     summary: Arc<radiant::runtime::GpuSignalSummary>,
     cursor_ratio: Option<f32>,
     note_ratios: Vec<(f32, bool)>,
@@ -268,6 +322,7 @@ impl WaveformWidget {
         common.paint.paints_state_layers = false;
         Self {
             common,
+            timeline: TimelineSurface::new(),
             summary: Arc::clone(&waveform.summary),
             cursor_ratio: cursor_ratio.map(clamp_ratio),
             note_ratios,
@@ -304,13 +359,6 @@ impl WaveformWidget {
         self
     }
 
-    fn ratio_from_position(bounds: Rect, position: Point) -> f32 {
-        if bounds.width() <= 0.0 {
-            return 0.0;
-        }
-        clamp_ratio((position.x - bounds.min.x) / bounds.width())
-    }
-
     fn lower_from_position(bounds: Rect, position: Point) -> bool {
         if bounds.height() <= 0.0 {
             return false;
@@ -325,14 +373,14 @@ impl WaveformWidget {
         if !Self::lower_from_position(bounds, position) {
             return false;
         }
-        let marker_x = bounds.x_for_ratio(ratio);
+        let marker_x = self.timeline.x_at(bounds, ratio);
         let rail_y = comment_rail_y(bounds);
         let hit_radius = DRAFT_MARKER_RADIUS + COMMENT_DRAG_HIT_RADIUS;
         (position.x - marker_x).abs() <= hit_radius && (position.y - rail_y).abs() <= hit_radius
     }
 
     fn persisted_note_hit(&self, bounds: Rect, position: Point) -> Option<(usize, f32)> {
-        if !bounds.contains(position) {
+        if !bounds.contains(position) || !Self::lower_from_position(bounds, position) {
             return None;
         }
 
@@ -343,7 +391,7 @@ impl WaveformWidget {
             .enumerate()
             .filter_map(|(index, (ratio, _))| {
                 let ratio = clamp_ratio(*ratio);
-                let dx = position.x - bounds.x_for_ratio(ratio);
+                let dx = position.x - self.timeline.x_at(bounds, ratio);
                 let dy = position.y - rail_y;
                 let distance_squared = dx * dx + dy * dy;
                 (distance_squared <= hover_radius_squared).then_some((
@@ -423,8 +471,8 @@ impl Widget for WaveformWidget {
         }
         match input {
             WidgetInput::PointerMove { position, .. } => {
-                let inside = bounds.contains(position);
-                let ratio = Self::ratio_from_position(bounds, position);
+                let inside = self.timeline.interactive_contains(bounds, position);
+                let ratio = self.timeline.ratio_at(bounds, position);
                 self.common.state.hovered = inside;
                 if self.comment_dragging {
                     self.hover_ratio = Some(ratio);
@@ -451,8 +499,8 @@ impl Widget for WaveformWidget {
                 position,
                 button: PointerButton::Primary,
                 ..
-            } if bounds.contains(position) => {
-                let ratio = Self::ratio_from_position(bounds, position);
+            } if self.timeline.interactive_contains(bounds, position) => {
+                let ratio = self.timeline.ratio_at(bounds, position);
                 if self.draft_marker_hit(bounds, position) {
                     self.comment_dragging = true;
                     self.comment_drag_note_index = None;
@@ -509,11 +557,11 @@ impl Widget for WaveformWidget {
                 button: PointerButton::Primary,
                 ..
             } if self.comment_dragging => {
-                let ratio = Self::ratio_from_position(bounds, position);
+                let ratio = self.timeline.ratio_at(bounds, position);
                 self.comment_dragging = false;
                 self.comment_drag_note_index = None;
-                self.common.state.hovered = bounds.contains(position);
-                self.hover_ratio = bounds.contains(position).then_some(ratio);
+                self.common.state.hovered = self.timeline.interactive_contains(bounds, position);
+                self.hover_ratio = self.common.state.hovered.then_some(ratio);
                 self.hover_lower = false;
                 self.hovered_note_ratio = self.persisted_note_near_position(bounds, position);
                 Some(WidgetOutput::typed(WaveformInteraction::CommentDragEnded {
@@ -530,10 +578,10 @@ impl Widget for WaveformWidget {
                 button: PointerButton::Primary,
                 ..
             } if self.playhead_dragging => {
-                let ratio = Self::ratio_from_position(bounds, position);
+                let ratio = self.timeline.ratio_at(bounds, position);
                 self.playhead_dragging = false;
-                self.common.state.hovered = bounds.contains(position);
-                self.hover_ratio = bounds.contains(position).then_some(ratio);
+                self.common.state.hovered = self.timeline.interactive_contains(bounds, position);
+                self.hover_ratio = self.common.state.hovered.then_some(ratio);
                 self.hover_lower = false;
                 self.hovered_note_ratio = self.persisted_note_near_position(bounds, position);
                 Some(WidgetOutput::typed(
@@ -593,8 +641,9 @@ impl Widget for WaveformWidget {
         }
 
         let colors = WaveformColors::from_theme(theme);
+        let plot_bounds = self.timeline.plot_bounds(bounds);
         let rail_y = comment_rail_y(bounds);
-        let bar_bounds = visible_bounds(bounds, self.visible_ratio);
+        let bar_bounds = visible_bounds(plot_bounds, self.visible_ratio);
         let upper_bounds = Rect::from_min_max(bar_bounds.min, Point::new(bar_bounds.max.x, rail_y));
         let lower_bounds =
             Rect::from_min_max(Point::new(bar_bounds.min.x, rail_y + 1.0), bar_bounds.max);
@@ -674,7 +723,7 @@ impl Widget for WaveformWidget {
             paint_note_marker(
                 primitives,
                 self.common.id,
-                bounds,
+                plot_bounds,
                 rail_y,
                 NoteMarkerStyle {
                     ratio,
@@ -698,7 +747,7 @@ impl Widget for WaveformWidget {
             paint_note_marker(
                 primitives,
                 self.common.id,
-                bounds,
+                plot_bounds,
                 rail_y,
                 NoteMarkerStyle {
                     ratio,
@@ -714,7 +763,7 @@ impl Widget for WaveformWidget {
             paint_cursor(
                 primitives,
                 self.common.id,
-                bounds,
+                plot_bounds,
                 ratio,
                 rail_y,
                 colors.cursor,
@@ -733,10 +782,11 @@ impl Widget for WaveformWidget {
             return;
         }
         let colors = WaveformColors::from_theme(theme);
+        let plot_bounds = self.timeline.plot_bounds(bounds);
         let rail_y = comment_rail_y(bounds);
         let hovered_note_ratio = self.local_hovered_note_ratio();
         if let Some(ratio) = self.hover_ratio {
-            let x = bounds.x_for_ratio(ratio);
+            let x = self.timeline.x_at(bounds, ratio);
             let line_bottom = rail_y - CURSOR_GAP_ABOVE_RAIL;
             fill_rect(
                 primitives,
@@ -760,7 +810,7 @@ impl Widget for WaveformWidget {
             paint_highlighted_note_marker(
                 primitives,
                 self.common.id,
-                bounds,
+                plot_bounds,
                 rail_y,
                 ratio,
                 colors,
@@ -843,6 +893,7 @@ fn rounded_corner_points(bounds: Rect, radius: f32) -> std::sync::Arc<[Point]> {
 #[derive(Clone, Debug)]
 struct ReferenceWaveformWidget {
     common: WidgetCommon,
+    timeline: TimelineSurface,
     summary: Arc<radiant::runtime::GpuSignalSummary>,
     cursor_ratio: Option<f32>,
     loop_selection: Option<(f32, f32)>,
@@ -858,7 +909,6 @@ struct ReferenceWaveformWidget {
     draft_ratio: Option<f32>,
     selected_note_ratio: Option<f32>,
     comment_pointer_down: bool,
-    start_hit_slop: f32,
     visible_ratio: Option<f32>,
 }
 
@@ -875,6 +925,7 @@ impl ReferenceWaveformWidget {
         common.paint.paints_state_layers = false;
         Self {
             common,
+            timeline: TimelineSurface::new(),
             summary: Arc::clone(&waveform.summary),
             cursor_ratio: cursor_ratio.map(clamp_ratio),
             loop_selection: loop_selection.map(normalize_range),
@@ -890,21 +941,8 @@ impl ReferenceWaveformWidget {
             draft_ratio: None,
             selected_note_ratio: None,
             comment_pointer_down: false,
-            start_hit_slop: 0.0,
             visible_ratio: None,
         }
-    }
-
-    fn ratio_from_position(bounds: Rect, position: Point) -> f32 {
-        if bounds.width() <= 0.0 {
-            return 0.0;
-        }
-        clamp_ratio((position.x - bounds.min.x) / bounds.width())
-    }
-
-    fn with_start_hit_slop(mut self, slop: f32) -> Self {
-        self.start_hit_slop = slop.max(0.0);
-        self
     }
 
     fn with_note_ratios(mut self, note_ratios: Vec<(f32, bool)>) -> Self {
@@ -927,23 +965,6 @@ impl ReferenceWaveformWidget {
         self
     }
 
-    fn plot_bounds(&self, bounds: Rect) -> Rect {
-        let start_x = (bounds.min.x + self.start_hit_slop).min(bounds.max.x);
-        Rect::from_min_max(Point::new(start_x, bounds.min.y), bounds.max)
-    }
-
-    fn start_edge_contains(&self, bounds: Rect, position: Point) -> bool {
-        let plot_bounds = self.plot_bounds(bounds);
-        position.y >= bounds.min.y
-            && position.y <= bounds.max.y
-            && position.x >= bounds.min.x
-            && position.x < plot_bounds.min.x
-    }
-
-    fn interactive_bounds_contains(&self, bounds: Rect, position: Point) -> bool {
-        self.plot_bounds(bounds).contains(position) || self.start_edge_contains(bounds, position)
-    }
-
     fn comment_rail_contains(bounds: Rect, position: Point) -> bool {
         position.y >= comment_rail_y(bounds) && bounds.contains(position)
     }
@@ -953,7 +974,6 @@ impl ReferenceWaveformWidget {
             return None;
         }
 
-        let plot_bounds = self.plot_bounds(bounds);
         let rail_y = comment_rail_y(bounds);
         let hover_radius_squared = NOTE_HOVER_RADIUS * NOTE_HOVER_RADIUS;
         self.note_ratios
@@ -961,7 +981,7 @@ impl ReferenceWaveformWidget {
             .enumerate()
             .filter_map(|(index, (ratio, _))| {
                 let ratio = clamp_ratio(*ratio);
-                let dx = position.x - plot_bounds.x_for_ratio(ratio);
+                let dx = position.x - self.timeline.x_at(bounds, ratio);
                 let dy = position.y - rail_y;
                 let distance_squared = dx * dx + dy * dy;
                 (distance_squared <= hover_radius_squared).then_some((
@@ -1057,9 +1077,8 @@ impl Widget for ReferenceWaveformWidget {
         }
         match input {
             WidgetInput::PointerMove { position, .. } => {
-                let plot_bounds = self.plot_bounds(bounds);
-                let ratio = Self::ratio_from_position(plot_bounds, position);
-                let inside = self.interactive_bounds_contains(bounds, position);
+                let ratio = self.timeline.ratio_at(bounds, position);
+                let inside = self.timeline.interactive_contains(bounds, position);
                 let hover_lower = inside && Self::comment_rail_contains(bounds, position);
                 self.common.state.hovered = inside;
                 if self.comment_pointer_down {
@@ -1099,8 +1118,8 @@ impl Widget for ReferenceWaveformWidget {
                 position,
                 button: PointerButton::Primary,
                 ..
-            } if self.interactive_bounds_contains(bounds, position) => {
-                let ratio = Self::ratio_from_position(self.plot_bounds(bounds), position);
+            } if self.timeline.interactive_contains(bounds, position) => {
+                let ratio = self.timeline.ratio_at(bounds, position);
                 self.pointer_down_position = Some(position);
                 self.pointer_down_ratio = Some(ratio);
                 self.comment_pointer_down = Self::comment_rail_contains(bounds, position);
@@ -1122,15 +1141,14 @@ impl Widget for ReferenceWaveformWidget {
                 button: PointerButton::Primary,
                 ..
             } if self.pointer_down_position.is_some() => {
-                let plot_bounds = self.plot_bounds(bounds);
-                let end_ratio = Self::ratio_from_position(plot_bounds, position);
+                let end_ratio = self.timeline.ratio_at(bounds, position);
                 let pointer_down_position = self.pointer_down_position.take();
                 let pointer_down_ratio = self.pointer_down_ratio.take();
                 let start_ratio = self.loop_drag_start_ratio.take();
                 let comment_pointer_down = self.comment_pointer_down;
                 self.comment_pointer_down = false;
                 self.loop_drag_current_ratio = None;
-                self.common.state.hovered = self.interactive_bounds_contains(bounds, position);
+                self.common.state.hovered = self.timeline.interactive_contains(bounds, position);
                 self.hover_ratio = self.common.state.hovered.then_some(end_ratio);
                 self.hover_lower = false;
                 self.hovered_note_ratio = self.persisted_note_near_position(bounds, position);
@@ -1210,7 +1228,7 @@ impl Widget for ReferenceWaveformWidget {
         }
         let colors = WaveformColors::from_theme(theme);
         fill_rect(primitives, self.common.id, bounds, theme.surface_base);
-        let plot_bounds = self.plot_bounds(bounds);
+        let plot_bounds = self.timeline.plot_bounds(bounds);
         let bar_bounds = visible_bounds(plot_bounds, self.visible_ratio);
         let rail_y = comment_rail_y(bounds);
         let upper_bounds = Rect::from_min_max(bar_bounds.min, Point::new(bar_bounds.max.x, rail_y));
@@ -1246,36 +1264,47 @@ impl Widget for ReferenceWaveformWidget {
         if self.visible_ratio.is_some() {
             return;
         }
-        if let Some((start_ratio, end_ratio)) = self.active_loop_selection() {
-            let start_x = plot_bounds.x_for_ratio(start_ratio);
-            let end_x = plot_bounds.x_for_ratio(end_ratio);
-            fill_rect(
-                primitives,
-                self.common.id,
-                Rect::from_min_max(
-                    Point::new(start_x, plot_bounds.min.y),
-                    Point::new(end_x.max(start_x + 1.0), plot_bounds.max.y),
-                ),
-                colors.reference_selection_fill,
-            );
-            fill_rect(
-                primitives,
-                self.common.id,
-                Rect::from_min_max(
-                    Point::new(start_x, plot_bounds.min.y),
-                    Point::new((start_x + 2.0).min(plot_bounds.max.x), plot_bounds.max.y),
-                ),
-                colors.reference_selection_edge,
-            );
-            fill_rect(
-                primitives,
-                self.common.id,
-                Rect::from_min_max(
-                    Point::new((end_x - 2.0).max(plot_bounds.min.x), plot_bounds.min.y),
-                    Point::new(end_x, plot_bounds.max.y),
-                ),
-                colors.reference_selection_edge,
-            );
+        if plot_bounds.has_finite_positive_area()
+            && let Some((start_ratio, end_ratio)) = self.active_loop_selection()
+        {
+            let start_x = self.timeline.x_at(bounds, start_ratio);
+            let end_x = self.timeline.x_at(bounds, end_ratio);
+            let selection_end_x = end_x.max(start_x + 1.0).min(plot_bounds.max.x);
+            if selection_end_x > start_x {
+                fill_rect(
+                    primitives,
+                    self.common.id,
+                    Rect::from_min_max(
+                        Point::new(start_x, plot_bounds.min.y),
+                        Point::new(selection_end_x, plot_bounds.max.y),
+                    ),
+                    colors.reference_selection_fill,
+                );
+            }
+            let start_edge_end = (start_x + 2.0).min(plot_bounds.max.x);
+            if start_edge_end > start_x {
+                fill_rect(
+                    primitives,
+                    self.common.id,
+                    Rect::from_min_max(
+                        Point::new(start_x, plot_bounds.min.y),
+                        Point::new(start_edge_end, plot_bounds.max.y),
+                    ),
+                    colors.reference_selection_edge,
+                );
+            }
+            let end_edge_start = (end_x - 2.0).max(plot_bounds.min.x);
+            if end_x > end_edge_start {
+                fill_rect(
+                    primitives,
+                    self.common.id,
+                    Rect::from_min_max(
+                        Point::new(end_edge_start, plot_bounds.min.y),
+                        Point::new(end_x, plot_bounds.max.y),
+                    ),
+                    colors.reference_selection_edge,
+                );
+            }
         }
         if let Some(ratio) = self.cursor_ratio {
             paint_cursor(
@@ -1360,7 +1389,7 @@ impl Widget for ReferenceWaveformWidget {
             return;
         }
         let colors = WaveformColors::from_theme(theme);
-        let plot_bounds = self.plot_bounds(bounds);
+        let plot_bounds = self.timeline.plot_bounds(bounds);
         if let Some(ratio) = self.hover_ratio {
             paint_cursor(
                 primitives,
@@ -1384,7 +1413,7 @@ impl Widget for ReferenceWaveformWidget {
                 fill_rect(
                     primitives,
                     self.common.id,
-                    marker_rect(plot_bounds.x_for_ratio(ratio), rail_y, MARKER_RADIUS),
+                    marker_rect(self.timeline.x_at(bounds, ratio), rail_y, MARKER_RADIUS),
                     colors.note_outline,
                 );
             }
@@ -1393,6 +1422,9 @@ impl Widget for ReferenceWaveformWidget {
 }
 
 fn fill_rect(primitives: &mut Vec<PaintPrimitive>, widget_id: u64, rect: Rect, color: Rgba8) {
+    if !rect.has_finite_positive_area() {
+        return;
+    }
     primitives.push(PaintPrimitive::FillRect(PaintFillRect {
         widget_id,
         rect,
@@ -1669,6 +1701,10 @@ mod tests {
         WaveformColors::from_theme(&ThemeTokens::default())
     }
 
+    fn timeline_x(bounds: Rect, ratio: f32) -> f32 {
+        TimelineSurface::new().x_at(bounds, ratio)
+    }
+
     fn generic_lower_marker_count(primitives: &[PaintPrimitive], rail_y: f32) -> usize {
         primitives
             .iter()
@@ -1817,7 +1853,7 @@ mod tests {
                 .handle_input(
                     bounds,
                     WidgetInput::pointer_move(Point::new(
-                        bounds.x_for_ratio(0.25) + 3.0,
+                        timeline_x(bounds, 0.25) + 3.0,
                         rail_y + 3.0,
                     )),
                 )
@@ -1859,7 +1895,7 @@ mod tests {
 
         widget.handle_input(
             bounds,
-            WidgetInput::pointer_move(Point::new(bounds.x_for_ratio(0.5), rail_y + 3.0)),
+            WidgetInput::pointer_move(Point::new(timeline_x(bounds, 0.5), rail_y + 3.0)),
         );
         assert_eq!(widget.hovered_note_ratio, None);
         overlay.clear();
@@ -1876,7 +1912,7 @@ mod tests {
     fn persisted_comment_hover_state_survives_retained_widget_rebuilds() {
         let bounds = Rect::from_min_max(Point::new(10.0, 20.0), Point::new(110.0, 120.0));
         let rail_y = comment_rail_y(bounds);
-        let pointer = Point::new(bounds.x_for_ratio(0.4), rail_y);
+        let pointer = Point::new(timeline_x(bounds, 0.4), rail_y);
         let mut previous = WaveformWidget::new(Arc::new(test_waveform()), None, vec![(0.4, false)]);
         previous.handle_input(bounds, WidgetInput::pointer_move(pointer));
 
@@ -2049,7 +2085,7 @@ mod tests {
 
         widget.handle_input(
             bounds,
-            WidgetInput::pointer_move(Point::new(bounds.x_for_ratio(0.5), bounds.min.y)),
+            WidgetInput::pointer_move(Point::new(timeline_x(bounds, 0.5), bounds.min.y)),
         );
         let paint_plan = widget.paint_plan_with_defaults(bounds);
         assert_eq!(highlighted_note_marker_count(&paint_plan.primitives), 0);
@@ -2075,7 +2111,7 @@ mod tests {
         assert_eq!(
             interaction(upper_widget.handle_input(
                 bounds,
-                WidgetInput::primary_press(Point::new(50.0, rail_y - 1.0)),
+                WidgetInput::primary_press(Point::new(timeline_x(bounds, 0.4), rail_y - 1.0)),
             )),
             WaveformInteraction::PlayheadDragStarted { ratio: 0.4 }
         );
@@ -2093,24 +2129,26 @@ mod tests {
             )
         }));
         assert_eq!(
-            interaction(
-                widget.handle_input(bounds, WidgetInput::primary_press(Point::new(50.0, rail_y)),)
-            ),
+            interaction(widget.handle_input(
+                bounds,
+                WidgetInput::primary_press(Point::new(timeline_x(bounds, 0.4), rail_y)),
+            )),
             WaveformInteraction::CommentDragStarted {
                 ratio: 0.4,
                 note_index: None,
             }
         );
         assert_eq!(
-            interaction(
-                widget.handle_input(bounds, WidgetInput::pointer_move(Point::new(80.0, rail_y)),)
-            ),
+            interaction(widget.handle_input(
+                bounds,
+                WidgetInput::pointer_move(Point::new(timeline_x(bounds, 0.7), rail_y)),
+            )),
             WaveformInteraction::CommentDragMoved { ratio: 0.7 }
         );
         assert_eq!(
             interaction(widget.handle_input(
                 bounds,
-                WidgetInput::primary_release(Point::new(90.0, rail_y)),
+                WidgetInput::primary_release(Point::new(timeline_x(bounds, 0.8), rail_y)),
             )),
             WaveformInteraction::CommentDragEnded { ratio: 0.8 }
         );
@@ -2130,7 +2168,7 @@ mod tests {
         assert_eq!(
             interaction(widget.handle_input(
                 bounds,
-                WidgetInput::primary_press(Point::new(bounds.x_for_ratio(0.3), rail_y)),
+                WidgetInput::primary_press(Point::new(timeline_x(bounds, 0.3), rail_y)),
             )),
             WaveformInteraction::CommentDragStarted {
                 ratio: 0.3,
@@ -2140,14 +2178,14 @@ mod tests {
         assert_eq!(
             interaction(widget.handle_input(
                 bounds,
-                WidgetInput::pointer_move(Point::new(bounds.x_for_ratio(0.6), rail_y)),
+                WidgetInput::pointer_move(Point::new(timeline_x(bounds, 0.6), rail_y)),
             )),
             WaveformInteraction::CommentDragMoved { ratio: 0.6 }
         );
         assert_eq!(
             interaction(widget.handle_input(
                 bounds,
-                WidgetInput::primary_release(Point::new(bounds.x_for_ratio(0.75), rail_y)),
+                WidgetInput::primary_release(Point::new(timeline_x(bounds, 0.75), rail_y)),
             )),
             WaveformInteraction::CommentDragEnded { ratio: 0.75 }
         );
@@ -2163,7 +2201,7 @@ mod tests {
         assert_eq!(
             interaction(comment_widget.handle_input(
                 bounds,
-                WidgetInput::primary_press(Point::new(bounds.x_for_ratio(0.3), rail_y)),
+                WidgetInput::primary_press(Point::new(timeline_x(bounds, 0.3), rail_y)),
             )),
             WaveformInteraction::CommentDragStarted {
                 ratio: 0.3,
@@ -2172,7 +2210,7 @@ mod tests {
         );
         let _ = comment_widget.handle_input(
             bounds,
-            WidgetInput::pointer_move(Point::new(bounds.x_for_ratio(0.6), rail_y)),
+            WidgetInput::pointer_move(Point::new(timeline_x(bounds, 0.6), rail_y)),
         );
 
         assert_eq!(
@@ -2191,7 +2229,7 @@ mod tests {
         assert_eq!(
             interaction(playhead_widget.handle_input(
                 bounds,
-                WidgetInput::primary_press(Point::new(40.0, bounds.min.y)),
+                WidgetInput::primary_press(Point::new(timeline_x(bounds, 0.3), bounds.min.y)),
             )),
             WaveformInteraction::PlayheadDragStarted { ratio: 0.3 }
         );
@@ -2237,25 +2275,30 @@ mod tests {
         }));
         assert_eq!(
             reference_bars.len(),
-            display_bar_count(bounds.width()),
+            display_bar_count(widget.timeline.plot_bounds(bounds).width()),
             "the reference signal should be painted once above the comment rail"
         );
         assert!(reference_bars.iter().all(|bar| bar.rect.max.y <= rail_y));
 
         assert_eq!(
-            widget.handle_input(bounds, WidgetInput::primary_press(Point::new(30.0, 20.0)),),
+            widget.handle_input(
+                bounds,
+                WidgetInput::primary_press(Point::new(timeline_x(bounds, 0.2), 20.0)),
+            ),
             None
         );
         assert_eq!(
-            reference_interaction(
-                widget.handle_input(bounds, WidgetInput::pointer_move(Point::new(90.0, 20.0)),)
-            ),
+            reference_interaction(widget.handle_input(
+                bounds,
+                WidgetInput::pointer_move(Point::new(timeline_x(bounds, 0.8), 20.0)),
+            )),
             ReferenceWaveformInteraction::Started { ratio: 0.2 }
         );
         assert_eq!(
-            reference_interaction(
-                widget.handle_input(bounds, WidgetInput::primary_release(Point::new(90.0, 20.0)),)
-            ),
+            reference_interaction(widget.handle_input(
+                bounds,
+                WidgetInput::primary_release(Point::new(timeline_x(bounds, 0.8), 20.0)),
+            )),
             ReferenceWaveformInteraction::Ended {
                 start_ratio: 0.2,
                 end_ratio: 0.8,
@@ -2281,13 +2324,17 @@ mod tests {
 
         assert!(
             widget
-                .handle_input(bounds, WidgetInput::primary_press(Point::new(30.0, 20.0)))
+                .handle_input(
+                    bounds,
+                    WidgetInput::primary_press(Point::new(timeline_x(bounds, 0.2), 20.0)),
+                )
                 .is_none()
         );
         assert_eq!(
-            reference_interaction(
-                widget.handle_input(bounds, WidgetInput::primary_release(Point::new(30.0, 20.0)))
-            ),
+            reference_interaction(widget.handle_input(
+                bounds,
+                WidgetInput::primary_release(Point::new(timeline_x(bounds, 0.2), 20.0)),
+            )),
             ReferenceWaveformInteraction::Clicked { ratio: 0.2 }
         );
         assert!(widget.loop_drag_start_ratio.is_none());
@@ -2305,7 +2352,7 @@ mod tests {
             widget
                 .handle_input(
                     bounds,
-                    WidgetInput::pointer_move(Point::new(33.0, rail_y + 3.0)),
+                    WidgetInput::pointer_move(Point::new(timeline_x(bounds, 0.2), rail_y + 3.0)),
                 )
                 .is_none()
         );
@@ -2321,7 +2368,7 @@ mod tests {
 
         widget.handle_input(
             bounds,
-            WidgetInput::pointer_move(Point::new(bounds.x_for_ratio(0.5), rail_y + 3.0)),
+            WidgetInput::pointer_move(Point::new(timeline_x(bounds, 0.5), rail_y + 3.0)),
         );
         overlay.clear();
         widget.append_runtime_overlay_paint(
@@ -2337,14 +2384,14 @@ mod tests {
             widget
                 .handle_input(
                     bounds,
-                    WidgetInput::primary_press(Point::new(30.0, rail_y + 4.0))
+                    WidgetInput::primary_press(Point::new(timeline_x(bounds, 0.2), rail_y + 4.0))
                 )
                 .is_none()
         );
         assert_eq!(
             reference_interaction(widget.handle_input(
                 bounds,
-                WidgetInput::primary_release(Point::new(30.0, rail_y + 4.0))
+                WidgetInput::primary_release(Point::new(timeline_x(bounds, 0.2), rail_y + 4.0))
             )),
             ReferenceWaveformInteraction::CommentClicked { ratio: 0.2 }
         );
@@ -2394,7 +2441,10 @@ mod tests {
         let mut previous = ReferenceWaveformWidget::new(Arc::new(test_waveform()), None, None);
         assert!(
             previous
-                .handle_input(bounds, WidgetInput::primary_press(Point::new(30.0, 20.0)))
+                .handle_input(
+                    bounds,
+                    WidgetInput::primary_press(Point::new(timeline_x(bounds, 0.2), 20.0)),
+                )
                 .is_none()
         );
 
@@ -2402,21 +2452,23 @@ mod tests {
         current.synchronize_from_previous(&previous);
 
         assert_eq!(
-            reference_interaction(
-                current.handle_input(bounds, WidgetInput::pointer_move(Point::new(90.0, 20.0)))
-            ),
+            reference_interaction(current.handle_input(
+                bounds,
+                WidgetInput::pointer_move(Point::new(timeline_x(bounds, 0.8), 20.0)),
+            )),
             ReferenceWaveformInteraction::Started { ratio: 0.2 }
         );
         assert_eq!(
-            reference_interaction(
-                current.handle_input(bounds, WidgetInput::pointer_move(Point::new(100.0, 20.0)))
-            ),
+            reference_interaction(current.handle_input(
+                bounds,
+                WidgetInput::pointer_move(Point::new(timeline_x(bounds, 0.9), 20.0)),
+            )),
             ReferenceWaveformInteraction::Moved { ratio: 0.9 }
         );
         assert_eq!(
             reference_interaction(current.handle_input(
                 bounds,
-                WidgetInput::primary_release(Point::new(100.0, 20.0))
+                WidgetInput::primary_release(Point::new(timeline_x(bounds, 0.9), 20.0))
             )),
             ReferenceWaveformInteraction::Ended {
                 start_ratio: 0.2,
@@ -2429,6 +2481,7 @@ mod tests {
     fn reference_waveform_paints_the_shared_cursor() {
         let bounds = Rect::from_min_max(Point::new(10.0, 20.0), Point::new(110.0, 96.0));
         let widget = ReferenceWaveformWidget::new(Arc::new(test_waveform()), Some(0.5), None);
+        let expected_x = timeline_x(bounds, 0.5);
         let paint_plan = widget.paint_plan_with_defaults(bounds);
 
         assert!(paint_plan.primitives.iter().any(|primitive| {
@@ -2436,8 +2489,8 @@ mod tests {
                 primitive,
                 radiant::runtime::PaintPrimitive::FillRect(fill)
                     if fill.color == colors().cursor
-                        && (fill.rect.min.x - 59.0).abs() < f32::EPSILON
-                        && (fill.rect.max.x - 61.0).abs() < f32::EPSILON
+                        && (fill.rect.min.x - (expected_x - 1.0)).abs() < f32::EPSILON
+                        && (fill.rect.max.x - (expected_x + 1.0)).abs() < f32::EPSILON
                         && fill.rect.min.y == bounds.min.y
                         && fill.rect.max.y == bounds.max.y
             )
@@ -2449,18 +2502,20 @@ mod tests {
         let bounds = Rect::from_min_max(Point::new(10.0, 20.0), Point::new(110.0, 96.0));
         let ratio = 0.5;
         let mut widget = ReferenceWaveformWidget::new(Arc::new(test_waveform()), Some(ratio), None)
-            .with_start_hit_slop(REFERENCE_START_HIT_SLOP)
             .with_note_ratios(vec![(ratio, false)]);
 
-        let plot_bounds = widget.plot_bounds(bounds);
-        let expected_x = plot_bounds.x_for_ratio(ratio);
+        let expected_x = timeline_x(bounds, ratio);
         let rail_y = comment_rail_y(bounds);
         let paint_plan = widget.paint_plan_with_defaults(bounds);
         let cursor_center_x = paint_plan
             .primitives
             .iter()
             .find_map(|primitive| match primitive {
-                PaintPrimitive::FillRect(fill) if fill.color == colors().cursor => {
+                PaintPrimitive::FillRect(fill)
+                    if fill.color == colors().cursor
+                        && (fill.rect.width() - CURSOR_WIDTH).abs() < f32::EPSILON
+                        && fill.rect.min.y == bounds.min.y =>
+                {
                     Some((fill.rect.min.x + fill.rect.max.x) * 0.5)
                 }
                 _ => None,
@@ -2539,7 +2594,7 @@ mod tests {
         }
 
         let temporary_ratio = 0.75;
-        let temporary_position = Point::new(plot_bounds.x_for_ratio(temporary_ratio), rail_y + 3.0);
+        let temporary_position = Point::new(timeline_x(bounds, temporary_ratio), rail_y + 3.0);
         widget.handle_input(bounds, WidgetInput::pointer_move(temporary_position));
         overlay.clear();
         widget.append_runtime_overlay_paint(
@@ -2562,9 +2617,7 @@ mod tests {
                 _ => None,
             })
             .expect("temporary lower-rail marker should be painted");
-        assert!(
-            (temporary_marker_center_x - plot_bounds.x_for_ratio(temporary_ratio)).abs() < 1e-6
-        );
+        assert!((temporary_marker_center_x - timeline_x(bounds, temporary_ratio)).abs() < 1e-6);
     }
 
     #[test]
@@ -2613,8 +2666,7 @@ mod tests {
     #[test]
     fn reference_waveform_start_edge_clamps_hover_and_click_to_zero() {
         let bounds = Rect::from_min_max(Point::new(0.0, 20.0), Point::new(100.0, 96.0));
-        let mut widget = ReferenceWaveformWidget::new(Arc::new(test_waveform()), None, None)
-            .with_start_hit_slop(REFERENCE_START_HIT_SLOP);
+        let mut widget = ReferenceWaveformWidget::new(Arc::new(test_waveform()), None, None);
 
         assert!(
             widget
@@ -2667,14 +2719,233 @@ mod tests {
     }
 
     #[test]
+    fn main_waveform_start_edge_hover_and_playhead_drag_use_ratio_zero() {
+        let bounds = Rect::from_min_max(Point::new(0.0, 20.0), Point::new(100.0, 120.0));
+        let gutter = Point::new(5.0, 50.0);
+        let mut widget = WaveformWidget::new(Arc::new(test_waveform()), None, Vec::new());
+
+        assert!(
+            widget
+                .handle_input(bounds, WidgetInput::pointer_move(gutter))
+                .is_none()
+        );
+        assert_eq!(widget.hover_ratio, Some(0.0));
+        assert!(widget.common.state.hovered);
+
+        let mut overlay = Vec::new();
+        widget.append_runtime_overlay_paint(
+            &mut overlay,
+            bounds,
+            &Default::default(),
+            &Default::default(),
+        );
+        let start_x = timeline_x(bounds, 0.0);
+        assert!(overlay.iter().any(|primitive| {
+            matches!(
+                primitive,
+                PaintPrimitive::FillRect(fill)
+                    if fill.color == colors().cursor
+                        && (fill.rect.min.x - (start_x - 1.0)).abs() < f32::EPSILON
+                        && (fill.rect.max.x - (start_x + 1.0)).abs() < f32::EPSILON
+                        && fill.rect.min.y == bounds.min.y
+            )
+        }));
+
+        assert_eq!(
+            interaction(widget.handle_input(bounds, WidgetInput::primary_press(gutter))),
+            WaveformInteraction::PlayheadDragStarted { ratio: 0.0 }
+        );
+        assert_eq!(
+            interaction(widget.handle_input(bounds, WidgetInput::primary_release(gutter))),
+            WaveformInteraction::PlayheadDragEnded { ratio: 0.0 }
+        );
+    }
+
+    #[test]
+    fn upper_start_gutter_keeps_playhead_semantics_for_ratio_zero_persisted_marker() {
+        let bounds = Rect::from_min_max(Point::new(0.0, 20.0), Point::new(100.0, 120.0));
+        let rail_y = comment_rail_y(bounds);
+        let upper_gutter = Point::new(bounds.min.x + REFERENCE_START_HIT_SLOP * 0.5, rail_y - 1.0);
+        let mut widget = WaveformWidget::new(Arc::new(test_waveform()), None, vec![(0.0, false)]);
+
+        assert_eq!(
+            interaction(widget.handle_input(bounds, WidgetInput::primary_press(upper_gutter),)),
+            WaveformInteraction::PlayheadDragStarted { ratio: 0.0 }
+        );
+        assert_eq!(
+            interaction(widget.handle_input(bounds, WidgetInput::primary_release(upper_gutter),)),
+            WaveformInteraction::PlayheadDragEnded { ratio: 0.0 }
+        );
+        assert!(!widget.playhead_dragging);
+        assert!(!widget.comment_dragging);
+    }
+
+    #[test]
+    fn main_comment_markers_share_plot_coordinates_with_cursor_and_hit_testing() {
+        let bounds = Rect::from_min_max(Point::new(10.0, 20.0), Point::new(110.0, 120.0));
+        let ratio = 0.5;
+        let expected_x = timeline_x(bounds, ratio);
+        let rail_y = comment_rail_y(bounds);
+        let mut widget =
+            WaveformWidget::new(Arc::new(test_waveform()), Some(ratio), vec![(ratio, false)]);
+        let paint_plan = widget.paint_plan_with_defaults(bounds);
+        let cursor_center_x = paint_plan
+            .primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                PaintPrimitive::FillRect(fill)
+                    if fill.color == colors().cursor
+                        && (fill.rect.width() - CURSOR_WIDTH).abs() < f32::EPSILON
+                        && fill.rect.min.y == bounds.min.y =>
+                {
+                    Some((fill.rect.min.x + fill.rect.max.x) * 0.5)
+                }
+                _ => None,
+            })
+            .expect("main cursor should be painted");
+        let marker_center_x = paint_plan
+            .primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                PaintPrimitive::FillPolygon(fill) if fill.color == colors().note_fill => {
+                    let (min_x, max_x) = fill
+                        .points
+                        .iter()
+                        .map(|point| point.x)
+                        .fold((f32::INFINITY, f32::NEG_INFINITY), |(min_x, max_x), x| {
+                            (min_x.min(x), max_x.max(x))
+                        });
+                    Some((min_x + max_x) * 0.5)
+                }
+                _ => None,
+            })
+            .expect("persisted main marker should be painted");
+        assert!((cursor_center_x - expected_x).abs() < 1e-6);
+        assert!((marker_center_x - expected_x).abs() < 1e-6);
+
+        let marker_position = Point::new(expected_x, rail_y + 3.0);
+        assert!(
+            widget
+                .handle_input(bounds, WidgetInput::pointer_move(marker_position))
+                .is_none()
+        );
+        assert_eq!(widget.hovered_note_ratio, Some(ratio));
+
+        let mut overlay = Vec::new();
+        widget.append_runtime_overlay_paint(
+            &mut overlay,
+            bounds,
+            &Default::default(),
+            &Default::default(),
+        );
+        assert_eq!(highlighted_note_marker_count(&overlay), 1);
+        let highlighted_center_x = overlay
+            .iter()
+            .find_map(|primitive| match primitive {
+                PaintPrimitive::FillPolygon(fill) if fill.color == colors().note_hover_fill => {
+                    let (min_x, max_x) = fill
+                        .points
+                        .iter()
+                        .map(|point| point.x)
+                        .fold((f32::INFINITY, f32::NEG_INFINITY), |(min_x, max_x), x| {
+                            (min_x.min(x), max_x.max(x))
+                        });
+                    Some((min_x + max_x) * 0.5)
+                }
+                _ => None,
+            })
+            .expect("hovered main marker should be highlighted");
+        assert!((highlighted_center_x - expected_x).abs() < 1e-6);
+
+        assert_eq!(
+            interaction(widget.handle_input(bounds, WidgetInput::primary_press(marker_position),)),
+            WaveformInteraction::CommentDragStarted {
+                ratio,
+                note_index: Some(0),
+            }
+        );
+        assert_eq!(
+            interaction(
+                widget.handle_input(bounds, WidgetInput::primary_release(marker_position),)
+            ),
+            WaveformInteraction::CommentDragEnded { ratio }
+        );
+
+        let mut draft_widget = WaveformWidget::new(Arc::new(test_waveform()), None, Vec::new())
+            .with_draft_ratio(Some(ratio));
+        assert_eq!(
+            interaction(
+                draft_widget.handle_input(bounds, WidgetInput::primary_press(marker_position),)
+            ),
+            WaveformInteraction::CommentDragStarted {
+                ratio,
+                note_index: None,
+            }
+        );
+    }
+
+    #[test]
+    fn main_and_reference_share_the_same_start_gutter_boundary() {
+        let bounds = Rect::from_min_max(Point::new(10.0, 20.0), Point::new(110.0, 120.0));
+        let gutter = Point::new(15.0, 40.0);
+        let plot_start = timeline_x(bounds, 0.0);
+        let mut main = WaveformWidget::new(Arc::new(test_waveform()), None, Vec::new());
+        let mut reference = ReferenceWaveformWidget::new(Arc::new(test_waveform()), None, None);
+
+        assert_eq!(plot_start, 20.0);
+        assert!(main.timeline.interactive_contains(bounds, gutter));
+        assert!(reference.timeline.interactive_contains(bounds, gutter));
+        assert_eq!(main.timeline.ratio_at(bounds, gutter), 0.0);
+        assert_eq!(reference.timeline.ratio_at(bounds, gutter), 0.0);
+        assert!(
+            !main
+                .timeline
+                .interactive_contains(bounds, Point::new(bounds.min.x - 1.0, gutter.y))
+        );
+
+        assert!(
+            main.handle_input(bounds, WidgetInput::pointer_move(gutter))
+                .is_none()
+        );
+        assert!(
+            reference
+                .handle_input(bounds, WidgetInput::pointer_move(gutter))
+                .is_none()
+        );
+        assert_eq!(main.hover_ratio, Some(0.0));
+        assert_eq!(reference.hover_ratio, Some(0.0));
+    }
+
+    #[test]
+    fn narrow_timeline_bounds_do_not_emit_invalid_fill_geometry() {
+        let bounds = Rect::from_min_max(Point::new(0.0, 0.0), Point::new(4.0, 20.0));
+        let timeline = TimelineSurface::new();
+        assert_eq!(timeline.plot_bounds(bounds).width(), 0.0);
+        assert_eq!(timeline.ratio_at(bounds, Point::new(2.0, 10.0)), 0.0);
+        assert_eq!(timeline.x_at(bounds, 0.0), 4.0);
+
+        let main_plan = WaveformWidget::new(Arc::new(test_waveform()), None, Vec::new())
+            .paint_plan_with_defaults(bounds);
+        let reference_plan = ReferenceWaveformWidget::new(Arc::new(test_waveform()), None, None)
+            .paint_plan_with_defaults(bounds);
+        for plan in [main_plan, reference_plan] {
+            assert!(plan.primitives.iter().all(|primitive| match primitive {
+                PaintPrimitive::FillRect(fill) => fill.rect.has_finite_positive_area(),
+                _ => true,
+            }));
+        }
+    }
+
+    #[test]
     fn upper_waveform_emits_a_captured_playhead_drag_with_clamped_ratios() {
         let bounds = Rect::from_min_max(Point::new(10.0, 20.0), Point::new(110.0, 120.0));
         let mut widget = WaveformWidget::new(Arc::new(test_waveform()), None, Vec::new());
 
         assert_eq!(
-            interaction(
-                widget.handle_input(bounds, WidgetInput::primary_press(Point::new(35.0, 40.0)),)
-            ),
+            interaction(widget.handle_input(
+                bounds,
+                WidgetInput::primary_press(Point::new(timeline_x(bounds, 0.25), 40.0)),
+            )),
             WaveformInteraction::PlayheadDragStarted { ratio: 0.25 }
         );
         assert_eq!(
@@ -2690,9 +2961,10 @@ mod tests {
             WaveformInteraction::PlayheadDragMoved { ratio: 1.0 }
         );
         assert_eq!(
-            interaction(
-                widget.handle_input(bounds, WidgetInput::primary_release(Point::new(60.0, 40.0)),)
-            ),
+            interaction(widget.handle_input(
+                bounds,
+                WidgetInput::primary_release(Point::new(timeline_x(bounds, 0.5), 40.0)),
+            )),
             WaveformInteraction::PlayheadDragEnded { ratio: 0.5 }
         );
         assert!(!widget.playhead_dragging);
@@ -2702,17 +2974,19 @@ mod tests {
     fn playhead_drag_state_survives_widget_synchronization() {
         let bounds = Rect::from_min_max(Point::new(10.0, 20.0), Point::new(110.0, 120.0));
         let mut previous = WaveformWidget::new(Arc::new(test_waveform()), None, Vec::new());
-        interaction(
-            previous.handle_input(bounds, WidgetInput::primary_press(Point::new(35.0, 40.0))),
-        );
+        interaction(previous.handle_input(
+            bounds,
+            WidgetInput::primary_press(Point::new(timeline_x(bounds, 0.25), 40.0)),
+        ));
 
         let mut current = WaveformWidget::new(Arc::new(test_waveform()), None, Vec::new());
         current.synchronize_from_previous(&previous);
 
         assert_eq!(
-            interaction(
-                current.handle_input(bounds, WidgetInput::pointer_move(Point::new(85.0, 40.0)),)
-            ),
+            interaction(current.handle_input(
+                bounds,
+                WidgetInput::pointer_move(Point::new(timeline_x(bounds, 0.75), 40.0)),
+            )),
             WaveformInteraction::PlayheadDragMoved { ratio: 0.75 }
         );
     }
@@ -2723,7 +2997,7 @@ mod tests {
         let mut previous_main = WaveformWidget::new(Arc::new(test_waveform()), None, Vec::new());
         interaction(previous_main.handle_input(
             main_bounds,
-            WidgetInput::primary_press(Point::new(35.0, 40.0)),
+            WidgetInput::primary_press(Point::new(timeline_x(main_bounds, 0.25), 40.0)),
         ));
 
         let mut preview_main = WaveformWidget::new(Arc::new(test_waveform()), None, Vec::new())
@@ -2731,15 +3005,17 @@ mod tests {
         preview_main.synchronize_from_previous(&previous_main);
         assert!(!preview_main.accepts_pointer_move());
         assert!(
-            !preview_main
-                .accepts_pointer_input(&WidgetInput::primary_press(Point::new(35.0, 40.0,)))
+            !preview_main.accepts_pointer_input(&WidgetInput::primary_press(Point::new(
+                timeline_x(main_bounds, 0.25),
+                40.0,
+            )))
         );
         assert!(!preview_main.playhead_dragging);
         assert!(
             preview_main
                 .handle_input(
                     main_bounds,
-                    WidgetInput::primary_release(Point::new(85.0, 40.0))
+                    WidgetInput::primary_release(Point::new(timeline_x(main_bounds, 0.75), 40.0))
                 )
                 .is_none()
         );
@@ -2750,7 +3026,7 @@ mod tests {
         assert_eq!(
             interaction(finalized_main.handle_input(
                 main_bounds,
-                WidgetInput::primary_press(Point::new(35.0, 40.0)),
+                WidgetInput::primary_press(Point::new(timeline_x(main_bounds, 0.25), 40.0)),
             )),
             WaveformInteraction::PlayheadDragStarted { ratio: 0.25 }
         );
@@ -2825,9 +3101,10 @@ mod tests {
         let mut widget = WaveformWidget::new(Arc::new(test_waveform()), None, Vec::new());
 
         assert_eq!(
-            interaction(
-                widget.handle_input(bounds, WidgetInput::primary_press(Point::new(60.0, 105.0)),)
-            ),
+            interaction(widget.handle_input(
+                bounds,
+                WidgetInput::primary_press(Point::new(timeline_x(bounds, 0.5), 105.0)),
+            )),
             WaveformInteraction::Clicked {
                 ratio: 0.5,
                 lower: true,
@@ -2836,15 +3113,16 @@ mod tests {
         assert!(!widget.playhead_dragging);
         assert!(widget.comment_dragging);
         assert_eq!(
-            interaction(
-                widget.handle_input(bounds, WidgetInput::pointer_move(Point::new(85.0, 105.0)))
-            ),
+            interaction(widget.handle_input(
+                bounds,
+                WidgetInput::pointer_move(Point::new(timeline_x(bounds, 0.75), 105.0)),
+            )),
             WaveformInteraction::CommentDragMoved { ratio: 0.75 }
         );
         assert_eq!(
             interaction(widget.handle_input(
                 bounds,
-                WidgetInput::primary_release(Point::new(90.0, 105.0))
+                WidgetInput::primary_release(Point::new(timeline_x(bounds, 0.8), 105.0))
             )),
             WaveformInteraction::CommentDragEnded { ratio: 0.8 }
         );
