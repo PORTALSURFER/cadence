@@ -175,4 +175,9 @@ test("release workflow keeps signing and publication on separate immutable jobs"
   const githubReleaseIndex = publishJob.indexOf("Create or verify GitHub release idempotently");
   const portalSurferIndex = publishJob.indexOf("Publish exact release to PortalSurfer");
   assert.ok(githubReleaseIndex >= 0 && githubReleaseIndex < portalSurferIndex, "PortalSurfer publication must be last");
+  assert.match(
+    publishJob,
+    /- name: Publish exact release to PortalSurfer\n        run: \|\n          node scripts\/release\/publish_release\.mjs \\\n            --manifest release-output\/cadence-release-manifest\.json \\\n            --root release-output/,
+    "publisher arguments must remain separate shell arguments after YAML parsing",
+  );
 });

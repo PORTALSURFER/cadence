@@ -360,6 +360,7 @@ jobs:
           done
 
       - name: Publish exact release to PortalSurfer
-        run: node scripts/release/publish_release.mjs \
-          --manifest release-output/cadence-release-manifest.json \
-          --root release-output
+        run: |
+          node scripts/release/publish_release.mjs \
+            --manifest release-output/cadence-release-manifest.json \
+            --root release-output
