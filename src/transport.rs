@@ -12,7 +12,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
     },
     thread,
@@ -21,6 +21,9 @@ use std::{
 
 const COMMAND_CAPACITY: usize = 32;
 const CONTROL_INTERVAL: Duration = Duration::from_millis(8);
+pub const CONTROLS_BUSY_ERROR: &str = "Audio controls are busy — try again shortly.";
+pub const DEFAULT_VOLUME: f32 = 0.8;
+pub const MAX_OUTPUT_GAIN: f32 = 16.0;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Snapshot {
@@ -39,6 +42,7 @@ struct SharedSnapshot {
     position_millis: AtomicU64,
     playing: AtomicBool,
     ready: AtomicBool,
+    requested_volume: AtomicU32,
     error_available: AtomicBool,
     error: Mutex<Option<(u64, String)>>,
 }
@@ -52,6 +56,7 @@ impl SharedSnapshot {
             position_millis: AtomicU64::new(0),
             playing: AtomicBool::new(false),
             ready: AtomicBool::new(false),
+            requested_volume: AtomicU32::new(DEFAULT_VOLUME.to_bits()),
             error_available: AtomicBool::new(false),
             error: Mutex::new(None),
         }
@@ -104,6 +109,12 @@ impl SharedSnapshot {
                 None
             }
         }
+    }
+
+    fn requested_volume(&self) -> f32 {
+        normalize_output_gain(f32::from_bits(
+            self.requested_volume.load(Ordering::Acquire),
+        ))
     }
 }
 
@@ -187,6 +198,10 @@ impl PendingLoad {
         }
     }
 
+    fn is_pending(&self) -> bool {
+        !self.pointer.load(Ordering::Acquire).is_null()
+    }
+
     fn clear_generation(&self, generation: u64) {
         let Some(command) = self.take() else {
             return;
@@ -210,6 +225,7 @@ impl Drop for PendingLoad {
 #[derive(Clone, Debug)]
 pub struct AudioTransport {
     commands: SyncSender<Command>,
+    queued_commands: Arc<AtomicUsize>,
     shared: Arc<SharedSnapshot>,
     pending_load: Arc<PendingLoad>,
     next_token: Arc<AtomicU64>,
@@ -218,16 +234,26 @@ pub struct AudioTransport {
 impl AudioTransport {
     pub fn spawn() -> Self {
         let (commands, receiver) = mpsc::sync_channel(COMMAND_CAPACITY);
+        let queued_commands = Arc::new(AtomicUsize::new(0));
         let shared = Arc::new(SharedSnapshot::new());
         let pending_load = Arc::new(PendingLoad::new());
+        let thread_queued_commands = Arc::clone(&queued_commands);
         let thread_shared = Arc::clone(&shared);
         let thread_pending_load = Arc::clone(&pending_load);
         thread::Builder::new()
             .name(String::from("cadence-audio-transport"))
-            .spawn(move || run_transport(receiver, thread_shared, thread_pending_load))
+            .spawn(move || {
+                run_transport(
+                    receiver,
+                    thread_queued_commands,
+                    thread_shared,
+                    thread_pending_load,
+                )
+            })
             .expect("Cadence audio transport thread should spawn");
         Self {
             commands,
+            queued_commands,
             shared,
             pending_load,
             next_token: Arc::new(AtomicU64::new(1)),
@@ -240,6 +266,53 @@ impl AudioTransport {
 
     pub fn take_error(&self, generation: u64) -> Option<String> {
         self.shared.take_error(generation)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_error_for_test(&self, generation: u64, error: String) {
+        self.shared.set_error(generation, error);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_snapshot_for_test(&self, snapshot: Snapshot) {
+        self.shared
+            .generation
+            .store(snapshot.generation, Ordering::Release);
+        self.shared
+            .acknowledged_token
+            .store(snapshot.acknowledged_token, Ordering::Release);
+        self.shared
+            .position_millis
+            .store(snapshot.position_millis, Ordering::Release);
+        self.shared
+            .playing
+            .store(snapshot.playing, Ordering::Release);
+        self.shared.ready.store(snapshot.ready, Ordering::Release);
+    }
+
+    /// Set an output gain for a comparison source such as the reference
+    /// track. This is separate from the user's 0–1 audition slider so a
+    /// loudness-match offset can boost a quiet reference without changing the
+    /// primary track's control value or raw LUFS analysis.
+    pub fn set_output_gain(&self, gain: f32) {
+        self.shared
+            .requested_volume
+            .store(normalize_output_gain(gain).to_bits(), Ordering::Release);
+    }
+
+    pub(crate) fn has_command_capacity(&self, required: usize) -> bool {
+        required <= COMMAND_CAPACITY
+            && self.queued_commands.load(Ordering::Acquire) <= COMMAND_CAPACITY - required
+    }
+
+    pub(crate) fn has_pending_load(&self) -> bool {
+        self.pending_load.is_pending()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_command_queue_full_for_test(&self) {
+        self.queued_commands
+            .store(COMMAND_CAPACITY, Ordering::Release);
     }
 
     pub fn load(
@@ -258,6 +331,10 @@ impl AudioTransport {
             path,
             duration_millis,
         };
+        if !self.try_reserve_command_slot() {
+            self.store_pending_load(command)?;
+            return Ok(token);
+        }
         match self.commands.try_send(command) {
             Ok(()) => {
                 self.clear_pending_load(generation);
@@ -266,10 +343,12 @@ impl AudioTransport {
             // The transport thread will pick up the latest load intent from
             // the coalescing slot on its next control tick.
             Err(TrySendError::Full(command)) => {
+                self.release_command_slot();
                 self.store_pending_load(command)?;
                 Ok(token)
             }
             Err(TrySendError::Disconnected(_)) => {
+                self.release_command_slot();
                 self.clear_pending_load(generation);
                 Err(String::from("The audio transport is no longer available."))
             }
@@ -286,6 +365,9 @@ impl AudioTransport {
     }
 
     pub fn play(&self, generation: u64) -> Result<u64, String> {
+        if self.has_pending_load() {
+            return Err(String::from(CONTROLS_BUSY_ERROR));
+        }
         let token = self.next_token();
         self.try_send(Command::Play { token, generation })
             .map(|()| token)
@@ -304,6 +386,9 @@ impl AudioTransport {
         duration_millis: u64,
         resume: bool,
     ) -> Result<u64, String> {
+        if self.has_pending_load() {
+            return Err(String::from(CONTROLS_BUSY_ERROR));
+        }
         let token = self.next_token();
         self.try_send(Command::Seek {
             token,
@@ -315,12 +400,17 @@ impl AudioTransport {
     }
 
     fn try_send(&self, command: Command) -> Result<(), String> {
+        if !self.try_reserve_command_slot() {
+            return Err(String::from(CONTROLS_BUSY_ERROR));
+        }
         match self.commands.try_send(command) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => {
-                Err(String::from("Audio controls are busy — try again shortly."))
+                self.release_command_slot();
+                Err(String::from(CONTROLS_BUSY_ERROR))
             }
             Err(TrySendError::Disconnected(_)) => {
+                self.release_command_slot();
                 Err(String::from("The audio transport is no longer available."))
             }
         }
@@ -328,6 +418,29 @@ impl AudioTransport {
 
     fn next_token(&self) -> u64 {
         self.next_token.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn try_reserve_command_slot(&self) -> bool {
+        let mut queued = self.queued_commands.load(Ordering::Acquire);
+        loop {
+            if queued >= COMMAND_CAPACITY {
+                return false;
+            }
+            match self.queued_commands.compare_exchange_weak(
+                queued,
+                queued + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(current) => queued = current,
+            }
+        }
+    }
+
+    fn release_command_slot(&self) {
+        let previous = self.queued_commands.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0);
     }
 
     fn store_pending_load(&self, command: Command) -> Result<(), String> {
@@ -349,6 +462,7 @@ struct LoadedTrack {
 
 fn run_transport(
     receiver: Receiver<Command>,
+    queued_commands: Arc<AtomicUsize>,
     shared: Arc<SharedSnapshot>,
     pending_load: Arc<PendingLoad>,
 ) {
@@ -368,6 +482,7 @@ fn run_transport(
     };
     let mut player: Option<Player> = None;
     let mut loaded: Option<LoadedTrack> = None;
+    let mut applied_volume = None;
 
     loop {
         if let Some(command) = take_pending_load(&pending_load) {
@@ -375,6 +490,7 @@ fn run_transport(
         }
         match receiver.recv_timeout(CONTROL_INTERVAL) {
             Ok(command) => {
+                release_command_slot(&queued_commands);
                 handle_command(command, &shared, output.as_ref(), &mut player, &mut loaded)
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -384,6 +500,7 @@ fn run_transport(
         loop {
             match receiver.try_recv() {
                 Ok(command) => {
+                    release_command_slot(&queued_commands);
                     handle_command(command, &shared, output.as_ref(), &mut player, &mut loaded)
                 }
                 Err(TryRecvError::Empty) => break,
@@ -392,12 +509,18 @@ fn run_transport(
         }
 
         reconcile_stale_track(&shared, &mut player, &mut loaded);
+        apply_requested_volume(&shared, player.as_ref(), &mut applied_volume);
         publish_snapshot(&shared, player.as_ref(), loaded.as_ref());
     }
 
     drop(player);
     drop(loaded);
     drop(output);
+}
+
+fn release_command_slot(queued_commands: &AtomicUsize) {
+    let previous = queued_commands.fetch_sub(1, Ordering::AcqRel);
+    debug_assert!(previous > 0);
 }
 
 fn take_pending_load(pending_load: &PendingLoad) -> Option<Command> {
@@ -631,6 +754,7 @@ fn load_track(
 
     let player_handle = Player::connect_new(output.mixer());
     player_handle.append(decoder);
+    player_handle.set_volume(shared.requested_volume());
     player_handle.pause();
     *player = Some(player_handle);
     *loaded = Some(LoadedTrack {
@@ -640,6 +764,23 @@ fn load_track(
     });
     shared.ready.store(true, Ordering::Release);
     true
+}
+
+fn apply_requested_volume(
+    shared: &SharedSnapshot,
+    player: Option<&Player>,
+    applied_volume: &mut Option<f32>,
+) {
+    let Some(player) = player else {
+        *applied_volume = None;
+        return;
+    };
+    let requested = shared.requested_volume();
+    let changed = applied_volume.is_none_or(|applied| (applied - requested).abs() > f32::EPSILON);
+    if changed {
+        player.set_volume(requested);
+        *applied_volume = Some(requested);
+    }
 }
 
 fn publish_snapshot(
@@ -676,17 +817,99 @@ pub fn clamp_position(position_millis: u64, duration_millis: u64) -> u64 {
     position_millis.min(duration_millis)
 }
 
+pub fn normalize_volume(volume: f32) -> f32 {
+    if volume.is_finite() {
+        volume.clamp(0.0, 1.0)
+    } else {
+        DEFAULT_VOLUME
+    }
+}
+
+pub fn normalize_output_gain(gain: f32) -> f32 {
+    if gain.is_finite() {
+        gain.clamp(0.0, MAX_OUTPUT_GAIN)
+    } else {
+        1.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Command, PendingLoad, SharedSnapshot, clamp_position, is_current};
+    use super::{
+        AudioTransport, CONTROLS_BUSY_ERROR, Command, DEFAULT_VOLUME, MAX_OUTPUT_GAIN, PendingLoad,
+        SharedSnapshot, clamp_position, is_current, normalize_output_gain, normalize_volume,
+    };
     use std::path::PathBuf;
-    use std::sync::atomic::Ordering;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        mpsc,
+    };
 
     #[test]
     fn seek_position_is_saturated_to_track_duration() {
         assert_eq!(clamp_position(2_000, 1_000), 1_000);
         assert_eq!(clamp_position(250, 1_000), 250);
         assert_eq!(clamp_position(250, 0), 0);
+    }
+
+    #[test]
+    fn volume_is_finite_and_clamped_to_the_audition_range() {
+        assert_eq!(normalize_volume(-0.25), 0.0);
+        assert_eq!(normalize_volume(1.25), 1.0);
+        assert_eq!(normalize_volume(f32::NAN), DEFAULT_VOLUME);
+        assert_eq!(SharedSnapshot::new().requested_volume(), DEFAULT_VOLUME);
+    }
+
+    #[test]
+    fn comparison_output_gain_allows_a_bounded_loudness_match_boost() {
+        assert_eq!(normalize_output_gain(-1.0), 0.0);
+        assert_eq!(
+            normalize_output_gain(MAX_OUTPUT_GAIN + 1.0),
+            MAX_OUTPUT_GAIN
+        );
+        assert_eq!(normalize_output_gain(f32::NAN), 1.0);
+    }
+
+    #[test]
+    fn shared_output_gain_preserves_above_unity_reference_match() {
+        let shared = SharedSnapshot::new();
+        shared
+            .requested_volume
+            .store(2.5_f32.to_bits(), Ordering::Release);
+
+        assert_eq!(shared.requested_volume(), 2.5);
+    }
+
+    #[test]
+    fn command_capacity_preflight_rejects_a_full_queue() {
+        let transport = AudioTransport::spawn();
+        assert!(transport.has_command_capacity(2));
+        transport.force_command_queue_full_for_test();
+        assert!(!transport.has_command_capacity(1));
+        assert!(!transport.has_command_capacity(2));
+    }
+
+    #[test]
+    fn pending_load_blocks_dependent_controls_until_it_is_admitted() {
+        let (commands, _receiver) = mpsc::sync_channel(super::COMMAND_CAPACITY);
+        let transport = AudioTransport {
+            commands,
+            queued_commands: Arc::new(AtomicUsize::new(super::COMMAND_CAPACITY)),
+            shared: Arc::new(SharedSnapshot::new()),
+            pending_load: Arc::new(PendingLoad::new()),
+            next_token: Arc::new(AtomicU64::new(1)),
+        };
+
+        transport
+            .load(0, PathBuf::from("pending.wav"), 1_000)
+            .expect("a full queue should coalesce the load");
+        assert!(transport.has_pending_load());
+        assert_eq!(
+            transport.seek(0, 250, 1_000, true),
+            Err(String::from(CONTROLS_BUSY_ERROR))
+        );
+        assert_eq!(transport.play(0), Err(String::from(CONTROLS_BUSY_ERROR)));
     }
 
     #[test]

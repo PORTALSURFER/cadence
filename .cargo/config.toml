@@ -1,0 +1,5 @@
+[target.aarch64-apple-darwin]
+runner = "bash scripts/cargo_macos_runner.sh"
+
+[target.x86_64-apple-darwin]
+runner = "bash scripts/cargo_macos_runner.sh"

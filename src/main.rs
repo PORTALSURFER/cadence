@@ -5,12 +5,13 @@ mod transport;
 mod waveform;
 
 use radiant::{
+    application::{AnchoredPopoverParts, anchored_popover_from_parts},
     gui::types::{Point, Vector2},
     prelude as ui,
     runtime::{FileDialogRequest, NativeRunOptions, PlatformResponse, PlatformResult},
 };
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -19,26 +20,77 @@ use std::{
 enum Message {
     ImportPressed,
     FilePicked(PlatformResult),
+    ReplacePressed(String),
+    ReplaceFilePicked {
+        track_id: String,
+        result: PlatformResult,
+    },
+    ReferencePressed(String),
+    ReferenceFilesPicked {
+        track_id: String,
+        paths: Vec<PathBuf>,
+    },
     FileDropped(ui::NativeFileDrop),
     LibraryLoaded(Result<storage::Library, String>),
     ImportCompleted(Result<storage::Library, String>),
+    ReplaceCompleted {
+        track_id: String,
+        result: Result<storage::Library, String>,
+    },
+    ReferenceImportCompleted {
+        track_id: String,
+        path: PathBuf,
+        result: Result<storage::Library, String>,
+    },
     LibrarySaved(Result<(), String>),
     DecodeCompleted {
         track_id: String,
         generation: u64,
         result: Result<audio::WaveformData, String>,
     },
+    DecodeProgress {
+        track_id: String,
+        generation: u64,
+        progress: audio::WaveformProgress,
+    },
+    ReferenceDecodeCompleted {
+        track_id: String,
+        generation: u64,
+        result: Result<audio::WaveformData, String>,
+    },
+    ReferenceDecodeProgress {
+        track_id: String,
+        generation: u64,
+        progress: audio::WaveformProgress,
+    },
     SelectTrack(String),
-    ToggleWorkspace,
+    SelectWorkspace(WorkspaceMode),
+    SetAuditionFilter(storage::TrackStatus),
+    SetReviewStatusFilter(Option<storage::TrackStatus>),
+    SetPlannerStatusFilter(Option<storage::TrackStatus>),
+    ShuffleAudition,
     ToggleFavorite(String),
     ToggleStageMenu(String),
     ToggleStageMenuAt {
         track_id: String,
         position: Point,
     },
+    ToggleStatusMenuAt {
+        track_id: String,
+        host: StatusMenuHost,
+    },
+    ToggleReferenceMenu(String),
+    SetReferenceTrack {
+        track_id: String,
+        path: PathBuf,
+    },
     SetStage {
         track_id: String,
         stage: storage::TrackStage,
+    },
+    SetStatus {
+        track_id: String,
+        status: storage::TrackStatus,
     },
     PlannerCardDrag {
         track_id: String,
@@ -52,7 +104,31 @@ enum Message {
     ConfirmRemoveTrack(String),
     CancelRemoveTrack,
     TogglePlayback,
+    StopPlayback,
+    NewNoteAtCurrentTime,
+    AuditionPlay,
+    AuditionPrevious,
+    AuditionNext,
+    SelectAuditionSource(AuditionSource),
+    ToggleReferenceMatch,
+    AuditionVolumeChanged(f32),
     Frame,
+    ReferenceLoopDragStarted {
+        ratio: f32,
+    },
+    ReferenceLoopDragMoved {
+        ratio: f32,
+    },
+    ReferenceLoopDragEnded {
+        start_ratio: f32,
+        end_ratio: f32,
+    },
+    ReferenceWaveformClicked {
+        ratio: f32,
+    },
+    ReferenceCommentClicked {
+        ratio: f32,
+    },
     WaveformClicked {
         ratio: f32,
         lower: bool,
@@ -66,18 +142,83 @@ enum Message {
     WaveformPlayheadDragEnded {
         ratio: f32,
     },
+    CommentDragStarted {
+        ratio: f32,
+        note_index: Option<usize>,
+    },
+    CommentDragMoved {
+        ratio: f32,
+    },
+    CommentDragEnded {
+        ratio: f32,
+    },
+    CommentDragCancelled,
     DraftNoteChanged(String),
     SaveDraftNote,
     CancelDraftNote,
+    SelectNote(String),
+    CommentHoverStarted(String),
+    CommentHoverEnded(String),
+    ReferenceCommentHoverStarted(String),
+    ReferenceCommentHoverEnded(String),
     EditNote(String),
     ToggleNoteDone(String),
     DeleteNote(String),
+    ReferenceDraftNoteChanged(String),
+    SaveReferenceDraftNote,
+    CancelReferenceDraftNote,
+    SelectReferenceNote(String),
+    EditReferenceNote(String),
+    ToggleReferenceNoteDone(String),
+    DeleteReferenceNote(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WorkspaceMode {
     Review,
     Planner,
+    Audition,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatusMenuHost {
+    Library,
+    Planner,
+    ReviewHeader,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum AuditionSource {
+    #[default]
+    Main,
+    Reference,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ReferenceLoopSelection {
+    start_ratio: f32,
+    end_ratio: f32,
+}
+
+const LIBRARY_WIDTH: f32 = 252.0;
+// Keep the review panel footprint stable while giving both track waveforms
+// the same visual height.
+const WAVEFORM_HEIGHT: f32 = 160.0;
+const REFERENCE_WAVEFORM_HEIGHT: f32 = WAVEFORM_HEIGHT;
+const REFERENCE_HEADER_HEIGHT: f32 = 26.0;
+const REFERENCE_SECTION_SPACING: f32 = 4.0;
+const WAVEFORM_SECTION_SPACING: f32 = 6.0;
+const AUDITION_SOURCE_SELECTOR_WIDTH: f32 = 84.0;
+const FAVORITE_CONTROL_WIDTH: f32 = 112.0;
+const MIN_REFERENCE_LOOP_MILLIS: u64 = 120;
+const MAIN_COMMENT_EDITOR_ID: u64 = 0xCAD3_1001;
+const REFERENCE_COMMENT_EDITOR_ID: u64 = 0xCAD3_1002;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ImportBatchProgress {
+    total: usize,
+    completed: usize,
+    failed: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -92,6 +233,15 @@ struct AppState {
     waveform_track_id: Option<String>,
     waveform_busy: bool,
     waveform_generation: u64,
+    waveform_cancellation: Option<ui::CancellationToken>,
+    waveform_progress: Option<f32>,
+    reference_waveform: Option<audio::WaveformData>,
+    reference_waveform_track_id: Option<String>,
+    reference_waveform_busy: bool,
+    reference_waveform_generation: u64,
+    reference_waveform_cancellation: Option<ui::CancellationToken>,
+    reference_waveform_progress: Option<f32>,
+    reference_loop_selection: Option<ReferenceLoopSelection>,
     review_cursor_millis: u64,
     playhead_drag_active: bool,
     transport: transport::AudioTransport,
@@ -100,13 +250,48 @@ struct AppState {
     transport_playing: bool,
     transport_polling: bool,
     transport_waiting_token: Option<u64>,
+    audition_volume: f32,
+    audition_source: AuditionSource,
+    reference_transport: Option<transport::AudioTransport>,
+    reference_transport_generation: u64,
+    reference_transport_position_millis: u64,
+    reference_transport_playing: bool,
+    reference_transport_polling: bool,
+    reference_transport_waiting_token: Option<u64>,
+    reference_transport_loaded: bool,
+    reference_only_playback: bool,
+    reference_match_enabled: bool,
     draft_note: Option<NoteDraft>,
+    reference_draft_note: Option<NoteDraft>,
+    persisted_note_drag: Option<PersistedNoteDrag>,
+    selected_note_id: Option<String>,
+    hovered_note_id: Option<String>,
+    selected_reference_note_id: Option<String>,
+    hovered_reference_note_id: Option<String>,
     stage_menu_track_id: Option<String>,
     stage_menu_anchor: Option<Point>,
+    status_menu_track_id: Option<String>,
+    status_menu_host: Option<StatusMenuHost>,
     remove_confirmation_track_id: Option<String>,
     planner_drag_source_track_id: Option<String>,
     planner_drag_target_stage: Option<storage::TrackStage>,
     planner_drag_pointer: Option<Point>,
+    review_status_filter: Option<storage::TrackStatus>,
+    planner_status_filter: Option<storage::TrackStatus>,
+    audition_status_filter: storage::TrackStatus,
+    audition_queue: Vec<String>,
+    audition_queue_index: usize,
+    audition_heard: Vec<String>,
+    audition_shuffle_round: u64,
+    audition_auto_advance: bool,
+    audition_play_token: Option<u64>,
+    audition_pending_play_track_id: Option<String>,
+    import_batch: Option<ImportBatchProgress>,
+    pending_import_paths: Vec<PathBuf>,
+    pending_reference_paths: Vec<PathBuf>,
+    pending_reference_track_id: Option<String>,
+    reference_import_selected_path: Option<PathBuf>,
+    reference_menu_track_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -114,6 +299,14 @@ struct NoteDraft {
     note_id: Option<String>,
     time_millis: u64,
     body: String,
+}
+
+#[derive(Clone, Debug)]
+struct PersistedNoteDrag {
+    track_id: String,
+    note_id: String,
+    original_time_millis: u64,
+    moved: bool,
 }
 
 impl Default for AppState {
@@ -129,6 +322,15 @@ impl Default for AppState {
             waveform_track_id: None,
             waveform_busy: false,
             waveform_generation: 0,
+            waveform_cancellation: None,
+            waveform_progress: None,
+            reference_waveform: None,
+            reference_waveform_track_id: None,
+            reference_waveform_busy: false,
+            reference_waveform_generation: 0,
+            reference_waveform_cancellation: None,
+            reference_waveform_progress: None,
+            reference_loop_selection: None,
             review_cursor_millis: 0,
             playhead_drag_active: false,
             transport: transport::AudioTransport::spawn(),
@@ -137,19 +339,61 @@ impl Default for AppState {
             transport_playing: false,
             transport_polling: false,
             transport_waiting_token: None,
+            audition_volume: transport::DEFAULT_VOLUME,
+            audition_source: AuditionSource::Main,
+            reference_transport: None,
+            reference_transport_generation: 0,
+            reference_transport_position_millis: 0,
+            reference_transport_playing: false,
+            reference_transport_polling: false,
+            reference_transport_waiting_token: None,
+            reference_transport_loaded: false,
+            reference_only_playback: false,
+            reference_match_enabled: false,
             draft_note: None,
+            reference_draft_note: None,
+            persisted_note_drag: None,
+            selected_note_id: None,
+            hovered_note_id: None,
+            selected_reference_note_id: None,
+            hovered_reference_note_id: None,
             stage_menu_track_id: None,
             stage_menu_anchor: None,
+            status_menu_track_id: None,
+            status_menu_host: None,
             remove_confirmation_track_id: None,
             planner_drag_source_track_id: None,
             planner_drag_target_stage: None,
             planner_drag_pointer: None,
+            review_status_filter: None,
+            planner_status_filter: None,
+            audition_status_filter: storage::TrackStatus::Inbox,
+            audition_queue: Vec::new(),
+            audition_queue_index: 0,
+            audition_heard: Vec::new(),
+            audition_shuffle_round: 0,
+            audition_auto_advance: false,
+            audition_play_token: None,
+            audition_pending_play_track_id: None,
+            import_batch: None,
+            pending_import_paths: Vec::new(),
+            pending_reference_paths: Vec::new(),
+            pending_reference_track_id: None,
+            reference_import_selected_path: None,
+            reference_menu_track_id: None,
         }
     }
 }
 
 fn playback_shortcut(state: &AppState, press: ui::KeyPress) -> ui::ShortcutResolution<Message> {
-    if state.draft_note.is_none() && press == ui::KeyPress::new(ui::KeyCode::Space) {
+    if press == ui::KeyPress::new(ui::KeyCode::Escape) {
+        ui::ShortcutResolution::action(Message::StopPlayback)
+    } else if state.draft_note.is_none()
+        && state.reference_draft_note.is_none()
+        && press == ui::KeyPress::new(ui::KeyCode::N)
+    {
+        ui::ShortcutResolution::action(Message::NewNoteAtCurrentTime)
+    } else if state.draft_note.is_none() && press == ui::KeyPress::new(ui::KeyCode::Space) {
         ui::ShortcutResolution::action(Message::TogglePlayback)
     } else {
         ui::ShortcutResolution::unhandled()
@@ -159,6 +403,11 @@ fn playback_shortcut(state: &AppState, press: ui::KeyPress) -> ui::ShortcutResol
 fn native_launch_options() -> NativeRunOptions {
     let mut options = NativeRunOptions::default();
     options.window.behavior.maximized = true;
+    options.window.behavior.integrated_titlebar = true;
+    options
+        .window
+        .behavior
+        .integrated_titlebar_drag_region_height = Some(42.0);
     options
 }
 
@@ -180,6 +429,9 @@ fn main() -> radiant::Result {
         .animation(|state| {
             state.transport_playing
                 || state.transport_polling
+                || state.reference_transport_playing
+                || state.reference_transport_polling
+                || state.audition_pending_play_track_id.is_some()
                 || state.playhead_drag_active
                 || state.planner_drag_source_track_id.is_some()
         })
@@ -197,30 +449,94 @@ fn schedule_library_load(context: &mut ui::UiUpdateContext<Message>) {
         .run(|_| storage::load_library(), Message::LibraryLoaded);
 }
 
+fn decode_or_load_cached_waveform(
+    path: &Path,
+    cache_path: &Path,
+    should_cancel: impl Fn() -> bool,
+    mut on_progress: impl FnMut(audio::WaveformProgress),
+) -> Result<audio::WaveformData, String> {
+    let source_fingerprint = audio::waveform_cache_fingerprint(path);
+    if should_cancel() {
+        return Err(String::from("cancelled"));
+    }
+    if let Some(waveform) = audio::load_waveform_cache(path, cache_path) {
+        if should_cancel() {
+            return Err(String::from("cancelled"));
+        }
+        on_progress(audio::WaveformProgress {
+            waveform: waveform.clone(),
+            progress: Some(1.0),
+        });
+        return Ok(waveform);
+    }
+
+    let result = audio::decode_waveform_with_progress_and_cancellation(
+        path,
+        &should_cancel,
+        &mut on_progress,
+    );
+    if should_cancel() {
+        return Err(String::from("cancelled"));
+    }
+    if let Ok(waveform) = &result
+        && let Some(source_fingerprint) = source_fingerprint
+    {
+        let _ = audio::write_waveform_cache_if_unchanged(
+            path,
+            cache_path,
+            source_fingerprint,
+            waveform,
+        );
+    }
+    result
+}
+
 fn schedule_waveform_decode(
     state: &mut AppState,
     context: &mut ui::UiUpdateContext<Message>,
     track_id: String,
     path: PathBuf,
 ) {
+    if let Some(cancellation) = state.waveform_cancellation.take() {
+        cancellation.cancel();
+    }
     state.waveform_busy = true;
     state.waveform_generation = state.waveform_generation.wrapping_add(1);
     let generation = state.waveform_generation;
     state.waveform = None;
     state.waveform_track_id = None;
-    state.status = format!("Analyzing waveform for {}…", path.display());
+    state.waveform_progress = None;
+    state.status = format!("Preparing MAIN waveform and loudness · {}…", path.display());
+    let cache_path = storage::waveform_cache_path(&path);
+    let progress_track_id = track_id.clone();
     let completion_track_id = track_id;
-    context
+    let cancellation = context
         .business()
         .blocking_io("cadence-decode-waveform")
-        .run(
-            move |_| audio::decode_waveform(&path),
+        .cancellable()
+        .stream_latest(
+            move |work, sink| {
+                decode_or_load_cached_waveform(
+                    &path,
+                    &cache_path,
+                    || work.is_cancelled(),
+                    |progress| {
+                        let _ = sink.emit(progress);
+                    },
+                )
+            },
+            move |progress| Message::DecodeProgress {
+                track_id: progress_track_id.clone(),
+                generation,
+                progress,
+            },
             move |result| Message::DecodeCompleted {
                 track_id: completion_track_id.clone(),
                 generation,
                 result,
             },
         );
+    state.waveform_cancellation = Some(cancellation);
     context.request_repaint();
 }
 
@@ -237,11 +553,160 @@ fn schedule_selected_waveform_decode(
     if let Some((track_id, path)) = selected {
         schedule_waveform_decode(state, context, track_id, path);
     } else {
+        if let Some(cancellation) = state.waveform_cancellation.take() {
+            cancellation.cancel();
+        }
         state.waveform_generation = state.waveform_generation.wrapping_add(1);
         state.waveform_busy = false;
         state.waveform = None;
         state.waveform_track_id = None;
+        state.waveform_progress = None;
         context.request_repaint();
+    }
+}
+
+fn schedule_reference_waveform_decode(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    track_id: String,
+    path: PathBuf,
+) {
+    if let Some(cancellation) = state.reference_waveform_cancellation.take() {
+        cancellation.cancel();
+    }
+    state.reference_waveform_busy = true;
+    state.reference_waveform_generation = state.reference_waveform_generation.wrapping_add(1);
+    let generation = state.reference_waveform_generation;
+    state.reference_waveform = None;
+    state.reference_waveform_track_id = None;
+    state.reference_waveform_progress = None;
+    state.reference_loop_selection = None;
+    let cache_path = storage::waveform_cache_path(&path);
+    let progress_track_id = track_id.clone();
+    let completion_track_id = track_id;
+    let cancellation = context
+        .business()
+        .blocking_io("cadence-decode-reference-waveform")
+        .cancellable()
+        .stream_latest(
+            move |work, sink| {
+                decode_or_load_cached_waveform(
+                    &path,
+                    &cache_path,
+                    || work.is_cancelled(),
+                    |progress| {
+                        let _ = sink.emit(progress);
+                    },
+                )
+            },
+            move |progress| Message::ReferenceDecodeProgress {
+                track_id: progress_track_id.clone(),
+                generation,
+                progress,
+            },
+            move |result| Message::ReferenceDecodeCompleted {
+                track_id: completion_track_id.clone(),
+                generation,
+                result,
+            },
+        );
+    state.reference_waveform_cancellation = Some(cancellation);
+    context.request_repaint();
+}
+
+fn schedule_selected_reference_decode(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+) {
+    let selected = state
+        .library
+        .selected_track_id
+        .as_ref()
+        .and_then(|id| state.library.tracks.iter().find(|track| &track.id == id))
+        .and_then(|track| {
+            track
+                .reference_path
+                .clone()
+                .map(|path| (track.id.clone(), path))
+        });
+    if let Some((track_id, path)) = selected {
+        schedule_reference_waveform_decode(state, context, track_id, path);
+    } else {
+        if let Some(cancellation) = state.reference_waveform_cancellation.take() {
+            cancellation.cancel();
+        }
+        state.reference_waveform_generation = state.reference_waveform_generation.wrapping_add(1);
+        state.reference_waveform_busy = false;
+        state.reference_waveform = None;
+        state.reference_waveform_track_id = None;
+        state.reference_waveform_progress = None;
+        state.reference_loop_selection = None;
+        context.request_repaint();
+    }
+}
+
+fn current_loudness_match_gain_db(state: &AppState) -> Option<f32> {
+    let primary_lufs = state
+        .waveform
+        .as_ref()
+        .filter(|_| {
+            state.library.selected_track_id.as_deref() == state.waveform_track_id.as_deref()
+        })
+        .and_then(|waveform| waveform.integrated_lufs);
+    let reference_lufs = state
+        .reference_waveform
+        .as_ref()
+        .filter(|_| {
+            state.library.selected_track_id.as_deref()
+                == state.reference_waveform_track_id.as_deref()
+        })
+        .and_then(|waveform| waveform.integrated_lufs);
+    audio::loudness_match_gain_db(primary_lufs, reference_lufs)
+}
+
+fn current_lufs_meter_value(state: &AppState, track_id: &str) -> Option<f32> {
+    let position_millis = state.transport_position_millis;
+    state
+        .waveform
+        .as_ref()
+        .filter(|_| state.waveform_track_id.as_deref() == Some(track_id))
+        .and_then(|waveform| audio::loudness_at_position(waveform, position_millis))
+}
+
+fn current_reference_lufs_meter_value(state: &AppState, track_id: &str) -> Option<f32> {
+    let position_millis = state.reference_transport_position_millis;
+    state
+        .reference_waveform
+        .as_ref()
+        .filter(|_| state.reference_waveform_track_id.as_deref() == Some(track_id))
+        .and_then(|waveform| audio::loudness_at_position(waveform, position_millis))
+}
+
+fn reference_output_gain(state: &AppState) -> f32 {
+    let match_gain = state
+        .reference_match_enabled
+        .then(|| current_loudness_match_gain_db(state))
+        .flatten()
+        .map_or(1.0, audio::linear_gain_for_db);
+    if state.audition_source == AuditionSource::Reference {
+        transport::normalize_output_gain(state.audition_volume * match_gain)
+    } else {
+        0.0
+    }
+}
+
+fn main_output_gain(state: &AppState) -> f32 {
+    if state.audition_source == AuditionSource::Main {
+        state.audition_volume
+    } else {
+        0.0
+    }
+}
+
+fn sync_audition_output_gains(state: &AppState) {
+    state.transport.set_output_gain(main_output_gain(state));
+    if let Some(reference_transport) = state.reference_transport.as_ref() {
+        reference_transport.set_output_gain(reference_output_gain(state));
     }
 }
 
@@ -263,6 +728,32 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 context.request_repaint();
             }
         },
+        Message::ReplacePressed(track_id) => request_replace(state, context, track_id),
+        Message::ReplaceFilePicked { track_id, result } => match result {
+            Ok(PlatformResponse::Path(path)) => schedule_replace(state, context, track_id, path),
+            Ok(PlatformResponse::Canceled) => {
+                state.status = String::from("Replace canceled.");
+                context.request_repaint();
+            }
+            Ok(response) => {
+                state.status = format!("Unexpected file-picker response: {response:?}");
+                context.request_repaint();
+            }
+            Err(error) => {
+                state.status = format!("Could not open the file picker: {error}");
+                context.request_repaint();
+            }
+        },
+        Message::ReferencePressed(track_id) => request_reference(state, context, track_id),
+        Message::ReferenceFilesPicked { track_id, paths } => {
+            state.busy = false;
+            if paths.is_empty() {
+                state.status = String::from("Reference import canceled.");
+            } else {
+                schedule_reference_import(state, context, track_id, paths);
+            }
+            context.request_repaint();
+        }
         Message::FileDropped(drop) => {
             if drop.phase == ui::NativeFileDropPhase::Drop
                 && let Some(path) = drop.path
@@ -285,21 +776,38 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                         )
                     };
                     state.library = library;
+                    if state.workspace_mode == WorkspaceMode::Audition {
+                        rebuild_audition_queue(state);
+                    }
                     state.review_cursor_millis = 0;
                     state.draft_note = None;
+                    state.reference_draft_note = None;
+                    rollback_persisted_note_drag(state);
+                    state.selected_note_id = None;
+                    state.hovered_note_id = None;
+                    state.selected_reference_note_id = None;
+                    state.hovered_reference_note_id = None;
                     close_stage_menu(state);
+                    close_status_menu(state);
+                    state.reference_menu_track_id = None;
                     state.remove_confirmation_track_id = None;
                     reset_transport(state);
+                    reset_reference_transport(state);
+                    state.reference_match_enabled = false;
                     schedule_selected_waveform_decode(state, context);
+                    schedule_selected_reference_decode(state, context);
                 }
                 Err(error) => {
                     state.status = error;
                 }
             }
+            schedule_next_pending_import(state, context);
             context.request_repaint();
         }
         Message::ImportCompleted(result) => {
+            let failed = result.is_err();
             state.busy = false;
+            record_import_attempt(state, failed);
             clear_planner_drag(state);
             match result {
                 Ok(library) => {
@@ -309,17 +817,156 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                         plural(library.tracks.len())
                     );
                     state.library = library;
+                    if state.workspace_mode == WorkspaceMode::Audition {
+                        reconcile_audition_queue(state);
+                    }
                     state.review_cursor_millis = 0;
                     state.draft_note = None;
+                    state.reference_draft_note = None;
+                    rollback_persisted_note_drag(state);
+                    state.selected_note_id = None;
+                    state.hovered_note_id = None;
+                    state.selected_reference_note_id = None;
+                    state.hovered_reference_note_id = None;
                     close_stage_menu(state);
+                    close_status_menu(state);
+                    state.reference_menu_track_id = None;
                     state.remove_confirmation_track_id = None;
                     reset_transport(state);
+                    reset_reference_transport(state);
+                    state.reference_match_enabled = false;
                     schedule_selected_waveform_decode(state, context);
+                    schedule_selected_reference_decode(state, context);
                 }
                 Err(error) => {
                     state.status = error;
                 }
             }
+            finish_import_batch(state);
+            schedule_next_pending_import(state, context);
+            context.request_repaint();
+        }
+        Message::ReplaceCompleted { track_id, result } => {
+            state.busy = false;
+            clear_planner_drag(state);
+            match result {
+                Ok(library) => {
+                    let title = library
+                        .tracks
+                        .iter()
+                        .find(|track| track.id == track_id)
+                        .map(|track| track.title.clone())
+                        .unwrap_or_else(|| String::from("track"));
+                    state.library = library;
+                    state.library.selected_track_id = Some(track_id);
+                    if state.workspace_mode == WorkspaceMode::Audition {
+                        reconcile_audition_queue(state);
+                    }
+                    state.review_cursor_millis = 0;
+                    state.draft_note = None;
+                    state.reference_draft_note = None;
+                    rollback_persisted_note_drag(state);
+                    state.selected_note_id = None;
+                    state.hovered_note_id = None;
+                    state.selected_reference_note_id = None;
+                    state.hovered_reference_note_id = None;
+                    close_stage_menu(state);
+                    close_status_menu(state);
+                    state.reference_menu_track_id = None;
+                    state.remove_confirmation_track_id = None;
+                    reset_transport(state);
+                    reset_reference_transport(state);
+                    state.reference_match_enabled = false;
+                    state.status = format!("Replaced {title}; existing comments were cleared.");
+                    schedule_selected_waveform_decode(state, context);
+                    schedule_selected_reference_decode(state, context);
+                }
+                Err(error) => state.status = error,
+            }
+            schedule_next_pending_import(state, context);
+            context.request_repaint();
+        }
+        Message::ReferenceImportCompleted {
+            track_id,
+            path,
+            result,
+        } => {
+            let failed = result.is_err();
+            state.busy = false;
+            record_import_attempt(state, failed);
+            match result {
+                Ok(library) => {
+                    state.library = library;
+                    if state.reference_import_selected_path.is_none() {
+                        state.reference_import_selected_path = Some(path);
+                    }
+                    let title = state
+                        .library
+                        .tracks
+                        .iter()
+                        .find(|track| track.id == track_id)
+                        .map(|track| track.title.clone())
+                        .unwrap_or_else(|| String::from("track"));
+                    state.status = format!("Reference track added for {title}.");
+                }
+                Err(error) => state.status = error,
+            }
+            let has_more = !state.pending_reference_paths.is_empty();
+            if has_more {
+                schedule_next_pending_reference_import(state, context);
+            } else {
+                let selected_path = state.reference_import_selected_path.take();
+                state.pending_reference_track_id = None;
+                if let Some(path) = selected_path {
+                    match storage::set_reference_track_selection(
+                        &mut state.library,
+                        &track_id,
+                        path,
+                    ) {
+                        Ok(changed) if changed => schedule_library_save(state, context),
+                        Ok(_) => {}
+                        Err(error) => state.status = error,
+                    }
+                }
+                finish_import_batch(state);
+                if state.library.selected_track_id.as_deref() == Some(track_id.as_str()) {
+                    reset_reference_transport(state);
+                    state.reference_match_enabled = false;
+                    schedule_selected_reference_decode(state, context);
+                }
+                schedule_next_pending_import(state, context);
+            }
+            state.reference_menu_track_id = None;
+            context.request_repaint();
+        }
+        Message::ToggleReferenceMenu(track_id) => {
+            if !state.busy
+                && state
+                    .library
+                    .tracks
+                    .iter()
+                    .any(|track| track.id == track_id)
+            {
+                state.reference_menu_track_id =
+                    if state.reference_menu_track_id.as_deref() == Some(track_id.as_str()) {
+                        None
+                    } else {
+                        Some(track_id)
+                    };
+                context.request_repaint();
+            }
+        }
+        Message::DecodeProgress {
+            track_id,
+            generation,
+            progress,
+        } => {
+            if !decode_result_is_current(state, &track_id, generation) {
+                return;
+            }
+            state.waveform_track_id = Some(track_id);
+            state.waveform_progress = progress.progress;
+            state.waveform = Some(progress.waveform);
             context.request_repaint();
         }
         Message::DecodeCompleted {
@@ -330,7 +977,11 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             if !decode_result_is_current(state, &track_id, generation) {
                 return;
             }
+            state.waveform_cancellation = None;
+            state.waveform_progress = None;
             state.waveform_busy = false;
+            let pending_audition = state.workspace_mode == WorkspaceMode::Audition
+                && state.audition_pending_play_track_id.as_deref() == Some(track_id.as_str());
             match result {
                 Ok(waveform) => {
                     state.waveform_track_id = Some(track_id.clone());
@@ -355,14 +1006,73 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                                 .map_or(0, |waveform| waveform.duration_millis),
                         ) {
                             Ok(token) => begin_transport_polling(state, token),
-                            Err(error) => state.status = error,
+                            Err(error) => {
+                                state.status = error;
+                                if pending_audition {
+                                    state.audition_auto_advance = false;
+                                    state.audition_play_token = None;
+                                    state.audition_pending_play_track_id = None;
+                                    advance_audition(state, context);
+                                }
+                            }
                         }
                     }
+                }
+                Err(error) if error == "cancelled" => {
+                    state.waveform = None;
+                    state.waveform_track_id = None;
                 }
                 Err(error) => {
                     state.waveform = None;
                     state.waveform_track_id = None;
                     state.status = format!("Waveform unavailable: {error}");
+                    if pending_audition {
+                        state.audition_auto_advance = false;
+                        state.audition_play_token = None;
+                        state.audition_pending_play_track_id = None;
+                        advance_audition(state, context);
+                    }
+                }
+            }
+            context.request_repaint();
+        }
+        Message::ReferenceDecodeProgress {
+            track_id,
+            generation,
+            progress,
+        } => {
+            if !reference_decode_result_is_current(state, &track_id, generation) {
+                return;
+            }
+            state.reference_waveform_track_id = Some(track_id);
+            state.reference_waveform_progress = progress.progress;
+            state.reference_waveform = Some(progress.waveform);
+            context.request_repaint();
+        }
+        Message::ReferenceDecodeCompleted {
+            track_id,
+            generation,
+            result,
+        } => {
+            if !reference_decode_result_is_current(state, &track_id, generation) {
+                return;
+            }
+            state.reference_waveform_cancellation = None;
+            state.reference_waveform_progress = None;
+            state.reference_waveform_busy = false;
+            match result {
+                Ok(waveform) => {
+                    state.reference_waveform_track_id = Some(track_id);
+                    state.reference_waveform = Some(waveform);
+                }
+                Err(error) if error == "cancelled" => {
+                    state.reference_waveform = None;
+                    state.reference_waveform_track_id = None;
+                }
+                Err(error) => {
+                    state.reference_waveform = None;
+                    state.reference_waveform_track_id = None;
+                    state.status = format!("Reference waveform unavailable: {error}");
                 }
             }
             context.request_repaint();
@@ -371,26 +1081,63 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             if state.planner_drag_source_track_id.is_some() {
                 state.planner_drag_pointer = context.current_pointer_position();
             }
+            let was_audition_playing = state.workspace_mode == WorkspaceMode::Audition
+                && state.audition_auto_advance
+                && state.transport_playing;
+            let was_shared_playing = !state.reference_only_playback
+                && (state.transport_playing || state.reference_transport_playing);
+            update_reference_transport(state);
             let snapshot = state.transport.snapshot();
-            if snapshot.generation != state.transport_generation {
-                context.request_repaint();
-                return;
+            let audition_play_acknowledged = state.workspace_mode == WorkspaceMode::Audition
+                && state.audition_auto_advance
+                && state
+                    .audition_play_token
+                    .is_some_and(|token| transport_command_is_confirmed(snapshot, token));
+            let pending_audition = state.workspace_mode == WorkspaceMode::Audition
+                && state.audition_pending_play_track_id.is_some();
+            let mut main_snapshot_applied = false;
+            if snapshot.generation == state.transport_generation {
+                if let Some(error) = state.transport.take_error(state.transport_generation) {
+                    state.playhead_drag_active = false;
+                    state.transport_playing = false;
+                    state.transport_polling = false;
+                    state.transport_waiting_token = None;
+                    state.audition_auto_advance = false;
+                    state.audition_play_token = None;
+                    state.audition_pending_play_track_id = None;
+                    state.status = error;
+                    if pending_audition {
+                        advance_audition(state, context);
+                    }
+                } else if state
+                    .transport_waiting_token
+                    .is_none_or(|token| transport_command_is_confirmed(snapshot, token))
+                {
+                    state.transport_waiting_token = None;
+                    apply_transport_snapshot(state, snapshot);
+                    main_snapshot_applied = true;
+                }
             }
-            if let Some(error) = state.transport.take_error(state.transport_generation) {
-                state.playhead_drag_active = false;
-                state.transport_playing = false;
-                state.transport_polling = false;
-                state.transport_waiting_token = None;
-                state.status = error;
-            } else if state
-                .transport_waiting_token
-                .is_some_and(|token| !transport_command_is_confirmed(snapshot, token))
-            {
-                context.request_repaint();
-                return;
+            let natural_audition_completion = main_snapshot_applied
+                && (was_audition_playing || audition_play_acknowledged)
+                && state.workspace_mode == WorkspaceMode::Audition
+                && !state.transport_playing
+                && !state.transport_polling
+                && state.transport_waiting_token.is_none()
+                && snapshot.ready
+                && !snapshot.playing
+                && state.waveform_track_id.as_deref() == state.library.selected_track_id.as_deref()
+                && state
+                    .waveform
+                    .as_ref()
+                    .is_some_and(|waveform| snapshot.position_millis >= waveform.duration_millis);
+            if state.reference_loop_selection.is_some() {
+                enforce_reference_loop(state, was_shared_playing);
+            } else if natural_audition_completion {
+                advance_audition(state, context);
             } else {
-                state.transport_waiting_token = None;
-                apply_transport_snapshot(state, snapshot);
+                maybe_start_pending_audition(state, context);
+                enforce_reference_loop(state, was_shared_playing);
             }
             context.request_repaint();
         }
@@ -404,35 +1151,66 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             };
             if save_again {
                 schedule_library_save(state, context);
+            } else {
+                schedule_next_pending_import(state, context);
+                schedule_next_pending_reference_import(state, context);
             }
             context.request_repaint();
         }
         Message::SelectTrack(id) => {
             if !state.busy && state.library.tracks.iter().any(|track| track.id == id) {
-                state.workspace_mode = WorkspaceMode::Review;
-                state.library.selected_track_id = Some(id);
-                close_stage_menu(state);
-                state.remove_confirmation_track_id = None;
-                clear_planner_drag(state);
-                state.waveform = None;
-                state.waveform_track_id = None;
-                state.waveform_busy = false;
-                state.review_cursor_millis = 0;
-                state.draft_note = None;
-                reset_transport(state);
-                schedule_library_save(state, context);
-                schedule_selected_waveform_decode(state, context);
+                if state.workspace_mode == WorkspaceMode::Audition {
+                    state.audition_heard.retain(|heard_id| heard_id != &id);
+                }
+                select_track_internal(state, context, id, false);
             }
         }
-        Message::ToggleWorkspace => {
-            state.workspace_mode = match state.workspace_mode {
-                WorkspaceMode::Review => WorkspaceMode::Planner,
-                WorkspaceMode::Planner => WorkspaceMode::Review,
-            };
-            close_stage_menu(state);
-            state.remove_confirmation_track_id = None;
-            clear_planner_drag(state);
+        Message::SelectWorkspace(mode) => {
+            set_workspace_mode(state, context, mode);
+        }
+        Message::SetAuditionFilter(status) => {
+            if state.busy || state.workspace_mode != WorkspaceMode::Audition {
+                return;
+            }
+            state.audition_status_filter = status;
+            state.audition_shuffle_round = 0;
+            state.audition_auto_advance = false;
+            state.audition_play_token = None;
+            state.audition_pending_play_track_id = None;
+            rebuild_audition_queue(state);
+            if let Some(track_id) = state.audition_queue.first().cloned() {
+                select_track_internal(state, context, track_id, false);
+                state.status = format!(
+                    "Auditioning {} tracks in {}.",
+                    state.audition_queue.len(),
+                    status.label()
+                );
+            } else {
+                reset_transport(state);
+                reset_reference_transport(state);
+                state.status = format!("No tracks in {}.", status.label());
+            }
             context.request_repaint();
+        }
+        Message::SetReviewStatusFilter(status) => {
+            if state.review_status_filter != status {
+                state.review_status_filter = status;
+                close_stage_menu(state);
+                close_status_menu(state);
+            }
+            context.request_repaint();
+        }
+        Message::SetPlannerStatusFilter(status) => {
+            if state.planner_status_filter != status {
+                state.planner_status_filter = status;
+                close_stage_menu(state);
+                close_status_menu(state);
+                clear_planner_drag(state);
+            }
+            context.request_repaint();
+        }
+        Message::ShuffleAudition => {
+            shuffle_audition(state, context);
         }
         Message::ToggleFavorite(id) => {
             if !state.busy
@@ -447,6 +1225,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 if state.stage_menu_track_id.as_deref() == Some(id.as_str()) {
                     close_stage_menu(state);
                 } else {
+                    close_status_menu(state);
                     state.stage_menu_track_id = Some(id);
                     state.stage_menu_anchor = Some(keyboard_stage_menu_anchor(state));
                 }
@@ -464,6 +1243,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 if state.stage_menu_track_id.as_deref() == Some(track_id.as_str()) {
                     close_stage_menu(state);
                 } else {
+                    close_status_menu(state);
                     state.stage_menu_track_id = Some(track_id);
                     state.stage_menu_anchor = Some(stage_menu_anchor_from_pointer(position));
                 }
@@ -481,9 +1261,77 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     }
                 };
                 close_stage_menu(state);
+                close_status_menu(state);
                 clear_planner_drag(state);
                 if changed {
                     state.status = format!("Stage set to {}.", stage.label());
+                    schedule_library_save(state, context);
+                }
+                context.request_repaint();
+            }
+        }
+        Message::ToggleStatusMenuAt { track_id, host } => {
+            toggle_status_menu(state, track_id, host, context);
+        }
+        Message::SetReferenceTrack { track_id, path } => {
+            if !state.busy {
+                let selected =
+                    state.library.selected_track_id.as_deref() == Some(track_id.as_str());
+                let changed = match storage::set_reference_track_selection(
+                    &mut state.library,
+                    &track_id,
+                    path.clone(),
+                ) {
+                    Ok(changed) => changed,
+                    Err(error) => {
+                        state.status = error;
+                        state.reference_menu_track_id = None;
+                        context.request_repaint();
+                        return;
+                    }
+                };
+                state.reference_menu_track_id = None;
+                if changed {
+                    if selected {
+                        reset_reference_transport(state);
+                        state.reference_match_enabled = false;
+                        schedule_selected_reference_decode(state, context);
+                    }
+                    state.reference_draft_note = None;
+                    state.selected_reference_note_id = None;
+                    state.hovered_reference_note_id = None;
+                    state.status = format!("Reference set to {}.", reference_track_name(&path));
+                    schedule_library_save(state, context);
+                }
+                context.request_repaint();
+            }
+        }
+        Message::SetStatus { track_id, status } => {
+            if !state.busy {
+                let pending_selected_audition = state.workspace_mode == WorkspaceMode::Audition
+                    && state.library.selected_track_id.as_deref() == Some(track_id.as_str())
+                    && state.audition_pending_play_track_id.as_deref() == Some(track_id.as_str())
+                    && status != state.audition_status_filter;
+                let changed = match storage::set_track_status(&mut state.library, &track_id, status)
+                {
+                    Ok(changed) => changed,
+                    Err(error) => {
+                        state.status = error;
+                        close_status_menu(state);
+                        context.request_repaint();
+                        return;
+                    }
+                };
+                close_status_menu(state);
+                if changed {
+                    if state.workspace_mode == WorkspaceMode::Audition {
+                        sync_audition_queue_after_status_change(state, &track_id);
+                        if pending_selected_audition {
+                            disarm_audition_auto_advance(state);
+                            advance_audition(state, context);
+                        }
+                    }
+                    state.status = format!("Status set to {}.", status.label());
                     schedule_library_save(state, context);
                 }
                 context.request_repaint();
@@ -509,6 +1357,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     state.planner_drag_source_track_id = Some(track_id.clone());
                     state.planner_drag_target_stage = None;
                     close_stage_menu(state);
+                    close_status_menu(state);
                     state.remove_confirmation_track_id = None;
                     state.planner_drag_pointer = drag_message_position(message);
                     let title = state
@@ -601,6 +1450,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             match storage::set_track_stage(&mut state.library, &source_id, stage) {
                 Ok(true) => {
                     close_stage_menu(state);
+                    close_status_menu(state);
                     state.status = format!("Moved track to {}.", stage.label());
                     schedule_library_save(state, context);
                 }
@@ -614,6 +1464,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
         Message::RequestRemoveTrack(id) => {
             if !state.busy && state.library.tracks.iter().any(|track| track.id == id) {
                 close_stage_menu(state);
+                close_status_menu(state);
                 state.remove_confirmation_track_id = Some(id);
                 state.status = String::from(
                     "Confirm removal from the library. The source audio file will stay on disk.",
@@ -637,15 +1488,35 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             };
             state.remove_confirmation_track_id = None;
             close_stage_menu(state);
+            close_status_menu(state);
             clear_planner_drag(state);
+            if state.workspace_mode == WorkspaceMode::Audition {
+                reconcile_audition_queue(state);
+            }
             if selected {
                 state.draft_note = None;
+                rollback_persisted_note_drag(state);
+                state.selected_note_id = None;
+                state.hovered_note_id = None;
                 state.library.selected_track_id =
                     storage::selection_after_removal(&state.library, removed.0);
+                if let Some(cancellation) = state.waveform_cancellation.take() {
+                    cancellation.cancel();
+                }
+                if let Some(cancellation) = state.reference_waveform_cancellation.take() {
+                    cancellation.cancel();
+                }
                 state.waveform = None;
                 state.waveform_track_id = None;
                 state.waveform_busy = false;
+                state.waveform_progress = None;
+                state.reference_waveform = None;
+                state.reference_waveform_track_id = None;
+                state.reference_waveform_busy = false;
+                state.reference_waveform_progress = None;
                 reset_transport(state);
+                reset_reference_transport(state);
+                state.reference_match_enabled = false;
             }
             state.status = format!(
                 "Removed {} from the library. The source audio file remains on disk.",
@@ -654,6 +1525,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             schedule_library_save(state, context);
             if selected {
                 schedule_selected_waveform_decode(state, context);
+                schedule_selected_reference_decode(state, context);
             }
             context.request_repaint();
         }
@@ -662,80 +1534,125 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             state.status = String::from("Track kept in the library.");
             context.request_repaint();
         }
-        Message::TogglePlayback => {
-            if state.busy {
-                return;
-            }
-            let Some(_waveform) = state
-                .waveform
-                .as_ref()
-                .filter(|_| selected_track(state).is_some())
-            else {
-                state.status = String::from("Audio analysis is still pending.");
+        Message::TogglePlayback => toggle_playback(state, context),
+        Message::StopPlayback => stop_playback(state, context),
+        Message::NewNoteAtCurrentTime => start_note_at_current_time(state, context),
+        Message::AuditionPlay => play_audition(state, context),
+        Message::AuditionPrevious => previous_audition(state, context),
+        Message::AuditionNext => next_audition(state, context),
+        Message::SelectAuditionSource(source) => select_audition_source(state, context, source),
+        Message::ToggleReferenceMatch => {
+            let Some(gain_db) = current_loudness_match_gain_db(state) else {
+                state.status = String::from(
+                    "Reference matching needs LUFS analysis for both the imported and reference tracks.",
+                );
                 context.request_repaint();
                 return;
             };
-            let result = if state.transport_playing {
-                state.transport.pause(state.transport_generation)
+            state.reference_match_enabled = !state.reference_match_enabled;
+            sync_audition_output_gains(state);
+            state.status = if state.reference_match_enabled {
+                format!("Reference matched to the imported track · {gain_db:+.1} dB.")
             } else {
-                state.transport.play(state.transport_generation)
+                String::from("Reference loudness matching disabled.")
             };
-            match result {
-                Ok(token) => {
-                    begin_transport_polling(state, token);
-                    state.status = if state.transport_playing {
-                        String::from("Pausing playback…")
-                    } else {
-                        String::from("Preparing playback…")
-                    };
-                }
-                Err(error) => state.status = error,
-            }
             context.request_repaint();
         }
+        Message::AuditionVolumeChanged(volume) => {
+            let volume = transport::normalize_volume(volume);
+            state.audition_volume = volume;
+            // This gain is applied only by Rodio's output player. The
+            // decoder's integrated LUFS value is computed from raw samples.
+            sync_audition_output_gains(state);
+            context.request_repaint();
+        }
+        Message::ReferenceLoopDragStarted { .. } => {
+            if state.busy || state.reference_waveform_busy || state.waveform_busy {
+                return;
+            }
+            if selected_reference_details(state).is_none() {
+                return;
+            }
+            disarm_audition_auto_advance(state);
+            set_audition_source(state, AuditionSource::Reference);
+            state.reference_loop_selection = None;
+            state.status = String::from("Paint a loop across the reference waveform…");
+            context.request_repaint();
+        }
+        Message::ReferenceLoopDragMoved { .. } => {
+            if !state.busy
+                && !state.waveform_busy
+                && !state.reference_waveform_busy
+                && selected_reference_details(state).is_some()
+            {
+                state.status = String::from("Selecting a reference loop…");
+                context.request_repaint();
+            }
+        }
+        Message::ReferenceLoopDragEnded {
+            start_ratio,
+            end_ratio,
+        } => finish_reference_loop_selection(state, context, start_ratio, end_ratio),
+        Message::ReferenceWaveformClicked { ratio } => {
+            seek_reference_waveform_position(state, context, ratio)
+        }
+        Message::ReferenceCommentClicked { ratio } => {
+            start_reference_comment_draft(state, context, ratio)
+        }
         Message::WaveformClicked { ratio, lower } => {
-            if state.busy {
+            if state.busy || state.waveform_busy {
                 return;
             }
             let Some(waveform) = state.waveform.as_ref() else {
                 return;
             };
-            let time_millis = waveform::millis_for_ratio(ratio, waveform.duration_millis);
+            let duration_millis = waveform.duration_millis;
+            let time_millis = waveform::millis_for_ratio(ratio, duration_millis);
+            state.hovered_note_id = None;
             if lower {
-                state.review_cursor_millis = time_millis;
-                state.draft_note = Some(NoteDraft {
-                    note_id: None,
-                    time_millis,
-                    body: String::new(),
-                });
-                state.status = format!(
-                    "Comment at {} — type a note below.",
-                    format_timestamp(time_millis)
-                );
+                start_main_note_draft(state, context, time_millis);
             } else {
+                set_audition_source(state, AuditionSource::Main);
                 state.draft_note = None;
-                match state.transport.seek(
-                    state.transport_generation,
-                    time_millis,
-                    waveform.duration_millis,
-                    state.transport_playing,
-                ) {
-                    Ok(token) => {
-                        begin_transport_polling(state, token);
-                        state.status =
-                            format!("Review cursor at {}.", format_timestamp(time_millis));
+                state.selected_note_id = None;
+                disarm_audition_auto_advance(state);
+                let was_playing = state.transport_playing;
+                if was_playing {
+                    match resume_main_at_position_with_reference(state, time_millis) {
+                        Ok(()) => {
+                            state.status =
+                                format!("Review cursor at {}.", format_timestamp(time_millis));
+                        }
+                        Err(error) => state.status = error,
                     }
-                    Err(error) => state.status = error,
+                } else {
+                    state.reference_only_playback = false;
+                    match state.transport.seek(
+                        state.transport_generation,
+                        time_millis,
+                        duration_millis,
+                        false,
+                    ) {
+                        Ok(token) => {
+                            begin_transport_polling(state, token);
+                            state.status =
+                                format!("Review cursor at {}.", format_timestamp(time_millis));
+                        }
+                        Err(error) => state.status = error,
+                    }
                 }
             }
             context.request_repaint();
         }
         Message::WaveformPlayheadDragStarted { ratio } => {
-            if state.busy || state.waveform.is_none() {
+            if state.busy || state.waveform_busy || state.waveform.is_none() {
                 return;
             }
+            rollback_persisted_note_drag(state);
+            set_audition_source(state, AuditionSource::Main);
             state.playhead_drag_active = true;
             state.draft_note = None;
+            state.hovered_note_id = None;
             seek_review_position(state, context, ratio, false);
         }
         Message::WaveformPlayheadDragMoved { ratio } => {
@@ -751,6 +1668,46 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             state.playhead_drag_active = false;
             seek_review_position(state, context, ratio, true);
         }
+        Message::CommentDragStarted { ratio, note_index } => {
+            if state.busy || state.waveform_busy {
+                return;
+            }
+            if let Some(note_index) = note_index {
+                start_persisted_note_drag(state, context, note_index);
+            } else {
+                rollback_persisted_note_drag(state);
+                move_draft_note(state, context, ratio);
+            }
+        }
+        Message::CommentDragMoved { ratio } => {
+            if state.busy || state.waveform_busy {
+                return;
+            }
+            if state.persisted_note_drag.is_some() {
+                move_persisted_note(state, context, ratio);
+            } else {
+                move_draft_note(state, context, ratio);
+            }
+        }
+        Message::CommentDragEnded { ratio } => {
+            if state.busy || state.waveform_busy {
+                return;
+            }
+            if state.persisted_note_drag.is_some() {
+                finish_persisted_note_drag(state, context, ratio);
+            } else {
+                move_draft_note(state, context, ratio);
+            }
+        }
+        Message::CommentDragCancelled => {
+            if state.persisted_note_drag.is_some() {
+                rollback_persisted_note_drag(state);
+            } else {
+                state.draft_note = None;
+            }
+            state.status = String::from("Comment canceled.");
+            context.request_repaint();
+        }
         Message::DraftNoteChanged(body) => {
             if let Some(draft) = state.draft_note.as_mut() {
                 draft.body = body;
@@ -760,18 +1717,75 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
         Message::SaveDraftNote => save_draft_note(state, context),
         Message::CancelDraftNote => {
             state.draft_note = None;
+            rollback_persisted_note_drag(state);
             state.status = String::from("Comment canceled.");
             context.request_repaint();
+        }
+        Message::SelectNote(id) => {
+            if state.busy {
+                return;
+            }
+            rollback_persisted_note_drag(state);
+            let note = selected_track(state)
+                .and_then(|track| track.notes.iter().find(|note| note.id == id))
+                .cloned();
+            if let Some(note) = note {
+                state.selected_note_id = Some(note.id);
+                state.review_cursor_millis = note.time_millis;
+                state.draft_note = None;
+                state.status = format!(
+                    "Selected comment at {}.",
+                    format_timestamp(note.time_millis)
+                );
+                context.request_repaint();
+            }
+        }
+        Message::CommentHoverStarted(id) => {
+            if state.busy {
+                return;
+            }
+            let is_current_note = selected_track(state)
+                .is_some_and(|track| track.notes.iter().any(|note| note.id == id));
+            if is_current_note && state.hovered_note_id.as_deref() != Some(id.as_str()) {
+                state.hovered_note_id = Some(id);
+                context.request_repaint();
+            }
+        }
+        Message::CommentHoverEnded(id) => {
+            if state.hovered_note_id.as_deref() == Some(id.as_str()) {
+                state.hovered_note_id = None;
+                context.request_repaint();
+            }
+        }
+        Message::ReferenceCommentHoverStarted(id) => {
+            if state.busy {
+                return;
+            }
+            let is_current_note = selected_reference_notes(state)
+                .iter()
+                .any(|note| note.id == id);
+            if is_current_note && state.hovered_reference_note_id.as_deref() != Some(id.as_str()) {
+                state.hovered_reference_note_id = Some(id);
+                context.request_repaint();
+            }
+        }
+        Message::ReferenceCommentHoverEnded(id) => {
+            if state.hovered_reference_note_id.as_deref() == Some(id.as_str()) {
+                state.hovered_reference_note_id = None;
+                context.request_repaint();
+            }
         }
         Message::EditNote(id) => {
             if state.busy {
                 return;
             }
+            rollback_persisted_note_drag(state);
             let note = selected_track(state)
                 .and_then(|track| track.notes.iter().find(|note| note.id == id))
                 .cloned();
             if let Some(note) = note {
                 state.review_cursor_millis = note.time_millis;
+                state.selected_note_id = Some(note.id.clone());
                 state.draft_note = Some(NoteDraft {
                     note_id: Some(note.id),
                     time_millis: note.time_millis,
@@ -798,6 +1812,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             if state.busy {
                 return;
             }
+            rollback_persisted_note_drag(state);
             let removed = selected_track_mut(state).and_then(|track| {
                 track
                     .notes
@@ -806,6 +1821,16 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     .map(|index| track.notes.remove(index))
             });
             if removed.is_some() {
+                if state.hovered_note_id.as_deref() == Some(id.as_str()) {
+                    state.hovered_note_id = None;
+                }
+                if state
+                    .selected_note_id
+                    .as_ref()
+                    .is_some_and(|selected_id| selected_id == &id)
+                {
+                    state.selected_note_id = None;
+                }
                 if state
                     .draft_note
                     .as_ref()
@@ -820,7 +1845,912 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
             context.request_repaint();
         }
+        Message::ReferenceDraftNoteChanged(body) => {
+            if let Some(draft) = state.reference_draft_note.as_mut() {
+                draft.body = body;
+                context.request_repaint();
+            }
+        }
+        Message::SaveReferenceDraftNote => save_reference_draft_note(state, context),
+        Message::CancelReferenceDraftNote => {
+            state.reference_draft_note = None;
+            state.status = String::from("Reference comment canceled.");
+            context.request_repaint();
+        }
+        Message::SelectReferenceNote(id) => {
+            if state.busy {
+                return;
+            }
+            let note = selected_reference_notes(state)
+                .iter()
+                .find(|note| note.id == id)
+                .cloned();
+            if let Some(note) = note {
+                state.selected_reference_note_id = Some(note.id);
+                state.reference_draft_note = None;
+                state.status = format!(
+                    "Selected reference comment at {}.",
+                    format_timestamp(note.time_millis)
+                );
+                context.request_repaint();
+            }
+        }
+        Message::EditReferenceNote(id) => {
+            if state.busy {
+                return;
+            }
+            let note = selected_reference_notes(state)
+                .iter()
+                .find(|note| note.id == id)
+                .cloned();
+            if let Some(note) = note {
+                state.selected_reference_note_id = Some(note.id.clone());
+                state.reference_draft_note = Some(NoteDraft {
+                    note_id: Some(note.id),
+                    time_millis: note.time_millis,
+                    body: note.body,
+                });
+                state.status = format!(
+                    "Editing reference comment at {}.",
+                    format_timestamp(note.time_millis)
+                );
+                context.focus(REFERENCE_COMMENT_EDITOR_ID);
+                context.request_repaint();
+            }
+        }
+        Message::ToggleReferenceNoteDone(id) => {
+            if state.busy {
+                return;
+            }
+            if let Some(note) = selected_reference_note_mut(state, &id) {
+                note.done = !note.done;
+                schedule_library_save(state, context);
+                context.request_repaint();
+            }
+        }
+        Message::DeleteReferenceNote(id) => {
+            if state.busy {
+                return;
+            }
+            let removed = selected_reference_track_mut(state).and_then(|reference| {
+                reference
+                    .notes
+                    .iter()
+                    .position(|note| note.id == id)
+                    .map(|index| reference.notes.remove(index))
+            });
+            if removed.is_some() {
+                if state.selected_reference_note_id.as_deref() == Some(id.as_str()) {
+                    state.selected_reference_note_id = None;
+                }
+                if state.hovered_reference_note_id.as_deref() == Some(id.as_str()) {
+                    state.hovered_reference_note_id = None;
+                }
+                if state
+                    .reference_draft_note
+                    .as_ref()
+                    .is_some_and(|draft| draft.note_id.as_deref() == Some(id.as_str()))
+                {
+                    state.reference_draft_note = None;
+                }
+                state.status = String::from("Reference comment deleted locally.");
+                schedule_library_save(state, context);
+            } else {
+                state.status = String::from("That reference comment no longer exists.");
+            }
+            context.request_repaint();
+        }
     }
+}
+
+fn selected_reference_details(state: &AppState) -> Option<(PathBuf, u64)> {
+    selected_track(state).and_then(|track| {
+        let path = track.reference_path.clone()?;
+        let duration_millis = state
+            .reference_waveform
+            .as_ref()
+            .filter(|_| {
+                !state.reference_waveform_busy
+                    && state.reference_waveform_track_id.as_deref() == Some(track.id.as_str())
+            })
+            .map(|waveform| waveform.duration_millis)?;
+        Some((path, duration_millis))
+    })
+}
+
+fn reference_loop_bounds_for_selection(
+    state: &AppState,
+    selection: ReferenceLoopSelection,
+) -> Option<(u64, u64, u64, u64)> {
+    let main_duration_millis = state
+        .waveform
+        .as_ref()
+        .filter(|_| {
+            state.library.selected_track_id.as_deref() == state.waveform_track_id.as_deref()
+        })
+        .map(|waveform| waveform.duration_millis)?;
+    let (_, reference_duration_millis) = selected_reference_details(state)?;
+    let reference_start_millis =
+        waveform::millis_for_ratio(selection.start_ratio, reference_duration_millis);
+    let reference_end_millis =
+        waveform::millis_for_ratio(selection.end_ratio, reference_duration_millis);
+    let main_start_millis = waveform::millis_for_ratio(selection.start_ratio, main_duration_millis);
+    let main_end_millis = waveform::millis_for_ratio(selection.end_ratio, main_duration_millis);
+    (reference_end_millis > reference_start_millis && main_end_millis > main_start_millis)
+        .then_some((
+            main_start_millis,
+            main_end_millis,
+            reference_start_millis,
+            reference_end_millis,
+        ))
+}
+
+fn reference_loop_bounds(state: &AppState) -> Option<(u64, u64, u64, u64)> {
+    reference_loop_bounds_for_selection(state, state.reference_loop_selection?)
+}
+
+fn seek_synchronized_positions(
+    state: &mut AppState,
+    main_position_millis: u64,
+    reference_position_millis: u64,
+    resume: bool,
+) -> Result<(), String> {
+    if state.waveform_busy || state.reference_waveform_busy {
+        return Err(String::from("Audio analysis is still building."));
+    }
+    let Some(main_duration_millis) = state
+        .waveform
+        .as_ref()
+        .filter(|_| {
+            state.library.selected_track_id.as_deref() == state.waveform_track_id.as_deref()
+        })
+        .map(|waveform| waveform.duration_millis)
+    else {
+        return Err(String::from("Audio analysis is still pending."));
+    };
+    let reference_details = selected_reference_details(state);
+    if !state.transport.has_command_capacity(1) {
+        return Err(String::from(transport::CONTROLS_BUSY_ERROR));
+    }
+    let reference_was_loaded = state.reference_transport_loaded;
+    if reference_details.is_some() {
+        let reference_transport = state
+            .reference_transport
+            .get_or_insert_with(transport::AudioTransport::spawn);
+        if reference_transport.has_pending_load() {
+            return Err(String::from(transport::CONTROLS_BUSY_ERROR));
+        }
+        let required_slots = if reference_was_loaded { 1 } else { 2 };
+        if !reference_transport.has_command_capacity(required_slots) {
+            return Err(String::from(transport::CONTROLS_BUSY_ERROR));
+        }
+    }
+    let main_token = state.transport.seek(
+        state.transport_generation,
+        main_position_millis,
+        main_duration_millis,
+        resume,
+    )?;
+    begin_transport_polling(state, main_token);
+    if let Some((reference_path, reference_duration_millis)) = reference_details {
+        let reference_gain = reference_output_gain(state);
+        let reference_transport = state
+            .reference_transport
+            .get_or_insert_with(transport::AudioTransport::spawn);
+        reference_transport.set_output_gain(reference_gain);
+        if !reference_was_loaded {
+            reference_transport.load(
+                state.reference_transport_generation,
+                reference_path,
+                reference_duration_millis,
+            )?;
+            if reference_transport.has_pending_load() {
+                return Err(String::from(transport::CONTROLS_BUSY_ERROR));
+            }
+            state.reference_transport_loaded = true;
+        }
+        let reference_token = reference_transport.seek(
+            state.reference_transport_generation,
+            reference_position_millis,
+            reference_duration_millis,
+            resume,
+        )?;
+        state.reference_transport_waiting_token = Some(reference_token);
+        state.reference_transport_polling = true;
+    }
+    state.reference_only_playback = false;
+    state.transport_position_millis = main_position_millis;
+    state.review_cursor_millis = main_position_millis;
+    state.reference_transport_position_millis = reference_position_millis;
+    Ok(())
+}
+
+fn resume_main_at_position_with_reference(
+    state: &mut AppState,
+    main_position_millis: u64,
+) -> Result<(), String> {
+    let reference_position_millis = selected_reference_details(state)
+        .map(|(_, duration_millis)| {
+            state
+                .reference_transport_position_millis
+                .min(duration_millis)
+        })
+        .unwrap_or(state.reference_transport_position_millis);
+    seek_synchronized_positions(state, main_position_millis, reference_position_millis, true)
+}
+
+fn seek_reference_waveform_position(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    ratio: f32,
+) {
+    if state.busy || state.waveform_busy || state.reference_waveform_busy {
+        return;
+    }
+    let Some((path, reference_duration_millis)) = selected_reference_details(state) else {
+        return;
+    };
+    disarm_audition_auto_advance(state);
+    set_audition_source(state, AuditionSource::Reference);
+    if let Some(reference_transport) = state.reference_transport.as_ref()
+        && !state.reference_transport_loaded
+        && reference_transport.has_pending_load()
+    {
+        state.status = String::from(transport::CONTROLS_BUSY_ERROR);
+        context.request_repaint();
+        return;
+    }
+    let ratio = waveform::clamp_ratio(ratio);
+    let reference_position_millis = waveform::millis_for_ratio(ratio, reference_duration_millis);
+    state.draft_note = None;
+    rollback_persisted_note_drag(state);
+    state.selected_note_id = None;
+    let reference_gain = reference_output_gain(state);
+    let reference_transport = state
+        .reference_transport
+        .get_or_insert_with(transport::AudioTransport::spawn);
+    reference_transport.set_output_gain(reference_gain);
+    if !state.reference_transport_loaded {
+        if let Err(error) = reference_transport.load(
+            state.reference_transport_generation,
+            path,
+            reference_duration_millis,
+        ) {
+            state.status = error;
+            context.request_repaint();
+            return;
+        }
+        if reference_transport.has_pending_load() {
+            state.status = String::from(transport::CONTROLS_BUSY_ERROR);
+            context.request_repaint();
+            return;
+        }
+        state.reference_transport_loaded = true;
+    }
+    match reference_transport.seek(
+        state.reference_transport_generation,
+        reference_position_millis,
+        reference_duration_millis,
+        true,
+    ) {
+        Ok(token) => {
+            state.reference_transport_position_millis = reference_position_millis;
+            state.reference_transport_waiting_token = Some(token);
+            state.reference_transport_polling = true;
+            state.reference_only_playback = true;
+            state.status = format!(
+                "Playing reference from {}.",
+                format_timestamp(reference_position_millis)
+            );
+        }
+        Err(error) => state.status = error,
+    }
+    context.request_repaint();
+}
+
+fn finish_reference_loop_selection(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    start_ratio: f32,
+    end_ratio: f32,
+) {
+    if state.busy || state.waveform_busy || state.reference_waveform_busy {
+        return;
+    }
+    let Some((_, reference_duration_millis)) = selected_reference_details(state) else {
+        return;
+    };
+    disarm_audition_auto_advance(state);
+    set_audition_source(state, AuditionSource::Reference);
+    let start_ratio = waveform::clamp_ratio(start_ratio);
+    let end_ratio = waveform::clamp_ratio(end_ratio);
+    let (start_ratio, end_ratio) = if start_ratio <= end_ratio {
+        (start_ratio, end_ratio)
+    } else {
+        (end_ratio, start_ratio)
+    };
+    let start_millis = waveform::millis_for_ratio(start_ratio, reference_duration_millis);
+    let end_millis = waveform::millis_for_ratio(end_ratio, reference_duration_millis);
+    if end_millis <= start_millis
+        || end_millis.saturating_sub(start_millis) < MIN_REFERENCE_LOOP_MILLIS
+    {
+        state.reference_loop_selection = None;
+        state.status = String::from("Reference loop cleared.");
+        context.request_repaint();
+        return;
+    }
+
+    let candidate_selection = ReferenceLoopSelection {
+        start_ratio,
+        end_ratio,
+    };
+    let Some((main_start_millis, _, reference_start_millis, _)) =
+        reference_loop_bounds_for_selection(state, candidate_selection)
+    else {
+        context.request_repaint();
+        return;
+    };
+    let was_playing = state.reference_only_playback
+        || state.transport_playing
+        || state.reference_transport_playing;
+    if was_playing {
+        if let Err(error) =
+            seek_synchronized_positions(state, main_start_millis, reference_start_millis, true)
+        {
+            state.status = error;
+            context.request_repaint();
+            return;
+        } else {
+            state.reference_loop_selection = Some(candidate_selection);
+        }
+    } else {
+        state.reference_loop_selection = Some(candidate_selection);
+        state.transport_position_millis = main_start_millis;
+        state.review_cursor_millis = main_start_millis;
+        state.reference_transport_position_millis = reference_start_millis;
+    }
+    state.status = format!(
+        "Reference loop {}–{}.",
+        format_timestamp(start_millis),
+        format_timestamp(end_millis),
+    );
+    context.request_repaint();
+}
+
+fn select_audition_source(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    source: AuditionSource,
+) {
+    if state.busy {
+        return;
+    }
+    if source == AuditionSource::Reference {
+        if state.reference_waveform_busy {
+            state.status = String::from("Reference analysis is still pending.");
+            context.request_repaint();
+            return;
+        }
+        if selected_reference_details(state).is_none() {
+            state.status = String::from("Import and analyze a reference track first.");
+            context.request_repaint();
+            return;
+        }
+    }
+    if state.audition_source != source {
+        set_audition_source(state, source);
+        state.status = match source {
+            AuditionSource::Main => String::from("Now hearing the imported track."),
+            AuditionSource::Reference => String::from("Now hearing the reference track."),
+        };
+    }
+    context.request_repaint();
+}
+
+fn set_audition_source(state: &mut AppState, source: AuditionSource) {
+    if state.audition_source == source {
+        return;
+    }
+    state.audition_source = source;
+    sync_audition_output_gains(state);
+}
+
+fn play_audition(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
+    if state.busy || state.workspace_mode != WorkspaceMode::Audition {
+        return;
+    }
+    if state.transport_playing || state.reference_transport_playing {
+        state.status = String::from("Audition playback is already active.");
+        context.request_repaint();
+        return;
+    }
+    let Some(track_id) = state.library.selected_track_id.clone() else {
+        state.status = String::from("Select an audition track before playing.");
+        context.request_repaint();
+        return;
+    };
+    if !state
+        .audition_queue
+        .iter()
+        .any(|queued_id| queued_id == &track_id)
+    {
+        state.status = String::from("Select an audition track before playing.");
+        context.request_repaint();
+        return;
+    }
+
+    let waveform_ready = !state.waveform_busy
+        && state.waveform_track_id.as_deref() == Some(track_id.as_str())
+        && state.waveform.is_some();
+    let transport_pending = state.transport_polling
+        || state.transport_waiting_token.is_some()
+        || state.transport.has_pending_load()
+        || state.reference_transport_polling
+        || state.reference_transport_waiting_token.is_some()
+        || state
+            .reference_transport
+            .as_ref()
+            .is_some_and(transport::AudioTransport::has_pending_load);
+    if !waveform_ready || state.reference_waveform_busy || transport_pending {
+        state.audition_auto_advance = true;
+        state.audition_play_token = None;
+        state.audition_pending_play_track_id = Some(track_id.clone());
+        let title = state
+            .library
+            .tracks
+            .iter()
+            .find(|track| track.id == track_id)
+            .map_or(track_id, |track| track.title.clone());
+        state.status = format!("Loading audition track: {title}…");
+        context.request_repaint();
+        return;
+    }
+
+    // The existing toggle path owns paired main/reference admission. Calling it
+    // only after the active-playback guard makes this a one-way Play command.
+    state.audition_pending_play_track_id = None;
+    toggle_playback(state, context);
+}
+
+fn previous_audition(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
+    move_audition(state, context, AuditionMove::Previous);
+}
+
+fn next_audition(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
+    move_audition(state, context, AuditionMove::Next);
+}
+
+#[derive(Clone, Copy)]
+enum AuditionMove {
+    Previous,
+    Next,
+}
+
+fn move_audition(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    direction: AuditionMove,
+) {
+    if state.busy || state.workspace_mode != WorkspaceMode::Audition {
+        return;
+    }
+    let Some(current_id) = state.library.selected_track_id.clone() else {
+        state.status = match direction {
+            AuditionMove::Previous => {
+                String::from("Already at the beginning of the audition queue.")
+            }
+            AuditionMove::Next => String::from("Already at the end of the audition queue."),
+        };
+        context.request_repaint();
+        return;
+    };
+    let Some(current_index) = state
+        .audition_queue
+        .iter()
+        .position(|track_id| track_id == &current_id)
+    else {
+        state.status = match direction {
+            AuditionMove::Previous => {
+                String::from("Already at the beginning of the audition queue.")
+            }
+            AuditionMove::Next => String::from("Already at the end of the audition queue."),
+        };
+        context.request_repaint();
+        return;
+    };
+    let destination_index = match direction {
+        AuditionMove::Previous => current_index.checked_sub(1),
+        AuditionMove::Next => current_index
+            .checked_add(1)
+            .filter(|index| *index < state.audition_queue.len()),
+    };
+    let Some(destination_index) = destination_index else {
+        state.status = match direction {
+            AuditionMove::Previous => {
+                String::from("Already at the beginning of the audition queue.")
+            }
+            AuditionMove::Next => String::from("Already at the end of the audition queue."),
+        };
+        context.request_repaint();
+        return;
+    };
+    let Some(destination_id) = state.audition_queue.get(destination_index).cloned() else {
+        return;
+    };
+
+    if matches!(direction, AuditionMove::Next)
+        && !state
+            .audition_heard
+            .iter()
+            .any(|heard_id| heard_id == &current_id)
+    {
+        state.audition_heard.push(current_id);
+    }
+    state
+        .audition_heard
+        .retain(|heard_id| heard_id != &destination_id);
+    let title = state
+        .library
+        .tracks
+        .iter()
+        .find(|track| track.id == destination_id)
+        .map_or_else(|| destination_id.clone(), |track| track.title.clone());
+    select_track_internal(state, context, destination_id, true);
+    state.status = match direction {
+        AuditionMove::Previous => format!("Loading previous audition track: {title}…"),
+        AuditionMove::Next => format!("Loading next audition track: {title}…"),
+    };
+    context.request_repaint();
+}
+
+fn stop_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
+    state.audition_auto_advance = false;
+    state.audition_play_token = None;
+    state.audition_pending_play_track_id = None;
+    let main_active = state.transport_playing
+        || state.transport_polling
+        || state.transport_waiting_token.is_some();
+    let reference_active = state.reference_transport.as_ref().is_some_and(|_| {
+        state.reference_transport_playing
+            || state.reference_transport_polling
+            || state.reference_transport_waiting_token.is_some()
+    });
+    if !main_active && !reference_active {
+        return;
+    }
+
+    let reference_capacity_available = !reference_active
+        || state.reference_transport.as_ref().is_some_and(|transport| {
+            !transport.has_pending_load() && transport.has_command_capacity(1)
+        });
+    if (main_active && !state.transport.has_command_capacity(1)) || !reference_capacity_available {
+        state.status = String::from(transport::CONTROLS_BUSY_ERROR);
+        context.request_repaint();
+        return;
+    }
+
+    let main_token = if main_active {
+        match state.transport.pause(state.transport_generation) {
+            Ok(token) => Some(token),
+            Err(error) => {
+                state.status = error;
+                context.request_repaint();
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    let reference_token = if reference_active {
+        let Some(reference_transport) = state.reference_transport.as_ref() else {
+            state.status = String::from(transport::CONTROLS_BUSY_ERROR);
+            context.request_repaint();
+            return;
+        };
+        match reference_transport.pause(state.reference_transport_generation) {
+            Ok(token) => Some(token),
+            Err(error) => {
+                if let Some(token) = main_token {
+                    begin_transport_polling(state, token);
+                }
+                state.status = error;
+                context.request_repaint();
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
+    if let Some(token) = main_token {
+        begin_transport_polling(state, token);
+    }
+    if let Some(token) = reference_token {
+        state.reference_transport_waiting_token = Some(token);
+        state.reference_transport_polling = true;
+    }
+    state.reference_only_playback = false;
+    state.status = String::from("Stopping playback…");
+    context.request_repaint();
+}
+
+fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
+    if state.busy || state.waveform_busy || state.reference_waveform_busy {
+        if state.waveform_busy || state.reference_waveform_busy {
+            state.status = String::from("Audio analysis is still building.");
+            context.request_repaint();
+        }
+        return;
+    }
+    if state.transport_polling || state.reference_transport_polling {
+        return;
+    }
+    let Some(waveform) = state
+        .waveform
+        .as_ref()
+        .filter(|_| selected_track(state).is_some())
+    else {
+        state.status = String::from("Audio analysis is still pending.");
+        context.request_repaint();
+        return;
+    };
+
+    let reference_details = selected_reference_details(state);
+    if let Some(reference_transport) = state.reference_transport.as_ref()
+        && !state.reference_transport_loaded
+        && reference_transport.has_pending_load()
+    {
+        state.status = String::from(transport::CONTROLS_BUSY_ERROR);
+        context.request_repaint();
+        return;
+    }
+    let reference_pending = selected_track(state)
+        .and_then(|track| track.reference_path.as_ref())
+        .is_some()
+        && state.reference_waveform_busy;
+    if !state.transport_playing && !state.reference_transport_playing && reference_pending {
+        state.status = String::from("Reference analysis is still pending.");
+        context.request_repaint();
+        return;
+    }
+
+    if state.transport_playing || state.reference_transport_playing {
+        if state.workspace_mode == WorkspaceMode::Audition {
+            state.audition_auto_advance = false;
+            state.audition_play_token = None;
+        }
+        let reference_will_pause =
+            state.reference_transport_loaded && state.reference_transport.is_some();
+        let reference_capacity_available =
+            state
+                .reference_transport
+                .as_ref()
+                .is_none_or(|reference_transport| {
+                    !reference_will_pause
+                        || (!reference_transport.has_pending_load()
+                            && reference_transport.has_command_capacity(1))
+                });
+        if !state.transport.has_command_capacity(1) || !reference_capacity_available {
+            state.status = String::from(transport::CONTROLS_BUSY_ERROR);
+            context.request_repaint();
+            return;
+        }
+        let main_result = state.transport.pause(state.transport_generation);
+        let reference_result = state
+            .reference_transport
+            .as_ref()
+            .filter(|_| state.reference_transport_loaded)
+            .map(|reference_transport| {
+                reference_transport.pause(state.reference_transport_generation)
+            });
+        match main_result {
+            Ok(token) => begin_transport_polling(state, token),
+            Err(error) => state.status = error,
+        }
+        if let Some(result) = reference_result {
+            match result {
+                Ok(token) => {
+                    state.reference_transport_waiting_token = Some(token);
+                    state.reference_transport_polling = true;
+                }
+                Err(error) => state.status = error,
+            }
+        }
+        state.status = String::from("Pausing playback…");
+        state.reference_only_playback = false;
+    } else {
+        let duration_millis = waveform.duration_millis;
+        let loop_bounds = reference_loop_bounds(state);
+        if !state.transport.has_command_capacity(1) {
+            state.status = String::from(transport::CONTROLS_BUSY_ERROR);
+            context.request_repaint();
+            return;
+        }
+        if reference_details.is_some() {
+            let reference_transport = state
+                .reference_transport
+                .get_or_insert_with(transport::AudioTransport::spawn);
+            if reference_transport.has_pending_load() {
+                state.status = String::from(transport::CONTROLS_BUSY_ERROR);
+                context.request_repaint();
+                return;
+            }
+            let required_reference_slots = if state.reference_transport_loaded {
+                2
+            } else {
+                3
+            };
+            if !reference_transport.has_command_capacity(required_reference_slots) {
+                state.status = String::from(transport::CONTROLS_BUSY_ERROR);
+                context.request_repaint();
+                return;
+            }
+        }
+        let (position_millis, reference_position_millis) = if let Some((
+            main_start_millis,
+            main_end_millis,
+            reference_start_millis,
+            reference_end_millis,
+        )) = loop_bounds
+        {
+            let main_position_in_loop = state.transport_position_millis >= main_start_millis
+                && state.transport_position_millis < main_end_millis;
+            let reference_position_in_loop = state.reference_transport_position_millis
+                >= reference_start_millis
+                && state.reference_transport_position_millis < reference_end_millis;
+            if main_position_in_loop && reference_position_in_loop {
+                (
+                    state.transport_position_millis,
+                    state.reference_transport_position_millis,
+                )
+            } else {
+                (main_start_millis, reference_start_millis)
+            }
+        } else {
+            let main_position_millis = state.transport_position_millis;
+            (
+                if main_position_millis >= duration_millis {
+                    0
+                } else {
+                    main_position_millis
+                },
+                state.reference_transport_position_millis,
+            )
+        };
+        state.transport_position_millis = position_millis;
+        state.review_cursor_millis = position_millis;
+        state.reference_only_playback = false;
+
+        let main_result = if loop_bounds.is_some() {
+            state.transport.seek(
+                state.transport_generation,
+                position_millis,
+                duration_millis,
+                true,
+            )
+        } else {
+            state.transport.play(state.transport_generation)
+        };
+        let main_token = match main_result {
+            Ok(token) => token,
+            Err(error) => {
+                if state.workspace_mode == WorkspaceMode::Audition {
+                    state.audition_auto_advance = false;
+                    state.audition_play_token = None;
+                }
+                state.status = error;
+                context.request_repaint();
+                return;
+            }
+        };
+        if state.workspace_mode == WorkspaceMode::Audition {
+            state.audition_auto_advance = true;
+            state.audition_play_token = Some(main_token);
+        }
+        begin_transport_polling(state, main_token);
+
+        if let Some((path, reference_duration_millis)) = reference_details {
+            let reference_position_millis =
+                reference_position_millis.min(reference_duration_millis);
+            let reference_gain = reference_output_gain(state);
+            let reference_transport = state
+                .reference_transport
+                .get_or_insert_with(transport::AudioTransport::spawn);
+            reference_transport.set_output_gain(reference_gain);
+            if !state.reference_transport_loaded {
+                if let Err(error) = reference_transport.load(
+                    state.reference_transport_generation,
+                    path,
+                    reference_duration_millis,
+                ) {
+                    state.status = error;
+                    context.request_repaint();
+                    return;
+                }
+                if reference_transport.has_pending_load() {
+                    state.status = String::from(transport::CONTROLS_BUSY_ERROR);
+                    context.request_repaint();
+                    return;
+                }
+                state.reference_transport_loaded = true;
+            }
+            if let Err(error) = reference_transport.seek(
+                state.reference_transport_generation,
+                reference_position_millis,
+                reference_duration_millis,
+                false,
+            ) {
+                state.status = error;
+                context.request_repaint();
+                return;
+            }
+            let reference_token =
+                match reference_transport.play(state.reference_transport_generation) {
+                    Ok(token) => token,
+                    Err(error) => {
+                        state.status = error;
+                        context.request_repaint();
+                        return;
+                    }
+                };
+            state.reference_transport_position_millis = reference_position_millis;
+            state.reference_transport_waiting_token = Some(reference_token);
+            state.reference_transport_polling = true;
+            state.status = if state.audition_source == AuditionSource::Reference {
+                String::from("Playing reference and imported track…")
+            } else {
+                String::from("Playing imported and reference tracks…")
+            };
+        } else {
+            state.status = String::from("Playing imported track…");
+        }
+    }
+    context.request_repaint();
+}
+
+fn start_note_at_current_time(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
+    if state.busy || state.waveform_busy {
+        return;
+    }
+    let Some(track_id) = state.library.selected_track_id.as_deref() else {
+        state.status = String::from("Select a track before adding a comment.");
+        context.request_repaint();
+        return;
+    };
+    let Some(duration_millis) = state
+        .waveform
+        .as_ref()
+        .filter(|_| state.waveform_track_id.as_deref() == Some(track_id))
+        .map(|waveform| waveform.duration_millis)
+    else {
+        state.status = String::from("Audio analysis is still pending.");
+        context.request_repaint();
+        return;
+    };
+    let time_millis = state.review_cursor_millis.min(duration_millis);
+    start_main_note_draft(state, context, time_millis);
+}
+
+fn start_main_note_draft(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    time_millis: u64,
+) {
+    rollback_persisted_note_drag(state);
+    set_audition_source(state, AuditionSource::Main);
+    state.review_cursor_millis = time_millis;
+    state.draft_note = Some(NoteDraft {
+        note_id: None,
+        time_millis,
+        body: String::new(),
+    });
+    state.selected_note_id = None;
+    state.status = format!(
+        "Comment at {} — type a note below.",
+        format_timestamp(time_millis)
+    );
+    context.focus(MAIN_COMMENT_EDITOR_ID);
+    context.request_repaint();
 }
 
 fn save_draft_note(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
@@ -866,6 +2796,276 @@ fn save_draft_note(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
     context.request_repaint();
 }
 
+fn start_reference_comment_draft(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    ratio: f32,
+) {
+    if state.busy || state.reference_waveform_busy {
+        return;
+    }
+    let Some(waveform) = state
+        .reference_waveform
+        .as_ref()
+        .filter(|_| !state.reference_waveform_busy)
+    else {
+        return;
+    };
+    if selected_track(state)
+        .and_then(|track| track.reference_path.as_ref())
+        .is_none()
+    {
+        return;
+    }
+    let time_millis = waveform::millis_for_ratio(ratio, waveform.duration_millis);
+    state.reference_draft_note = Some(NoteDraft {
+        note_id: None,
+        time_millis,
+        body: String::new(),
+    });
+    state.selected_reference_note_id = None;
+    state.hovered_reference_note_id = None;
+    state.status = format!(
+        "Reference comment at {} — type a note below.",
+        format_timestamp(time_millis)
+    );
+    context.focus(REFERENCE_COMMENT_EDITOR_ID);
+    context.request_repaint();
+}
+
+fn save_reference_draft_note(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
+    if state.busy {
+        state.status = String::from("Finish importing before saving a reference comment.");
+        context.request_repaint();
+        return;
+    }
+    let Some(draft) = state.reference_draft_note.clone() else {
+        return;
+    };
+    let body = draft.body.trim().to_owned();
+    if body.is_empty() {
+        state.status = String::from("Write a reference comment before saving.");
+        context.request_repaint();
+        return;
+    }
+    let Some(reference) = selected_reference_track_mut(state) else {
+        state.status = String::from("Select a reference track before saving a comment.");
+        context.request_repaint();
+        return;
+    };
+    if let Some(note_id) = draft.note_id {
+        if let Some(note) = reference.notes.iter_mut().find(|note| note.id == note_id) {
+            note.body = body;
+        } else {
+            state.status = String::from("That reference comment no longer exists.");
+            context.request_repaint();
+            return;
+        }
+    } else {
+        reference.notes.push(storage::Note {
+            id: unique_note_id(),
+            time_millis: draft.time_millis,
+            body,
+            done: false,
+        });
+        reference.notes.sort_by_key(|note| note.time_millis);
+    }
+    state.reference_draft_note = None;
+    state.status = String::from("Reference comment saved locally.");
+    schedule_library_save(state, context);
+    context.request_repaint();
+}
+
+fn move_draft_note(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>, ratio: f32) {
+    let Some(duration_millis) = state
+        .waveform
+        .as_ref()
+        .map(|waveform| waveform.duration_millis)
+    else {
+        return;
+    };
+    let Some(draft) = state
+        .draft_note
+        .as_mut()
+        .filter(|draft| draft.note_id.is_none())
+    else {
+        return;
+    };
+    let time_millis = waveform::millis_for_ratio(ratio, duration_millis);
+    draft.time_millis = time_millis;
+    state.review_cursor_millis = time_millis;
+    state.status = format!("Comment at {}.", format_timestamp(time_millis));
+    context.request_repaint();
+}
+
+fn start_persisted_note_drag(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    note_index: usize,
+) {
+    rollback_persisted_note_drag(state);
+    if state.busy {
+        return;
+    }
+    let Some(track_id) = state.library.selected_track_id.clone() else {
+        return;
+    };
+    let waveform_is_current =
+        state.waveform.is_some() && state.waveform_track_id.as_deref() == Some(track_id.as_str());
+    let Some((note_id, time_millis)) = state
+        .library
+        .tracks
+        .iter()
+        .find(|track| track.id == track_id)
+        .filter(|_| waveform_is_current)
+        .and_then(|track| {
+            track
+                .notes
+                .get(note_index)
+                .map(|note| (note.id.clone(), note.time_millis))
+        })
+    else {
+        state.status = String::from("That comment no longer exists.");
+        context.request_repaint();
+        return;
+    };
+
+    if state
+        .draft_note
+        .as_ref()
+        .is_some_and(|draft| draft.note_id.as_deref() == Some(note_id.as_str()))
+    {
+        if let Some(draft) = state.draft_note.as_mut() {
+            draft.time_millis = time_millis;
+        }
+    } else {
+        // Picking up a saved marker supersedes an empty draft or an editor for
+        // another note; it must never create a second draft for this marker.
+        state.draft_note = None;
+    }
+    state.persisted_note_drag = Some(PersistedNoteDrag {
+        track_id,
+        note_id: note_id.clone(),
+        original_time_millis: time_millis,
+        moved: false,
+    });
+    state.selected_note_id = Some(note_id);
+    state.hovered_note_id = None;
+    state.review_cursor_millis = time_millis;
+    state.status = format!("Dragging comment at {}…", format_timestamp(time_millis));
+    context.request_repaint();
+}
+
+fn move_persisted_note(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    ratio: f32,
+) {
+    let Some(drag) = state.persisted_note_drag.clone() else {
+        return;
+    };
+    let Some(duration_millis) = state
+        .waveform
+        .as_ref()
+        .filter(|_| state.waveform_track_id.as_deref() == Some(drag.track_id.as_str()))
+        .map(|waveform| waveform.duration_millis)
+    else {
+        rollback_persisted_note_drag(state);
+        return;
+    };
+    let time_millis = waveform::millis_for_ratio(ratio, duration_millis);
+    let note_exists = state
+        .library
+        .tracks
+        .iter_mut()
+        .find(|track| track.id == drag.track_id)
+        .and_then(|track| track.notes.iter_mut().find(|note| note.id == drag.note_id))
+        .map(|note| note.time_millis = time_millis)
+        .is_some();
+    if !note_exists {
+        rollback_persisted_note_drag(state);
+        state.status = String::from("That comment no longer exists.");
+        context.request_repaint();
+        return;
+    }
+    if let Some(active_drag) = state.persisted_note_drag.as_mut() {
+        active_drag.moved |= time_millis != active_drag.original_time_millis;
+    }
+    if let Some(draft) = state
+        .draft_note
+        .as_mut()
+        .filter(|draft| draft.note_id.as_deref() == Some(drag.note_id.as_str()))
+    {
+        draft.time_millis = time_millis;
+    }
+    state.review_cursor_millis = time_millis;
+    state.status = format!("Comment at {}.", format_timestamp(time_millis));
+    context.request_repaint();
+}
+
+fn finish_persisted_note_drag(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    ratio: f32,
+) {
+    let Some(drag) = state.persisted_note_drag.take() else {
+        return;
+    };
+    let Some(duration_millis) = state
+        .waveform
+        .as_ref()
+        .filter(|_| state.waveform_track_id.as_deref() == Some(drag.track_id.as_str()))
+        .map(|waveform| waveform.duration_millis)
+    else {
+        return;
+    };
+    let time_millis = waveform::millis_for_ratio(ratio, duration_millis);
+    let Some(track) = state
+        .library
+        .tracks
+        .iter_mut()
+        .find(|track| track.id == drag.track_id)
+    else {
+        state.status = String::from("That track is no longer in the library.");
+        context.request_repaint();
+        return;
+    };
+    let Some(note) = track.notes.iter_mut().find(|note| note.id == drag.note_id) else {
+        state.status = String::from("That comment no longer exists.");
+        context.request_repaint();
+        return;
+    };
+    if drag.moved {
+        note.time_millis = time_millis;
+    }
+    let final_time_millis = note.time_millis;
+    let changed = final_time_millis != drag.original_time_millis;
+    track.notes.sort_by_key(|note| note.time_millis);
+    if let Some(draft) = state
+        .draft_note
+        .as_mut()
+        .filter(|draft| draft.note_id.as_deref() == Some(drag.note_id.as_str()))
+    {
+        draft.time_millis = final_time_millis;
+    }
+    state.review_cursor_millis = final_time_millis;
+    state.status = if changed {
+        format!(
+            "Comment moved to {} and saved locally.",
+            format_timestamp(final_time_millis)
+        )
+    } else {
+        format!(
+            "Selected comment at {}.",
+            format_timestamp(final_time_millis)
+        )
+    };
+    if changed {
+        schedule_library_save(state, context);
+    }
+    context.request_repaint();
+}
+
 fn request_import(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
     if state.busy {
         state.status = String::from("The library is still loading.");
@@ -877,37 +3077,143 @@ fn request_import(state: &mut AppState, context: &mut ui::UiUpdateContext<Messag
         context.request_repaint();
         return;
     }
-    context.pick_file(
-        FileDialogRequest::new().title("Import audio track").filter(
-            "Audio",
-            vec![
-                String::from("wav"),
-                String::from("aiff"),
-                String::from("flac"),
-                String::from("m4a"),
-                String::from("mp3"),
-                String::from("ogg"),
-                String::from("opus"),
-                String::from("aac"),
-            ],
-        ),
-        Message::FilePicked,
-    );
+    context.pick_file(audio_file_dialog("Import audio track"), Message::FilePicked);
 }
 
-fn schedule_import(
+fn request_replace(
     state: &mut AppState,
     context: &mut ui::UiUpdateContext<Message>,
-    path: PathBuf,
+    track_id: String,
 ) {
     if state.busy {
-        return;
-    }
-    if state.save_in_flight {
-        state.status = String::from("Saving the library — try importing again in a moment.");
+        state.status = String::from("The library is still loading.");
         context.request_repaint();
         return;
     }
+    if state.save_in_flight {
+        state.status = String::from("Saving the library — try replacing again in a moment.");
+        context.request_repaint();
+        return;
+    }
+    if !state
+        .library
+        .tracks
+        .iter()
+        .any(|track| track.id == track_id)
+    {
+        state.status = String::from("That track is no longer in the library.");
+        context.request_repaint();
+        return;
+    }
+    context.pick_file(audio_file_dialog("Replace audio track"), move |result| {
+        Message::ReplaceFilePicked { track_id, result }
+    });
+}
+
+fn request_reference(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    track_id: String,
+) {
+    if state.busy {
+        state.status = String::from("The library is still loading.");
+        context.request_repaint();
+        return;
+    }
+    if state.save_in_flight {
+        state.status =
+            String::from("Saving the library — try importing a reference again in a moment.");
+        context.request_repaint();
+        return;
+    }
+    if !state
+        .library
+        .tracks
+        .iter()
+        .any(|track| track.id == track_id)
+    {
+        state.status = String::from("That track is no longer in the library.");
+        context.request_repaint();
+        return;
+    }
+    state.busy = true;
+    state.status = String::from("Choosing reference tracks…");
+    context
+        .business()
+        .blocking_io("cadence-pick-reference-tracks")
+        .run(
+            |_| pick_reference_tracks(),
+            move |paths| Message::ReferenceFilesPicked { track_id, paths },
+        );
+    context.request_repaint();
+}
+
+fn audio_file_dialog(title: &str) -> FileDialogRequest {
+    FileDialogRequest::new().title(title).filter(
+        "Audio",
+        vec![
+            String::from("wav"),
+            String::from("aiff"),
+            String::from("flac"),
+            String::from("m4a"),
+            String::from("mp3"),
+            String::from("ogg"),
+            String::from("opus"),
+            String::from("aac"),
+        ],
+    )
+}
+
+fn pick_reference_tracks() -> Vec<PathBuf> {
+    // Radiant's pinned platform picker intentionally returns one path. Keep
+    // the multi-selection interaction local to Cadence until that API grows a
+    // native multi-path response.
+    rfd::FileDialog::new()
+        .set_title("Import reference tracks")
+        .add_filter(
+            "Audio",
+            &["wav", "aiff", "flac", "m4a", "mp3", "ogg", "opus", "aac"],
+        )
+        .pick_files()
+        .unwrap_or_default()
+}
+
+fn record_import_attempt(state: &mut AppState, failed: bool) {
+    if let Some(batch) = state.import_batch.as_mut() {
+        batch.completed = batch.completed.saturating_add(1).min(batch.total);
+        if failed {
+            batch.failed = batch.failed.saturating_add(1).min(batch.completed);
+        }
+    }
+}
+
+fn finish_import_batch(state: &mut AppState) {
+    let should_finish = match state.import_batch.as_ref() {
+        Some(batch) => {
+            batch.completed >= batch.total
+                && state.pending_import_paths.is_empty()
+                && state.pending_reference_paths.is_empty()
+        }
+        None => false,
+    };
+    if !should_finish {
+        return;
+    }
+
+    let Some(batch) = state.import_batch.take() else {
+        return;
+    };
+    if batch.total > 1 {
+        state.status = format!(
+            "Imported {} of {} files; {} failed.",
+            batch.total - batch.failed,
+            batch.total,
+            batch.failed
+        );
+    }
+}
+
+fn start_import(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>, path: PathBuf) {
     state.busy = true;
     state.status = format!("Importing {}…", path.display());
     let library = state.library.clone();
@@ -915,6 +3221,179 @@ fn schedule_import(
         move |_| storage::import_into_library(library, path),
         Message::ImportCompleted,
     );
+    context.request_repaint();
+}
+
+fn schedule_import(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    path: PathBuf,
+) {
+    let batch = state.import_batch.get_or_insert_with(Default::default);
+    batch.total = batch.total.saturating_add(1);
+    if state.busy || state.save_in_flight {
+        let display_name = path.display().to_string();
+        state.pending_import_paths.push(path);
+        state.status = if state.busy {
+            format!(
+                "Queued {} for import · {} file{} waiting.",
+                display_name,
+                state.pending_import_paths.len(),
+                plural(state.pending_import_paths.len())
+            )
+        } else {
+            String::from("Saving the library — the dropped file is queued for import.")
+        };
+        context.request_repaint();
+        return;
+    }
+    start_import(state, context, path);
+}
+
+fn schedule_next_pending_import(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
+    if state.busy || state.save_in_flight {
+        return;
+    }
+    let Some(path) =
+        (!state.pending_import_paths.is_empty()).then(|| state.pending_import_paths.remove(0))
+    else {
+        return;
+    };
+    start_import(state, context, path);
+}
+
+fn schedule_reference_import(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    track_id: String,
+    paths: Vec<PathBuf>,
+) {
+    if paths.is_empty() {
+        state.status = String::from("Reference import canceled.");
+        context.request_repaint();
+        return;
+    }
+    if !state
+        .library
+        .tracks
+        .iter()
+        .any(|track| track.id == track_id)
+    {
+        state.status = String::from("That track is no longer in the library.");
+        context.request_repaint();
+        return;
+    }
+    state.pending_reference_paths = paths;
+    state.pending_reference_track_id = Some(track_id);
+    state.reference_import_selected_path = None;
+    state.reference_draft_note = None;
+    state.selected_reference_note_id = None;
+    state.hovered_reference_note_id = None;
+    state.import_batch = Some(ImportBatchProgress {
+        total: state.pending_reference_paths.len(),
+        completed: 0,
+        failed: 0,
+    });
+    schedule_next_pending_reference_import(state, context);
+}
+
+fn schedule_next_pending_reference_import(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+) {
+    if state.busy || state.save_in_flight {
+        return;
+    }
+    let Some(track_id) = state.pending_reference_track_id.clone() else {
+        return;
+    };
+    let Some(path) = (!state.pending_reference_paths.is_empty())
+        .then(|| state.pending_reference_paths.remove(0))
+    else {
+        return;
+    };
+    schedule_reference(state, context, track_id, path);
+}
+
+fn schedule_replace(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    track_id: String,
+    path: PathBuf,
+) {
+    if state.busy {
+        return;
+    }
+    if state.save_in_flight {
+        state.status = String::from("Saving the library — try replacing again in a moment.");
+        context.request_repaint();
+        return;
+    }
+    if !state
+        .library
+        .tracks
+        .iter()
+        .any(|track| track.id == track_id)
+    {
+        state.status = String::from("That track is no longer in the library.");
+        context.request_repaint();
+        return;
+    }
+    state.busy = true;
+    state.status = format!("Replacing with {}…", path.display());
+    let library = state.library.clone();
+    let completion_track_id = track_id.clone();
+    context.business().blocking_io("cadence-replace-track").run(
+        move |_| storage::replace_track(library, &track_id, path),
+        move |result| Message::ReplaceCompleted {
+            track_id: completion_track_id,
+            result,
+        },
+    );
+    context.request_repaint();
+}
+
+fn schedule_reference(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    track_id: String,
+    path: PathBuf,
+) {
+    if state.busy {
+        return;
+    }
+    if state.save_in_flight {
+        state.status =
+            String::from("Saving the library — try importing a reference again in a moment.");
+        context.request_repaint();
+        return;
+    }
+    if !state
+        .library
+        .tracks
+        .iter()
+        .any(|track| track.id == track_id)
+    {
+        state.status = String::from("That track is no longer in the library.");
+        context.request_repaint();
+        return;
+    }
+    state.busy = true;
+    state.status = format!("Importing reference {}…", path.display());
+    let library = state.library.clone();
+    let completion_track_id = track_id.clone();
+    let completion_path = path.clone();
+    context
+        .business()
+        .blocking_io("cadence-import-reference")
+        .run(
+            move |_| storage::set_reference_track(library, &track_id, path),
+            move |result| Message::ReferenceImportCompleted {
+                track_id: completion_track_id,
+                path: completion_path,
+                result,
+            },
+        );
     context.request_repaint();
 }
 
@@ -935,6 +3414,7 @@ fn schedule_library_save(state: &mut AppState, context: &mut ui::UiUpdateContext
 
 fn reset_transport(state: &mut AppState) {
     state.transport_generation = state.transport_generation.wrapping_add(1);
+    state.audition_play_token = None;
     state.transport_position_millis = 0;
     state.review_cursor_millis = 0;
     state.playhead_drag_active = false;
@@ -942,6 +3422,22 @@ fn reset_transport(state: &mut AppState) {
     state.transport_polling = false;
     state.transport_waiting_token = None;
     let _ = state.transport.unload(state.transport_generation);
+}
+
+fn reset_reference_transport(state: &mut AppState) {
+    state.reference_transport_generation = state.reference_transport_generation.wrapping_add(1);
+    state.reference_transport_position_millis = 0;
+    state.reference_loop_selection = None;
+    state.audition_source = AuditionSource::Main;
+    state.reference_transport_playing = false;
+    state.reference_transport_polling = false;
+    state.reference_transport_waiting_token = None;
+    state.reference_transport_loaded = false;
+    state.reference_only_playback = false;
+    if let Some(reference_transport) = state.reference_transport.as_ref() {
+        let _ = reference_transport.unload(state.reference_transport_generation);
+    }
+    sync_audition_output_gains(state);
 }
 
 fn begin_transport_polling(state: &mut AppState, token: u64) {
@@ -963,12 +3459,89 @@ fn apply_transport_snapshot(state: &mut AppState, snapshot: transport::Snapshot)
     }
 }
 
+fn update_reference_transport(state: &mut AppState) {
+    let Some(snapshot) = state
+        .reference_transport
+        .as_ref()
+        .map(transport::AudioTransport::snapshot)
+    else {
+        return;
+    };
+    if snapshot.generation != state.reference_transport_generation {
+        return;
+    }
+    if let Some(error) = state
+        .reference_transport
+        .as_ref()
+        .and_then(|reference_transport| {
+            reference_transport.take_error(state.reference_transport_generation)
+        })
+    {
+        state.reference_transport_playing = false;
+        state.reference_transport_polling = false;
+        state.reference_transport_waiting_token = None;
+        state.reference_transport_loaded = false;
+        state.reference_only_playback = false;
+        state.status = error;
+    } else if state
+        .reference_transport_waiting_token
+        .is_none_or(|token| transport_command_is_confirmed(snapshot, token))
+    {
+        state.reference_transport_waiting_token = None;
+        apply_reference_transport_snapshot(state, snapshot);
+    }
+}
+
+fn apply_reference_transport_snapshot(state: &mut AppState, snapshot: transport::Snapshot) {
+    if snapshot.ready {
+        state.reference_transport_position_millis = snapshot.position_millis;
+        state.reference_transport_playing = snapshot.playing;
+        state.reference_transport_polling = false;
+    } else {
+        state.reference_transport_playing = false;
+        state.reference_transport_polling = false;
+    }
+}
+
+fn enforce_reference_loop(state: &mut AppState, was_shared_playing: bool) {
+    if state.reference_only_playback {
+        return;
+    }
+    let Some((main_start_millis, main_end_millis, reference_start_millis, reference_end_millis)) =
+        reference_loop_bounds(state)
+    else {
+        return;
+    };
+    if state.transport_polling
+        || state.reference_transport_polling
+        || !(was_shared_playing || state.transport_playing || state.reference_transport_playing)
+        || !state.reference_transport_loaded
+    {
+        return;
+    }
+    let loop_reached = state.transport_position_millis >= main_end_millis
+        || state.reference_transport_position_millis >= reference_end_millis;
+    if !loop_reached {
+        return;
+    }
+    if let Err(error) =
+        seek_synchronized_positions(state, main_start_millis, reference_start_millis, true)
+    {
+        state.status = error;
+    } else {
+        state.status = String::from("Looping the selected reference section…");
+    }
+}
+
 fn seek_review_position(
     state: &mut AppState,
     context: &mut ui::UiUpdateContext<Message>,
     ratio: f32,
     resume: bool,
 ) {
+    if state.waveform_busy || state.reference_waveform_busy {
+        return;
+    }
     let Some(duration_millis) = state
         .waveform
         .as_ref()
@@ -976,18 +3549,14 @@ fn seek_review_position(
     else {
         return;
     };
+    disarm_audition_auto_advance(state);
     let time_millis = waveform::millis_for_ratio(ratio, duration_millis);
+    state.reference_only_playback = false;
     state.review_cursor_millis = time_millis;
     state.transport_position_millis = time_millis;
     if resume {
-        match state.transport.seek(
-            state.transport_generation,
-            time_millis,
-            duration_millis,
-            true,
-        ) {
-            Ok(token) => {
-                begin_transport_polling(state, token);
+        match resume_main_at_position_with_reference(state, time_millis) {
+            Ok(()) => {
                 state.status = format!("Playing from {}.", format_timestamp(time_millis));
             }
             Err(error) => state.status = error,
@@ -1003,10 +3572,484 @@ fn close_stage_menu(state: &mut AppState) {
     state.stage_menu_anchor = None;
 }
 
+fn select_track_internal(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    id: String,
+    pending_play: bool,
+) {
+    if state.busy || !state.library.tracks.iter().any(|track| track.id == id) {
+        return;
+    }
+    let in_audition = state.workspace_mode == WorkspaceMode::Audition;
+    let previous_selected_id = state.library.selected_track_id.clone();
+    if !in_audition {
+        state.workspace_mode = WorkspaceMode::Review;
+    }
+    if in_audition
+        && let Some(previous_id) = previous_selected_id.as_deref()
+        && previous_id != id
+    {
+        remove_audition_queue_entry_if_outside_filter(state, previous_id);
+    }
+    state.library.selected_track_id = Some(id.clone());
+    if in_audition {
+        if let Some(index) = state
+            .audition_queue
+            .iter()
+            .position(|track_id| track_id == &id)
+        {
+            state.audition_queue_index = index;
+        }
+        state.audition_auto_advance = pending_play;
+        state.audition_play_token = None;
+        state.audition_pending_play_track_id = pending_play.then_some(id);
+    } else {
+        state.audition_auto_advance = false;
+        state.audition_play_token = None;
+        state.audition_pending_play_track_id = None;
+    }
+    close_stage_menu(state);
+    close_status_menu(state);
+    state.reference_menu_track_id = None;
+    state.remove_confirmation_track_id = None;
+    clear_planner_drag(state);
+    if let Some(cancellation) = state.waveform_cancellation.take() {
+        cancellation.cancel();
+    }
+    if let Some(cancellation) = state.reference_waveform_cancellation.take() {
+        cancellation.cancel();
+    }
+    state.waveform = None;
+    state.waveform_track_id = None;
+    state.waveform_busy = false;
+    state.waveform_progress = None;
+    state.reference_waveform = None;
+    state.reference_waveform_track_id = None;
+    state.reference_waveform_busy = false;
+    state.reference_waveform_progress = None;
+    state.review_cursor_millis = 0;
+    state.draft_note = None;
+    state.reference_draft_note = None;
+    rollback_persisted_note_drag(state);
+    state.selected_note_id = None;
+    state.hovered_note_id = None;
+    state.selected_reference_note_id = None;
+    state.hovered_reference_note_id = None;
+    reset_transport(state);
+    reset_reference_transport(state);
+    state.reference_match_enabled = false;
+    schedule_library_save(state, context);
+    schedule_selected_waveform_decode(state, context);
+    schedule_selected_reference_decode(state, context);
+}
+
+fn set_workspace_mode(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    mode: WorkspaceMode,
+) {
+    if state.workspace_mode == mode {
+        return;
+    }
+    state.audition_auto_advance = false;
+    state.audition_play_token = None;
+    state.audition_pending_play_track_id = None;
+    state.workspace_mode = mode;
+    if mode == WorkspaceMode::Audition {
+        rebuild_audition_queue(state);
+        if let Some(track_id) = state.audition_queue.first().cloned() {
+            select_track_internal(state, context, track_id, false);
+        } else {
+            reset_transport(state);
+            reset_reference_transport(state);
+        }
+    }
+    close_stage_menu(state);
+    close_status_menu(state);
+    state.reference_menu_track_id = None;
+    state.remove_confirmation_track_id = None;
+    clear_planner_drag(state);
+    context.request_repaint();
+}
+
+fn disarm_audition_auto_advance(state: &mut AppState) {
+    if state.workspace_mode == WorkspaceMode::Audition {
+        state.audition_auto_advance = false;
+        state.audition_play_token = None;
+        state.audition_pending_play_track_id = None;
+    }
+}
+
+fn rebuild_audition_queue(state: &mut AppState) {
+    let mut queue = state
+        .library
+        .tracks
+        .iter()
+        .filter(|track| track.status == state.audition_status_filter)
+        .map(|track| track.id.clone())
+        .collect::<Vec<_>>();
+    let seed = audition_shuffle_seed(
+        state.audition_status_filter,
+        &queue,
+        state.audition_shuffle_round,
+    );
+    deterministic_shuffle(&mut queue, seed);
+    let selected_id = state.library.selected_track_id.as_deref();
+    state.audition_queue_index = selected_id
+        .and_then(|selected_id| queue.iter().position(|id| id == selected_id))
+        .unwrap_or(0)
+        .min(queue.len());
+    state.audition_queue = queue;
+    state.audition_heard.clear();
+}
+
+fn shuffle_audition(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
+    if state.busy || state.workspace_mode != WorkspaceMode::Audition {
+        return;
+    }
+    let previous_queue = state.audition_queue.clone();
+    let previous_selected = state.library.selected_track_id.clone();
+    state.audition_shuffle_round = state.audition_shuffle_round.wrapping_add(1);
+    rebuild_audition_queue(state);
+    ensure_audition_shuffle_change(
+        &mut state.audition_queue,
+        &previous_queue,
+        previous_selected.as_deref(),
+    );
+    state.audition_heard.clear();
+
+    if let Some(track_id) = state.audition_queue.first().cloned() {
+        select_track_internal(state, context, track_id, true);
+        state.status = format!(
+            "New {} audition order ready — loading first track…",
+            state.audition_status_filter.label()
+        );
+    } else {
+        state.audition_auto_advance = false;
+        state.audition_play_token = None;
+        state.audition_pending_play_track_id = None;
+        reset_transport(state);
+        reset_reference_transport(state);
+        state.status = format!("No tracks in {}.", state.audition_status_filter.label());
+    }
+    context.request_repaint();
+}
+
+fn ensure_audition_shuffle_change(
+    queue: &mut Vec<String>,
+    previous_queue: &[String],
+    previous_selected: Option<&str>,
+) {
+    if queue.len() < 2 {
+        return;
+    }
+    let shuffled = queue.clone();
+    let order_changed = |candidate: &[String]| candidate != previous_queue;
+    let first_is_new = |candidate: &[String]| {
+        previous_selected.is_none_or(|selected| candidate.first().is_none_or(|id| id != selected))
+    };
+
+    for rotation in 0..queue.len() {
+        let mut candidate = shuffled.clone();
+        candidate.rotate_left(rotation);
+        if order_changed(&candidate) && first_is_new(&candidate) {
+            *queue = candidate;
+            return;
+        }
+    }
+    for rotation in 0..queue.len() {
+        let mut candidate = shuffled.clone();
+        candidate.rotate_left(rotation);
+        if order_changed(&candidate) {
+            *queue = candidate;
+            return;
+        }
+    }
+}
+
+fn reconcile_audition_queue(state: &mut AppState) {
+    let old_queue = std::mem::take(&mut state.audition_queue);
+    let old_index = state.audition_queue_index;
+    let current_id = old_queue.get(old_index).cloned();
+    let active_anchor_id = audition_navigation_anchor(state);
+    let mut queue = old_queue
+        .into_iter()
+        .filter(|track_id| {
+            state
+                .library
+                .tracks
+                .iter()
+                .find(|track| &track.id == track_id)
+                .is_some_and(|track| {
+                    track.status == state.audition_status_filter
+                        || active_anchor_id == Some(track_id.as_str())
+                })
+        })
+        .collect::<Vec<_>>();
+    for track in state
+        .library
+        .tracks
+        .iter()
+        .filter(|track| track.status == state.audition_status_filter)
+    {
+        if !queue.iter().any(|track_id| track_id == &track.id) {
+            queue.push(track.id.clone());
+        }
+    }
+    state.audition_queue_index = current_id
+        .and_then(|current_id| queue.iter().position(|id| id == &current_id))
+        .unwrap_or(old_index.min(queue.len()));
+    state.audition_queue = queue;
+    state.audition_heard.retain(|heard_id| {
+        state
+            .library
+            .tracks
+            .iter()
+            .any(|track| &track.id == heard_id)
+    });
+}
+
+fn audition_navigation_anchor(state: &AppState) -> Option<&str> {
+    if state.workspace_mode != WorkspaceMode::Audition
+        || state.audition_pending_play_track_id.is_some()
+        || !(state.transport_playing
+            || state.transport_polling
+            || state.transport_waiting_token.is_some()
+            || state.reference_transport_playing
+            || state.reference_transport_polling
+            || state.reference_transport_waiting_token.is_some())
+    {
+        return None;
+    }
+    state.library.selected_track_id.as_deref()
+}
+
+fn remove_audition_queue_entry_if_outside_filter(state: &mut AppState, track_id: &str) {
+    let matches_filter = state
+        .library
+        .tracks
+        .iter()
+        .find(|track| track.id == track_id)
+        .is_some_and(|track| track.status == state.audition_status_filter);
+    if matches_filter {
+        return;
+    }
+    let Some(position) = state.audition_queue.iter().position(|id| id == track_id) else {
+        return;
+    };
+    state.audition_queue.remove(position);
+    if position < state.audition_queue_index {
+        state.audition_queue_index = state.audition_queue_index.saturating_sub(1);
+    }
+    if state.audition_queue.is_empty() {
+        state.audition_queue_index = 0;
+    } else {
+        state.audition_queue_index = state.audition_queue_index.min(state.audition_queue.len());
+    }
+}
+
+fn sync_audition_queue_after_status_change(state: &mut AppState, track_id: &str) {
+    let matches_filter = state
+        .library
+        .tracks
+        .iter()
+        .find(|track| track.id == track_id)
+        .is_some_and(|track| track.status == state.audition_status_filter);
+    let is_navigation_anchor = audition_navigation_anchor(state) == Some(track_id);
+    let Some(_) = state.audition_queue.iter().position(|id| id == track_id) else {
+        if matches_filter {
+            state.audition_queue.push(track_id.to_owned());
+        }
+        return;
+    };
+    if !matches_filter && !is_navigation_anchor {
+        remove_audition_queue_entry_if_outside_filter(state, track_id);
+    }
+}
+
+fn audition_shuffle_seed(status: storage::TrackStatus, track_ids: &[String], round: u64) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64 ^ round;
+    for byte in status.label().bytes().chain([0]) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    for id in track_ids {
+        for byte in id.bytes().chain([0]) {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    hash
+}
+
+fn deterministic_shuffle(items: &mut [String], mut seed: u64) {
+    for index in (1..items.len()).rev() {
+        seed ^= seed >> 12;
+        seed ^= seed << 25;
+        seed ^= seed >> 27;
+        seed = seed.wrapping_mul(0x2545f4914f6cdd1d);
+        items.swap(index, (seed as usize) % (index + 1));
+    }
+}
+
+fn next_audition_track_index(state: &AppState) -> Option<usize> {
+    let selected_id = state.library.selected_track_id.as_deref();
+    let mut index = state.audition_queue_index;
+    if state.audition_queue.get(index).map(String::as_str) == selected_id {
+        index += 1;
+    }
+    while let Some(track_id) = state.audition_queue.get(index) {
+        if !state
+            .audition_heard
+            .iter()
+            .any(|heard_id| heard_id == track_id)
+            && state
+                .library
+                .tracks
+                .iter()
+                .find(|track| track.id == *track_id)
+                .is_some_and(|track| track.status == state.audition_status_filter)
+        {
+            return Some(index);
+        }
+        index += 1;
+    }
+    None
+}
+
+fn advance_audition(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
+    if let Some(current_id) = state.library.selected_track_id.as_ref()
+        && !state
+            .audition_heard
+            .iter()
+            .any(|heard_id| heard_id == current_id)
+    {
+        state.audition_heard.push(current_id.clone());
+    }
+    let Some(next_index) = next_audition_track_index(state) else {
+        state.audition_auto_advance = false;
+        state.audition_play_token = None;
+        state.audition_pending_play_track_id = None;
+        state.status = String::from("Audition complete.");
+        return;
+    };
+    let Some(track_id) = state.audition_queue.get(next_index).cloned() else {
+        return;
+    };
+    let title = state
+        .library
+        .tracks
+        .iter()
+        .find(|track| track.id == track_id)
+        .map_or_else(|| track_id.clone(), |track| track.title.clone());
+    select_track_internal(state, context, track_id, true);
+    state.status = format!("Loading next audition track: {title}…");
+}
+
+fn maybe_start_pending_audition(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
+    let Some(track_id) = state.audition_pending_play_track_id.clone() else {
+        return;
+    };
+    if state.workspace_mode != WorkspaceMode::Audition
+        || state.busy
+        || state.waveform_busy
+        || state.transport_polling
+        || state.transport_waiting_token.is_some()
+        || state.transport.has_pending_load()
+        || state.reference_waveform_busy
+        || state.library.selected_track_id.as_deref() != Some(track_id.as_str())
+        || state.waveform_track_id.as_deref() != Some(track_id.as_str())
+        || state.waveform.is_none()
+    {
+        return;
+    }
+    if !state.transport.has_command_capacity(1) {
+        return;
+    }
+    if selected_reference_details(state).is_some() {
+        let reference_transport = state
+            .reference_transport
+            .get_or_insert_with(transport::AudioTransport::spawn);
+        let required_slots = if state.reference_transport_loaded {
+            2
+        } else {
+            3
+        };
+        if reference_transport.has_pending_load()
+            || !reference_transport.has_command_capacity(required_slots)
+        {
+            return;
+        }
+    }
+    state.audition_pending_play_track_id = None;
+    toggle_playback(state, context);
+}
+
+fn close_status_menu(state: &mut AppState) {
+    state.status_menu_track_id = None;
+    state.status_menu_host = None;
+}
+
+fn toggle_status_menu(
+    state: &mut AppState,
+    track_id: String,
+    host: StatusMenuHost,
+    context: &mut ui::UiUpdateContext<Message>,
+) {
+    if !state.busy
+        && state
+            .library
+            .tracks
+            .iter()
+            .any(|track| track.id == track_id)
+    {
+        if state.status_menu_track_id.as_deref() == Some(track_id.as_str())
+            && state.status_menu_host == Some(host)
+        {
+            close_status_menu(state);
+        } else {
+            close_stage_menu(state);
+            state.status_menu_track_id = Some(track_id);
+            state.status_menu_host = Some(host);
+        }
+        context.request_repaint();
+    }
+}
+
 fn clear_planner_drag(state: &mut AppState) {
     state.planner_drag_source_track_id = None;
     state.planner_drag_target_stage = None;
     state.planner_drag_pointer = None;
+}
+
+fn rollback_persisted_note_drag(state: &mut AppState) {
+    let Some(drag) = state.persisted_note_drag.take() else {
+        return;
+    };
+
+    let mut note_restored = false;
+    if let Some(track) = state
+        .library
+        .tracks
+        .iter_mut()
+        .find(|track| track.id == drag.track_id)
+        && let Some(note) = track.notes.iter_mut().find(|note| note.id == drag.note_id)
+    {
+        note.time_millis = drag.original_time_millis;
+        track.notes.sort_by_key(|note| note.time_millis);
+        note_restored = true;
+    }
+    if note_restored && state.library.selected_track_id.as_deref() == Some(drag.track_id.as_str()) {
+        state.review_cursor_millis = drag.original_time_millis;
+    }
+    if let Some(draft) = state
+        .draft_note
+        .as_mut()
+        .filter(|draft| draft.note_id.as_deref() == Some(drag.note_id.as_str()))
+    {
+        draft.time_millis = drag.original_time_millis;
+    }
 }
 
 fn drag_message_position(message: ui::DragHandleMessage) -> Option<Point> {
@@ -1022,12 +4065,18 @@ fn drag_message_position(message: ui::DragHandleMessage) -> Option<Point> {
 fn project_surface(state: &AppState) -> ui::View<Message> {
     let workspace = match state.workspace_mode {
         WorkspaceMode::Review => ui::row([
-            library_panel(state).width(310.0).fill_height(),
+            library_panel(state).width(LIBRARY_WIDTH).fill_height(),
             review_panel(state).fill(),
         ])
-        .spacing(14.0)
+        .spacing(10.0)
         .fill(),
         WorkspaceMode::Planner => planner_panel(state).fill(),
+        WorkspaceMode::Audition => ui::row([
+            audition_panel(state).width(LIBRARY_WIDTH).fill_height(),
+            review_panel(state).fill(),
+        ])
+        .spacing(10.0)
+        .fill(),
     };
 
     let drag_preview = state
@@ -1055,45 +4104,375 @@ fn project_surface(state: &AppState) -> ui::View<Message> {
                 .find(|track| track.id == track_id)
                 .map(|track| stage_menu_popover(track, anchor))
         });
-    let content = ui::column([
-        ui::row([
-            chrome::text("PORTALSURFER / CADENCE")
-                .height(24.0)
-                .fill_width(),
-            ui::button(if state.workspace_mode == WorkspaceMode::Planner {
-                "Review desk"
-            } else {
-                "Planner"
-            })
-            .primary()
-            .message(Message::ToggleWorkspace)
-            .text_color(ui::TextColorRole::Custom(chrome::TEXT_PRIMARY))
+    let workspace_tabs = [
+        WorkspaceMode::Review,
+        WorkspaceMode::Planner,
+        WorkspaceMode::Audition,
+    ]
+    .into_iter()
+    .map(|mode| {
+        let label = workspace_mode_label(mode);
+        ui::button(label)
+            .selected(state.workspace_mode == mode)
+            .message(Message::SelectWorkspace(mode))
+            .key(format!("workspace-tab-{}", label.to_ascii_lowercase()))
+            .width(82.0)
+            .height(28.0)
+    })
+    .collect::<Vec<_>>();
+    let header = ui::row([
+        ui::spacer().fill_width(),
+        ui::row(workspace_tabs)
+            .spacing(4.0)
+            .width(254.0)
             .height(28.0),
-            ui::badge("NATIVE / RADIANT").subtle().passive(),
-        ])
-        .fill_width()
-        .spacing(12.0),
+    ])
+    .fill_width()
+    .height(36.0)
+    .spacing(12.0);
+    let status_bar =
+        if let Some(batch) = state.import_batch.as_ref().filter(|batch| batch.total > 1) {
+            let current = batch.completed.saturating_add(1).min(batch.total);
+            let remaining = batch.total.saturating_sub(batch.completed);
+            let progress = ui::column([
+                ui::row([
+                    ui::text(format!(
+                        "Importing {current} of {} · {remaining} remaining · {} failed",
+                        batch.total, batch.failed
+                    ))
+                    .truncate()
+                    .height(20.0)
+                    .fill_width(),
+                    ui::text("SPACE  play · ESC  stop · N  note")
+                        .height(20.0)
+                        .width(280.0)
+                        .subtle(),
+                ])
+                .fill_width()
+                .height(20.0)
+                .spacing(12.0),
+                ui::determinate_progress_bar(batch.completed as f32 / batch.total as f32)
+                    .passive::<Message>()
+                    .fill_width()
+                    .height(10.0),
+            ])
+            .padding_x(8.0)
+            .padding_y(4.0)
+            .fill_width()
+            .height(38.0)
+            .spacing(2.0);
+            ui::stack([ui::card().fill(), progress])
+                .fill_width()
+                .height(46.0)
+        } else {
+            ui::stack([
+                ui::card().fill(),
+                ui::row([
+                    ui::text(state.status.clone())
+                        .truncate()
+                        .height(24.0)
+                        .fill_width(),
+                    ui::text("SPACE  play · ESC  stop · N  note")
+                        .height(24.0)
+                        .width(280.0)
+                        .subtle(),
+                ])
+                .padding_x(8.0)
+                .fill_width()
+                .height(24.0)
+                .spacing(12.0),
+            ])
+            .fill_width()
+            .height(30.0)
+        };
+
+    let content = ui::column([
+        header,
         workspace
             .accepts_native_file_drop()
             .on_native_file_drop(Message::FileDropped),
-        chrome::muted_text(state.status.clone())
-            .height(24.0)
-            .fill_width(),
+        status_bar,
     ])
     .padding(18.0)
     .spacing(12.0)
     .fill();
 
     ui::scene(
-        ui::stack([chrome::background().fill(), content])
-            .fill()
-            .overlays(
-                ui::overlays()
-                    .popover_opt(stage_menu)
-                    .drag_preview_opt(drag_preview),
-            ),
+        ui::stack([content]).fill().overlays(
+            ui::overlays()
+                .popover_opt(stage_menu)
+                .drag_preview_opt(drag_preview),
+        ),
     )
     .into_view()
+}
+
+fn audition_panel(state: &AppState) -> ui::View<Message> {
+    let selected_id = state.library.selected_track_id.as_deref();
+    let queue_tracks = state
+        .audition_queue
+        .iter()
+        .enumerate()
+        .filter_map(|(index, track_id)| {
+            state
+                .library
+                .tracks
+                .iter()
+                .find(|track| &track.id == track_id)
+                .cloned()
+                .map(|track| (index, track))
+        })
+        .collect::<Vec<_>>();
+    let queue_count = queue_tracks.len();
+    let filter_buttons = audition_statuses()
+        .into_iter()
+        .map(|status| {
+            let selected = state.audition_status_filter == status;
+            let label = status.label().to_owned();
+            let input = ui::button(label.clone())
+                .selected(selected)
+                .message(Message::SetAuditionFilter(status))
+                .key(format!("audition-filter-{}", status.label()))
+                .fill_width()
+                .height(26.0);
+            input.fill_width().height(26.0)
+        })
+        .collect::<Vec<_>>();
+    let queue = if queue_tracks.is_empty() {
+        ui::column([
+            ui::text("No matching tracks.").height(26.0).fill_width(),
+            ui::text(format!(
+                "Move a track into {} or choose another filter.",
+                state.audition_status_filter.label()
+            ))
+            .wrap()
+            .height(44.0)
+            .fill_width()
+            .subtle(),
+        ])
+        .padding(12.0)
+        .spacing(6.0)
+        .fill_width()
+    } else {
+        ui::list(queue_tracks, move |(index, track)| {
+            audition_queue_row(index, track, selected_id)
+        })
+        .without_chrome()
+        .fill_height()
+    };
+    let progress = if queue_count == 0 {
+        String::from("0 tracks")
+    } else {
+        format!(
+            "{} of {} track{}",
+            state
+                .audition_queue_index
+                .saturating_add(1)
+                .min(queue_count),
+            queue_count,
+            plural(queue_count)
+        )
+    };
+    let audition_controls = ui::row([
+        ui::button("Previous")
+            .message(Message::AuditionPrevious)
+            .key("audition-previous")
+            .height(30.0)
+            .width(76.0),
+        ui::button("Play")
+            .message(Message::AuditionPlay)
+            .key("audition-play")
+            .height(30.0)
+            .width(42.0),
+        ui::button("Stop")
+            .message(Message::StopPlayback)
+            .key("audition-stop")
+            .height(30.0)
+            .width(42.0),
+        ui::button("Next")
+            .message(Message::AuditionNext)
+            .key("audition-next")
+            .height(30.0)
+            .width(50.0),
+    ])
+    .spacing(4.0)
+    .fill_width();
+    let content = ui::column([
+        ui::row([
+            ui::column([
+                ui::text("AUDITION / PLAYLIST")
+                    .height(18.0)
+                    .fill_width()
+                    .subtle(),
+                ui::text("Fixed shuffle · one pass")
+                    .height(26.0)
+                    .fill_width(),
+            ])
+            .fill_width(),
+            ui::button("Shuffle")
+                .primary()
+                .message(Message::ShuffleAudition)
+                .key("audition-shuffle")
+                .height(26.0)
+                .width(80.0),
+        ])
+        .fill_width()
+        .spacing(8.0),
+        audition_controls,
+        ui::text("PLAY STATUS").height(18.0).fill_width().subtle(),
+        ui::column(filter_buttons).spacing(3.0).fill_width(),
+        ui::row([ui::text(format!(
+            "{} queue · {}",
+            state.audition_status_filter.label(),
+            progress
+        ))
+        .truncate()
+        .height(22.0)
+        .fill_width()
+        .subtle()])
+        .fill_width()
+        .height(22.0),
+        queue,
+    ])
+    .padding(14.0)
+    .spacing(8.0)
+    .fill_height();
+    ui::stack([ui::card().fill(), content]).fill_height()
+}
+
+fn audition_queue_row(
+    index: usize,
+    track: storage::Track,
+    selected_id: Option<&str>,
+) -> ui::View<Message> {
+    let selected = selected_id == Some(track.id.as_str());
+    let track_id = track.id.clone();
+    let title = format!("{:02}  {}", index + 1, track.title);
+    let favorite_control =
+        favorite_toggle(&track, selected, format!("audition-favorite-{}", track.id));
+    let input = ui::button(title.clone())
+        .selected(selected)
+        .message(Message::SelectTrack(track_id.clone()))
+        .key(format!("audition-queue-track-{track_id}"))
+        .fill_width()
+        .height(28.0);
+    let row = ui::column([
+        ui::row([input.fill_width().height(28.0), favorite_control])
+            .fill_width()
+            .spacing(6.0)
+            .height(28.0),
+        ui::text(track.original_name)
+            .truncate()
+            .height(18.0)
+            .fill_width()
+            .subtle(),
+    ])
+    .padding(7.0)
+    .spacing(2.0)
+    .fill_width();
+    ui::stack([ui::card().fill(), row])
+        .key(format!("audition-queue-row-{track_id}"))
+        .fill_width()
+}
+
+fn audition_statuses() -> [storage::TrackStatus; 5] {
+    [
+        storage::TrackStatus::Inbox,
+        storage::TrackStatus::Refine,
+        storage::TrackStatus::Release,
+        storage::TrackStatus::Archive,
+        storage::TrackStatus::Maybe,
+    ]
+}
+
+fn status_filter_options() -> [Option<storage::TrackStatus>; 6] {
+    [
+        None,
+        Some(storage::TrackStatus::Inbox),
+        Some(storage::TrackStatus::Refine),
+        Some(storage::TrackStatus::Release),
+        Some(storage::TrackStatus::Archive),
+        Some(storage::TrackStatus::Maybe),
+    ]
+}
+
+fn status_filter_label(status: Option<storage::TrackStatus>) -> &'static str {
+    status.map_or("All", storage::TrackStatus::label)
+}
+
+fn status_filter_button(
+    selected: Option<storage::TrackStatus>,
+    key_prefix: &str,
+    status: Option<storage::TrackStatus>,
+    message: fn(Option<storage::TrackStatus>) -> Message,
+    fill_width: bool,
+) -> ui::View<Message> {
+    let button = ui::button(status_filter_label(status))
+        .selected(selected == status)
+        .message(message(status))
+        .key(format!(
+            "{key_prefix}-status-filter-{}",
+            status_filter_label(status).to_ascii_lowercase()
+        ))
+        .height(26.0);
+    if fill_width {
+        button.fill_width()
+    } else {
+        button.width(76.0)
+    }
+}
+
+fn status_filter_controls(
+    selected: Option<storage::TrackStatus>,
+    key_prefix: &str,
+    message: fn(Option<storage::TrackStatus>) -> Message,
+) -> ui::View<Message> {
+    ui::row(
+        status_filter_options()
+            .into_iter()
+            .map(|status| status_filter_button(selected, key_prefix, status, message, false))
+            .collect::<Vec<_>>(),
+    )
+    .spacing(3.0)
+    .fill_width()
+}
+
+fn wrapped_status_filter_controls(
+    selected: Option<storage::TrackStatus>,
+    key_prefix: &str,
+    message: fn(Option<storage::TrackStatus>) -> Message,
+) -> ui::View<Message> {
+    let options = status_filter_options();
+    let rows = [options[..3].to_vec(), options[3..].to_vec()]
+        .into_iter()
+        .map(|options| {
+            ui::row(
+                options
+                    .into_iter()
+                    .map(|status| status_filter_button(selected, key_prefix, status, message, true))
+                    .collect::<Vec<_>>(),
+            )
+            .spacing(3.0)
+            .fill_width()
+        })
+        .collect::<Vec<_>>();
+    ui::column(rows).spacing(3.0).fill_width()
+}
+
+fn review_status_filter_message(status: Option<storage::TrackStatus>) -> Message {
+    Message::SetReviewStatusFilter(status)
+}
+
+fn planner_status_filter_message(status: Option<storage::TrackStatus>) -> Message {
+    Message::SetPlannerStatusFilter(status)
+}
+
+const fn workspace_mode_label(mode: WorkspaceMode) -> &'static str {
+    match mode {
+        WorkspaceMode::Review => "Review",
+        WorkspaceMode::Planner => "Planner",
+        WorkspaceMode::Audition => "Audition",
+    }
 }
 
 fn planner_panel(state: &AppState) -> ui::View<Message> {
@@ -1103,6 +4482,7 @@ fn planner_panel(state: &AppState) -> ui::View<Message> {
         storage::TrackStage::Mixdown,
         storage::TrackStage::Mastering,
     ];
+    let filtered_tracks = tracks_with_status(&state.library.tracks, state.planner_status_filter);
     let drag_source_track_id = state.planner_drag_source_track_id.as_deref();
     let drag_source_stage = drag_source_track_id.and_then(|track_id| {
         state
@@ -1117,28 +4497,39 @@ fn planner_panel(state: &AppState) -> ui::View<Message> {
     let columns = stages.into_iter().map(|stage| {
         planner_column(
             stage,
-            tracks_in_stage(&state.library.tracks, stage),
-            state.library.selected_track_id.as_deref(),
-            state.stage_menu_track_id.as_deref(),
+            tracks_in_stage(&filtered_tracks, stage),
+            state.planner_status_filter,
+            PlannerColumnContext {
+                selected_id: state.library.selected_track_id.as_deref(),
+                stage_menu_track_id: state.stage_menu_track_id.as_deref(),
+                status_menu_track_id: state.status_menu_track_id.as_deref(),
+                status_menu_host: state.status_menu_host,
+            },
             drag_active,
             drag_source_stage,
             drag_target_stage,
         )
     });
-    let track_count = state.library.tracks.len();
+    let track_count = filtered_tracks.len();
     ui::column([
         ui::row([
             ui::column([
-                chrome::muted_text("FINISHING BOARD")
+                ui::text("FINISHING BOARD")
                     .height(18.0)
                     .fill_width()
                     .subtle(),
-                chrome::text("Move every track toward release.")
+                ui::text("Move every track toward release.")
                     .height(30.0)
                     .fill_width(),
             ])
             .fill_width(),
-            chrome::muted_text(format!(
+            status_filter_controls(
+                state.planner_status_filter,
+                "planner",
+                planner_status_filter_message,
+            )
+            .width(480.0),
+            ui::text(format!(
                 "{} track{} · derived from the library",
                 track_count,
                 plural(track_count)
@@ -1155,39 +4546,69 @@ fn planner_panel(state: &AppState) -> ui::View<Message> {
     .fill()
 }
 
+struct PlannerColumnContext<'a> {
+    selected_id: Option<&'a str>,
+    stage_menu_track_id: Option<&'a str>,
+    status_menu_track_id: Option<&'a str>,
+    status_menu_host: Option<StatusMenuHost>,
+}
+
 fn planner_column(
     stage: storage::TrackStage,
     tracks: Vec<storage::Track>,
-    selected_id: Option<&str>,
-    stage_menu_track_id: Option<&str>,
+    status_filter: Option<storage::TrackStatus>,
+    context: PlannerColumnContext<'_>,
     drag_active: bool,
     drag_source_stage: Option<storage::TrackStage>,
     drag_target_stage: Option<storage::TrackStage>,
 ) -> ui::View<Message> {
+    let PlannerColumnContext {
+        selected_id,
+        stage_menu_track_id,
+        status_menu_track_id,
+        status_menu_host,
+    } = context;
     let count = tracks.len();
     let candidate = drag_active && planner_drop_is_valid(drag_source_stage, stage);
     let current_target = drag_target_stage == Some(stage);
     let mut children = vec![
         ui::row([
-            chrome::text(if current_target {
+            ui::text(if current_target {
                 "DROP HERE"
             } else {
                 stage.label()
             })
             .height(24.0)
             .fill_width(),
-            ui::badge(count.to_string()).subtle().passive(),
+            ui::badge(count.to_string())
+                .passive()
+                .subtle()
+                .width(32.0)
+                .height(24.0),
         ])
         .fill_width()
         .spacing(8.0),
     ];
     if tracks.is_empty() {
-        children.push(
+        children.push(if status_filter.is_some() {
             ui::column([
-                chrome::text("No tracks here yet.")
-                    .height(24.0)
-                    .fill_width(),
-                chrome::muted_text("Choose this stage from a card when it is ready.")
+                ui::text("No matching tracks.").height(24.0).fill_width(),
+                ui::text(format!(
+                    "No tracks in the {} status.",
+                    status_filter_label(status_filter)
+                ))
+                .wrap()
+                .height(44.0)
+                .fill_width()
+                .subtle(),
+            ])
+            .padding(10.0)
+            .spacing(6.0)
+            .fill_width()
+        } else {
+            ui::column([
+                ui::text("No tracks here yet.").height(24.0).fill_width(),
+                ui::text("Choose this stage from a card when it is ready.")
                     .wrap()
                     .height(44.0)
                     .fill_width()
@@ -1195,18 +4616,25 @@ fn planner_column(
             ])
             .padding(10.0)
             .spacing(6.0)
-            .fill_width(),
-        );
+            .fill_width()
+        });
     } else {
         children.push(
             ui::list(tracks, move |track| {
-                planner_card(track, selected_id, stage_menu_track_id)
+                planner_card(
+                    track,
+                    selected_id,
+                    stage_menu_track_id,
+                    status_menu_track_id,
+                    status_menu_host,
+                )
             })
+            .without_chrome()
             .fill_height(),
         );
     }
     let content = ui::stack([
-        chrome::panel().fill(),
+        ui::card().fill(),
         ui::column(children).padding(12.0).spacing(8.0).fill(),
     ])
     .fill();
@@ -1233,70 +4661,84 @@ fn planner_card(
     track: storage::Track,
     selected_id: Option<&str>,
     stage_menu_track_id: Option<&str>,
+    status_menu_track_id: Option<&str>,
+    status_menu_host: Option<StatusMenuHost>,
 ) -> ui::View<Message> {
     let selected = selected_id == Some(track.id.as_str());
     let stage_menu_open = stage_menu_track_id == Some(track.id.as_str());
+    let status_menu_open = status_menu_host == Some(StatusMenuHost::Planner)
+        && status_menu_track_id == Some(track.id.as_str());
     let title_track_id = track.id.clone();
     let drag_track_id = track.id.clone();
-    let favorite_id = track.id.clone();
+    let favorite_control =
+        favorite_toggle(&track, selected, format!("planner-favorite-{}", track.id));
     let open_comments = track.notes.iter().filter(|note| !note.done).count();
     let card_content = ui::column([
         ui::row([
-            ui::button("↕")
-                .subtle()
-                .hover_chrome_only()
-                .click_or_drag(
-                    Message::PlannerCardHandleActivated(track.id.clone()),
-                    move |message| Message::PlannerCardDrag {
-                        track_id: drag_track_id.clone(),
-                        message,
-                    },
-                )
-                .key(format!("planner-card-drag-{}", track.id))
-                .size(22.0, 22.0)
-                .text_color(ui::TextColorRole::Custom(chrome::TEXT_PRIMARY)),
-            ui::button(track.title.clone())
-                .message(Message::SelectTrack(title_track_id))
-                .fill_width()
-                .height(28.0)
-                .text_color(ui::TextColorRole::Custom(chrome::TEXT_PRIMARY)),
+            card_control(
+                selected,
+                "↕",
+                ui::button("↕")
+                    .click_or_drag(
+                        Message::PlannerCardHandleActivated(track.id.clone()),
+                        move |message| Message::PlannerCardDrag {
+                            track_id: drag_track_id.clone(),
+                            message,
+                        },
+                    )
+                    .key(format!("planner-card-drag-{}", track.id))
+                    .size(22.0, 22.0),
+            )
+            .width(22.0)
+            .height(22.0),
+            card_control(
+                selected,
+                track.title.clone(),
+                ui::button(track.title.clone())
+                    .selected(selected)
+                    .message(Message::SelectTrack(title_track_id))
+                    .fill_width()
+                    .height(28.0),
+            )
+            .fill_width()
+            .height(28.0),
+            favorite_control,
         ])
         .fill_width()
         .spacing(6.0),
-        chrome::muted_text(track.original_name.clone())
+        card_muted_text(selected, track.original_name.clone())
             .truncate()
             .height(20.0)
             .fill_width()
             .subtle(),
-        ui::row([
-            chrome::muted_text(format!(
-                "{} open comment{}",
-                open_comments,
-                plural(open_comments)
-            ))
-            .height(22.0)
-            .fill_width()
-            .subtle(),
-            ui::button(if track.favorite { "★" } else { "☆" })
-                .message(Message::ToggleFavorite(favorite_id))
-                .subtle()
-                .height(22.0)
-                .text_color(ui::TextColorRole::Custom(chrome::TEXT_PRIMARY)),
-        ])
+        card_muted_text(
+            selected,
+            format!("{} open comment{}", open_comments, plural(open_comments)),
+        )
+        .height(22.0)
         .fill_width()
-        .spacing(6.0),
-        stage_dropdown(&track, stage_menu_open),
+        .subtle(),
+        stage_dropdown(&track, stage_menu_open, selected),
+        status_dropdown_for_host(&track, status_menu_open, selected, StatusMenuHost::Planner),
     ])
     .padding(10.0)
     .spacing(5.0)
     .fill_width();
-    let mut card = ui::stack([chrome::panel().fill(), card_content])
+    let card_background = ui::card().fill();
+    ui::stack([card_background, card_content])
         .key(format!("planner-card-{}", track.id))
-        .fill_width();
-    if selected {
-        card = card.primary();
-    }
-    card
+        .fill_width()
+}
+
+fn tracks_with_status(
+    tracks: &[storage::Track],
+    status: Option<storage::TrackStatus>,
+) -> Vec<storage::Track> {
+    tracks
+        .iter()
+        .filter(|track| status.is_none_or(|status| track.status == status))
+        .cloned()
+        .collect()
 }
 
 fn tracks_in_stage(tracks: &[storage::Track], stage: storage::TrackStage) -> Vec<storage::Track> {
@@ -1318,8 +4760,9 @@ const STAGE_MENU_WIDTH: f32 = 174.0;
 
 fn keyboard_stage_menu_anchor(state: &AppState) -> Point {
     match state.workspace_mode {
-        WorkspaceMode::Review => Point::new(310.0, 150.0),
+        WorkspaceMode::Review => Point::new(LIBRARY_WIDTH, 150.0),
         WorkspaceMode::Planner => Point::new(18.0 + STAGE_MENU_WIDTH * 0.5, 96.0),
+        WorkspaceMode::Audition => Point::new(LIBRARY_WIDTH, 150.0),
     }
 }
 
@@ -1352,11 +4795,69 @@ fn stage_dropdown_options(track: &storage::Track) -> Vec<ui::DropdownOption<Mess
     .collect()
 }
 
-fn stage_dropdown(track: &storage::Track, open: bool) -> ui::View<Message> {
+fn status_dropdown_options(track: &storage::Track) -> Vec<ui::DropdownOption<Message>> {
+    let status_id = track.id.clone();
+    [
+        storage::TrackStatus::Inbox,
+        storage::TrackStatus::Refine,
+        storage::TrackStatus::Release,
+        storage::TrackStatus::Archive,
+        storage::TrackStatus::Maybe,
+    ]
+    .into_iter()
+    .map(|status| {
+        ui::DropdownOption::new(
+            status.label(),
+            track.status == status,
+            Message::SetStatus {
+                track_id: status_id.clone(),
+                status,
+            },
+        )
+    })
+    .collect()
+}
+
+fn card_control(
+    _selected: bool,
+    _value: impl Into<ui::TextContent>,
+    input: ui::View<Message>,
+) -> ui::View<Message> {
+    input
+}
+
+fn card_muted_text(_selected: bool, value: impl Into<ui::TextContent>) -> ui::View<Message> {
+    ui::text(value)
+}
+
+fn favorite_toggle(track: &storage::Track, selected: bool, key: String) -> ui::View<Message> {
+    let label = if track.favorite {
+        "★ STARRED"
+    } else {
+        "☆ UNSTARRED"
+    };
+    let input = if track.favorite {
+        ui::button(label).primary()
+    } else {
+        ui::button(label).subtle()
+    };
+    input
+        .active(track.favorite)
+        .selected(selected)
+        .message(Message::ToggleFavorite(track.id.clone()))
+        .key(key)
+        .width(FAVORITE_CONTROL_WIDTH)
+}
+
+fn stage_dropdown(track: &storage::Track, open: bool, selected: bool) -> ui::View<Message> {
     let stage_id = track.id.clone();
-    ui::dropdown_trigger(track.stage.label(), open)
-        .toggle_message(Message::ToggleStageMenu(stage_id.clone()))
-        .build()
+    let label = track.stage.label().to_owned();
+    ui::button(label.clone())
+        .active(open)
+        .selected(selected)
+        .message(Message::ToggleStageMenu(stage_id.clone()))
+        .fill_width()
+        .height(24.0)
         .pointer_target(
             ui::pointer_target(true)
                 .pointer_move(false)
@@ -1375,35 +4876,88 @@ fn stage_dropdown(track: &storage::Track, open: bool) -> ui::View<Message> {
                 }),
         )
         .key(format!("stage-dropdown-{}", track.id))
-        .fill_width()
 }
 
 fn stage_menu_popover(track: &storage::Track, anchor: Point) -> ui::View<Message> {
     let options = stage_dropdown_options(track);
-    ui::anchored_dropdown_menu_popover(
+    let size = Vector2::new(STAGE_MENU_WIDTH, ui::dropdown_menu_height(options.len()));
+    anchored_popover_from_parts(AnchoredPopoverParts::below(
+        ui::dropdown_menu(options),
         ui::AnchoredPopoverAnchor::pointer(anchor),
-        Vector2::new(STAGE_MENU_WIDTH, ui::dropdown_menu_height(options.len())),
-        options,
-    )
+        size,
+    ))
+}
+
+fn status_dropdown_trigger(
+    track: &storage::Track,
+    open: bool,
+    host: StatusMenuHost,
+) -> ui::View<Message> {
+    let status_id = track.id.clone();
+    let label = track.status.label().to_owned();
+    ui::dropdown_trigger(label, open)
+        .toggle_message(Message::ToggleStatusMenuAt {
+            track_id: status_id,
+            host,
+        })
+        .build()
+        .key(format!("status-dropdown-{}", track.id))
+        .fill_width()
+        .height(ui::dropdown_trigger_height())
+}
+
+fn status_dropdown_for_host(
+    track: &storage::Track,
+    open: bool,
+    _selected: bool,
+    host: StatusMenuHost,
+) -> ui::View<Message> {
+    let trigger = status_dropdown_trigger(track, open, host);
+    if open {
+        ui::column([trigger, status_menu(track, host)])
+            .spacing(3.0)
+            .fill_width()
+    } else {
+        ui::column([trigger])
+            .fill_width()
+            .height(ui::dropdown_trigger_height())
+    }
+}
+
+fn status_menu(track: &storage::Track, host: StatusMenuHost) -> ui::View<Message> {
+    let options = status_dropdown_options(track);
+    let option_count = options.len();
+    ui::dropdown_menu(options)
+        .key(format!(
+            "status-menu-{}-{}",
+            track.id,
+            status_menu_host_key(host)
+        ))
+        .fill_width()
+        .height(ui::dropdown_menu_height(option_count))
+}
+
+const fn status_menu_host_key(host: StatusMenuHost) -> &'static str {
+    match host {
+        StatusMenuHost::Library => "library",
+        StatusMenuHost::Planner => "planner",
+        StatusMenuHost::ReviewHeader => "review-header",
+    }
 }
 
 fn library_panel(state: &AppState) -> ui::View<Message> {
     let selected_id = state.library.selected_track_id.clone();
-    let tracks = state.library.tracks.clone();
+    let tracks = tracks_with_status(&state.library.tracks, state.review_status_filter);
     let track_count = tracks.len();
-    ui::column([
-        chrome::muted_text("private studio")
-            .height(18.0)
-            .fill_width()
-            .subtle(),
-        chrome::text("cadence").height(34.0).fill_width(),
+    let total_track_count = state.library.tracks.len();
+    let content = ui::column([
+        ui::text("cadence").height(34.0).fill_width(),
         ui::button("＋ Import track")
             .primary()
             .message(Message::ImportPressed)
             .fill_width()
-            .height(36.0)
-            .text_color(ui::TextColorRole::Custom(chrome::TEXT_PRIMARY)),
-        chrome::muted_text(format!(
+            .height(36.0),
+        ui::text(format!(
             "YOUR LIBRARY  ·  {} track{}",
             track_count,
             plural(track_count)
@@ -1411,18 +4965,41 @@ fn library_panel(state: &AppState) -> ui::View<Message> {
         .height(24.0)
         .fill_width()
         .subtle(),
+        ui::text("SHOW STATUS").height(18.0).fill_width().subtle(),
+        wrapped_status_filter_controls(
+            state.review_status_filter,
+            "review",
+            review_status_filter_message,
+        ),
         if tracks.is_empty() {
-            ui::column([
-                chrome::text("No tracks yet.").height(28.0).fill_width(),
-                chrome::muted_text("Choose a file or drop audio onto the workspace.")
+            if total_track_count == 0 {
+                ui::column([
+                    ui::text("No tracks yet.").height(28.0).fill_width(),
+                    ui::text("Choose a file or drop audio onto the workspace.")
+                        .wrap()
+                        .height(48.0)
+                        .fill_width()
+                        .subtle(),
+                ])
+                .padding(12.0)
+                .spacing(6.0)
+                .fill_width()
+            } else {
+                ui::column([
+                    ui::text("No matching tracks.").height(28.0).fill_width(),
+                    ui::text(format!(
+                        "No tracks in the {} status.",
+                        status_filter_label(state.review_status_filter)
+                    ))
                     .wrap()
                     .height(48.0)
                     .fill_width()
                     .subtle(),
-            ])
-            .padding(12.0)
-            .spacing(6.0)
-            .fill_width()
+                ])
+                .padding(12.0)
+                .spacing(6.0)
+                .fill_width()
+            }
         } else {
             ui::list(tracks.into_iter().enumerate(), move |(index, track)| {
                 track_row(
@@ -1430,15 +5007,19 @@ fn library_panel(state: &AppState) -> ui::View<Message> {
                     track,
                     selected_id.as_deref(),
                     state.stage_menu_track_id.as_deref(),
+                    state.status_menu_track_id.as_deref(),
+                    state.status_menu_host,
                     state.remove_confirmation_track_id.as_deref(),
                 )
             })
+            .without_chrome()
             .fill_height()
         },
     ])
     .padding(14.0)
     .spacing(10.0)
-    .fill_height()
+    .fill_height();
+    ui::stack([ui::card().fill(), content]).fill_height()
 }
 
 fn track_row(
@@ -1446,77 +5027,110 @@ fn track_row(
     track: storage::Track,
     selected_id: Option<&str>,
     stage_menu_track_id: Option<&str>,
+    status_menu_track_id: Option<&str>,
+    status_menu_host: Option<StatusMenuHost>,
     remove_confirmation_track_id: Option<&str>,
 ) -> ui::View<Message> {
     let selected = selected_id == Some(track.id.as_str());
     let id = track.id.clone();
-    let favorite_id = track.id.clone();
     let stage_menu_open = stage_menu_track_id == Some(track.id.as_str());
+    let status_menu_open = status_menu_host == Some(StatusMenuHost::Library)
+        && status_menu_track_id == Some(track.id.as_str());
     let remove_confirmation_open = remove_confirmation_track_id == Some(track.id.as_str());
     let remove_id = track.id.clone();
-    let stage_control = stage_dropdown(&track, stage_menu_open);
+    let favorite_control =
+        favorite_toggle(&track, selected, format!("library-favorite-{}", track.id));
+    let stage_control = stage_dropdown(&track, stage_menu_open, selected);
+    let status_control =
+        status_dropdown_for_host(&track, status_menu_open, selected, StatusMenuHost::Library);
     let removal_controls = if remove_confirmation_open {
         ui::row([
-            ui::button("Confirm")
-                .primary()
-                .message(Message::ConfirmRemoveTrack(remove_id.clone()))
-                .height(20.0)
-                .text_color(ui::TextColorRole::Custom(chrome::TEXT_PRIMARY)),
-            ui::button("Keep")
-                .subtle()
-                .message(Message::CancelRemoveTrack)
-                .height(20.0)
-                .text_color(ui::TextColorRole::Custom(chrome::TEXT_PRIMARY)),
+            card_control(
+                selected,
+                "Confirm",
+                ui::button("Confirm")
+                    .message(Message::ConfirmRemoveTrack(remove_id.clone()))
+                    .height(20.0),
+            )
+            .height(20.0),
+            card_control(
+                selected,
+                "Cancel",
+                ui::button("Cancel")
+                    .message(Message::CancelRemoveTrack)
+                    .height(20.0),
+            )
+            .height(20.0),
         ])
         .spacing(4.0)
         .fill_width()
     } else {
-        ui::row([
-            ui::button(if track.favorite { "★" } else { "☆" })
-                .message(Message::ToggleFavorite(favorite_id))
-                .subtle()
-                .height(20.0)
-                .fill_width()
-                .text_color(ui::TextColorRole::Custom(chrome::TEXT_PRIMARY)),
+        card_control(
+            selected,
+            "Remove",
             ui::button("Remove")
                 .message(Message::RequestRemoveTrack(remove_id))
-                .subtle()
                 .height(20.0)
-                .fill_width()
-                .text_color(ui::TextColorRole::Custom(chrome::TEXT_PRIMARY)),
-        ])
-        .spacing(4.0)
+                .fill_width(),
+        )
+        .height(20.0)
         .fill_width()
     };
-    let mut row = ui::stack([
-        chrome::panel().fill(),
-        ui::row([
-            ui::button(track.title)
-                .message(Message::SelectTrack(id))
+    let row_background = ui::card().fill();
+    ui::stack([
+        row_background,
+        ui::column([
+            ui::row([
+                card_control(
+                    selected,
+                    track.title.clone(),
+                    ui::button(track.title)
+                        .selected(selected)
+                        .message(Message::SelectTrack(id))
+                        .fill_width()
+                        .height(28.0),
+                )
                 .fill_width()
-                .text_color(ui::TextColorRole::Custom(chrome::TEXT_PRIMARY)),
-            ui::column([removal_controls, stage_control])
-                .width(186.0)
-                .spacing(4.0)
-                .padding_x(6.0),
+                .height(28.0),
+                favorite_control,
+            ])
+            .spacing(6.0)
+            .fill_width()
+            .height(28.0),
+            removal_controls,
+            stage_control,
+            status_control,
         ])
-        .padding_y(6.0)
+        .padding(6.0)
         .fill_width()
         .spacing(4.0),
     ])
     .key(format!("library-track-{}", track.id))
-    .fill_width();
-    if selected {
-        row = row.primary();
-    }
-    row
+    .fill_width()
+}
+
+fn audition_source_choice(
+    label: &'static str,
+    source: AuditionSource,
+    active: bool,
+) -> ui::View<Message> {
+    let value = if active {
+        format!("● {label}")
+    } else {
+        format!("○ {label}")
+    };
+    let input = ui::button(value.clone())
+        .active(active)
+        .message(Message::SelectAuditionSource(source))
+        .height(28.0);
+    input.width(AUDITION_SOURCE_SELECTOR_WIDTH).height(28.0)
 }
 
 fn review_panel(state: &AppState) -> ui::View<Message> {
     let Some(track) = selected_track(state).cloned() else {
         return ui::column([
-            chrome::text("Your review desk").height(30.0).fill_width(),
-            chrome::text("Import a track to begin reviewing.")
+            ui::text("Your review desk").height(30.0).fill_width(),
+            ui::text("Import a track to begin reviewing.")
                 .height(28.0)
                 .fill_width(),
             ui::spacer().fill(),
@@ -1529,7 +5143,9 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
     let note_ratios = state
         .waveform
         .as_ref()
-        .filter(|_| state.waveform_track_id.as_deref() == Some(track.id.as_str()))
+        .filter(|_| {
+            !state.waveform_busy && state.waveform_track_id.as_deref() == Some(track.id.as_str())
+        })
         .map(|waveform| {
             track
                 .notes
@@ -1541,22 +5157,49 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let hovered_note_ratio = note_ratio_for_id(state, &track, state.hovered_note_id.as_deref());
+    let selected_note_ratio = note_ratio_for_id(state, &track, state.selected_note_id.as_deref());
     let cursor_ratio = state
         .waveform
         .as_ref()
-        .filter(|_| state.waveform_track_id.as_deref() == Some(track.id.as_str()))
+        .filter(|_| {
+            !state.waveform_busy && state.waveform_track_id.as_deref() == Some(track.id.as_str())
+        })
         .and_then(|waveform| {
             waveform::ratio_for_millis(state.review_cursor_millis, waveform.duration_millis)
+        });
+    let draft_ratio = state
+        .draft_note
+        .as_ref()
+        .filter(|draft| draft.note_id.is_none())
+        .and_then(|draft| {
+            state
+                .waveform
+                .as_ref()
+                .filter(|_| {
+                    !state.waveform_busy
+                        && state.waveform_track_id.as_deref() == Some(track.id.as_str())
+                })
+                .and_then(|waveform| {
+                    waveform::ratio_for_millis(draft.time_millis, waveform.duration_millis)
+                })
         });
     let waveform_view = if let Some(waveform) = state
         .waveform
         .as_ref()
         .filter(|_| state.waveform_track_id.as_deref() == Some(track.id.as_str()))
     {
-        waveform::view(
+        waveform::view_with_progress(
             Arc::new(waveform.clone()),
             cursor_ratio,
+            draft_ratio,
             note_ratios,
+            hovered_note_ratio,
+            selected_note_ratio,
+            state
+                .waveform_busy
+                .then_some(state.waveform_progress)
+                .flatten(),
             |interaction| match interaction {
                 waveform::WaveformInteraction::Clicked { ratio, lower } => {
                     Message::WaveformClicked { ratio, lower }
@@ -1570,20 +5213,32 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
                 waveform::WaveformInteraction::PlayheadDragEnded { ratio } => {
                     Message::WaveformPlayheadDragEnded { ratio }
                 }
+                waveform::WaveformInteraction::CommentDragStarted { ratio, note_index } => {
+                    Message::CommentDragStarted { ratio, note_index }
+                }
+                waveform::WaveformInteraction::CommentDragMoved { ratio } => {
+                    Message::CommentDragMoved { ratio }
+                }
+                waveform::WaveformInteraction::CommentDragEnded { ratio } => {
+                    Message::CommentDragEnded { ratio }
+                }
+                waveform::WaveformInteraction::CommentDragCancelled => {
+                    Message::CommentDragCancelled
+                }
             },
         )
         .fill_width()
-        .height(250.0)
+        .height(WAVEFORM_HEIGHT)
     } else {
         ui::column([
-            chrome::text(if state.waveform_busy {
+            ui::text(if state.waveform_busy {
                 "Analyzing the real audio file…"
             } else {
                 "Waveform unavailable for this file."
             })
             .height(28.0)
             .fill_width(),
-            chrome::muted_text(
+            ui::text(
                 "The imported path remains external to the native library; if it moved, re-import it.",
             )
                 .wrap()
@@ -1594,7 +5249,7 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
         .padding(12.0)
         .spacing(8.0)
         .fill_width()
-        .height(250.0)
+        .height(WAVEFORM_HEIGHT)
     };
     let metadata = state
         .waveform
@@ -1615,94 +5270,516 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
         .as_ref()
         .filter(|_| state.waveform_track_id.as_deref() == Some(track.id.as_str()))
         .map_or(0, |waveform| waveform.duration_millis);
-    let transport_controls = if duration_millis > 0 {
-        ui::row([
-            ui::button(if state.transport_playing {
-                "❚❚ Pause"
-            } else {
-                "▶ Play"
-            })
-            .primary()
+    let meter_lufs = current_lufs_meter_value(state, &track.id);
+    let analysis_state = if duration_millis > 0 && !state.waveform_busy {
+        "READY"
+    } else if state.waveform_busy {
+        "BUILDING"
+    } else {
+        "WAITING"
+    };
+    let transport_controls = if duration_millis > 0 && !state.waveform_busy {
+        let shared_playing = state.transport_playing || state.reference_transport_playing;
+        let play_label = if shared_playing { "Pause" } else { "Play" };
+        let play_control = ui::button(play_label)
+            .active(shared_playing)
             .message(Message::TogglePlayback)
-            .height(32.0)
-            .text_color(ui::TextColorRole::Custom(chrome::TEXT_PRIMARY)),
-            chrome::muted_text(format!(
-                "{} / {}",
+            .height(32.0);
+        ui::row([
+            ui::text(format!(
+                "{metadata} · {} / {}",
                 format_timestamp(state.transport_position_millis.min(duration_millis)),
-                format_duration(duration_millis)
+                format_duration(duration_millis),
             ))
             .height(32.0)
             .fill_width()
             .subtle(),
+            ui::text(format!(
+                "VOL {:02}",
+                (state.audition_volume * 100.0).round() as u32
+            ))
+            .height(32.0)
+            .width(62.0)
+            .subtle(),
+            ui::slider(state.audition_volume)
+                .primary()
+                .track_height(5.0)
+                .message(Message::AuditionVolumeChanged)
+                .key("native-audition-volume")
+                .height(28.0)
+                .width(128.0),
+            play_control.width(64.0).height(32.0),
+            ui::badge(analysis_state)
+                .passive()
+                .subtle()
+                .width(88.0)
+                .height(28.0),
         ])
-        .spacing(10.0)
+        .spacing(8.0)
         .fill_width()
     } else {
-        chrome::muted_text("Playback controls will appear after audio analysis.")
-            .height(28.0)
-            .fill_width()
-            .subtle()
-    };
-
-    let mut waveform_section = vec![
         ui::row([
-            chrome::muted_text("01  WAVEFORM / TOP TO PLAY")
-                .height(18.0)
-                .fill_width()
-                .subtle(),
-            chrome::muted_text("02  BOTTOM TO COMMENT")
-                .height(18.0)
-                .subtle(),
+            ui::text(metadata).height(28.0).fill_width().subtle(),
+            ui::badge(analysis_state)
+                .passive()
+                .subtle()
+                .width(88.0)
+                .height(28.0),
         ])
+        .spacing(8.0)
         .fill_width()
-        .spacing(10.0),
-        chrome::muted_text(metadata)
-            .height(22.0)
-            .fill_width()
-            .subtle(),
-        transport_controls,
+    };
+    let waveform_with_meter = ui::row([
+        chrome::lufs_meter(meter_lufs, state.waveform_busy)
+            .width(68.0)
+            .height(WAVEFORM_HEIGHT),
         waveform_view,
-    ];
+    ])
+    .spacing(8.0)
+    .fill_width()
+    .height(WAVEFORM_HEIGHT);
+    let reference_height = reference_section_height(state, &track);
+    let waveform_pair_height = WAVEFORM_HEIGHT + WAVEFORM_SECTION_SPACING + reference_height;
+    let waveform_pair = ui::column([
+        waveform_with_meter,
+        reference_waveform_section(state, &track),
+    ])
+    .spacing(WAVEFORM_SECTION_SPACING)
+    .fill_width()
+    .height(waveform_pair_height);
+    let audition_source_control = if track.reference_path.is_some() {
+        let main_choice = audition_source_choice(
+            "MAIN",
+            AuditionSource::Main,
+            state.audition_source == AuditionSource::Main,
+        );
+        let reference_choice = audition_source_choice(
+            "REF",
+            AuditionSource::Reference,
+            state.audition_source == AuditionSource::Reference,
+        );
+        ui::column([
+            ui::column([ui::spacer().fill(), main_choice, ui::spacer().fill()])
+                .height(WAVEFORM_HEIGHT),
+            ui::spacer()
+                .height(WAVEFORM_SECTION_SPACING + reference_height - REFERENCE_WAVEFORM_HEIGHT),
+            ui::column([ui::spacer().fill(), reference_choice, ui::spacer().fill()])
+                .height(REFERENCE_WAVEFORM_HEIGHT),
+        ])
+        .width(AUDITION_SOURCE_SELECTOR_WIDTH)
+        .height(waveform_pair_height)
+    } else {
+        ui::spacer()
+            .width(AUDITION_SOURCE_SELECTOR_WIDTH)
+            .height(waveform_pair_height)
+    };
+    let waveform_with_source = ui::row([audition_source_control, waveform_pair])
+        .spacing(8.0)
+        .fill_width()
+        .height(waveform_pair_height);
+
+    let mut waveform_section = vec![transport_controls, waveform_with_source];
+    if track.reference_path.is_some() {
+        waveform_section.push(reference_comments_panel(state, &track));
+    }
     if let Some(draft) = state.draft_note.as_ref() {
         waveform_section.push(note_editor(draft));
     }
 
-    ui::column([
+    let favorite_label = if track.favorite { "★" } else { "☆" };
+    let favorite_id = track.id.clone();
+    let replace_id = track.id.clone();
+    let favorite_input = ui::button(favorite_label)
+        .active(track.favorite)
+        .message(Message::ToggleFavorite(favorite_id))
+        .height(28.0);
+    let favorite_control = favorite_input;
+    let status_menu_open = state.status_menu_host == Some(StatusMenuHost::ReviewHeader)
+        && state.status_menu_track_id.as_deref() == Some(track.id.as_str());
+    let status_trigger =
+        status_dropdown_trigger(&track, status_menu_open, StatusMenuHost::ReviewHeader)
+            .width(126.0);
+    let mut track_header_rows = vec![
         ui::row([
-            ui::column([
-                chrome::muted_text("LOCAL TRACK")
-                    .height(18.0)
-                    .fill_width()
-                    .subtle(),
-                chrome::text(track.title.clone()).height(34.0).fill_width(),
-                chrome::muted_text(track.original_name.clone())
-                    .height(22.0)
-                    .fill_width()
-                    .subtle(),
-            ])
-            .fill_width(),
-            ui::badge(track.stage.label()).primary().passive(),
+            ui::text(track.title.clone())
+                .key(format!("review-track-title-{}", track.id))
+                .truncate()
+                .height(28.0)
+                .fill_width(),
+            ui::badge(track.stage.label().to_owned())
+                .passive()
+                .subtle()
+                .width(174.0)
+                .height(28.0),
+            status_trigger,
+            favorite_control.width(36.0).height(28.0),
+            ui::button("Replace")
+                .message(Message::ReplacePressed(replace_id))
+                .height(28.0)
+                .width(96.0)
+                .height(28.0),
         ])
         .fill_width()
-        .spacing(12.0),
+        .spacing(8.0)
+        .height(ui::dropdown_trigger_height()),
+    ];
+    let options = status_dropdown_options(&track);
+    let menu_height = ui::dropdown_menu_height(options.len());
+    track_header_rows.push(
+        ui::row([
+            ui::spacer().fill_width().height(menu_height),
+            status_menu(&track, StatusMenuHost::ReviewHeader)
+                .width(126.0)
+                .height(menu_height),
+            ui::spacer().width(36.0 + 8.0 + 96.0).height(menu_height),
+        ])
+        .fill_width()
+        .key(format!("review-status-menu-{}", track.id))
+        .height(if status_menu_open { menu_height } else { 0.0 }),
+    );
+    let track_header_height =
+        ui::dropdown_trigger_height() + if status_menu_open { menu_height } else { 0.0 } + 3.0;
+    let track_header = ui::column(track_header_rows)
+        .fill_width()
+        .height(track_header_height)
+        .spacing(3.0);
+
+    let content = ui::column([
+        track_header,
         ui::column(waveform_section)
-            .padding(16.0)
-            .spacing(10.0)
+            .padding(10.0)
+            .spacing(6.0)
             .fill_width(),
-        comments_panel(&track),
-        ui::spacer().fill(),
+        comments_panel(state, &track),
     ])
-    .padding(18.0)
-    .spacing(14.0)
-    .fill()
+    .padding(12.0)
+    .spacing(10.0)
+    .fill();
+    ui::stack([ui::card().fill(), content]).fill()
 }
 
-fn comments_panel(track: &storage::Track) -> ui::View<Message> {
-    let open_count = track.notes.iter().filter(|note| !note.done).count();
+fn reference_dropdown_paths(state: &AppState, track: &storage::Track) -> Vec<PathBuf> {
+    let mut paths = state
+        .library
+        .reference_tracks
+        .iter()
+        .map(|reference| reference.path.clone())
+        .collect::<Vec<_>>();
+    if let Some(path) = track.reference_path.as_ref()
+        && !paths.iter().any(|candidate| candidate == path)
+    {
+        paths.push(path.clone());
+    }
+    paths
+}
+
+fn reference_dropdown_options(
+    state: &AppState,
+    track: &storage::Track,
+) -> Vec<ui::DropdownOption<Message>> {
+    let selected_path = track.reference_path.as_ref();
+    let track_id = track.id.clone();
+    reference_dropdown_paths(state, track)
+        .into_iter()
+        .map(|path| {
+            let selected = selected_path == Some(&path);
+            ui::DropdownOption::new(
+                reference_track_name(&path),
+                selected,
+                Message::SetReferenceTrack {
+                    track_id: track_id.clone(),
+                    path,
+                },
+            )
+        })
+        .collect()
+}
+
+fn reference_menu_is_open(state: &AppState, track: &storage::Track) -> bool {
+    state.reference_menu_track_id.as_deref() == Some(track.id.as_str())
+        && !reference_dropdown_paths(state, track).is_empty()
+}
+
+fn reference_section_height(state: &AppState, track: &storage::Track) -> f32 {
+    let menu_height = if reference_menu_is_open(state, track) {
+        ui::dropdown_menu_height(reference_dropdown_paths(state, track).len()) + 3.0
+    } else {
+        0.0
+    };
+    REFERENCE_HEADER_HEIGHT + menu_height + REFERENCE_SECTION_SPACING + REFERENCE_WAVEFORM_HEIGHT
+}
+
+fn reference_waveform_section(state: &AppState, track: &storage::Track) -> ui::View<Message> {
+    let has_reference = track.reference_path.is_some();
+    let reference_waveform = state
+        .reference_waveform
+        .as_ref()
+        .filter(|_| state.reference_waveform_track_id.as_deref() == Some(track.id.as_str()));
+    let reference_cursor_ratio = reference_waveform
+        .filter(|_| !state.reference_waveform_busy)
+        .and_then(|waveform| {
+            waveform::ratio_for_millis(
+                state.reference_transport_position_millis,
+                waveform.duration_millis,
+            )
+        });
+    let reference_integrated_lufs =
+        reference_waveform.and_then(|waveform| waveform.integrated_lufs);
+    let reference_meter_lufs = current_reference_lufs_meter_value(state, &track.id);
+    let match_gain_db = current_loudness_match_gain_db(state);
+    let reference_name = track.reference_path.as_ref().map_or_else(
+        || String::from("No reference track"),
+        |path| reference_track_name(path),
+    );
+    let reference_label = if let Some(reference_lufs) = reference_integrated_lufs {
+        format!("REFERENCE · {reference_name} · {reference_lufs:.1} LUFS")
+    } else if has_reference && state.reference_waveform_busy {
+        format!("REFERENCE · {reference_name} · BUILDING")
+    } else if has_reference {
+        format!("REFERENCE · {reference_name}")
+    } else {
+        String::from("REFERENCE TRACK")
+    };
+    let reference_label =
+        if let Some((_, _, start_millis, end_millis)) = reference_loop_bounds(state) {
+            format!(
+                "{reference_label} · LOOP {}–{}",
+                format_timestamp(start_millis),
+                format_timestamp(end_millis),
+            )
+        } else {
+            reference_label
+        };
+    let reference_paths = reference_dropdown_paths(state, track);
+    let menu_open = reference_menu_is_open(state, track);
+    let selector_label = track
+        .reference_path
+        .as_ref()
+        .map_or("Choose reference".to_owned(), |path| {
+            reference_track_name(path)
+        });
+    let selector_trigger = ui::dropdown_trigger(selector_label, menu_open)
+        .toggle_message(Message::ToggleReferenceMenu(track.id.clone()))
+        .build()
+        .key(format!("reference-dropdown-{}", track.id))
+        .width(190.0)
+        .height(26.0);
+    let selector = if menu_open {
+        ui::column([
+            selector_trigger,
+            ui::dropdown_menu(reference_dropdown_options(state, track))
+                .key(format!("reference-menu-{}", track.id))
+                .width(190.0)
+                .height(ui::dropdown_menu_height(reference_paths.len())),
+        ])
+        .spacing(3.0)
+        .width(190.0)
+        .height(ui::dropdown_menu_height(reference_paths.len()) + 29.0)
+    } else {
+        ui::column([selector_trigger]).width(190.0).height(26.0)
+    };
+    let action_label = if has_reference {
+        "Replace reference"
+    } else {
+        "Import reference"
+    };
+    let action = ui::button(action_label)
+        .primary()
+        .message(Message::ReferencePressed(track.id.clone()))
+        .width(142.0)
+        .height(26.0);
+    let reference_controls = if reference_waveform.is_some() && !state.reference_waveform_busy {
+        let match_label = match match_gain_db {
+            Some(gain_db) => format!("MATCH {gain_db:+.1} dB"),
+            None => String::from("MATCH REF"),
+        };
+        ui::row([
+            selector,
+            ui::button(match_label)
+                .active(state.reference_match_enabled && match_gain_db.is_some())
+                .message(Message::ToggleReferenceMatch)
+                .width(112.0)
+                .height(26.0),
+            action,
+        ])
+        .spacing(8.0)
+        .height(
+            reference_section_height(state, track)
+                - REFERENCE_SECTION_SPACING
+                - REFERENCE_WAVEFORM_HEIGHT,
+        )
+    } else {
+        ui::row([selector, action]).spacing(8.0).height(
+            reference_section_height(state, track)
+                - REFERENCE_SECTION_SPACING
+                - REFERENCE_WAVEFORM_HEIGHT,
+        )
+    };
+    let header_height = reference_section_height(state, track)
+        - REFERENCE_SECTION_SPACING
+        - REFERENCE_WAVEFORM_HEIGHT;
+    let header = ui::row([
+        ui::spacer().width(68.0).height(header_height),
+        ui::text(reference_label)
+            .truncate()
+            .height(24.0)
+            .fill_width()
+            .subtle(),
+        reference_controls,
+    ])
+    .spacing(8.0)
+    .fill_width()
+    .height(header_height);
+    let reference_body = if let Some(waveform) = reference_waveform {
+        let loop_selection = state
+            .reference_loop_selection
+            .map(|selection| (selection.start_ratio, selection.end_ratio));
+        let notes = reference_notes_for_track(&state.library, track);
+        let note_ratios = notes
+            .iter()
+            .filter_map(|note| {
+                waveform::ratio_for_millis(note.time_millis, waveform.duration_millis)
+                    .map(|ratio| (ratio, note.done))
+            })
+            .collect::<Vec<_>>();
+        let draft_ratio = state
+            .reference_draft_note
+            .as_ref()
+            .filter(|draft| draft.note_id.is_none())
+            .and_then(|draft| {
+                waveform::ratio_for_millis(draft.time_millis, waveform.duration_millis)
+            });
+        let hovered_note_ratio =
+            reference_note_ratio_for_id(state, track, state.hovered_reference_note_id.as_deref());
+        waveform::reference_view_with_comments(
+            Arc::new(waveform.clone()),
+            reference_cursor_ratio,
+            loop_selection,
+            state
+                .reference_waveform_busy
+                .then_some(state.reference_waveform_progress)
+                .flatten(),
+            note_ratios,
+            draft_ratio,
+            hovered_note_ratio,
+            reference_note_ratio_for_id(state, track, state.selected_reference_note_id.as_deref()),
+            |interaction| match interaction {
+                waveform::ReferenceWaveformInteraction::Clicked { ratio } => {
+                    Message::ReferenceWaveformClicked { ratio }
+                }
+                waveform::ReferenceWaveformInteraction::CommentClicked { ratio } => {
+                    Message::ReferenceCommentClicked { ratio }
+                }
+                waveform::ReferenceWaveformInteraction::Started { ratio } => {
+                    Message::ReferenceLoopDragStarted { ratio }
+                }
+                waveform::ReferenceWaveformInteraction::Moved { ratio } => {
+                    Message::ReferenceLoopDragMoved { ratio }
+                }
+                waveform::ReferenceWaveformInteraction::Ended {
+                    start_ratio,
+                    end_ratio,
+                } => Message::ReferenceLoopDragEnded {
+                    start_ratio,
+                    end_ratio,
+                },
+            },
+        )
+        .fill_width()
+        .height(REFERENCE_WAVEFORM_HEIGHT)
+    } else {
+        let message = if state.reference_waveform_busy && state.waveform_busy {
+            "Reference queued behind main analysis…"
+        } else if state.reference_waveform_busy {
+            "Analyzing reference waveform…"
+        } else if has_reference {
+            "Reference waveform unavailable for this file."
+        } else {
+            "Import a reference track to compare it below."
+        };
+        ui::column([ui::text(message).height(24.0).fill_width()])
+            .padding(10.0)
+            .fill_width()
+            .height(REFERENCE_WAVEFORM_HEIGHT)
+    };
+    let reference_meter = if has_reference {
+        chrome::lufs_meter(reference_meter_lufs, state.reference_waveform_busy)
+            .width(68.0)
+            .height(REFERENCE_WAVEFORM_HEIGHT)
+    } else {
+        ui::spacer().width(68.0).height(REFERENCE_WAVEFORM_HEIGHT)
+    };
+    let body = ui::row([reference_meter, reference_body])
+        .spacing(0.0)
+        .fill_width()
+        .height(REFERENCE_WAVEFORM_HEIGHT);
+    ui::column([header, body])
+        .spacing(REFERENCE_SECTION_SPACING)
+        .fill_width()
+        .height(reference_section_height(state, track))
+}
+
+fn reference_comments_panel(state: &AppState, track: &storage::Track) -> ui::View<Message> {
+    let notes = reference_notes_for_track(&state.library, track).to_vec();
+    let open_count = notes.iter().filter(|note| !note.done).count();
+    let selected_note_id = state.selected_reference_note_id.clone();
     let mut children = vec![
         ui::row([
-            chrome::text("ALL COMMENTS").height(24.0).fill_width(),
-            chrome::muted_text(format!("{} total · {} open", track.notes.len(), open_count))
+            ui::text("REFERENCE COMMENTS / CLICK TO PIN")
+                .height(24.0)
+                .fill_width(),
+            ui::text(format!("{} total · {} open", notes.len(), open_count))
+                .height(24.0)
+                .subtle(),
+        ])
+        .fill_width()
+        .spacing(10.0),
+    ];
+    let list_height = if notes.is_empty() {
+        children.push(
+            ui::text("Click the lower reference waveform rail to add a comment for this file.")
+                .wrap()
+                .height(38.0)
+                .fill_width()
+                .subtle(),
+        );
+        38.0
+    } else {
+        let note_count = notes.len();
+        let list = ui::list(notes.into_iter().enumerate(), move |(index, note)| {
+            reference_note_row(index, note, selected_note_id.as_deref())
+        })
+        .without_chrome()
+        .fill_width()
+        .height(note_count as f32 * 44.0);
+        let height = note_count as f32 * 44.0;
+        children.push(list);
+        height
+    };
+    let editor_height = if let Some(draft) = state.reference_draft_note.as_ref() {
+        children.push(reference_note_editor(draft));
+        122.0
+    } else {
+        0.0
+    };
+    let height = 24.0 + 12.0 + 8.0 + list_height + editor_height;
+    ui::stack([
+        ui::card().fill(),
+        ui::column(children).padding(12.0).spacing(8.0).fill_width(),
+    ])
+    .fill_width()
+    .height(height)
+}
+
+fn comments_panel(state: &AppState, track: &storage::Track) -> ui::View<Message> {
+    let open_count = track.notes.iter().filter(|note| !note.done).count();
+    let selected_note_id = state.selected_note_id.clone();
+    let mut children = vec![
+        ui::row([
+            ui::text("02  COMMENTS / CLICK TO PIN")
+                .height(24.0)
+                .fill_width(),
+            ui::text(format!("{} total · {} open", track.notes.len(), open_count))
                 .height(24.0)
                 .subtle(),
         ])
@@ -1711,34 +5788,35 @@ fn comments_panel(track: &storage::Track) -> ui::View<Message> {
     ];
     if track.notes.is_empty() {
         children.push(
-            chrome::muted_text(
-                "Hover the lower waveform rail and click to place a timestamped comment.",
-            )
-            .wrap()
-            .height(42.0)
-            .fill_width()
-            .subtle(),
+            ui::text("Hover the lower waveform rail and click to place a timestamped comment.")
+                .wrap()
+                .height(42.0)
+                .fill_width()
+                .subtle(),
         );
     } else {
-        children.push(
-            ui::list(
-                track.notes.clone().into_iter().enumerate(),
-                |(index, note)| note_row(index, note),
-            )
-            .fill_width()
-            .fill_height(),
-        );
+        let notes = track.notes.clone();
+        let list = ui::list(notes.into_iter().enumerate(), move |(index, note)| {
+            note_row(index, note, selected_note_id.as_deref())
+        })
+        .without_chrome()
+        .fill_width()
+        .fill_height();
+        children.push(list);
     }
-    ui::column(children)
+    let content = ui::column(children)
         .padding(12.0)
         .spacing(8.0)
+        .fill_width()
+        .fill_height();
+    ui::stack([ui::card().fill(), content])
         .fill_width()
         .fill_height()
 }
 
 fn note_editor(draft: &NoteDraft) -> ui::View<Message> {
     ui::column([
-        chrome::muted_text(format!(
+        ui::text(format!(
             "COMMENT AT {}",
             format_timestamp(draft.time_millis)
         ))
@@ -1747,19 +5825,27 @@ fn note_editor(draft: &NoteDraft) -> ui::View<Message> {
         .subtle(),
         ui::text_input(draft.body.clone())
             .placeholder("Write a comment…")
-            .message(Message::DraftNoteChanged)
-            .key("native-note-draft")
+            .message_event(|input| {
+                let submitted = input.is_submitted();
+                let value = input.into_value();
+                if submitted {
+                    Message::SaveDraftNote
+                } else {
+                    Message::DraftNoteChanged(value)
+                }
+            })
+            .id(MAIN_COMMENT_EDITOR_ID)
             .fill_width()
             .height(38.0),
         ui::row([
             ui::button("Save comment")
                 .primary()
                 .message(Message::SaveDraftNote)
-                .text_color(ui::TextColorRole::Custom(chrome::TEXT_PRIMARY)),
+                .height(28.0),
             ui::button("Cancel")
                 .subtle()
                 .message(Message::CancelDraftNote)
-                .text_color(ui::TextColorRole::Custom(chrome::TEXT_PRIMARY)),
+                .height(28.0),
         ])
         .spacing(8.0)
         .fill_width(),
@@ -1769,33 +5855,154 @@ fn note_editor(draft: &NoteDraft) -> ui::View<Message> {
     .fill_width()
 }
 
-fn note_row(index: usize, note: storage::Note) -> ui::View<Message> {
+fn reference_note_editor(draft: &NoteDraft) -> ui::View<Message> {
+    ui::column([
+        ui::text(format!(
+            "REFERENCE COMMENT AT {}",
+            format_timestamp(draft.time_millis)
+        ))
+        .height(20.0)
+        .fill_width()
+        .subtle(),
+        ui::text_input(draft.body.clone())
+            .placeholder("Write a reference comment…")
+            .message_event(|input| {
+                let submitted = input.is_submitted();
+                let value = input.into_value();
+                if submitted {
+                    Message::SaveReferenceDraftNote
+                } else {
+                    Message::ReferenceDraftNoteChanged(value)
+                }
+            })
+            .id(REFERENCE_COMMENT_EDITOR_ID)
+            .fill_width()
+            .height(38.0),
+        ui::row([
+            ui::button("Save reference comment")
+                .primary()
+                .message(Message::SaveReferenceDraftNote)
+                .height(28.0),
+            ui::button("Cancel")
+                .subtle()
+                .message(Message::CancelReferenceDraftNote)
+                .height(28.0),
+        ])
+        .spacing(8.0)
+        .fill_width(),
+    ])
+    .padding(10.0)
+    .spacing(8.0)
+    .fill_width()
+}
+
+fn note_row(
+    index: usize,
+    note: storage::Note,
+    selected_note_id: Option<&str>,
+) -> ui::View<Message> {
+    let selected = selected_note_id == Some(note.id.as_str());
     let note_id = note.id.clone();
+    let select_id = note.id.clone();
     let edit_id = note.id.clone();
     let delete_id = note.id.clone();
-    ui::list_row(
+    let row = ui::list_row(
         index,
         [
-            chrome::muted_text(format_timestamp(note.time_millis))
+            ui::text(format_timestamp(note.time_millis))
                 .height(30.0)
                 .width(68.0)
                 .subtle(),
-            chrome::text(note.body).wrap().height(30.0).fill_width(),
+            ui::text(note.body).wrap().height(30.0).fill_width(),
             ui::button(if note.done { "Done" } else { "Open" })
-                .subtle()
+                .selected(selected)
                 .message(Message::ToggleNoteDone(note_id))
-                .text_color(ui::TextColorRole::Custom(chrome::TEXT_PRIMARY)),
+                .height(28.0),
             ui::button("Edit")
-                .subtle()
+                .selected(selected)
                 .message(Message::EditNote(edit_id))
-                .text_color(ui::TextColorRole::Custom(chrome::TEXT_PRIMARY)),
+                .height(28.0),
             ui::button("Delete")
-                .subtle()
+                .selected(selected)
                 .message(Message::DeleteNote(delete_id))
-                .text_color(ui::TextColorRole::Custom(chrome::TEXT_PRIMARY)),
+                .height(28.0),
         ],
     )
+    .fill_width();
+    let row_key = select_id.clone();
+    let hover_id = note.id.clone();
+    let row_actions = ui::row_actions().primary(move || Message::SelectNote(select_id.clone()));
+    let row_surface = ui::interactive_row_underlay(row)
+        .selected(selected)
+        .stable_row_identity(0xCAD3_0002, row_key)
+        .actions(row_actions)
+        .fill_width()
+        .height(44.0);
+    ui::stack([
+        row_surface,
+        chrome::comment_hover(
+            Message::CommentHoverStarted(hover_id.clone()),
+            Message::CommentHoverEnded(hover_id),
+        )
+        .key(format!("comment-hover-{}", note.id))
+        .fill(),
+    ])
     .fill_width()
+    .height(44.0)
+}
+
+fn reference_note_row(
+    index: usize,
+    note: storage::Note,
+    selected_note_id: Option<&str>,
+) -> ui::View<Message> {
+    let selected = selected_note_id == Some(note.id.as_str());
+    let select_id = note.id.clone();
+    let hover_id = note.id.clone();
+    let hover_key = note.id.clone();
+    let row = ui::list_row(
+        index,
+        [
+            ui::text(format_timestamp(note.time_millis))
+                .height(30.0)
+                .width(68.0)
+                .subtle(),
+            ui::text(note.body).wrap().height(30.0).fill_width(),
+            ui::button(if note.done { "Done" } else { "Open" })
+                .selected(selected)
+                .message(Message::ToggleReferenceNoteDone(note.id.clone()))
+                .height(28.0),
+            ui::button("Edit")
+                .selected(selected)
+                .message(Message::EditReferenceNote(note.id.clone()))
+                .height(28.0),
+            ui::button("Delete")
+                .selected(selected)
+                .message(Message::DeleteReferenceNote(note.id))
+                .height(28.0),
+        ],
+    )
+    .fill_width();
+    let row_key = select_id.clone();
+    let row_actions =
+        ui::row_actions().primary(move || Message::SelectReferenceNote(select_id.clone()));
+    let row_surface = ui::interactive_row_underlay(row)
+        .selected(selected)
+        .stable_row_identity(0xCAD3_0003, row_key)
+        .actions(row_actions)
+        .fill_width()
+        .height(44.0);
+    ui::stack([
+        row_surface,
+        chrome::comment_hover(
+            Message::ReferenceCommentHoverStarted(hover_id.clone()),
+            Message::ReferenceCommentHoverEnded(hover_id),
+        )
+        .key(format!("reference-comment-hover-{hover_key}"))
+        .fill(),
+    ])
+    .fill_width()
+    .height(44.0)
 }
 
 fn selected_track(state: &AppState) -> Option<&storage::Track> {
@@ -1804,6 +6011,87 @@ fn selected_track(state: &AppState) -> Option<&storage::Track> {
         .selected_track_id
         .as_ref()
         .and_then(|id| state.library.tracks.iter().find(|track| &track.id == id))
+}
+
+fn reference_notes_for_track<'a>(
+    library: &'a storage::Library,
+    track: &storage::Track,
+) -> &'a [storage::Note] {
+    let Some(path) = track.reference_path.as_ref() else {
+        return &[];
+    };
+    library
+        .reference_tracks
+        .iter()
+        .find(|reference| reference.path == *path)
+        .map_or(&[], |reference| reference.notes.as_slice())
+}
+
+fn selected_reference_notes(state: &AppState) -> &[storage::Note] {
+    selected_track(state)
+        .map(|track| reference_notes_for_track(&state.library, track))
+        .unwrap_or(&[])
+}
+
+fn selected_reference_track_mut(state: &mut AppState) -> Option<&mut storage::ReferenceTrack> {
+    let selected_id = state.library.selected_track_id.as_ref()?.clone();
+    let path = state
+        .library
+        .tracks
+        .iter()
+        .find(|track| track.id == selected_id)
+        .and_then(|track| track.reference_path.clone())?;
+    state
+        .library
+        .reference_tracks
+        .iter_mut()
+        .find(|reference| reference.path == path)
+}
+
+fn selected_reference_note_mut<'a>(
+    state: &'a mut AppState,
+    note_id: &str,
+) -> Option<&'a mut storage::Note> {
+    selected_reference_track_mut(state)?
+        .notes
+        .iter_mut()
+        .find(|note| note.id == note_id)
+}
+
+fn reference_track_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map_or_else(|| path.to_string_lossy().into_owned(), ToOwned::to_owned)
+}
+
+fn note_ratio_for_id(
+    state: &AppState,
+    track: &storage::Track,
+    note_id: Option<&str>,
+) -> Option<f32> {
+    let note = note_id.and_then(|id| track.notes.iter().find(|note| note.id == id))?;
+    let waveform = state
+        .waveform
+        .as_ref()
+        .filter(|_| state.waveform_track_id.as_deref() == Some(track.id.as_str()))?;
+    waveform::ratio_for_millis(note.time_millis, waveform.duration_millis)
+}
+
+fn reference_note_ratio_for_id(
+    state: &AppState,
+    track: &storage::Track,
+    note_id: Option<&str>,
+) -> Option<f32> {
+    let note = note_id.and_then(|id| {
+        reference_notes_for_track(&state.library, track)
+            .iter()
+            .find(|note| note.id == id)
+    })?;
+    let waveform = state
+        .reference_waveform
+        .as_ref()
+        .filter(|_| state.reference_waveform_track_id.as_deref() == Some(track.id.as_str()))?;
+    waveform::ratio_for_millis(note.time_millis, waveform.duration_millis)
 }
 
 fn selected_track_mut(state: &mut AppState) -> Option<&mut storage::Track> {
@@ -1818,6 +6106,11 @@ fn selected_track_mut(state: &mut AppState) -> Option<&mut storage::Track> {
 fn decode_result_is_current(state: &AppState, track_id: &str, generation: u64) -> bool {
     state.library.selected_track_id.as_deref() == Some(track_id)
         && state.waveform_generation == generation
+}
+
+fn reference_decode_result_is_current(state: &AppState, track_id: &str, generation: u64) -> bool {
+    state.library.selected_track_id.as_deref() == Some(track_id)
+        && state.reference_waveform_generation == generation
 }
 
 fn transport_command_is_confirmed(snapshot: transport::Snapshot, token: u64) -> bool {
@@ -1848,15 +6141,23 @@ fn plural(count: usize) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, Message, NoteDraft, apply_transport_snapshot, decode_result_is_current,
-        native_launch_options, planner_drop_is_valid, playback_shortcut, project_surface,
-        stage_dropdown, stage_menu_anchor_from_pointer, stage_menu_popover, tracks_in_stage,
-        transport_command_is_confirmed, update,
+        AppState, AuditionSource, ImportBatchProgress, Message, NoteDraft, ReferenceLoopSelection,
+        StatusMenuHost, WAVEFORM_HEIGHT, WorkspaceMode, apply_transport_snapshot,
+        audition_shuffle_seed, audition_statuses, current_loudness_match_gain_db,
+        current_lufs_meter_value, current_reference_lufs_meter_value, decode_result_is_current,
+        deterministic_shuffle, main_output_gain, native_launch_options, note_editor,
+        note_ratio_for_id, planner_drop_is_valid, playback_shortcut, project_surface,
+        rebuild_audition_queue, reconcile_audition_queue, reference_decode_result_is_current,
+        reference_loop_bounds, reference_output_gain, selected_reference_notes, selected_track,
+        stage_dropdown, stage_menu_anchor_from_pointer, stage_menu_popover,
+        status_dropdown_for_host, sync_audition_queue_after_status_change, tracks_in_stage,
+        tracks_with_status, transport_command_is_confirmed, update,
     };
     use crate::transport::Snapshot;
     use crate::{
-        audio::WaveformData,
-        storage::{Note, Track, TrackStage},
+        audio::{LoudnessPoint, WaveformData},
+        storage::{Library, Note, ReferenceTrack, Track, TrackStage, TrackStatus},
+        transport, waveform,
     };
     use radiant::{
         application::IntoView,
@@ -1868,7 +6169,7 @@ mod tests {
         },
         theme::ThemeTokens,
     };
-    use std::{path::PathBuf, sync::Arc};
+    use std::{path::PathBuf, sync::Arc, time::Duration};
 
     fn planner_drag_state(pointer: Point) -> AppState {
         let mut state = AppState {
@@ -1883,12 +6184,104 @@ mod tests {
             title: String::from("Preview me"),
             original_name: String::from("preview.wav"),
             path: PathBuf::from("/external/preview.wav"),
+            reference_path: None,
             size: 0,
             favorite: false,
             stage: TrackStage::SoundDesign,
+            status: TrackStatus::Inbox,
             notes: Vec::new(),
         });
         state
+    }
+
+    fn audition_track(id: &str) -> Track {
+        Track {
+            id: String::from(id),
+            title: String::from(id),
+            original_name: format!("{id}.wav"),
+            path: PathBuf::from(format!("/external/{id}.wav")),
+            reference_path: None,
+            size: 0,
+            favorite: false,
+            stage: TrackStage::Production,
+            status: TrackStatus::Inbox,
+            notes: Vec::new(),
+        }
+    }
+
+    fn audition_waveform() -> WaveformData {
+        WaveformData {
+            sample_rate: 48_000,
+            channels: 1,
+            duration_millis: 1_000,
+            render_frames: 48_000,
+            integrated_lufs: Some(-7.0),
+            loudness_profile: Arc::from([]),
+            summary: Arc::new(
+                radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                    &[0.0, 0.5, 0.0, 0.5],
+                    4,
+                    1,
+                ),
+            ),
+        }
+    }
+
+    fn audition_state(ids: &[&str]) -> AppState {
+        let queue = ids.iter().map(|id| String::from(*id)).collect::<Vec<_>>();
+        let selected_id = queue.first().cloned();
+        let mut state = AppState {
+            busy: false,
+            workspace_mode: WorkspaceMode::Audition,
+            audition_queue: queue,
+            audition_queue_index: 0,
+            waveform: selected_id.as_ref().map(|_| audition_waveform()),
+            waveform_track_id: selected_id.clone(),
+            ..AppState::default()
+        };
+        state.library.selected_track_id = selected_id;
+        state.library.tracks = ids.iter().map(|id| audition_track(id)).collect();
+        state
+    }
+
+    fn dropdown_surface_rect(primitives: &[PaintPrimitive], anchor: Point) -> Option<Rect> {
+        primitives.iter().find_map(|primitive| match primitive {
+            PaintPrimitive::FillPolygon(fill)
+                if fill.color == ThemeTokens::default().surface_overlay =>
+            {
+                let min_x = fill
+                    .points
+                    .iter()
+                    .map(|point| point.x)
+                    .fold(f32::INFINITY, f32::min);
+                let min_y = fill
+                    .points
+                    .iter()
+                    .map(|point| point.y)
+                    .fold(f32::INFINITY, f32::min);
+                let max_x = fill
+                    .points
+                    .iter()
+                    .map(|point| point.x)
+                    .fold(f32::NEG_INFINITY, f32::max);
+                let max_y = fill
+                    .points
+                    .iter()
+                    .map(|point| point.y)
+                    .fold(f32::NEG_INFINITY, f32::max);
+                let rect = Rect::from_min_max(Point::new(min_x, min_y), Point::new(max_x, max_y));
+                ((rect.min.x - anchor.x).abs() < 0.01 && (rect.min.y - anchor.y).abs() < 0.01)
+                    .then_some(rect)
+            }
+            PaintPrimitive::FillRect(fill)
+                if fill.color == ThemeTokens::default().surface_overlay
+                    && (fill.rect.min.x - anchor.x).abs() < 0.01
+                    && (fill.rect.min.y - anchor.y).abs() < 0.01 =>
+            {
+                Some(fill.rect)
+            }
+            _ => None,
+        })
     }
 
     fn planner_drag_preview_rect(state: &AppState) -> Option<Rect> {
@@ -1916,6 +6309,75 @@ mod tests {
     }
 
     #[test]
+    fn unmodified_n_maps_to_a_new_note_at_the_current_time() {
+        let state = AppState::default();
+
+        assert_eq!(
+            playback_shortcut(&state, ui::KeyPress::new(ui::KeyCode::N)),
+            ui::ShortcutResolution::action(Message::NewNoteAtCurrentTime)
+        );
+    }
+
+    #[test]
+    fn note_shortcut_creates_a_draft_for_the_current_audition_track_and_focuses_editor() {
+        let mut state = audition_state(&["note-hotkey-track"]);
+        state.review_cursor_millis = 640;
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut state, Message::NewNoteAtCurrentTime, &mut context);
+
+        let focus_command = context.into_command();
+        assert!(matches!(
+            focus_command,
+            radiant::runtime::Command::Batch(commands)
+                if commands.iter().any(|command| matches!(
+                    command,
+                    radiant::runtime::Command::Focus(id)
+                        if *id == super::MAIN_COMMENT_EDITOR_ID
+                ))
+        ));
+        assert_eq!(
+            state.draft_note.as_ref().map(|draft| draft.time_millis),
+            Some(640)
+        );
+        assert_eq!(state.status, "Comment at 00:00 — type a note below.");
+    }
+
+    #[test]
+    fn project_surface_exposes_shell_context_and_playback_hints() {
+        let labels = project_surface(&AppState::default())
+            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 720.0))
+            .paint_plan
+            .text_label_strings();
+
+        assert!(!labels.iter().any(|label| label == "PORTALSURFER / CADENCE"));
+        assert!(!labels.iter().any(|label| label == "LOCAL REVIEW DESK"));
+
+        for label in [
+            "Review",
+            "Planner",
+            "Audition",
+            "SPACE  play · ESC  stop · N  note",
+        ] {
+            assert!(
+                labels.iter().any(|painted| painted == label),
+                "missing {label:?}"
+            );
+        }
+        assert!(!labels.iter().any(|label| label == "NATIVE · RADIANT"));
+    }
+
+    #[test]
+    fn playback_shortcut_maps_unmodified_escape_to_stop_playback() {
+        let state = AppState::default();
+
+        assert_eq!(
+            playback_shortcut(&state, ui::KeyPress::new(ui::KeyCode::Escape)),
+            ui::ShortcutResolution::action(Message::StopPlayback)
+        );
+    }
+
+    #[test]
     fn playhead_drag_tracks_pointer_and_starts_playback_on_release() {
         let mut state = AppState {
             busy: false,
@@ -1924,6 +6386,8 @@ mod tests {
                 channels: 1,
                 duration_millis: 1_000,
                 render_frames: 48_000,
+                integrated_lufs: Some(-7.0),
+                loudness_profile: std::sync::Arc::from([]),
                 summary: Arc::new(
                     radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                         &[0.1, 0.8, 0.2, 0.4],
@@ -1997,6 +6461,181 @@ mod tests {
         assert!(state.transport_playing);
     }
 
+    fn persisted_comment_drag_state() -> (AppState, String, String) {
+        let track_id = String::from("comment-drag-track");
+        let note_id = String::from("move-me");
+        let waveform = WaveformData {
+            sample_rate: 48_000,
+            channels: 1,
+            duration_millis: 2_000,
+            render_frames: 96_000,
+            integrated_lufs: Some(-7.0),
+            loudness_profile: Arc::from([]),
+            summary: Arc::new(
+                radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                    &[0.1, 0.8, 0.2, 0.4],
+                    4,
+                    1,
+                ),
+            ),
+        };
+        let mut state = AppState {
+            busy: false,
+            waveform: Some(waveform),
+            waveform_track_id: Some(track_id.clone()),
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(track_id.clone());
+        state.library.tracks.push(Track {
+            id: track_id.clone(),
+            title: String::from("Comment drag track"),
+            original_name: String::from("comment-drag-track.wav"),
+            path: PathBuf::from("/external/comment-drag-track.wav"),
+            reference_path: None,
+            size: 0,
+            favorite: false,
+            stage: TrackStage::SoundDesign,
+            status: TrackStatus::Inbox,
+            notes: vec![
+                Note {
+                    id: note_id.clone(),
+                    time_millis: 500,
+                    body: String::from("move this"),
+                    done: false,
+                },
+                Note {
+                    id: String::from("anchor"),
+                    time_millis: 1_000,
+                    body: String::from("keep this"),
+                    done: false,
+                },
+            ],
+        });
+        (state, track_id, note_id)
+    }
+
+    #[test]
+    fn persisted_comment_drag_moves_and_saves_the_selected_note() {
+        let (mut state, _track_id, note_id) = persisted_comment_drag_state();
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::CommentDragStarted {
+                ratio: 0.25,
+                note_index: Some(0),
+            },
+            &mut context,
+        );
+        assert_eq!(state.selected_note_id.as_deref(), Some(note_id.as_str()));
+        assert!(state.draft_note.is_none());
+        assert!(state.persisted_note_drag.is_some());
+
+        update(
+            &mut state,
+            Message::CommentDragMoved { ratio: 0.75 },
+            &mut context,
+        );
+        assert_eq!(state.review_cursor_millis, 1_500);
+        assert_eq!(
+            selected_track(&state)
+                .and_then(|track| track.notes.iter().find(|note| note.id == note_id))
+                .map(|note| note.time_millis),
+            Some(1_500)
+        );
+
+        update(
+            &mut state,
+            Message::CommentDragEnded { ratio: 0.75 },
+            &mut context,
+        );
+        assert!(state.persisted_note_drag.is_none());
+        assert!(state.save_in_flight);
+        let note_ids = selected_track(&state).map(|track| {
+            track
+                .notes
+                .iter()
+                .map(|note| note.id.as_str())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(note_ids, Some(vec!["anchor", "move-me"]));
+        assert_eq!(state.status, "Comment moved to 00:01 and saved locally.");
+    }
+
+    #[test]
+    fn persisted_comment_drag_cancellation_rolls_back_without_saving() {
+        let (mut state, track_id, note_id) = persisted_comment_drag_state();
+        state.draft_note = Some(NoteDraft {
+            note_id: Some(note_id.clone()),
+            time_millis: 500,
+            body: String::from("edit this"),
+        });
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::CommentDragStarted {
+                ratio: 0.25,
+                note_index: Some(0),
+            },
+            &mut context,
+        );
+        update(
+            &mut state,
+            Message::CommentDragMoved { ratio: 0.75 },
+            &mut context,
+        );
+        assert_eq!(state.review_cursor_millis, 1_500);
+        assert_eq!(
+            state
+                .library
+                .tracks
+                .iter()
+                .find(|track| track.id == track_id)
+                .and_then(|track| track.notes.iter().find(|note| note.id == note_id))
+                .map(|note| note.time_millis),
+            Some(1_500)
+        );
+        assert_eq!(
+            state.draft_note.as_ref().map(|draft| draft.time_millis),
+            Some(1_500)
+        );
+
+        update(&mut state, Message::CommentDragCancelled, &mut context);
+        assert_eq!(
+            selected_track(&state)
+                .and_then(|track| track.notes.iter().find(|note| note.id == note_id))
+                .map(|note| note.time_millis),
+            Some(500)
+        );
+        assert_eq!(state.review_cursor_millis, 500);
+        assert_eq!(
+            state.draft_note.as_ref().map(|draft| draft.time_millis),
+            Some(500)
+        );
+        assert!(state.persisted_note_drag.is_none());
+        assert!(!state.save_in_flight);
+
+        update(
+            &mut state,
+            Message::CommentDragMoved { ratio: 0.25 },
+            &mut context,
+        );
+        update(
+            &mut state,
+            Message::CommentDragEnded { ratio: 0.25 },
+            &mut context,
+        );
+        assert_eq!(
+            selected_track(&state)
+                .and_then(|track| track.notes.iter().find(|note| note.id == note_id))
+                .map(|note| note.time_millis),
+            Some(500)
+        );
+        assert!(state.persisted_note_drag.is_none());
+        assert!(!state.save_in_flight);
+    }
+
     #[test]
     fn modified_space_is_unhandled() {
         let state = AppState::default();
@@ -2006,6 +6645,23 @@ mod tests {
             ui::KeyPress::with_control(ui::KeyCode::Space),
             ui::KeyPress::with_shift(ui::KeyCode::Space),
             ui::KeyPress::with_alt(ui::KeyCode::Space),
+        ] {
+            assert_eq!(
+                playback_shortcut(&state, press),
+                ui::ShortcutResolution::unhandled()
+            );
+        }
+    }
+
+    #[test]
+    fn modified_escape_is_unhandled() {
+        let state = AppState::default();
+
+        for press in [
+            ui::KeyPress::with_command(ui::KeyCode::Escape),
+            ui::KeyPress::with_control(ui::KeyCode::Escape),
+            ui::KeyPress::with_shift(ui::KeyCode::Escape),
+            ui::KeyPress::with_alt(ui::KeyCode::Escape),
         ] {
             assert_eq!(
                 playback_shortcut(&state, press),
@@ -2029,11 +6685,927 @@ mod tests {
             playback_shortcut(&state, ui::KeyPress::new(ui::KeyCode::Space)),
             ui::ShortcutResolution::unhandled()
         );
+        assert_eq!(
+            playback_shortcut(&state, ui::KeyPress::new(ui::KeyCode::N)),
+            ui::ShortcutResolution::unhandled()
+        );
+        assert_eq!(
+            playback_shortcut(&state, ui::KeyPress::new(ui::KeyCode::Escape)),
+            ui::ShortcutResolution::action(Message::StopPlayback)
+        );
+    }
+
+    #[test]
+    fn note_editor_submits_on_enter() {
+        #[derive(Clone)]
+        struct NoteEditorState {
+            draft: NoteDraft,
+            submitted: bool,
+        }
+
+        let bridge = DeclarativeOwnedRuntimeBridge::new(
+            NoteEditorState {
+                draft: NoteDraft {
+                    note_id: None,
+                    time_millis: 1_000,
+                    body: String::from("Submit me"),
+                },
+                submitted: false,
+            },
+            |state| {
+                ui::scene(note_editor(&state.draft))
+                    .into_view()
+                    .into_surface()
+            },
+            |state, message| {
+                if message == Message::SaveDraftNote {
+                    state.submitted = true;
+                }
+            },
+        );
+        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(640.0, 180.0));
+        let focused = runtime
+            .traverse_focus(FocusTraversal::Forward)
+            .expect("the comment input should participate in keyboard focus");
+
+        assert_eq!(
+            runtime.dispatch_event(Event::key_press(ui::WidgetKey::Enter)),
+            Some(focused)
+        );
+        assert!(runtime.bridge().state().submitted);
     }
 
     #[test]
     fn native_launch_starts_maximized() {
-        assert!(native_launch_options().window.behavior.maximized);
+        let options = native_launch_options();
+        assert!(options.window.behavior.maximized);
+        assert!(options.window.behavior.integrated_titlebar);
+        assert_eq!(
+            options
+                .window
+                .behavior
+                .integrated_titlebar_drag_region_height,
+            Some(42.0)
+        );
+    }
+
+    #[test]
+    fn audition_volume_changes_output_gain_without_changing_raw_lufs() {
+        let mut state = AppState {
+            busy: false,
+            waveform: Some(WaveformData {
+                sample_rate: 48_000,
+                channels: 2,
+                duration_millis: 1_000,
+                render_frames: 48_000,
+                integrated_lufs: Some(-7.0),
+                loudness_profile: std::sync::Arc::from([]),
+                summary: Arc::new(
+                    radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                        &[0.1, 0.8, 0.2, 0.4],
+                        4,
+                        2,
+                    ),
+                ),
+            }),
+            ..AppState::default()
+        };
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::AuditionVolumeChanged(0.25),
+            &mut context,
+        );
+
+        assert_eq!(state.audition_volume, 0.25);
+        assert_eq!(
+            state
+                .waveform
+                .as_ref()
+                .and_then(|waveform| waveform.integrated_lufs),
+            Some(-7.0)
+        );
+    }
+
+    #[test]
+    fn lufs_meter_follows_playback_position_without_volume_influence() {
+        let track_id = String::from("meter-track");
+        let mut state = AppState {
+            waveform: Some(WaveformData {
+                sample_rate: 100,
+                channels: 2,
+                duration_millis: 800,
+                render_frames: 80,
+                integrated_lufs: Some(-8.0),
+                loudness_profile: std::sync::Arc::from([
+                    LoudnessPoint {
+                        end_frame: 40,
+                        lufs: -4.0,
+                    },
+                    LoudnessPoint {
+                        end_frame: 80,
+                        lufs: -12.0,
+                    },
+                ]),
+                summary: Arc::new(
+                    radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                        &[0.1, 0.8, 0.2, 0.4],
+                        4,
+                        2,
+                    ),
+                ),
+            }),
+            waveform_track_id: Some(track_id.clone()),
+            transport_playing: true,
+            transport_position_millis: 400,
+            audition_volume: 0.1,
+            ..AppState::default()
+        };
+
+        assert_eq!(current_lufs_meter_value(&state, &track_id), Some(-4.0));
+
+        state.transport_position_millis = 600;
+        assert_eq!(current_lufs_meter_value(&state, &track_id), Some(-8.0));
+
+        state.audition_volume = 0.9;
+        assert_eq!(current_lufs_meter_value(&state, &track_id), Some(-8.0));
+
+        state.transport_position_millis = 800;
+        state.transport_playing = false;
+        assert_eq!(current_lufs_meter_value(&state, &track_id), Some(-12.0));
+    }
+
+    #[test]
+    fn reference_lufs_meter_follows_its_own_playback_position() {
+        let track_id = String::from("reference-meter-track");
+        let mut state = AppState {
+            waveform: Some(WaveformData {
+                sample_rate: 100,
+                channels: 1,
+                duration_millis: 800,
+                render_frames: 80,
+                integrated_lufs: Some(-8.0),
+                loudness_profile: std::sync::Arc::from([]),
+                summary: Arc::new(
+                    radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                        &[0.1, 0.8, 0.2, 0.4],
+                        4,
+                        1,
+                    ),
+                ),
+            }),
+            waveform_track_id: Some(track_id.clone()),
+            reference_waveform: Some(WaveformData {
+                sample_rate: 100,
+                channels: 1,
+                duration_millis: 800,
+                render_frames: 80,
+                integrated_lufs: Some(-8.0),
+                loudness_profile: std::sync::Arc::from([
+                    LoudnessPoint {
+                        end_frame: 40,
+                        lufs: -4.0,
+                    },
+                    LoudnessPoint {
+                        end_frame: 80,
+                        lufs: -12.0,
+                    },
+                ]),
+                summary: Arc::new(
+                    radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                        &[0.1, 0.8, 0.2, 0.4],
+                        4,
+                        1,
+                    ),
+                ),
+            }),
+            reference_waveform_track_id: Some(track_id.clone()),
+            transport_position_millis: 800,
+            reference_transport_position_millis: 400,
+            ..AppState::default()
+        };
+
+        assert_eq!(
+            current_reference_lufs_meter_value(&state, &track_id),
+            Some(-4.0)
+        );
+
+        state.reference_transport_position_millis = 600;
+        assert_eq!(
+            current_reference_lufs_meter_value(&state, &track_id),
+            Some(-8.0)
+        );
+        assert_eq!(current_lufs_meter_value(&state, &track_id), Some(-8.0));
+    }
+
+    #[test]
+    fn reference_match_uses_raw_lufs_without_changing_primary_volume() {
+        let track_id = String::from("match-track");
+        let primary = WaveformData {
+            sample_rate: 48_000,
+            channels: 2,
+            duration_millis: 1_000,
+            render_frames: 48_000,
+            integrated_lufs: Some(-8.0),
+            loudness_profile: std::sync::Arc::from([]),
+            summary: Arc::new(
+                radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                    &[0.1, 0.8, 0.2, 0.4],
+                    4,
+                    2,
+                ),
+            ),
+        };
+        let mut reference = primary.clone();
+        reference.integrated_lufs = Some(-14.0);
+        let mut state = AppState {
+            busy: false,
+            waveform: Some(primary),
+            waveform_track_id: Some(track_id.clone()),
+            reference_waveform: Some(reference),
+            reference_waveform_track_id: Some(track_id.clone()),
+            audition_volume: 0.5,
+            audition_source: AuditionSource::Reference,
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(track_id.clone());
+        state.library.tracks.push(Track {
+            id: track_id,
+            title: String::from("Match track"),
+            original_name: String::from("match-track.wav"),
+            path: PathBuf::from("/external/match-track.wav"),
+            reference_path: Some(PathBuf::from("/external/reference.wav")),
+            size: 0,
+            favorite: false,
+            stage: TrackStage::SoundDesign,
+            status: TrackStatus::Inbox,
+            notes: Vec::new(),
+        });
+        let mut context = ui::UiUpdateContext::default();
+
+        assert_eq!(current_loudness_match_gain_db(&state), Some(6.0));
+        update(&mut state, Message::ToggleReferenceMatch, &mut context);
+
+        assert!(state.reference_match_enabled);
+        assert_eq!(state.audition_volume, 0.5);
+        assert_eq!(
+            state
+                .waveform
+                .as_ref()
+                .and_then(|waveform| waveform.integrated_lufs),
+            Some(-8.0)
+        );
+        assert!((reference_output_gain(&state) - 0.9976).abs() < 0.002);
+    }
+
+    #[test]
+    fn audition_source_toggle_switches_the_audible_synchronized_track() {
+        let track_id = String::from("audition-track");
+        let waveform = WaveformData {
+            sample_rate: 48_000,
+            channels: 2,
+            duration_millis: 1_000,
+            render_frames: 48_000,
+            integrated_lufs: Some(-8.0),
+            loudness_profile: std::sync::Arc::from([]),
+            summary: Arc::new(
+                radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                    &[0.1, 0.8, 0.2, 0.4],
+                    4,
+                    2,
+                ),
+            ),
+        };
+        let mut state = AppState {
+            busy: false,
+            waveform: Some(waveform.clone()),
+            waveform_track_id: Some(track_id.clone()),
+            reference_waveform: Some(waveform),
+            reference_waveform_track_id: Some(track_id.clone()),
+            audition_volume: 0.5,
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(track_id.clone());
+        state.library.tracks.push(Track {
+            id: track_id,
+            title: String::from("Audition track"),
+            original_name: String::from("audition.wav"),
+            path: PathBuf::from("/external/audition.wav"),
+            reference_path: Some(PathBuf::from("/external/reference.wav")),
+            size: 0,
+            favorite: false,
+            stage: TrackStage::SoundDesign,
+            status: TrackStatus::Inbox,
+            notes: Vec::new(),
+        });
+        let mut context = ui::UiUpdateContext::default();
+
+        assert_eq!(main_output_gain(&state), 0.5);
+        assert_eq!(reference_output_gain(&state), 0.0);
+        update(
+            &mut state,
+            Message::SelectAuditionSource(AuditionSource::Reference),
+            &mut context,
+        );
+        assert_eq!(state.audition_source, AuditionSource::Reference);
+        assert_eq!(main_output_gain(&state), 0.0);
+        assert_eq!(reference_output_gain(&state), 0.5);
+        update(
+            &mut state,
+            Message::SelectAuditionSource(AuditionSource::Main),
+            &mut context,
+        );
+        assert_eq!(state.audition_source, AuditionSource::Main);
+
+        update(
+            &mut state,
+            Message::SelectAuditionSource(AuditionSource::Reference),
+            &mut context,
+        );
+        assert_eq!(state.audition_source, AuditionSource::Reference);
+        update(
+            &mut state,
+            Message::SelectAuditionSource(AuditionSource::Reference),
+            &mut context,
+        );
+        assert_eq!(state.audition_source, AuditionSource::Reference);
+    }
+
+    #[test]
+    fn main_waveform_click_switches_audition_to_the_imported_track() {
+        let mut state = shared_reference_playback_state();
+        state.audition_source = AuditionSource::Reference;
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::WaveformClicked {
+                ratio: 0.25,
+                lower: false,
+            },
+            &mut context,
+        );
+
+        assert_eq!(state.audition_source, AuditionSource::Main);
+        assert!(main_output_gain(&state) > 0.0);
+        assert_eq!(reference_output_gain(&state), 0.0);
+    }
+
+    #[test]
+    fn reference_waveform_click_then_loop_selection_resumes_shared_playback() {
+        let track_id = String::from("reference-click-track");
+        let main_waveform = WaveformData {
+            sample_rate: 48_000,
+            channels: 2,
+            duration_millis: 2_000,
+            render_frames: 96_000,
+            integrated_lufs: Some(-8.0),
+            loudness_profile: std::sync::Arc::from([]),
+            summary: Arc::new(
+                radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                    &[0.1, 0.8, 0.2, 0.4],
+                    4,
+                    2,
+                ),
+            ),
+        };
+        let reference_waveform = WaveformData {
+            duration_millis: 4_000,
+            render_frames: 192_000,
+            ..main_waveform.clone()
+        };
+        let mut state = AppState {
+            busy: false,
+            waveform: Some(main_waveform),
+            waveform_track_id: Some(track_id.clone()),
+            reference_waveform: Some(reference_waveform),
+            reference_waveform_track_id: Some(track_id.clone()),
+            reference_transport: Some(transport::AudioTransport::spawn()),
+            reference_transport_loaded: true,
+            reference_loop_selection: Some(ReferenceLoopSelection {
+                start_ratio: 0.1,
+                end_ratio: 0.2,
+            }),
+            review_cursor_millis: 600,
+            transport_position_millis: 600,
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(track_id.clone());
+        state.library.tracks.push(Track {
+            id: track_id,
+            title: String::from("Reference click track"),
+            original_name: String::from("reference-click.wav"),
+            path: PathBuf::from("/external/reference-click.wav"),
+            reference_path: Some(PathBuf::from("/external/reference.wav")),
+            size: 0,
+            favorite: false,
+            stage: TrackStage::SoundDesign,
+            status: TrackStatus::Inbox,
+            notes: Vec::new(),
+        });
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::ReferenceWaveformClicked { ratio: 0.25 },
+            &mut context,
+        );
+
+        assert_eq!(state.review_cursor_millis, 600);
+        assert_eq!(state.transport_position_millis, 600);
+        assert_eq!(state.reference_transport_position_millis, 1_000);
+        assert!(!state.transport_polling);
+        assert!(state.transport_waiting_token.is_none());
+        assert!(state.reference_transport_polling);
+        assert!(state.reference_transport_waiting_token.is_some());
+        assert!(state.reference_only_playback);
+        assert_eq!(state.audition_source, AuditionSource::Reference);
+        assert_eq!(main_output_gain(&state), 0.0);
+        assert_eq!(
+            waveform::ratio_for_millis(state.review_cursor_millis, 2_000),
+            Some(0.3)
+        );
+        assert_eq!(
+            waveform::ratio_for_millis(state.reference_transport_position_millis, 4_000),
+            Some(0.25)
+        );
+
+        update(
+            &mut state,
+            Message::ReferenceLoopDragEnded {
+                start_ratio: 0.25,
+                end_ratio: 0.75,
+            },
+            &mut context,
+        );
+
+        assert!(!state.reference_only_playback);
+        assert!(state.transport_polling);
+        assert!(state.transport_waiting_token.is_some());
+        assert!(state.reference_transport_polling);
+        assert!(state.reference_transport_waiting_token.is_some());
+        assert_eq!(state.review_cursor_millis, 500);
+        assert_eq!(state.transport_position_millis, 500);
+        assert_eq!(state.reference_transport_position_millis, 1_000);
+
+        update(&mut state, Message::Frame, &mut context);
+        assert_eq!(state.review_cursor_millis, 500);
+        assert_eq!(state.transport_position_millis, 500);
+    }
+
+    #[test]
+    fn reference_waveform_click_keeps_active_main_playback_independent() {
+        let track_id = String::from("active-reference-click-track");
+        let main_waveform = WaveformData {
+            sample_rate: 48_000,
+            channels: 2,
+            duration_millis: 2_000,
+            render_frames: 96_000,
+            integrated_lufs: Some(-8.0),
+            loudness_profile: std::sync::Arc::from([]),
+            summary: Arc::new(
+                radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                    &[0.1, 0.8, 0.2, 0.4],
+                    4,
+                    2,
+                ),
+            ),
+        };
+        let reference_waveform = WaveformData {
+            duration_millis: 4_000,
+            render_frames: 192_000,
+            ..main_waveform.clone()
+        };
+        let main_position_millis = 600;
+        let mut state = AppState {
+            busy: false,
+            waveform: Some(main_waveform),
+            waveform_track_id: Some(track_id.clone()),
+            reference_waveform: Some(reference_waveform),
+            reference_waveform_track_id: Some(track_id.clone()),
+            reference_transport: Some(transport::AudioTransport::spawn()),
+            reference_transport_loaded: true,
+            reference_transport_playing: true,
+            review_cursor_millis: main_position_millis,
+            transport_position_millis: main_position_millis,
+            transport_playing: true,
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(track_id.clone());
+        state.library.tracks.push(Track {
+            id: track_id,
+            title: String::from("Active reference click track"),
+            original_name: String::from("active-reference-click.wav"),
+            path: PathBuf::from("/external/active-reference-click.wav"),
+            reference_path: Some(PathBuf::from("/external/reference.wav")),
+            size: 0,
+            favorite: false,
+            stage: TrackStage::SoundDesign,
+            status: TrackStatus::Inbox,
+            notes: Vec::new(),
+        });
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::ReferenceWaveformClicked { ratio: 0.25 },
+            &mut context,
+        );
+
+        assert!(state.reference_only_playback);
+        assert!(state.transport_playing);
+        assert!(!state.transport_polling);
+        assert!(state.transport_waiting_token.is_none());
+        assert_eq!(state.transport_position_millis, main_position_millis);
+        assert_eq!(state.review_cursor_millis, main_position_millis);
+        assert!(state.reference_transport_polling);
+        assert!(state.reference_transport_waiting_token.is_some());
+        let generation = state.transport_generation;
+        apply_transport_snapshot(
+            &mut state,
+            Snapshot {
+                generation,
+                acknowledged_token: 0,
+                position_millis: main_position_millis + 8,
+                playing: true,
+                ready: true,
+            },
+        );
+        assert_eq!(state.transport_position_millis, main_position_millis + 8);
+        assert_eq!(state.review_cursor_millis, main_position_millis + 8);
+    }
+
+    #[test]
+    fn main_waveform_playhead_resume_starts_reference_at_its_stored_position() {
+        let track_id = String::from("main-seek-track");
+        let main_waveform = WaveformData {
+            sample_rate: 48_000,
+            channels: 2,
+            duration_millis: 2_000,
+            render_frames: 96_000,
+            integrated_lufs: Some(-8.0),
+            loudness_profile: std::sync::Arc::from([]),
+            summary: Arc::new(
+                radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                    &[0.1, 0.8, 0.2, 0.4],
+                    4,
+                    2,
+                ),
+            ),
+        };
+        let reference_waveform = WaveformData {
+            duration_millis: 4_000,
+            render_frames: 192_000,
+            ..main_waveform.clone()
+        };
+        let mut state = AppState {
+            busy: false,
+            waveform: Some(main_waveform),
+            waveform_track_id: Some(track_id.clone()),
+            reference_waveform: Some(reference_waveform),
+            reference_waveform_track_id: Some(track_id.clone()),
+            reference_transport: Some(transport::AudioTransport::spawn()),
+            reference_transport_loaded: true,
+            reference_transport_position_millis: 1_500,
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(track_id.clone());
+        state.library.tracks.push(Track {
+            id: track_id,
+            title: String::from("Main seek track"),
+            original_name: String::from("main-seek.wav"),
+            path: PathBuf::from("/external/main-seek.wav"),
+            reference_path: Some(PathBuf::from("/external/reference.wav")),
+            size: 0,
+            favorite: false,
+            stage: TrackStage::SoundDesign,
+            status: TrackStatus::Inbox,
+            notes: Vec::new(),
+        });
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::WaveformPlayheadDragStarted { ratio: 0.25 },
+            &mut context,
+        );
+        update(
+            &mut state,
+            Message::WaveformPlayheadDragEnded { ratio: 0.25 },
+            &mut context,
+        );
+
+        assert!(state.reference_loop_selection.is_none());
+        assert!(state.transport_polling);
+        assert!(state.transport_waiting_token.is_some());
+        assert!(state.reference_transport_polling);
+        assert!(state.reference_transport_waiting_token.is_some());
+        let main_ratio = waveform::ratio_for_millis(state.review_cursor_millis, 2_000)
+            .expect("the main waveform duration is nonzero");
+        let reference_ratio =
+            waveform::ratio_for_millis(state.reference_transport_position_millis, 4_000)
+                .expect("the reference waveform duration is nonzero");
+        assert_eq!(main_ratio, 0.25);
+        assert_eq!(reference_ratio, 0.375);
+    }
+
+    fn shared_reference_playback_state() -> AppState {
+        let track_id = String::from("paired-admission-track");
+        let main_waveform = WaveformData {
+            sample_rate: 48_000,
+            channels: 2,
+            duration_millis: 2_000,
+            render_frames: 96_000,
+            integrated_lufs: Some(-8.0),
+            loudness_profile: std::sync::Arc::from([]),
+            summary: Arc::new(
+                radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                    &[0.1, 0.8, 0.2, 0.4],
+                    4,
+                    2,
+                ),
+            ),
+        };
+        let reference_waveform = WaveformData {
+            duration_millis: 4_000,
+            render_frames: 192_000,
+            ..main_waveform.clone()
+        };
+        let mut state = AppState {
+            busy: false,
+            waveform: Some(main_waveform),
+            waveform_track_id: Some(track_id.clone()),
+            reference_waveform: Some(reference_waveform),
+            reference_waveform_track_id: Some(track_id.clone()),
+            reference_transport: Some(transport::AudioTransport::spawn()),
+            reference_transport_loaded: true,
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(track_id.clone());
+        state.library.tracks.push(Track {
+            id: track_id,
+            title: String::from("Paired admission track"),
+            original_name: String::from("paired-admission.wav"),
+            path: PathBuf::from("/external/paired-admission.wav"),
+            reference_path: Some(PathBuf::from("/external/paired-reference.wav")),
+            size: 0,
+            favorite: false,
+            stage: TrackStage::SoundDesign,
+            status: TrackStatus::Inbox,
+            notes: Vec::new(),
+        });
+        state
+    }
+
+    #[test]
+    fn shared_play_rejects_before_main_when_reference_queue_is_full() {
+        let mut state = shared_reference_playback_state();
+        let initial_position = state.transport_position_millis;
+        state
+            .reference_transport
+            .as_ref()
+            .expect("the paired state should have a reference transport")
+            .force_command_queue_full_for_test();
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut state, Message::TogglePlayback, &mut context);
+
+        assert_eq!(state.status, transport::CONTROLS_BUSY_ERROR);
+        assert!(!state.transport_polling);
+        assert!(!state.transport_playing);
+        assert_eq!(state.transport_position_millis, initial_position);
+    }
+
+    #[test]
+    fn shared_pause_rejects_before_main_when_reference_queue_is_full() {
+        let mut state = shared_reference_playback_state();
+        state.transport_playing = true;
+        state.reference_transport_playing = true;
+        state
+            .reference_transport
+            .as_ref()
+            .expect("the paired state should have a reference transport")
+            .force_command_queue_full_for_test();
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut state, Message::TogglePlayback, &mut context);
+
+        assert_eq!(state.status, transport::CONTROLS_BUSY_ERROR);
+        assert!(!state.transport_polling);
+        assert!(state.transport_playing);
+        assert!(state.reference_transport_playing);
+    }
+
+    #[test]
+    fn stop_playback_pauses_both_active_transports() {
+        let mut state = shared_reference_playback_state();
+        state.transport_playing = true;
+        state.reference_transport_playing = true;
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut state, Message::StopPlayback, &mut context);
+
+        assert_eq!(state.status, "Stopping playback…");
+        assert!(state.transport_playing);
+        assert!(state.transport_polling);
+        assert!(state.transport_waiting_token.is_some());
+        assert!(state.reference_transport_playing);
+        assert!(state.reference_transport_polling);
+        assert!(state.reference_transport_waiting_token.is_some());
+        assert!(!state.reference_only_playback);
+    }
+
+    #[test]
+    fn stop_playback_pauses_reference_only_playback() {
+        let mut state = shared_reference_playback_state();
+        state.reference_only_playback = true;
+        state.reference_transport_playing = true;
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut state, Message::StopPlayback, &mut context);
+
+        assert_eq!(state.status, "Stopping playback…");
+        assert!(!state.transport_polling);
+        assert!(state.transport_waiting_token.is_none());
+        assert!(state.reference_transport_playing);
+        assert!(state.reference_transport_polling);
+        assert!(state.reference_transport_waiting_token.is_some());
+        assert!(!state.reference_only_playback);
+    }
+
+    #[test]
+    fn stop_playback_rejects_before_main_when_reference_queue_is_full() {
+        let mut state = shared_reference_playback_state();
+        state.transport_playing = true;
+        state.reference_transport_playing = true;
+        state
+            .reference_transport
+            .as_ref()
+            .expect("the paired state should have a reference transport")
+            .force_command_queue_full_for_test();
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut state, Message::StopPlayback, &mut context);
+
+        assert_eq!(state.status, transport::CONTROLS_BUSY_ERROR);
+        assert!(!state.transport_polling);
+        assert!(state.transport_waiting_token.is_none());
+        assert!(state.transport_playing);
+        assert!(state.reference_transport_playing);
+    }
+
+    #[test]
+    fn toggle_playback_resumes_unloaded_reference_at_stored_normalized_position() {
+        let track_id = String::from("resume-reference-track");
+        let main_waveform = WaveformData {
+            sample_rate: 48_000,
+            channels: 2,
+            duration_millis: 2_000,
+            render_frames: 96_000,
+            integrated_lufs: Some(-8.0),
+            loudness_profile: std::sync::Arc::from([]),
+            summary: Arc::new(
+                radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                    &[0.1, 0.8, 0.2, 0.4],
+                    4,
+                    2,
+                ),
+            ),
+        };
+        let reference_waveform = WaveformData {
+            duration_millis: 4_000,
+            render_frames: 192_000,
+            ..main_waveform.clone()
+        };
+        let mut state = AppState {
+            busy: false,
+            waveform: Some(main_waveform),
+            waveform_track_id: Some(track_id.clone()),
+            reference_waveform: Some(reference_waveform),
+            reference_waveform_track_id: Some(track_id.clone()),
+            reference_transport: Some(transport::AudioTransport::spawn()),
+            reference_transport_loaded: false,
+            transport_playing: true,
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(track_id.clone());
+        state.library.tracks.push(Track {
+            id: track_id,
+            title: String::from("Resume reference track"),
+            original_name: String::from("resume-reference.wav"),
+            path: PathBuf::from("/external/resume-reference.wav"),
+            reference_path: Some(PathBuf::from("/external/reference.wav")),
+            size: 0,
+            favorite: false,
+            stage: TrackStage::SoundDesign,
+            status: TrackStatus::Inbox,
+            notes: Vec::new(),
+        });
+
+        let main_position_millis = 500;
+        state.transport_position_millis = main_position_millis;
+        state.review_cursor_millis = main_position_millis;
+        state.reference_transport_position_millis = 1_000;
+        assert_eq!(state.reference_transport_position_millis, 1_000);
+        assert!(!state.reference_transport_loaded);
+        assert!(state.reference_loop_selection.is_none());
+
+        let mut context = ui::UiUpdateContext::default();
+        update(&mut state, Message::TogglePlayback, &mut context);
+        assert!(state.transport_polling);
+
+        // Acknowledge the pause without waiting for the background transport.
+        state.transport_polling = false;
+        state.transport_waiting_token = None;
+        state.transport_playing = false;
+        update(&mut state, Message::TogglePlayback, &mut context);
+
+        assert_eq!(state.reference_transport_position_millis, 1_000);
+        assert_eq!(
+            waveform::ratio_for_millis(state.transport_position_millis, 2_000),
+            waveform::ratio_for_millis(state.reference_transport_position_millis, 4_000)
+        );
+    }
+
+    #[test]
+    fn reference_loop_selection_maps_to_both_track_timelines() {
+        let track_id = String::from("loop-track");
+        let primary = WaveformData {
+            sample_rate: 48_000,
+            channels: 2,
+            duration_millis: 2_000,
+            render_frames: 96_000,
+            integrated_lufs: Some(-8.0),
+            loudness_profile: std::sync::Arc::from([]),
+            summary: Arc::new(
+                radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                    &[0.1, 0.8, 0.2, 0.4],
+                    4,
+                    2,
+                ),
+            ),
+        };
+        let reference = WaveformData {
+            duration_millis: 4_000,
+            render_frames: 192_000,
+            ..primary.clone()
+        };
+        let mut state = AppState {
+            busy: false,
+            waveform: Some(primary),
+            waveform_track_id: Some(track_id.clone()),
+            reference_waveform: Some(reference),
+            reference_waveform_track_id: Some(track_id.clone()),
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(track_id.clone());
+        state.library.tracks.push(Track {
+            id: track_id,
+            title: String::from("Loop track"),
+            original_name: String::from("loop.wav"),
+            path: PathBuf::from("/external/loop.wav"),
+            reference_path: Some(PathBuf::from("/external/reference.wav")),
+            size: 0,
+            favorite: false,
+            stage: TrackStage::SoundDesign,
+            status: TrackStatus::Inbox,
+            notes: Vec::new(),
+        });
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::ReferenceLoopDragEnded {
+                start_ratio: 0.25,
+                end_ratio: 0.75,
+            },
+            &mut context,
+        );
+
+        assert_eq!(
+            state.reference_loop_selection,
+            Some(ReferenceLoopSelection {
+                start_ratio: 0.25,
+                end_ratio: 0.75,
+            })
+        );
+        assert_eq!(state.transport_position_millis, 500);
+        assert_eq!(state.reference_transport_position_millis, 1_000);
+        assert_eq!(
+            reference_loop_bounds(&state),
+            Some((500, 1_500, 1_000, 3_000))
+        );
+
+        update(
+            &mut state,
+            Message::ReferenceLoopDragEnded {
+                start_ratio: 0.25,
+                end_ratio: 0.25,
+            },
+            &mut context,
+        );
+        assert_eq!(state.reference_loop_selection, None);
     }
 
     #[test]
@@ -2046,6 +7618,8 @@ mod tests {
                 channels: 1,
                 duration_millis: 2_000,
                 render_frames: 96_000,
+                integrated_lufs: Some(-7.0),
+                loudness_profile: std::sync::Arc::from([]),
                 summary: Arc::new(
                     radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                         &[0.1, 0.8, 0.2, 0.4],
@@ -2063,9 +7637,11 @@ mod tests {
             title: String::from("Review track"),
             original_name: String::from("review-track.wav"),
             path: PathBuf::from("/external/review-track.wav"),
+            reference_path: None,
             size: 0,
             favorite: false,
             stage: TrackStage::SoundDesign,
+            status: TrackStatus::Inbox,
             notes: Vec::new(),
         });
         let mut context = ui::UiUpdateContext::default();
@@ -2079,6 +7655,18 @@ mod tests {
             &mut context,
         );
 
+        let focus_command = context.into_command();
+        assert!(matches!(
+            focus_command,
+            radiant::runtime::Command::Batch(commands)
+                if commands.iter().any(|command| matches!(
+                    command,
+                    radiant::runtime::Command::Focus(id)
+                        if *id == super::MAIN_COMMENT_EDITOR_ID
+                ))
+        ));
+        let mut context = ui::UiUpdateContext::default();
+
         let draft = state
             .draft_note
             .as_ref()
@@ -2087,19 +7675,33 @@ mod tests {
 
         let frame = project_surface(&state)
             .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1000.0));
-        let waveform_label_rect = frame
-            .paint_plan
-            .first_text_rect("COMMENTS / CLICK TO PIN")
-            .expect("the waveform comment rail should be visible");
+        assert!(
+            frame.paint_plan.primitives.iter().any(|primitive| {
+                matches!(
+                    primitive,
+                    PaintPrimitive::StrokePolygon(stroke)
+                        if stroke.color == ThemeTokens::default().text_primary
+                            && (stroke.width - 3.0).abs() < f32::EPSILON
+                )
+            }),
+            "the draft comment node should be visible on the waveform rail"
+        );
         let editor_rect = frame
             .paint_plan
             .first_text_rect("COMMENT AT 00:01")
             .expect("the draft editor should be visible after a lower click");
         let comments_rect = frame
             .paint_plan
-            .first_text_rect("ALL COMMENTS")
+            .first_text_rect("02  COMMENTS / CLICK TO PIN")
             .expect("the lower comments panel should remain visible");
         let labels = frame.paint_plan.text_label_strings();
+
+        assert!(
+            !labels
+                .iter()
+                .any(|label| label == "COMMENTS / CLICK TO PIN"),
+            "the waveform helper label should stay hidden"
+        );
 
         assert_eq!(
             labels
@@ -2110,8 +7712,7 @@ mod tests {
             "the draft editor should have one visible timestamp header"
         );
         assert!(
-            editor_rect.min.y >= waveform_label_rect.max.y
-                && editor_rect.min.y < comments_rect.min.y,
+            editor_rect.min.y < comments_rect.min.y,
             "the draft editor should be rendered beneath the waveform and before the lower comments list"
         );
         assert!(labels.iter().any(|label| label == "Save comment"));
@@ -2127,6 +7728,255 @@ mod tests {
                 )
             }),
             "the rendered draft editor should expose its input field"
+        );
+
+        update(
+            &mut state,
+            Message::CommentDragMoved { ratio: 0.75 },
+            &mut context,
+        );
+        assert_eq!(
+            state
+                .draft_note
+                .as_ref()
+                .expect("the draft should remain open while dragging")
+                .time_millis,
+            1_500
+        );
+        assert_eq!(state.review_cursor_millis, 1_500);
+
+        state
+            .draft_note
+            .as_mut()
+            .expect("the draft should still be open")
+            .note_id = Some(String::from("existing-note"));
+        update(
+            &mut state,
+            Message::CommentDragMoved { ratio: 0.25 },
+            &mut context,
+        );
+        assert_eq!(
+            state
+                .draft_note
+                .as_ref()
+                .expect("the edit draft should remain open")
+                .time_millis,
+            1_500,
+            "editing a saved comment must keep its fixed timestamp"
+        );
+    }
+
+    #[test]
+    fn selected_reference_track_projects_a_matching_waveform_below_the_main_review() {
+        let track_id = String::from("reference-track");
+        let waveform = WaveformData {
+            sample_rate: 48_000,
+            channels: 2,
+            duration_millis: 2_000,
+            render_frames: 96_000,
+            integrated_lufs: Some(-8.0),
+            loudness_profile: std::sync::Arc::from([]),
+            summary: Arc::new(
+                radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                    &[0.1, 0.8, 0.2, 0.4],
+                    4,
+                    2,
+                ),
+            ),
+        };
+        let mut state = AppState {
+            busy: false,
+            waveform: Some(waveform.clone()),
+            waveform_track_id: Some(track_id.clone()),
+            reference_waveform: Some(waveform),
+            reference_waveform_track_id: Some(track_id.clone()),
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(track_id.clone());
+        state.library.tracks.push(Track {
+            id: track_id,
+            title: String::from("Review track"),
+            original_name: String::from("review-track.wav"),
+            path: PathBuf::from("/external/review-track.wav"),
+            reference_path: Some(PathBuf::from("/external/reference.wav")),
+            size: 0,
+            favorite: false,
+            stage: TrackStage::SoundDesign,
+            status: TrackStatus::Inbox,
+            notes: Vec::new(),
+        });
+
+        let frame = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1_000.0));
+        let reference_rect = frame
+            .paint_plan
+            .first_text_rect("REFERENCE · reference.wav · -8.0 LUFS")
+            .expect("the reference track label should be visible");
+        let title_rect = frame
+            .paint_plan
+            .first_text_rect("Review track")
+            .expect("the primary track title should be visible");
+        let play_rect = frame
+            .paint_plan
+            .first_text_rect("Play")
+            .expect("the play control should be visible");
+        let volume_rect = frame
+            .paint_plan
+            .first_text_rect("VOL 80")
+            .expect("the volume label should be visible");
+        let main_waveform_left = frame
+            .paint_plan
+            .primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                PaintPrimitive::FillRect(fill)
+                    if fill.color == ThemeTokens::default().bg_secondary
+                        && fill.rect.width() > 300.0
+                        && fill.rect.height() <= WAVEFORM_HEIGHT =>
+                {
+                    Some(fill.rect.min.x)
+                }
+                _ => None,
+            })
+            .expect("the main waveform should paint its lower rail");
+        let labels = frame.paint_plan.text_label_strings();
+
+        assert!(labels.iter().any(|label| label == "Replace reference"));
+        assert!(labels.iter().any(|label| label == "● MAIN"));
+        assert!(labels.iter().any(|label| label == "○ REF"));
+        assert!(labels.iter().any(|label| label == "Play"));
+        assert!(labels.iter().any(|label| label == "MATCH +0.0 dB"));
+        assert!(
+            !labels.iter().any(|label| label == "LOCAL TRACK"),
+            "the redundant review-card section label should stay removed"
+        );
+        assert!(
+            !labels
+                .iter()
+                .any(|label| label == "01  WAVEFORM / TOP TO PLAY"),
+            "the redundant waveform heading should stay removed"
+        );
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.contains("48000 Hz") && label.contains("00:00 / 00:02")),
+            "metadata and transport time should share the compact toolbar"
+        );
+        assert!(
+            play_rect.min.x > volume_rect.max.x,
+            "the play control should sit to the right of the volume label"
+        );
+        assert!(
+            (reference_rect.min.x - main_waveform_left).abs() < 1.0,
+            "the reference label should align with the waveform body"
+        );
+        assert!(
+            reference_rect.min.y > title_rect.min.y,
+            "the reference section should be below the primary track header"
+        );
+    }
+
+    #[test]
+    fn reference_comment_draft_saves_to_its_catalog_entry_and_switching_keeps_comments_separate() {
+        let track_id = String::from("reference-comment-track");
+        let first_path = PathBuf::from("/external/first-reference.wav");
+        let second_path = PathBuf::from("/external/second-reference.wav");
+        let waveform = audition_waveform();
+        let mut state = AppState {
+            busy: false,
+            waveform: Some(waveform.clone()),
+            waveform_track_id: Some(track_id.clone()),
+            reference_waveform: Some(waveform),
+            reference_waveform_track_id: Some(track_id.clone()),
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(track_id.clone());
+        state.library.tracks.push(Track {
+            id: track_id.clone(),
+            title: String::from("Reference comment track"),
+            original_name: String::from("reference-comment.wav"),
+            path: PathBuf::from("/external/reference-comment.wav"),
+            reference_path: Some(first_path.clone()),
+            size: 0,
+            favorite: false,
+            stage: TrackStage::SoundDesign,
+            status: TrackStatus::Inbox,
+            notes: vec![Note {
+                id: String::from("main-note"),
+                time_millis: 100,
+                body: String::from("Main track note"),
+                done: false,
+            }],
+        });
+        state.library.reference_tracks = vec![
+            ReferenceTrack {
+                path: first_path.clone(),
+                notes: Vec::new(),
+            },
+            ReferenceTrack {
+                path: second_path.clone(),
+                notes: vec![Note {
+                    id: String::from("second-reference-note"),
+                    time_millis: 700,
+                    body: String::from("Only on the second reference."),
+                    done: false,
+                }],
+            },
+        ];
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::ReferenceCommentClicked { ratio: 0.25 },
+            &mut context,
+        );
+        let focus_command = context.into_command();
+        assert!(matches!(
+            focus_command,
+            radiant::runtime::Command::Batch(commands)
+                if commands.iter().any(|command| matches!(
+                    command,
+                    radiant::runtime::Command::Focus(id)
+                        if *id == super::REFERENCE_COMMENT_EDITOR_ID
+                ))
+        ));
+        let mut context = ui::UiUpdateContext::default();
+        assert_eq!(
+            state
+                .reference_draft_note
+                .as_ref()
+                .map(|draft| draft.time_millis),
+            Some(250)
+        );
+        update(
+            &mut state,
+            Message::ReferenceDraftNoteChanged(String::from("Check the reference kick.")),
+            &mut context,
+        );
+        update(&mut state, Message::SaveReferenceDraftNote, &mut context);
+
+        assert!(state.reference_draft_note.is_none());
+        assert_eq!(state.library.tracks[0].notes[0].body, "Main track note");
+        assert_eq!(state.library.reference_tracks[0].notes.len(), 1);
+        assert_eq!(
+            state.library.reference_tracks[0].notes[0].body,
+            "Check the reference kick."
+        );
+
+        update(
+            &mut state,
+            Message::SetReferenceTrack {
+                track_id: track_id.clone(),
+                path: second_path.clone(),
+            },
+            &mut context,
+        );
+        assert_eq!(state.library.tracks[0].reference_path, Some(second_path));
+        assert_eq!(state.library.reference_tracks[0].notes.len(), 1);
+        assert_eq!(state.library.reference_tracks[1].notes.len(), 1);
+        assert_eq!(
+            selected_reference_notes(&state)[0].body,
+            "Only on the second reference."
         );
     }
 
@@ -2148,9 +7998,11 @@ mod tests {
             title: String::from("Review track"),
             original_name: String::from("review-track.wav"),
             path: PathBuf::from("/external/review-track.wav"),
+            reference_path: None,
             size: 0,
             favorite: false,
             stage: TrackStage::SoundDesign,
+            status: TrackStatus::Inbox,
             notes: vec![
                 Note {
                     id: String::from("target-note"),
@@ -2199,9 +8051,11 @@ mod tests {
             title: String::from("Review track"),
             original_name: String::from("review-track.wav"),
             path: PathBuf::from("/external/review-track.wav"),
+            reference_path: None,
             size: 0,
             favorite: false,
             stage: TrackStage::SoundDesign,
+            status: TrackStatus::Inbox,
             notes: vec![
                 Note {
                     id: String::from("open-note"),
@@ -2223,7 +8077,11 @@ mod tests {
             .paint_plan
             .text_label_strings();
 
-        assert!(labels.iter().any(|label| label == "ALL COMMENTS"));
+        assert!(
+            labels
+                .iter()
+                .any(|label| label == "02  COMMENTS / CLICK TO PIN")
+        );
         assert!(labels.iter().any(|label| label == "first comment"));
         assert!(labels.iter().any(|label| label == "second comment"));
         assert_eq!(
@@ -2237,6 +8095,495 @@ mod tests {
     }
 
     #[test]
+    fn comment_row_hover_tracks_and_clears_the_linked_note() {
+        let track_id = String::from("hover-track");
+        let mut state = AppState {
+            busy: false,
+            waveform: Some(WaveformData {
+                sample_rate: 48_000,
+                channels: 1,
+                duration_millis: 2_000,
+                render_frames: 96_000,
+                integrated_lufs: Some(-7.0),
+                loudness_profile: Arc::from([]),
+                summary: Arc::new(
+                    radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                        &[0.1, 0.8, 0.2, 0.4],
+                        4,
+                        1,
+                    ),
+                ),
+            }),
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(track_id.clone());
+        state.waveform_track_id = Some(track_id.clone());
+        state.library.tracks.push(Track {
+            id: track_id,
+            title: String::from("Hover track"),
+            original_name: String::from("hover-track.wav"),
+            path: PathBuf::from("/external/hover-track.wav"),
+            reference_path: None,
+            size: 0,
+            favorite: false,
+            stage: TrackStage::SoundDesign,
+            status: TrackStatus::Inbox,
+            notes: vec![Note {
+                id: String::from("hover-note"),
+                time_millis: 1_000,
+                body: String::from("hover me"),
+                done: false,
+            }],
+        });
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::CommentHoverStarted(String::from("hover-note")),
+            &mut context,
+        );
+        assert_eq!(state.hovered_note_id.as_deref(), Some("hover-note"));
+        assert_eq!(
+            note_ratio_for_id(
+                &state,
+                state
+                    .library
+                    .tracks
+                    .first()
+                    .expect("the track should exist"),
+                state.hovered_note_id.as_deref(),
+            ),
+            Some(0.5)
+        );
+
+        update(
+            &mut state,
+            Message::CommentHoverEnded(String::from("hover-note")),
+            &mut context,
+        );
+        assert_eq!(state.hovered_note_id, None);
+    }
+
+    #[test]
+    fn reference_comment_row_hover_and_click_route_to_the_reference_marker() {
+        let track_id = String::from("reference-hover-track");
+        let note_id = String::from("reference-hover-note");
+        let reference_path = PathBuf::from("/external/reference-hover.wav");
+        let mut state = AppState {
+            busy: false,
+            reference_waveform: Some(audition_waveform()),
+            reference_waveform_track_id: Some(track_id.clone()),
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(track_id.clone());
+        state.library.tracks.push(Track {
+            id: track_id.clone(),
+            title: String::from("Reference hover track"),
+            original_name: String::from("reference-hover.wav"),
+            path: PathBuf::from("/external/reference-hover-main.wav"),
+            reference_path: Some(reference_path.clone()),
+            size: 0,
+            favorite: false,
+            stage: TrackStage::SoundDesign,
+            status: TrackStatus::Inbox,
+            notes: Vec::new(),
+        });
+        state.library.reference_tracks.push(ReferenceTrack {
+            path: reference_path,
+            notes: vec![Note {
+                id: note_id.clone(),
+                time_millis: 500,
+                body: String::from("reference hover me"),
+                done: false,
+            }],
+        });
+
+        let bridge = DeclarativeOwnedRuntimeBridge::new(
+            state,
+            |state| project_surface(state).into_surface(),
+            |state, message| {
+                let mut context = ui::UiUpdateContext::default();
+                update(state, message, &mut context);
+            },
+        );
+        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1_180.0, 1_000.0));
+        let frame = runtime.frame_with_default_theme();
+        let comment_rect = frame
+            .paint_plan
+            .first_text_rect("reference hover me")
+            .expect("the reference comment row should paint its body");
+        let comment_point = Point::new(
+            comment_rect.min.x + comment_rect.width() * 0.5,
+            comment_rect.min.y + comment_rect.height() * 0.5,
+        );
+
+        assert!(runtime.widget_at(comment_point).is_some());
+        runtime.dispatch_event(Event::pointer_move(comment_point));
+        assert_eq!(
+            runtime
+                .bridge()
+                .state()
+                .hovered_reference_note_id
+                .as_deref(),
+            Some(note_id.as_str())
+        );
+        runtime.dispatch_primary_click(comment_point);
+        assert_eq!(
+            runtime
+                .bridge()
+                .state()
+                .selected_reference_note_id
+                .as_deref(),
+            Some(note_id.as_str())
+        );
+
+        runtime.dispatch_event(Event::pointer_move(Point::new(10.0, 10.0)));
+        assert_eq!(runtime.bridge().state().hovered_reference_note_id, None);
+    }
+
+    #[test]
+    fn reference_waveform_comment_rail_is_a_single_interactive_surface() {
+        let track_id = String::from("reference-rail-track");
+        let reference_path = PathBuf::from("/external/reference-rail.wav");
+        let waveform = audition_waveform();
+        let mut state = AppState {
+            busy: false,
+            waveform: Some(waveform.clone()),
+            waveform_track_id: Some(track_id.clone()),
+            reference_waveform: Some(waveform),
+            reference_waveform_track_id: Some(track_id.clone()),
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(track_id.clone());
+        state.library.tracks.push(Track {
+            id: track_id,
+            title: String::from("Reference rail track"),
+            original_name: String::from("reference-rail-main.wav"),
+            path: PathBuf::from("/external/reference-rail-main.wav"),
+            reference_path: Some(reference_path.clone()),
+            size: 0,
+            favorite: false,
+            stage: TrackStage::SoundDesign,
+            status: TrackStatus::Inbox,
+            notes: Vec::new(),
+        });
+        state.library.reference_tracks.push(ReferenceTrack {
+            path: reference_path,
+            notes: Vec::new(),
+        });
+
+        let bridge = DeclarativeOwnedRuntimeBridge::new(
+            state,
+            |state| project_surface(state).into_surface(),
+            |state, message| {
+                let mut context = ui::UiUpdateContext::default();
+                update(state, message, &mut context);
+            },
+        );
+        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1_180.0, 1_000.0));
+        let frame = runtime.frame_with_default_theme();
+        let reference_bars = frame
+            .paint_plan
+            .primitives
+            .iter()
+            .filter_map(|primitive| match primitive {
+                PaintPrimitive::FillRect(fill)
+                    if fill.color == ThemeTokens::default().highlight_blue_soft =>
+                {
+                    Some(fill.rect)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !reference_bars.is_empty(),
+            "the reference waveform should paint once"
+        );
+        let distinct_bar_starts =
+            reference_bars
+                .iter()
+                .fold(Vec::<f32>::new(), |mut starts, rect| {
+                    if !starts
+                        .iter()
+                        .any(|start| (*start - rect.min.x).abs() < f32::EPSILON)
+                    {
+                        starts.push(rect.min.x);
+                    }
+                    starts
+                });
+        assert_eq!(
+            distinct_bar_starts.len(),
+            reference_bars.len(),
+            "the reference signal must not be painted into a second waveform band"
+        );
+        let reference_rail_y = reference_bars
+            .iter()
+            .map(|rect| rect.max.y)
+            .fold(f32::NEG_INFINITY, f32::max)
+            + 1.0;
+        let reference_min_x = reference_bars
+            .iter()
+            .map(|rect| rect.min.x)
+            .fold(f32::INFINITY, f32::min);
+        let reference_max_x = reference_bars
+            .iter()
+            .map(|rect| rect.max.x)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let rail_point = Point::new(
+            (reference_min_x + reference_max_x) * 0.5,
+            reference_rail_y + 8.0,
+        );
+
+        assert!(
+            runtime.widget_at(rail_point).is_some(),
+            "the reference comment rail must remain in the pointer hit-test surface"
+        );
+        assert!(
+            runtime
+                .dispatch_pointer_move_with_outcome(rail_point)
+                .routed(),
+            "hovering the reference comment rail must reach the reference widget"
+        );
+        runtime.dispatch_primary_click(rail_point);
+        let reference_time = runtime
+            .bridge()
+            .state()
+            .reference_draft_note
+            .as_ref()
+            .map(|draft| draft.time_millis);
+        assert!(
+            reference_time.is_some_and(|time| time.abs_diff(500) <= 10),
+            "clicking the reference rail should create a timestamped reference comment, got {reference_time:?}"
+        );
+    }
+
+    #[test]
+    fn composed_comment_pointer_routing_preserves_waveform_marker_highlights() {
+        let track_id = String::from("composed-comment-track");
+        let note_id = String::from("composed-comment");
+        let waveform = WaveformData {
+            sample_rate: 48_000,
+            channels: 1,
+            duration_millis: 2_000,
+            render_frames: 96_000,
+            integrated_lufs: Some(-7.0),
+            loudness_profile: Arc::from([]),
+            summary: Arc::new(
+                radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                    &[0.1, 0.8, 0.2, 0.4],
+                    4,
+                    1,
+                ),
+            ),
+        };
+        let mut state = AppState {
+            busy: false,
+            waveform: Some(waveform),
+            waveform_track_id: Some(track_id.clone()),
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(track_id.clone());
+        state.library.tracks.push(Track {
+            id: track_id,
+            title: String::from("Composed comment track"),
+            original_name: String::from("composed-comment-track.wav"),
+            path: PathBuf::from("/external/composed-comment-track.wav"),
+            reference_path: None,
+            size: 0,
+            favorite: false,
+            stage: TrackStage::SoundDesign,
+            status: TrackStatus::Inbox,
+            notes: vec![Note {
+                id: note_id.clone(),
+                time_millis: 1_000,
+                body: String::from("hover and select me"),
+                done: false,
+            }],
+        });
+
+        let bridge = DeclarativeOwnedRuntimeBridge::new(
+            state,
+            |state| project_surface(state).into_surface(),
+            |state, message| {
+                let mut context = ui::UiUpdateContext::default();
+                update(state, message, &mut context);
+            },
+        );
+        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1_180.0, 1_000.0));
+        let initial_frame = runtime.frame_with_default_theme();
+        let comment_rect = initial_frame
+            .paint_plan
+            .first_text_rect("hover and select me")
+            .expect("the composed comment row should paint its body");
+        let comment_point = Point::new(
+            comment_rect.min.x + comment_rect.width() * 0.5,
+            comment_rect.min.y + comment_rect.height() * 0.5,
+        );
+        let lower_waveform_rect = initial_frame
+            .paint_plan
+            .primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                PaintPrimitive::FillRect(fill)
+                    if fill.color == ThemeTokens::default().bg_secondary
+                        && fill.rect.width() > 300.0
+                        && fill.rect.height() <= WAVEFORM_HEIGHT =>
+                {
+                    Some(fill.rect)
+                }
+                _ => None,
+            })
+            .expect("the decoded main waveform should paint its lower rail");
+        let marker_center = Point::new(
+            lower_waveform_rect.min.x + lower_waveform_rect.width() * 0.5,
+            lower_waveform_rect.min.y - 1.0,
+        );
+        let highlighted_marker_count = |primitives: &[PaintPrimitive], center: Point| {
+            primitives
+                .iter()
+                .filter(|primitive| {
+                    let PaintPrimitive::StrokePolygon(stroke) = primitive else {
+                        return false;
+                    };
+                    if stroke.color != ThemeTokens::default().text_primary
+                        || (stroke.width - 3.0).abs() >= f32::EPSILON
+                    {
+                        return false;
+                    }
+                    let min_x = stroke
+                        .points
+                        .iter()
+                        .map(|point| point.x)
+                        .fold(f32::INFINITY, f32::min);
+                    let max_x = stroke
+                        .points
+                        .iter()
+                        .map(|point| point.x)
+                        .fold(f32::NEG_INFINITY, f32::max);
+                    let min_y = stroke
+                        .points
+                        .iter()
+                        .map(|point| point.y)
+                        .fold(f32::INFINITY, f32::min);
+                    let max_y = stroke
+                        .points
+                        .iter()
+                        .map(|point| point.y)
+                        .fold(f32::NEG_INFINITY, f32::max);
+                    ((min_x + max_x) * 0.5 - center.x).abs() < 0.5
+                        && ((min_y + max_y) * 0.5 - center.y).abs() < 0.5
+                        && (max_x - min_x - 9.0).abs() < 0.5
+                        && (max_y - min_y - 9.0).abs() < 0.5
+                })
+                .count()
+        };
+
+        assert!(runtime.widget_at(comment_point).is_some());
+        runtime.dispatch_event(Event::pointer_move(comment_point));
+        assert_eq!(
+            runtime.bridge().state().hovered_note_id.as_deref(),
+            Some(note_id.as_str()),
+            "a live comment-row pointer move should reach CommentHoverStarted"
+        );
+        let hovered_frame = runtime.frame_with_default_theme();
+        assert_eq!(
+            highlighted_marker_count(&hovered_frame.paint_plan.primitives, marker_center),
+            1,
+            "hovering the composed comment row should highlight its linked waveform marker"
+        );
+
+        runtime.dispatch_primary_click(comment_point);
+        assert_eq!(
+            runtime.bridge().state().selected_note_id.as_deref(),
+            Some(note_id.as_str())
+        );
+
+        let waveform_away_point = Point::new(
+            lower_waveform_rect.min.x + lower_waveform_rect.width() * 0.1,
+            lower_waveform_rect.min.y - 20.0,
+        );
+        assert!(runtime.widget_at(waveform_away_point).is_some());
+        runtime.dispatch_event(Event::pointer_move(waveform_away_point));
+        assert_eq!(runtime.bridge().state().hovered_note_id, None);
+        assert_eq!(
+            runtime.bridge().state().selected_note_id.as_deref(),
+            Some(note_id.as_str())
+        );
+        assert_eq!(
+            highlighted_marker_count(
+                &runtime.frame_with_default_theme().paint_plan.primitives,
+                marker_center,
+            ),
+            1,
+            "moving over the waveform away from the node should preserve the selected marker highlight"
+        );
+    }
+
+    #[test]
+    fn comment_row_selection_tracks_the_linked_note_for_waveform_highlight() {
+        let track_id = String::from("selected-track");
+        let mut state = AppState {
+            busy: false,
+            waveform: Some(WaveformData {
+                sample_rate: 48_000,
+                channels: 1,
+                duration_millis: 2_000,
+                render_frames: 96_000,
+                integrated_lufs: Some(-7.0),
+                loudness_profile: Arc::from([]),
+                summary: Arc::new(
+                    radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                        &[0.1, 0.8, 0.2, 0.4],
+                        4,
+                        1,
+                    ),
+                ),
+            }),
+            waveform_track_id: Some(track_id.clone()),
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(track_id.clone());
+        state.library.tracks.push(Track {
+            id: track_id,
+            title: String::from("Selected track"),
+            original_name: String::from("selected-track.wav"),
+            path: PathBuf::from("/external/selected-track.wav"),
+            reference_path: None,
+            size: 0,
+            favorite: false,
+            stage: TrackStage::SoundDesign,
+            status: TrackStatus::Inbox,
+            notes: vec![Note {
+                id: String::from("selected-note"),
+                time_millis: 1_000,
+                body: String::from("select me"),
+                done: false,
+            }],
+        });
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::SelectNote(String::from("selected-note")),
+            &mut context,
+        );
+
+        assert_eq!(state.selected_note_id.as_deref(), Some("selected-note"));
+        assert_eq!(
+            note_ratio_for_id(
+                &state,
+                state
+                    .library
+                    .tracks
+                    .first()
+                    .expect("the track should exist"),
+                state.selected_note_id.as_deref(),
+            ),
+            Some(0.5)
+        );
+    }
+
+    #[test]
     fn waveform_completion_requires_the_current_generation_and_selection() {
         let mut state = AppState::default();
         state.library.selected_track_id = Some(String::from("track-a"));
@@ -2244,6 +8591,73 @@ mod tests {
         assert!(decode_result_is_current(&state, "track-a", 7));
         assert!(!decode_result_is_current(&state, "track-a", 6));
         assert!(!decode_result_is_current(&state, "track-b", 7));
+    }
+
+    #[test]
+    fn reference_waveform_completion_requires_the_current_generation_and_selection() {
+        let mut state = AppState::default();
+        state.library.selected_track_id = Some(String::from("track-a"));
+        state.reference_waveform_generation = 4;
+        assert!(reference_decode_result_is_current(&state, "track-a", 4));
+        assert!(!reference_decode_result_is_current(&state, "track-a", 3));
+        assert!(!reference_decode_result_is_current(&state, "track-b", 4));
+    }
+
+    #[test]
+    fn waveform_progress_publishes_only_for_the_current_selection() {
+        let waveform = WaveformData {
+            sample_rate: 48_000,
+            channels: 1,
+            duration_millis: 2_000,
+            render_frames: 2,
+            integrated_lufs: None,
+            loudness_profile: Arc::from([]),
+            summary: Arc::new(
+                radiant::runtime::GpuSignalSummary::from_interleaved_samples(&[0.2, 0.4], 2, 1),
+            ),
+        };
+        let mut state = AppState {
+            busy: false,
+            waveform_busy: true,
+            waveform_generation: 7,
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(String::from("track-a"));
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::DecodeProgress {
+                track_id: String::from("track-a"),
+                generation: 7,
+                progress: crate::audio::WaveformProgress {
+                    waveform: waveform.clone(),
+                    progress: Some(0.4),
+                },
+            },
+            &mut context,
+        );
+        assert_eq!(state.waveform_track_id.as_deref(), Some("track-a"));
+        assert_eq!(state.waveform_progress, Some(0.4));
+        assert_eq!(state.waveform.as_ref(), Some(&waveform));
+
+        update(
+            &mut state,
+            Message::DecodeProgress {
+                track_id: String::from("track-b"),
+                generation: 7,
+                progress: crate::audio::WaveformProgress {
+                    waveform: WaveformData {
+                        duration_millis: 4_000,
+                        ..waveform.clone()
+                    },
+                    progress: Some(0.8),
+                },
+            },
+            &mut context,
+        );
+        assert_eq!(state.waveform_track_id.as_deref(), Some("track-a"));
+        assert_eq!(state.waveform_progress, Some(0.4));
     }
 
     #[test]
@@ -2267,9 +8681,11 @@ mod tests {
             title: String::from(id),
             original_name: format!("{id}.wav"),
             path: PathBuf::from(format!("/external/{id}.wav")),
+            reference_path: None,
             size: 0,
             favorite: false,
             stage,
+            status: TrackStatus::Inbox,
             notes: Vec::new(),
         };
         let tracks = vec![
@@ -2284,6 +8700,145 @@ mod tests {
         assert_eq!(production.len(), 1);
         assert_eq!(production[0].id, "production");
         assert!(mastering.is_empty());
+    }
+
+    #[test]
+    fn review_and_planner_status_filters_only_project_matching_tracks() {
+        let track = |id: &str, status: TrackStatus, stage: TrackStage| Track {
+            id: String::from(id),
+            title: format!("{id} track"),
+            original_name: format!("{id}.wav"),
+            path: PathBuf::from(format!("/external/{id}.wav")),
+            reference_path: None,
+            size: 0,
+            favorite: false,
+            stage,
+            status,
+            notes: Vec::new(),
+        };
+        let tracks = vec![
+            track("inbox", TrackStatus::Inbox, TrackStage::SoundDesign),
+            track("refine", TrackStatus::Refine, TrackStage::Production),
+            track("release", TrackStatus::Release, TrackStage::Mixdown),
+        ];
+
+        let refined = tracks_with_status(&tracks, Some(TrackStatus::Refine));
+        assert_eq!(
+            refined
+                .iter()
+                .map(|track| track.id.as_str())
+                .collect::<Vec<_>>(),
+            ["refine"]
+        );
+        assert_eq!(
+            tracks_in_stage(&refined, TrackStage::Production)
+                .iter()
+                .map(|track| track.id.as_str())
+                .collect::<Vec<_>>(),
+            ["refine"]
+        );
+
+        let mut review = AppState {
+            busy: false,
+            workspace_mode: WorkspaceMode::Review,
+            review_status_filter: Some(TrackStatus::Refine),
+            ..AppState::default()
+        };
+        review.library.tracks = tracks.clone();
+        let review_labels = project_surface(&review)
+            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 720.0))
+            .paint_plan
+            .text_label_strings();
+        assert!(review_labels.iter().any(|label| label == "refine track"));
+        assert!(!review_labels.iter().any(|label| label == "inbox track"));
+        assert!(!review_labels.iter().any(|label| label == "release track"));
+
+        let mut planner = AppState {
+            busy: false,
+            workspace_mode: WorkspaceMode::Planner,
+            planner_status_filter: Some(TrackStatus::Refine),
+            ..AppState::default()
+        };
+        planner.library.tracks = tracks;
+        let planner_labels = project_surface(&planner)
+            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 720.0))
+            .paint_plan
+            .text_label_strings();
+        assert!(planner_labels.iter().any(|label| label == "refine track"));
+        assert!(!planner_labels.iter().any(|label| label == "inbox track"));
+        assert!(!planner_labels.iter().any(|label| label == "release track"));
+
+        planner.planner_status_filter = Some(TrackStatus::Archive);
+        let empty_planner_labels = project_surface(&planner)
+            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 720.0))
+            .paint_plan
+            .text_label_strings();
+        assert!(
+            empty_planner_labels
+                .iter()
+                .any(|label| label == "No tracks in the Archive status.")
+        );
+        assert!(
+            !empty_planner_labels
+                .iter()
+                .any(|label| label == "No tracks here yet.")
+        );
+    }
+
+    #[test]
+    fn changing_status_filters_closes_hidden_card_controls() {
+        let mut state = AppState {
+            busy: false,
+            stage_menu_track_id: Some(String::from("hidden-track")),
+            stage_menu_anchor: Some(Point::new(40.0, 80.0)),
+            status_menu_track_id: Some(String::from("hidden-track")),
+            status_menu_host: Some(StatusMenuHost::Library),
+            ..AppState::default()
+        };
+        state.library.tracks.push(Track {
+            id: String::from("hidden-track"),
+            title: String::from("Hidden track"),
+            original_name: String::from("hidden-track.wav"),
+            path: PathBuf::from("/external/hidden-track.wav"),
+            reference_path: None,
+            size: 0,
+            favorite: false,
+            stage: TrackStage::Production,
+            status: TrackStatus::Inbox,
+            notes: Vec::new(),
+        });
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::SetReviewStatusFilter(Some(TrackStatus::Refine)),
+            &mut context,
+        );
+        assert!(state.stage_menu_track_id.is_none());
+        assert!(state.stage_menu_anchor.is_none());
+        assert!(state.status_menu_track_id.is_none());
+        assert!(state.status_menu_host.is_none());
+
+        state.stage_menu_track_id = Some(String::from("hidden-track"));
+        state.stage_menu_anchor = Some(Point::new(40.0, 80.0));
+        state.status_menu_track_id = Some(String::from("hidden-track"));
+        state.status_menu_host = Some(StatusMenuHost::Planner);
+        state.planner_drag_source_track_id = Some(String::from("hidden-track"));
+        state.planner_drag_target_stage = Some(TrackStage::Mixdown);
+        state.planner_drag_pointer = Some(Point::new(100.0, 120.0));
+
+        update(
+            &mut state,
+            Message::SetPlannerStatusFilter(Some(TrackStatus::Archive)),
+            &mut context,
+        );
+        assert!(state.stage_menu_track_id.is_none());
+        assert!(state.stage_menu_anchor.is_none());
+        assert!(state.status_menu_track_id.is_none());
+        assert!(state.status_menu_host.is_none());
+        assert!(state.planner_drag_source_track_id.is_none());
+        assert!(state.planner_drag_target_stage.is_none());
+        assert!(state.planner_drag_pointer.is_none());
     }
 
     #[test]
@@ -2385,9 +8940,11 @@ mod tests {
             title: String::from("Stage menu"),
             original_name: String::from("stage-menu.wav"),
             path: PathBuf::from("/external/stage-menu.wav"),
+            reference_path: None,
             size: 0,
             favorite: false,
             stage: TrackStage::Production,
+            status: TrackStatus::Inbox,
             notes: Vec::new(),
         };
 
@@ -2418,9 +8975,11 @@ mod tests {
             title: String::from("Stage trigger"),
             original_name: String::from("stage-trigger.wav"),
             path: PathBuf::from("/external/stage-trigger.wav"),
+            reference_path: None,
             size: 0,
             favorite: false,
             stage: TrackStage::Production,
+            status: TrackStatus::Inbox,
             notes: Vec::new(),
         };
         #[derive(Clone)]
@@ -2436,7 +8995,7 @@ mod tests {
                 anchor: None,
             },
             |state| {
-                let trigger = stage_dropdown(&state.track, state.open);
+                let trigger = stage_dropdown(&state.track, state.open, false);
                 let trigger = if let Some(anchor) = state.anchor {
                     trigger
                         .overlays(ui::overlays().popover(stage_menu_popover(&state.track, anchor)))
@@ -2482,9 +9041,11 @@ mod tests {
             title: String::from("Keyboard stage"),
             original_name: String::from("keyboard-stage.wav"),
             path: PathBuf::from("/external/keyboard-stage.wav"),
+            reference_path: None,
             size: 0,
             favorite: false,
             stage: TrackStage::Production,
+            status: TrackStatus::Inbox,
             notes: Vec::new(),
         };
         let track_id = track.id.clone();
@@ -2518,9 +9079,11 @@ mod tests {
             title: String::from("Focused stage"),
             original_name: String::from("focused-stage.wav"),
             path: PathBuf::from("/external/focused-stage.wav"),
+            reference_path: None,
             size: 0,
             favorite: false,
             stage: TrackStage::Production,
+            status: TrackStatus::Inbox,
             notes: Vec::new(),
         };
         #[derive(Clone)]
@@ -2536,7 +9099,7 @@ mod tests {
                 anchor: None,
             },
             |state| {
-                let trigger = stage_dropdown(&state.track, state.open);
+                let trigger = stage_dropdown(&state.track, state.open, false);
                 let trigger = if let Some(anchor) = state.anchor {
                     trigger
                         .overlays(ui::overlays().popover(stage_menu_popover(&state.track, anchor)))
@@ -2581,9 +9144,11 @@ mod tests {
             title: String::from("Context stage"),
             original_name: String::from("context-stage.wav"),
             path: PathBuf::from("/external/context-stage.wav"),
+            reference_path: None,
             size: 0,
             favorite: false,
             stage: TrackStage::Production,
+            status: TrackStatus::Inbox,
             notes: Vec::new(),
         };
 
@@ -2657,19 +9222,7 @@ mod tests {
                 })
                 .expect("opened context menu should paint a mastering option below the trigger");
             let anchor = stage_menu_anchor_from_pointer(trigger_point);
-            let menu_surface = frame
-                .paint_plan
-                .primitives
-                .iter()
-                .find_map(|primitive| match primitive {
-                    PaintPrimitive::FillRect(fill)
-                        if (fill.rect.min.x - anchor.x).abs() < 0.01
-                            && (fill.rect.min.y - anchor.y).abs() < 0.01 =>
-                    {
-                        Some(fill.rect)
-                    }
-                    _ => None,
-                })
+            let menu_surface = dropdown_surface_rect(&frame.paint_plan.primitives, anchor)
                 .expect("opened context menu should paint its surface at the pointer anchor");
             assert!((menu_surface.min.x - anchor.x).abs() < 0.01);
             assert!((menu_surface.min.y - anchor.y).abs() < 0.01);
@@ -2705,9 +9258,11 @@ mod tests {
             title: String::from("Stage popover"),
             original_name: String::from("stage-popover.wav"),
             path: PathBuf::from("/external/stage-popover.wav"),
+            reference_path: None,
             size: 0,
             favorite: false,
             stage: TrackStage::Production,
+            status: TrackStatus::Inbox,
             notes: Vec::new(),
         };
         #[derive(Clone)]
@@ -2798,9 +9353,11 @@ mod tests {
             title: String::from("Stage context"),
             original_name: String::from("stage-context.wav"),
             path: PathBuf::from("/external/stage-context.wav"),
+            reference_path: None,
             size: 0,
             favorite: false,
             stage: TrackStage::Production,
+            status: TrackStatus::Inbox,
             notes: Vec::new(),
         };
 
@@ -2815,20 +9372,9 @@ mod tests {
         planner_state.library.tracks.push(track.clone());
         let planner_frame = project_surface(&planner_state)
             .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 720.0));
-        let planner_menu_rect = planner_frame
-            .paint_plan
-            .primitives
-            .iter()
-            .find_map(|primitive| match primitive {
-                PaintPrimitive::FillRect(fill)
-                    if (fill.rect.min.x - planner_anchor.x).abs() < 0.01
-                        && (fill.rect.min.y - planner_anchor.y).abs() < 0.01 =>
-                {
-                    Some(fill.rect)
-                }
-                _ => None,
-            })
-            .expect("planner stage menu should paint its anchored surface");
+        let planner_menu_rect =
+            dropdown_surface_rect(&planner_frame.paint_plan.primitives, planner_anchor)
+                .expect("planner stage menu should paint its anchored surface");
 
         let library_anchor = Point::new(180.0, 140.0);
         let mut library_state = AppState {
@@ -2841,20 +9387,9 @@ mod tests {
         library_state.library.tracks.push(track);
         let library_frame = project_surface(&library_state)
             .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 720.0));
-        let library_menu_rect = library_frame
-            .paint_plan
-            .primitives
-            .iter()
-            .find_map(|primitive| match primitive {
-                PaintPrimitive::FillRect(fill)
-                    if (fill.rect.min.x - library_anchor.x).abs() < 0.01
-                        && (fill.rect.min.y - library_anchor.y).abs() < 0.01 =>
-                {
-                    Some(fill.rect)
-                }
-                _ => None,
-            })
-            .expect("library stage menu should paint its anchored surface");
+        let library_menu_rect =
+            dropdown_surface_rect(&library_frame.paint_plan.primitives, library_anchor)
+                .expect("library stage menu should paint its anchored surface");
 
         assert!(
             (planner_menu_rect.min.x - planner_anchor.x).abs() < 0.01
@@ -2866,5 +9401,1388 @@ mod tests {
                 && (library_menu_rect.min.y - library_anchor.y).abs() < 0.01,
             "library menu should use its supplied root anchor"
         );
+    }
+
+    #[test]
+    fn open_status_dropdown_projects_statuses_in_product_order() {
+        let track = Track {
+            id: String::from("status-menu"),
+            title: String::from("Status menu"),
+            original_name: String::from("status-menu.wav"),
+            path: PathBuf::from("/external/status-menu.wav"),
+            reference_path: None,
+            size: 0,
+            favorite: false,
+            stage: TrackStage::Production,
+            status: TrackStatus::Refine,
+            notes: Vec::new(),
+        };
+        let expected = ["Inbox", "Refine", "Release", "Archive", "Maybe"];
+        let actual = ui::scene(status_dropdown_for_host(
+            &track,
+            true,
+            false,
+            StatusMenuHost::Library,
+        ))
+        .into_view()
+        .view_frame_at_size_with_default_theme(Vector2::new(240.0, 220.0))
+        .paint_plan
+        .text_runs()
+        .filter(|run| run.rect.min.y > ui::dropdown_trigger_height())
+        .filter(|run| !run.text.is_empty())
+        .map(|run| run.text.as_str().to_owned())
+        .collect::<Vec<_>>();
+
+        assert_eq!(actual, expected.map(String::from).to_vec());
+    }
+
+    #[test]
+    fn status_transition_preserves_stage_and_favorite_and_saves_only_on_change() {
+        let mut state = AppState {
+            busy: false,
+            status_menu_track_id: Some(String::from("status-track")),
+            ..AppState::default()
+        };
+        state.library.tracks.push(Track {
+            id: String::from("status-track"),
+            title: String::from("Status track"),
+            original_name: String::from("status-track.wav"),
+            path: PathBuf::from("/external/status-track.wav"),
+            reference_path: Some(PathBuf::from("/external/reference.wav")),
+            size: 42,
+            favorite: true,
+            stage: TrackStage::Mixdown,
+            status: TrackStatus::Inbox,
+            notes: vec![Note {
+                id: String::from("status-note"),
+                time_millis: 500,
+                body: String::from("Keep this note."),
+                done: false,
+            }],
+        });
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::SetStatus {
+                track_id: String::from("status-track"),
+                status: TrackStatus::Release,
+            },
+            &mut context,
+        );
+
+        let track = &state.library.tracks[0];
+        assert_eq!(track.status, TrackStatus::Release);
+        assert_eq!(track.stage, TrackStage::Mixdown);
+        assert!(track.favorite);
+        assert_eq!(track.notes.len(), 1);
+        assert!(state.status_menu_track_id.is_none());
+        assert!(state.save_in_flight);
+        assert_eq!(state.status, "Status set to Release.");
+    }
+
+    #[test]
+    fn no_op_status_transition_closes_menu_without_scheduling_a_save() {
+        let mut state = AppState {
+            busy: false,
+            status_menu_track_id: Some(String::from("status-track")),
+            ..AppState::default()
+        };
+        state.library.tracks.push(Track {
+            id: String::from("status-track"),
+            title: String::from("Status track"),
+            original_name: String::from("status-track.wav"),
+            path: PathBuf::from("/external/status-track.wav"),
+            reference_path: None,
+            size: 0,
+            favorite: false,
+            stage: TrackStage::SoundDesign,
+            status: TrackStatus::Maybe,
+            notes: Vec::new(),
+        });
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::SetStatus {
+                track_id: String::from("status-track"),
+                status: TrackStatus::Maybe,
+            },
+            &mut context,
+        );
+
+        assert_eq!(state.library.tracks[0].status, TrackStatus::Maybe);
+        assert!(!state.save_in_flight);
+        assert!(!state.save_again);
+        assert!(state.status_menu_track_id.is_none());
+    }
+
+    #[test]
+    fn opening_stage_and_status_menus_closes_the_other_menu() {
+        let mut state = AppState {
+            busy: false,
+            ..AppState::default()
+        };
+        state.library.tracks.push(Track {
+            id: String::from("menu-track"),
+            title: String::from("Menu track"),
+            original_name: String::from("menu-track.wav"),
+            path: PathBuf::from("/external/menu-track.wav"),
+            reference_path: None,
+            size: 0,
+            favorite: false,
+            stage: TrackStage::Production,
+            status: TrackStatus::Inbox,
+            notes: Vec::new(),
+        });
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::ToggleStatusMenuAt {
+                track_id: String::from("menu-track"),
+                host: StatusMenuHost::Library,
+            },
+            &mut context,
+        );
+        assert!(state.stage_menu_track_id.is_none());
+        assert_eq!(state.status_menu_track_id.as_deref(), Some("menu-track"));
+
+        update(
+            &mut state,
+            Message::ToggleStageMenu(String::from("menu-track")),
+            &mut context,
+        );
+        assert_eq!(state.stage_menu_track_id.as_deref(), Some("menu-track"));
+        assert!(state.status_menu_track_id.is_none());
+    }
+
+    #[test]
+    fn keyboard_status_dropdown_expands_selected_review_header() {
+        let mut state = AppState {
+            busy: false,
+            workspace_mode: super::WorkspaceMode::Review,
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(String::from("selected-header"));
+        state.library.tracks.push(Track {
+            id: String::from("selected-header"),
+            title: String::from("Selected header"),
+            original_name: String::from("selected-header.wav"),
+            path: PathBuf::from("/external/selected-header.wav"),
+            reference_path: None,
+            size: 0,
+            favorite: false,
+            stage: TrackStage::Production,
+            status: TrackStatus::Inbox,
+            notes: Vec::new(),
+        });
+        let bridge = DeclarativeOwnedRuntimeBridge::new(
+            state,
+            |state| project_surface(state).into_surface(),
+            |state, message| {
+                let mut context = ui::UiUpdateContext::default();
+                update(state, message, &mut context);
+            },
+        );
+        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1180.0, 720.0));
+        let _ = runtime.frame(&ThemeTokens::default());
+        let frame = runtime.frame(&ThemeTokens::default());
+        let (trigger, trigger_rect) = frame
+            .paint_plan
+            .primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                PaintPrimitive::Text(text)
+                    if text.text.as_str() == TrackStatus::Inbox.label()
+                        && text.rect.min.x > super::LIBRARY_WIDTH =>
+                {
+                    Some((text.widget_id, text.rect))
+                }
+                _ => None,
+            })
+            .expect("the selected review header should paint its status trigger");
+        assert!(runtime.focus_widget(trigger));
+        assert_eq!(
+            runtime.dispatch_event(Event::key_press(ui::WidgetKey::Enter)),
+            Some(trigger)
+        );
+        assert_eq!(
+            runtime.bridge().state().status_menu_track_id.as_deref(),
+            Some("selected-header")
+        );
+
+        let opened_frame = runtime.frame(&ThemeTokens::default());
+        let release_option = opened_frame
+            .paint_plan
+            .primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                PaintPrimitive::Text(text)
+                    if text.text.as_str() == TrackStatus::Release.label()
+                        && text.rect.min.y > trigger_rect.min.y + trigger_rect.height()
+                        && text.rect.min.x >= trigger_rect.min.x
+                        && text.rect.min.x < trigger_rect.min.x + trigger_rect.width() =>
+                {
+                    Some(text.rect)
+                }
+                _ => None,
+            })
+            .expect("keyboard activation should project status options below the header trigger");
+        runtime.dispatch_primary_click(Point::new(
+            release_option.min.x + release_option.width() * 0.5,
+            release_option.min.y + release_option.height() * 0.5,
+        ));
+        assert_eq!(
+            runtime.bridge().state().library.tracks[0].status,
+            TrackStatus::Release
+        );
+    }
+
+    #[test]
+    fn keyboard_status_dropdown_follows_lower_library_and_planner_triggers() {
+        let track = |id: &str, status: TrackStatus| Track {
+            id: String::from(id),
+            title: String::from(id),
+            original_name: format!("{id}.wav"),
+            path: PathBuf::from(format!("/external/{id}.wav")),
+            reference_path: None,
+            size: 0,
+            favorite: false,
+            stage: TrackStage::Production,
+            status,
+            notes: Vec::new(),
+        };
+
+        let mut review_state = AppState {
+            busy: false,
+            workspace_mode: super::WorkspaceMode::Review,
+            ..AppState::default()
+        };
+        review_state.library.selected_track_id = Some(String::from("library-target"));
+        review_state
+            .library
+            .tracks
+            .push(track("library-first", TrackStatus::Maybe));
+        review_state
+            .library
+            .tracks
+            .push(track("library-target", TrackStatus::Inbox));
+
+        let review_bridge = DeclarativeOwnedRuntimeBridge::new(
+            review_state,
+            |state| project_surface(state).into_surface(),
+            |state, message| {
+                let mut context = ui::UiUpdateContext::default();
+                update(state, message, &mut context);
+            },
+        );
+        let mut review_runtime = SurfaceRuntime::new(review_bridge, Vector2::new(1180.0, 720.0));
+        let review_frame = review_runtime.frame(&ThemeTokens::default());
+        let (review_trigger, review_trigger_rect) = review_frame
+            .paint_plan
+            .primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                PaintPrimitive::Text(text)
+                    if text.text.as_str() == TrackStatus::Inbox.label()
+                        && text.rect.min.x < super::LIBRARY_WIDTH
+                        && text.rect.min.y > 250.0 =>
+                {
+                    Some((text.widget_id, text.rect))
+                }
+                _ => None,
+            })
+            .expect("the lower library row should paint its status trigger");
+        assert!(review_runtime.focus_widget(review_trigger));
+        assert_eq!(
+            review_runtime.dispatch_event(Event::key_press(ui::WidgetKey::Enter)),
+            Some(review_trigger)
+        );
+        assert_eq!(
+            review_runtime
+                .bridge()
+                .state()
+                .status_menu_track_id
+                .as_deref(),
+            Some("library-target")
+        );
+        let review_option = review_runtime
+            .frame(&ThemeTokens::default())
+            .paint_plan
+            .primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                PaintPrimitive::Text(text)
+                    if text.text.as_str() == TrackStatus::Release.label()
+                        && text.rect.min.y
+                            > review_trigger_rect.min.y + review_trigger_rect.height() =>
+                {
+                    Some(text.rect)
+                }
+                _ => None,
+            })
+            .expect("keyboard activation should project status options below the library trigger");
+        assert!(
+            review_option.min.x < review_trigger_rect.max.x
+                && review_option.max.x > review_trigger_rect.min.x,
+            "library status options should remain horizontally attached to their trigger"
+        );
+        review_runtime.dispatch_primary_click(Point::new(
+            review_option.min.x + review_option.width() * 0.5,
+            review_option.min.y + review_option.height() * 0.5,
+        ));
+        assert_eq!(
+            review_runtime.bridge().state().library.tracks[1].status,
+            TrackStatus::Release
+        );
+
+        let mut planner_state = AppState {
+            busy: false,
+            workspace_mode: super::WorkspaceMode::Planner,
+            ..AppState::default()
+        };
+        planner_state
+            .library
+            .tracks
+            .push(track("planner-first", TrackStatus::Maybe));
+        planner_state
+            .library
+            .tracks
+            .push(track("planner-target", TrackStatus::Inbox));
+
+        let planner_bridge = DeclarativeOwnedRuntimeBridge::new(
+            planner_state,
+            |state| project_surface(state).into_surface(),
+            |state, message| {
+                let mut context = ui::UiUpdateContext::default();
+                update(state, message, &mut context);
+            },
+        );
+        let mut planner_runtime = SurfaceRuntime::new(planner_bridge, Vector2::new(1180.0, 720.0));
+        let planner_frame = planner_runtime.frame(&ThemeTokens::default());
+        let (planner_trigger, planner_trigger_rect) = planner_frame
+            .paint_plan
+            .primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                PaintPrimitive::Text(text)
+                    if text.text.as_str() == TrackStatus::Inbox.label()
+                        && text.rect.min.y > 250.0 =>
+                {
+                    Some((text.widget_id, text.rect))
+                }
+                _ => None,
+            })
+            .expect("the non-first planner card should paint its status trigger");
+        assert!(planner_runtime.focus_widget(planner_trigger));
+        assert_eq!(
+            planner_runtime.dispatch_event(Event::key_press(ui::WidgetKey::Enter)),
+            Some(planner_trigger)
+        );
+        assert_eq!(
+            planner_runtime
+                .bridge()
+                .state()
+                .status_menu_track_id
+                .as_deref(),
+            Some("planner-target")
+        );
+        let planner_option = planner_runtime
+            .frame(&ThemeTokens::default())
+            .paint_plan
+            .primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                PaintPrimitive::Text(text)
+                    if text.text.as_str() == TrackStatus::Release.label()
+                        && text.rect.min.y
+                            > planner_trigger_rect.min.y + planner_trigger_rect.height() =>
+                {
+                    Some(text.rect)
+                }
+                _ => None,
+            })
+            .expect("keyboard activation should project status options below the planner trigger");
+        assert!(
+            planner_option.min.x < planner_trigger_rect.max.x
+                && planner_option.max.x > planner_trigger_rect.min.x,
+            "planner status options should remain horizontally attached to their trigger"
+        );
+        planner_runtime.dispatch_primary_click(Point::new(
+            planner_option.min.x + planner_option.width() * 0.5,
+            planner_option.min.y + planner_option.height() * 0.5,
+        ));
+        assert_eq!(
+            planner_runtime.bridge().state().library.tracks[1].status,
+            TrackStatus::Release
+        );
+    }
+
+    #[test]
+    fn audition_play_starts_a_ready_track_without_toggle_pause() {
+        let mut state = audition_state(&["ready"]);
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut state, Message::AuditionPlay, &mut context);
+
+        assert!(state.transport_polling);
+        assert!(state.transport_waiting_token.is_some());
+        assert!(state.audition_auto_advance);
+        assert!(state.audition_pending_play_track_id.is_none());
+    }
+
+    #[test]
+    fn audition_play_arms_pending_autoplay_while_the_track_loads() {
+        let mut state = audition_state(&["pending"]);
+        state.waveform = None;
+        state.waveform_track_id = None;
+        state.waveform_busy = true;
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut state, Message::AuditionPlay, &mut context);
+
+        assert!(state.audition_auto_advance);
+        assert_eq!(
+            state.audition_pending_play_track_id.as_deref(),
+            Some("pending")
+        );
+        assert!(!state.transport_playing);
+        assert!(!state.transport_polling);
+    }
+
+    #[test]
+    fn audition_play_does_not_pause_active_playback() {
+        let mut state = audition_state(&["active"]);
+        state.transport_playing = true;
+        state.audition_auto_advance = true;
+        state.audition_play_token = Some(7);
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut state, Message::AuditionPlay, &mut context);
+
+        assert!(state.transport_playing);
+        assert!(!state.transport_polling);
+        assert_eq!(state.audition_play_token, Some(7));
+        assert_eq!(state.status, "Audition playback is already active.");
+    }
+
+    #[test]
+    fn audition_controls_are_inert_outside_audition_and_while_busy() {
+        for mut state in [
+            AppState {
+                workspace_mode: WorkspaceMode::Review,
+                ..audition_state(&["review"])
+            },
+            AppState {
+                busy: true,
+                ..audition_state(&["busy"])
+            },
+        ] {
+            let selected_before = state.library.selected_track_id.clone();
+            let queue_before = state.audition_queue.clone();
+            let round_before = state.audition_shuffle_round;
+            let mut context = ui::UiUpdateContext::default();
+
+            for message in [
+                Message::AuditionPlay,
+                Message::AuditionPrevious,
+                Message::AuditionNext,
+                Message::ShuffleAudition,
+            ] {
+                update(&mut state, message, &mut context);
+            }
+
+            assert_eq!(state.library.selected_track_id, selected_before);
+            assert_eq!(state.audition_queue, queue_before);
+            assert_eq!(state.audition_shuffle_round, round_before);
+            assert!(state.audition_pending_play_track_id.is_none());
+        }
+    }
+
+    #[test]
+    fn audition_stop_clears_pending_autoplay_without_active_transport() {
+        let mut state = audition_state(&["pending-stop"]);
+        state.audition_auto_advance = true;
+        state.audition_pending_play_track_id = Some(String::from("pending-stop"));
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut state, Message::StopPlayback, &mut context);
+
+        assert!(!state.audition_auto_advance);
+        assert!(state.audition_play_token.is_none());
+        assert!(state.audition_pending_play_track_id.is_none());
+        assert!(!state.transport_playing);
+        assert!(!state.transport_polling);
+    }
+
+    #[test]
+    fn audition_next_resolves_selected_id_marks_current_heard_and_arms_destination() {
+        let mut state = audition_state(&["a", "b", "c"]);
+        state.library.selected_track_id = Some(String::from("b"));
+        state.audition_queue_index = 0;
+        state.audition_heard = vec![String::from("a"), String::from("c")];
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut state, Message::AuditionNext, &mut context);
+
+        assert_eq!(state.library.selected_track_id.as_deref(), Some("c"));
+        assert_eq!(state.audition_queue_index, 2);
+        assert!(state.audition_heard.iter().any(|id| id == "a"));
+        assert!(state.audition_heard.iter().any(|id| id == "b"));
+        assert!(!state.audition_heard.iter().any(|id| id == "c"));
+        assert_eq!(state.audition_pending_play_track_id.as_deref(), Some("c"));
+        assert!(state.audition_auto_advance);
+    }
+
+    #[test]
+    fn audition_previous_resolves_selected_id_without_marking_interrupted_current() {
+        let mut state = audition_state(&["a", "b", "c"]);
+        state.library.selected_track_id = Some(String::from("b"));
+        state.audition_queue_index = 2;
+        state.audition_heard.clear();
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut state, Message::AuditionPrevious, &mut context);
+
+        assert_eq!(state.library.selected_track_id.as_deref(), Some("a"));
+        assert_eq!(state.audition_queue_index, 0);
+        assert!(!state.audition_heard.iter().any(|id| id == "a"));
+        assert!(!state.audition_heard.iter().any(|id| id == "b"));
+        assert_eq!(state.audition_pending_play_track_id.as_deref(), Some("a"));
+        assert!(state.audition_auto_advance);
+    }
+
+    #[test]
+    fn audition_next_keeps_pool_anchor_when_current_track_changes_status() {
+        let mut state = audition_state(&["inbox-a", "inbox-b"]);
+        state.transport_playing = true;
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::SetStatus {
+                track_id: String::from("inbox-a"),
+                status: TrackStatus::Archive,
+            },
+            &mut context,
+        );
+        assert_eq!(
+            state.library.tracks[0].status,
+            TrackStatus::Archive,
+            "the current track should still move out of the selected pool"
+        );
+        assert_eq!(
+            state.audition_queue,
+            vec![String::from("inbox-a"), String::from("inbox-b")]
+        );
+
+        update(&mut state, Message::AuditionNext, &mut context);
+
+        assert_eq!(state.library.selected_track_id.as_deref(), Some("inbox-b"));
+        assert_eq!(state.audition_queue, vec![String::from("inbox-b")]);
+        assert_eq!(state.audition_queue_index, 0);
+        assert_eq!(
+            state.audition_pending_play_track_id.as_deref(),
+            Some("inbox-b")
+        );
+
+        update(&mut state, Message::AuditionPrevious, &mut context);
+
+        assert_eq!(state.library.selected_track_id.as_deref(), Some("inbox-b"));
+        assert_eq!(state.audition_queue, vec![String::from("inbox-b")]);
+        assert!(state.status.contains("beginning"));
+    }
+
+    #[test]
+    fn audition_next_keeps_pool_anchor_during_reference_only_playback() {
+        let mut state = audition_state(&["inbox-a", "inbox-b"]);
+        state.reference_transport = Some(transport::AudioTransport::spawn());
+        state.reference_transport_playing = true;
+        state.reference_only_playback = true;
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::SetStatus {
+                track_id: String::from("inbox-a"),
+                status: TrackStatus::Archive,
+            },
+            &mut context,
+        );
+        assert_eq!(
+            state.audition_queue,
+            vec![String::from("inbox-a"), String::from("inbox-b")]
+        );
+
+        update(&mut state, Message::AuditionNext, &mut context);
+
+        assert_eq!(state.library.selected_track_id.as_deref(), Some("inbox-b"));
+        assert_eq!(state.audition_queue, vec![String::from("inbox-b")]);
+    }
+
+    #[test]
+    fn audition_navigation_boundaries_leave_selection_and_playback_unchanged() {
+        let mut next_state = audition_state(&["a", "b", "c"]);
+        next_state.library.selected_track_id = Some(String::from("c"));
+        next_state.audition_queue_index = 0;
+        next_state.transport_playing = true;
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut next_state, Message::AuditionNext, &mut context);
+
+        assert_eq!(next_state.library.selected_track_id.as_deref(), Some("c"));
+        assert_eq!(next_state.audition_queue_index, 0);
+        assert!(next_state.transport_playing);
+        assert!(next_state.audition_pending_play_track_id.is_none());
+        assert!(next_state.status.contains("end"));
+
+        let mut previous_state = audition_state(&["a", "b", "c"]);
+        previous_state.library.selected_track_id = Some(String::from("a"));
+        previous_state.audition_queue_index = 2;
+        previous_state.transport_playing = true;
+
+        update(&mut previous_state, Message::AuditionPrevious, &mut context);
+
+        assert_eq!(
+            previous_state.library.selected_track_id.as_deref(),
+            Some("a")
+        );
+        assert_eq!(previous_state.audition_queue_index, 2);
+        assert!(previous_state.transport_playing);
+        assert!(previous_state.audition_pending_play_track_id.is_none());
+        assert!(previous_state.status.contains("beginning"));
+    }
+
+    #[test]
+    fn audition_shuffle_restarts_active_playback_with_a_new_order_and_current() {
+        let mut state = audition_state(&["a", "b", "c"]);
+        state.library.selected_track_id = Some(String::from("b"));
+        state.audition_queue = vec![String::from("a"), String::from("b"), String::from("c")];
+        state.audition_queue_index = 1;
+        state.audition_heard = vec![String::from("a")];
+        state.audition_shuffle_round = 4;
+        state.transport_playing = true;
+        let previous_order = state.audition_queue.clone();
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut state, Message::ShuffleAudition, &mut context);
+
+        assert_eq!(state.audition_shuffle_round, 5);
+        assert_ne!(state.audition_queue, previous_order);
+        assert_eq!(
+            state.library.selected_track_id.as_deref(),
+            state.audition_queue.first().map(String::as_str)
+        );
+        assert_ne!(state.audition_queue.first().map(String::as_str), Some("b"));
+        assert!(state.audition_heard.is_empty());
+        assert_eq!(
+            state.audition_pending_play_track_id.as_deref(),
+            state.audition_queue.first().map(String::as_str)
+        );
+        assert!(state.audition_auto_advance);
+        assert!(!state.transport_playing);
+    }
+
+    #[test]
+    fn audition_shuffle_replays_single_entry_and_resets_empty_queue() {
+        let mut single_state = audition_state(&["only"]);
+        single_state.audition_heard = vec![String::from("only")];
+        single_state.audition_shuffle_round = 2;
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut single_state, Message::ShuffleAudition, &mut context);
+
+        assert_eq!(single_state.audition_shuffle_round, 3);
+        assert_eq!(single_state.audition_queue, vec![String::from("only")]);
+        assert_eq!(
+            single_state.library.selected_track_id.as_deref(),
+            Some("only")
+        );
+        assert!(single_state.audition_heard.is_empty());
+        assert_eq!(
+            single_state.audition_pending_play_track_id.as_deref(),
+            Some("only")
+        );
+
+        let mut empty_state = audition_state(&[]);
+        empty_state.transport_playing = true;
+        empty_state.reference_transport = Some(transport::AudioTransport::spawn());
+        empty_state.reference_transport_playing = true;
+        empty_state.audition_heard = vec![String::from("gone")];
+
+        update(&mut empty_state, Message::ShuffleAudition, &mut context);
+
+        assert!(empty_state.audition_queue.is_empty());
+        assert!(empty_state.library.selected_track_id.is_none());
+        assert!(empty_state.audition_heard.is_empty());
+        assert!(!empty_state.transport_playing);
+        assert!(!empty_state.reference_transport_playing);
+        assert!(empty_state.audition_pending_play_track_id.is_none());
+        assert_eq!(empty_state.status, "No tracks in Inbox.");
+    }
+
+    #[test]
+    fn audition_stale_decode_generation_does_not_complete_pending_playback() {
+        let mut state = audition_state(&["stale"]);
+        state.waveform = None;
+        state.waveform_track_id = None;
+        state.waveform_busy = true;
+        state.waveform_generation = 2;
+        state.audition_auto_advance = true;
+        state.audition_pending_play_track_id = Some(String::from("stale"));
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::DecodeCompleted {
+                track_id: String::from("stale"),
+                generation: 1,
+                result: Ok(audition_waveform()),
+            },
+            &mut context,
+        );
+
+        assert!(state.waveform.is_none());
+        assert!(state.waveform_busy);
+        assert_eq!(state.waveform_generation, 2);
+        assert_eq!(
+            state.audition_pending_play_track_id.as_deref(),
+            Some("stale")
+        );
+    }
+
+    #[test]
+    fn audition_shuffle_is_deterministic_and_preserves_the_filtered_tracks() {
+        let ids = vec![
+            String::from("track-a"),
+            String::from("track-b"),
+            String::from("track-c"),
+            String::from("track-d"),
+        ];
+        let seed = audition_shuffle_seed(TrackStatus::Inbox, &ids, 0);
+        let mut first = ids.clone();
+        let mut second = ids.clone();
+        deterministic_shuffle(&mut first, seed);
+        deterministic_shuffle(&mut second, seed);
+
+        assert_eq!(first, second);
+        let mut sorted = first;
+        sorted.sort();
+        assert_eq!(sorted, ids);
+        assert_ne!(
+            audition_shuffle_seed(TrackStatus::Inbox, &ids, 0),
+            audition_shuffle_seed(TrackStatus::Inbox, &ids, 1)
+        );
+        assert_eq!(audition_statuses().len(), 5);
+    }
+
+    #[test]
+    fn audition_queue_filters_and_updates_membership_without_reordering() {
+        let track = |id: &str, status: TrackStatus| Track {
+            id: String::from(id),
+            title: String::from(id),
+            original_name: format!("{id}.wav"),
+            path: PathBuf::from(format!("/external/{id}.wav")),
+            reference_path: None,
+            size: 0,
+            favorite: false,
+            stage: TrackStage::Production,
+            status,
+            notes: Vec::new(),
+        };
+        let mut state = AppState {
+            busy: false,
+            workspace_mode: WorkspaceMode::Audition,
+            ..AppState::default()
+        };
+        state.library.tracks = vec![
+            track("inbox-a", TrackStatus::Inbox),
+            track("refine-a", TrackStatus::Refine),
+            track("inbox-b", TrackStatus::Inbox),
+        ];
+        rebuild_audition_queue(&mut state);
+        assert_eq!(state.audition_queue.len(), 2);
+        assert!(state.audition_queue.iter().all(|id| {
+            state
+                .library
+                .tracks
+                .iter()
+                .find(|track| &track.id == id)
+                .is_some_and(|track| track.status == TrackStatus::Inbox)
+        }));
+        let original_order = state.audition_queue.clone();
+
+        state.library.tracks[0].status = TrackStatus::Archive;
+        sync_audition_queue_after_status_change(&mut state, "inbox-a");
+        assert!(!state.audition_queue.iter().any(|id| id == "inbox-a"));
+
+        state.library.tracks[1].status = TrackStatus::Inbox;
+        sync_audition_queue_after_status_change(&mut state, "refine-a");
+        assert_eq!(state.audition_queue.len(), 2);
+        assert_eq!(
+            state.audition_queue.first(),
+            original_order
+                .iter()
+                .find(|id| *id == "inbox-b")
+                .or_else(|| original_order.iter().find(|id| *id == "inbox-a"))
+        );
+        assert!(state.audition_queue.iter().any(|id| id == "refine-a"));
+    }
+
+    #[test]
+    fn status_change_advances_pending_audition_before_decode_can_play_it() {
+        let pending_id = String::from("pending-audition-track");
+        let next_id = String::from("next-audition-track");
+        let track = |id: &str, status: TrackStatus| Track {
+            id: String::from(id),
+            title: String::from(id),
+            original_name: format!("{id}.wav"),
+            path: PathBuf::from(format!("/external/{id}.wav")),
+            reference_path: None,
+            size: 0,
+            favorite: false,
+            stage: TrackStage::Production,
+            status,
+            notes: Vec::new(),
+        };
+        let mut state = AppState {
+            busy: false,
+            workspace_mode: WorkspaceMode::Audition,
+            audition_status_filter: TrackStatus::Inbox,
+            audition_queue: vec![pending_id.clone(), next_id.clone()],
+            audition_queue_index: 0,
+            audition_auto_advance: true,
+            audition_pending_play_track_id: Some(pending_id.clone()),
+            waveform: Some(WaveformData {
+                sample_rate: 48_000,
+                channels: 1,
+                duration_millis: 1_000,
+                render_frames: 48_000,
+                integrated_lufs: Some(-7.0),
+                loudness_profile: Arc::from([]),
+                summary: Arc::new(
+                    radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                        &[0.0, 0.0, 0.0, 0.0],
+                        4,
+                        1,
+                    ),
+                ),
+            }),
+            waveform_track_id: Some(pending_id.clone()),
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(pending_id.clone());
+        state.library.tracks = vec![
+            track(&pending_id, TrackStatus::Inbox),
+            track(&next_id, TrackStatus::Inbox),
+        ];
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::SetStatus {
+                track_id: pending_id.clone(),
+                status: TrackStatus::Archive,
+            },
+            &mut context,
+        );
+
+        assert_eq!(
+            state.library.selected_track_id.as_deref(),
+            Some(next_id.as_str())
+        );
+        assert_eq!(state.audition_queue, vec![next_id.clone()]);
+        assert_eq!(
+            state.audition_pending_play_track_id.as_deref(),
+            Some(next_id.as_str())
+        );
+        assert_ne!(
+            state.audition_pending_play_track_id.as_deref(),
+            Some(pending_id.as_str())
+        );
+
+        update(&mut state, Message::Frame, &mut context);
+
+        assert!(!state.transport_playing);
+        assert!(!state.transport_polling);
+        assert_eq!(
+            state.audition_pending_play_track_id.as_deref(),
+            Some(next_id.as_str())
+        );
+    }
+
+    fn schedule_async_transport_error(
+        transport: transport::AudioTransport,
+        generation: u64,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(4));
+            transport.set_error_for_test(
+                generation,
+                String::from("Could not open test-audio.wav for playback: test failure"),
+            );
+        })
+    }
+
+    fn wait_for_frame_state(
+        state: &mut AppState,
+        context: &mut ui::UiUpdateContext<Message>,
+        predicate: impl Fn(&AppState) -> bool,
+    ) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            update(state, Message::Frame, context);
+            if predicate(state) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the asynchronous transport state did not arrive"
+            );
+            std::thread::sleep(Duration::from_millis(4));
+        }
+    }
+
+    #[test]
+    fn frame_transport_load_error_advances_pending_audition() {
+        let failed_id = String::from("failed-audition-track");
+        let next_id = String::from("next-audition-track");
+        let track = |id: &str, path: PathBuf| Track {
+            id: String::from(id),
+            title: String::from(id),
+            original_name: format!("{id}.wav"),
+            path,
+            reference_path: None,
+            size: 0,
+            favorite: false,
+            stage: TrackStage::Production,
+            status: TrackStatus::Inbox,
+            notes: Vec::new(),
+        };
+        let mut state = AppState {
+            busy: false,
+            workspace_mode: WorkspaceMode::Audition,
+            audition_queue: vec![failed_id.clone(), next_id.clone()],
+            audition_queue_index: 0,
+            audition_auto_advance: true,
+            audition_pending_play_track_id: Some(failed_id.clone()),
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(failed_id.clone());
+        state.library.tracks = vec![
+            track(
+                &failed_id,
+                PathBuf::from("/external/failed-audition-track.wav"),
+            ),
+            track(&next_id, PathBuf::from("/external/next-audition-track.wav")),
+        ];
+        let error_thread =
+            schedule_async_transport_error(state.transport.clone(), state.transport_generation);
+        state.transport_waiting_token = Some(1);
+        state.transport_polling = true;
+        let mut context = ui::UiUpdateContext::default();
+
+        wait_for_frame_state(&mut state, &mut context, |state| {
+            state.library.selected_track_id.as_deref() == Some(next_id.as_str())
+        });
+        error_thread
+            .join()
+            .expect("the asynchronous transport error should publish");
+
+        assert!(state.audition_heard.iter().any(|id| id == &failed_id));
+        assert_eq!(state.audition_queue_index, 1);
+        assert_eq!(
+            state.audition_pending_play_track_id.as_deref(),
+            Some(next_id.as_str())
+        );
+        assert!(state.audition_auto_advance);
+        assert_eq!(
+            state.status,
+            format!("Loading next audition track: {next_id}…")
+        );
+    }
+
+    #[test]
+    fn acknowledged_audition_play_advances_without_a_playing_frame() {
+        let finished_id = String::from("finished-audition-track");
+        let next_id = String::from("next-audition-track");
+        let track = |id: &str| Track {
+            id: String::from(id),
+            title: String::from(id),
+            original_name: format!("{id}.wav"),
+            path: PathBuf::from(format!("/external/{id}.wav")),
+            reference_path: None,
+            size: 0,
+            favorite: false,
+            stage: TrackStage::Production,
+            status: TrackStatus::Inbox,
+            notes: Vec::new(),
+        };
+        let mut state = AppState {
+            busy: false,
+            workspace_mode: WorkspaceMode::Audition,
+            audition_queue: vec![finished_id.clone(), next_id.clone()],
+            audition_queue_index: 0,
+            audition_auto_advance: true,
+            audition_play_token: Some(1),
+            transport_polling: true,
+            transport_waiting_token: Some(1),
+            waveform: Some(WaveformData {
+                sample_rate: 48_000,
+                channels: 1,
+                duration_millis: 1,
+                render_frames: 48,
+                integrated_lufs: Some(-7.0),
+                loudness_profile: Arc::from([]),
+                summary: Arc::new(
+                    radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                        &[0.0, 0.0, 0.0, 0.0],
+                        4,
+                        1,
+                    ),
+                ),
+            }),
+            waveform_track_id: Some(finished_id.clone()),
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(finished_id.clone());
+        state.library.tracks = vec![track(&finished_id), track(&next_id)];
+        state.transport.set_snapshot_for_test(Snapshot {
+            generation: state.transport_generation,
+            acknowledged_token: 1,
+            position_millis: 1,
+            playing: false,
+            ready: true,
+        });
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut state, Message::Frame, &mut context);
+
+        assert_eq!(
+            state.library.selected_track_id.as_deref(),
+            Some(next_id.as_str())
+        );
+        assert_eq!(
+            state.audition_pending_play_track_id.as_deref(),
+            Some(next_id.as_str())
+        );
+        assert_eq!(state.audition_queue_index, 1);
+        assert!(!state.transport_playing);
+    }
+
+    #[test]
+    fn frame_transport_load_error_retains_manual_stop_and_report() {
+        let mut state = AppState {
+            busy: false,
+            status: String::from("Preparing playback…"),
+            transport_playing: true,
+            transport_polling: true,
+            ..AppState::default()
+        };
+        let error_thread =
+            schedule_async_transport_error(state.transport.clone(), state.transport_generation);
+        state.transport_waiting_token = Some(1);
+        let mut context = ui::UiUpdateContext::default();
+
+        wait_for_frame_state(&mut state, &mut context, |state| {
+            state.status != "Preparing playback…"
+        });
+        error_thread
+            .join()
+            .expect("the asynchronous transport error should publish");
+
+        assert!(state.status.starts_with("Could not "));
+        assert!(!state.transport_playing);
+        assert!(!state.transport_polling);
+        assert!(state.transport_waiting_token.is_none());
+        assert!(!state.audition_auto_advance);
+        assert!(state.audition_pending_play_track_id.is_none());
+    }
+
+    #[test]
+    fn workspace_tabs_select_review_planner_and_audition_directly() {
+        let mut state = AppState {
+            busy: false,
+            ..AppState::default()
+        };
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::SelectWorkspace(WorkspaceMode::Planner),
+            &mut context,
+        );
+        assert_eq!(state.workspace_mode, WorkspaceMode::Planner);
+        update(
+            &mut state,
+            Message::SelectWorkspace(WorkspaceMode::Audition),
+            &mut context,
+        );
+        assert_eq!(state.workspace_mode, WorkspaceMode::Audition);
+        update(
+            &mut state,
+            Message::SelectWorkspace(WorkspaceMode::Review),
+            &mut context,
+        );
+        assert_eq!(state.workspace_mode, WorkspaceMode::Review);
+    }
+
+    #[test]
+    fn audition_surface_projects_filters_queue_and_shuffle_control() {
+        let track = |id: &str, status: TrackStatus| Track {
+            id: String::from(id),
+            title: String::from(id),
+            original_name: format!("{id}.wav"),
+            path: PathBuf::from(format!("/external/{id}.wav")),
+            reference_path: None,
+            size: 0,
+            favorite: false,
+            stage: TrackStage::Production,
+            status,
+            notes: Vec::new(),
+        };
+        let mut state = AppState {
+            busy: false,
+            workspace_mode: WorkspaceMode::Audition,
+            ..AppState::default()
+        };
+        state.library.tracks = vec![
+            track("inbox-track", TrackStatus::Inbox),
+            track("refine-track", TrackStatus::Refine),
+        ];
+        rebuild_audition_queue(&mut state);
+        let labels = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 720.0))
+            .paint_plan
+            .text_label_strings();
+
+        for label in [
+            "AUDITION / PLAYLIST",
+            "Fixed shuffle · one pass",
+            "PLAY STATUS",
+            "Inbox",
+            "Refine",
+            "Release",
+            "Archive",
+            "Maybe",
+            "Previous",
+            "Play",
+            "Stop",
+            "Next",
+            "Shuffle",
+            "01  inbox-track",
+        ] {
+            assert!(
+                labels.iter().any(|painted| painted == label),
+                "missing {label:?}"
+            );
+        }
+        assert!(!labels.iter().any(|label| label == "refine-track"));
+    }
+
+    #[test]
+    fn favorite_state_is_immediately_visible_in_all_track_lists() {
+        let mut starred = audition_track("starred-track");
+        starred.favorite = true;
+        starred.stage = TrackStage::SoundDesign;
+        let mut unstarred = audition_track("unstarred-track");
+        unstarred.stage = TrackStage::Production;
+        let mut state = AppState {
+            busy: false,
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(starred.id.clone());
+        state.library.tracks = vec![starred, unstarred];
+        state.audition_queue = vec![
+            String::from("starred-track"),
+            String::from("unstarred-track"),
+        ];
+
+        for mode in [
+            WorkspaceMode::Review,
+            WorkspaceMode::Planner,
+            WorkspaceMode::Audition,
+        ] {
+            state.workspace_mode = mode;
+            let labels = project_surface(&state)
+                .view_frame_at_size_with_default_theme(Vector2::new(1_400.0, 900.0))
+                .paint_plan
+                .text_label_strings();
+            assert!(
+                labels.iter().any(|label| label == "★ STARRED"),
+                "missing starred marker in {mode:?}"
+            );
+            assert!(
+                labels.iter().any(|label| label == "☆ UNSTARRED"),
+                "missing unstarred marker in {mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn successive_native_file_drop_events_queue_every_path_while_importing() {
+        let mut state = AppState {
+            busy: true,
+            ..AppState::default()
+        };
+        let mut context = ui::UiUpdateContext::default();
+        let first = PathBuf::from("/external/first.wav");
+        let second = PathBuf::from("/external/second.wav");
+
+        update(
+            &mut state,
+            Message::FileDropped(ui::NativeFileDrop::dropped(first.clone(), None, None)),
+            &mut context,
+        );
+        update(
+            &mut state,
+            Message::FileDropped(ui::NativeFileDrop::dropped(second.clone(), None, None)),
+            &mut context,
+        );
+
+        assert_eq!(state.pending_import_paths, vec![first, second]);
+        assert_eq!(
+            state.import_batch,
+            Some(ImportBatchProgress {
+                total: 2,
+                completed: 0,
+                failed: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn import_completion_advances_progress_continues_after_failure_and_clears() {
+        let mut state = AppState {
+            busy: true,
+            import_batch: Some(ImportBatchProgress {
+                total: 3,
+                completed: 0,
+                failed: 0,
+            }),
+            pending_import_paths: vec![
+                PathBuf::from("/external/second.wav"),
+                PathBuf::from("/external/third.wav"),
+            ],
+            ..AppState::default()
+        };
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::ImportCompleted(Ok(Library::default())),
+            &mut context,
+        );
+        assert_eq!(
+            state.import_batch,
+            Some(ImportBatchProgress {
+                total: 3,
+                completed: 1,
+                failed: 0,
+            })
+        );
+        assert_eq!(
+            state.pending_import_paths,
+            vec![PathBuf::from("/external/third.wav")]
+        );
+        assert!(state.busy);
+
+        update(
+            &mut state,
+            Message::ImportCompleted(Err(String::from("second failed"))),
+            &mut context,
+        );
+        assert_eq!(
+            state.import_batch,
+            Some(ImportBatchProgress {
+                total: 3,
+                completed: 2,
+                failed: 1,
+            })
+        );
+        assert!(state.pending_import_paths.is_empty());
+        assert!(state.busy);
+
+        update(
+            &mut state,
+            Message::ImportCompleted(Ok(Library::default())),
+            &mut context,
+        );
+        assert!(state.import_batch.is_none());
+        assert_eq!(state.status, "Imported 2 of 3 files; 1 failed.");
+        assert!(!state.busy);
+    }
+
+    #[test]
+    fn multi_file_import_status_projects_counter_and_determinate_bar() {
+        let state = AppState {
+            busy: true,
+            import_batch: Some(ImportBatchProgress {
+                total: 3,
+                completed: 1,
+                failed: 1,
+            }),
+            ..AppState::default()
+        };
+        let frame = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 720.0));
+        let labels = frame.paint_plan.text_label_strings();
+
+        assert!(
+            labels
+                .iter()
+                .any(|label| { label == "Importing 2 of 3 · 2 remaining · 1 failed" })
+        );
+
+        let fills = frame.paint_plan.fill_rects().collect::<Vec<_>>();
+        assert!(fills.windows(2).any(|pair| {
+            let track = pair[0];
+            let fill = pair[1];
+            track.widget_id == fill.widget_id
+                && (track.rect.min.y - fill.rect.min.y).abs() < f32::EPSILON
+                && (track.rect.height() - fill.rect.height()).abs() < f32::EPSILON
+                && (fill.rect.width() - track.rect.width() / 3.0).abs() < 0.01
+        }));
+    }
+
+    #[test]
+    fn audition_library_reconciliation_preserves_order_and_progress_cursor() {
+        let track = |id: &str| Track {
+            id: String::from(id),
+            title: String::from(id),
+            original_name: format!("{id}.wav"),
+            path: PathBuf::from(format!("/external/{id}.wav")),
+            reference_path: None,
+            size: 0,
+            favorite: false,
+            stage: TrackStage::Production,
+            status: TrackStatus::Inbox,
+            notes: Vec::new(),
+        };
+        let mut state = AppState {
+            busy: false,
+            workspace_mode: WorkspaceMode::Audition,
+            audition_queue: vec![String::from("a"), String::from("b")],
+            audition_queue_index: 1,
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(String::from("b"));
+        state.library.tracks = vec![track("a"), track("b"), track("c")];
+
+        reconcile_audition_queue(&mut state);
+        assert_eq!(
+            state.audition_queue,
+            vec![String::from("a"), String::from("b"), String::from("c")]
+        );
+        assert_eq!(state.audition_queue_index, 1);
+
+        state.library.tracks.retain(|track| track.id != "b");
+        reconcile_audition_queue(&mut state);
+        assert_eq!(
+            state.audition_queue,
+            vec![String::from("a"), String::from("c")]
+        );
+        assert_eq!(state.audition_queue_index, 1);
     }
 }

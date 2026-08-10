@@ -1,0 +1,365 @@
+name: Cadence release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: "Release channel"
+        required: true
+        default: stable
+        type: choice
+        options:
+          - stable
+          - nightly
+      version:
+        description: "Stable semver version without the v prefix; leave blank for nightly"
+        required: false
+        type: string
+
+concurrency:
+  group: cadence-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and sign release
+    runs-on: macos-14
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      channel: ${{ steps.release.outputs.channel }}
+      version: ${{ steps.release.outputs.version }}
+      build_id: ${{ steps.release.outputs.build_id }}
+      release_tag: ${{ steps.release.outputs.release_tag }}
+      tag_release: ${{ steps.release.outputs.tag_release }}
+      create_github_release: ${{ steps.release.outputs.create_github_release }}
+      artifact_upload_name: ${{ steps.release.outputs.artifact_upload_name }}
+      source_sha: ${{ steps.release.outputs.source_sha }}
+    env:
+      CARGO_TERM_COLOR: always
+      APPLE_DEVELOPER_ID_APPLICATION_CERT_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_CERT_BASE64 }}
+      APPLE_DEVELOPER_ID_APPLICATION_CERT_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_CERT_PASSWORD }}
+      APPLE_NOTARY_KEY_BASE64: ${{ secrets.APPLE_NOTARY_KEY_BASE64 }}
+      APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+      APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Select release metadata
+        id: release
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          RUN_NUMBER: ${{ github.run_number }}
+          SOURCE_SHA: ${{ github.sha }}
+          INPUT_CHANNEL: ${{ inputs.channel || '' }}
+          INPUT_VERSION: ${{ inputs.version || '' }}
+        run: |
+          set -euo pipefail
+
+          base_version_re='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
+          stable_version_re="^${base_version_re}$"
+          rc_version_re="^${base_version_re}-rc\.[1-9][0-9]*$"
+          nightly_version_re="^${base_version_re}-nightly\.[1-9][0-9]*$"
+          cargo_version="$(sed -n '/^\[package\]/,/^\[/{ s/^version = "\([^\"]*\)"/\1/p; }' Cargo.toml | head -n 1)"
+          cargo_base_version="${cargo_version%%-*}"
+          [[ "$cargo_base_version" =~ $base_version_re ]] || { echo "Cargo.toml does not contain a numeric package version" >&2; exit 1; }
+          [[ "$SOURCE_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || { echo "GitHub did not provide a full commit SHA" >&2; exit 1; }
+          [[ "$RUN_NUMBER" =~ ^[1-9][0-9]*$ ]] || { echo "GitHub run number is not a positive integer" >&2; exit 1; }
+
+          source_sha="$(printf '%s' "$SOURCE_SHA" | tr '[:upper:]' '[:lower:]')"
+          channel=""
+          version=""
+          release_tag=""
+          tag_release=false
+
+          case "$EVENT_NAME" in
+            push)
+              [[ "$REF" == refs/tags/v* ]] || { echo "push releases must run from a v-prefixed tag" >&2; exit 1; }
+              version="${REF_NAME#v}"
+              release_tag="$REF_NAME"
+              tag_release=true
+              if [[ "$version" =~ $stable_version_re ]]; then
+                channel=stable
+              elif [[ "$version" =~ $rc_version_re ]]; then
+                channel=rc
+              elif [[ "$version" =~ $nightly_version_re ]]; then
+                channel=nightly
+              else
+                echo "tag version must be X.Y.Z, X.Y.Z-rc.N, or X.Y.Z-nightly.N: $version" >&2
+                exit 2
+              fi
+              ;;
+            schedule)
+              channel=nightly
+              version="${cargo_base_version}-nightly.${RUN_NUMBER}"
+              ;;
+            workflow_dispatch)
+              channel="$INPUT_CHANNEL"
+              case "$channel" in
+                stable)
+                  [[ -n "$INPUT_VERSION" ]] || { echo "stable manual releases require the version input" >&2; exit 2; }
+                  version="$INPUT_VERSION"
+                  ;;
+                nightly)
+                  [[ -z "$INPUT_VERSION" ]] || { echo "nightly manual releases use Cargo.toml plus the run number; leave version blank" >&2; exit 2; }
+                  version="${cargo_base_version}-nightly.${RUN_NUMBER}"
+                  ;;
+                *)
+                  echo "invalid release channel: $channel" >&2
+                  exit 2
+                  ;;
+              esac
+              if [[ "$channel" == stable && "$REF" == refs/tags/* ]]; then
+                [[ "$REF_NAME" == "v${version}" ]] || { echo "stable version $version does not match tag $REF_NAME" >&2; exit 1; }
+                release_tag="$REF_NAME"
+                tag_release=true
+              fi
+              ;;
+            *)
+              echo "unsupported release event: $EVENT_NAME" >&2
+              exit 1
+              ;;
+          esac
+
+          case "$channel" in
+            stable)
+              [[ "$version" =~ $stable_version_re ]] || { echo "stable releases require X.Y.Z: $version" >&2; exit 2; }
+              [[ "$cargo_version" == "$version" ]] || { echo "Cargo.toml version $cargo_version does not match stable version $version" >&2; exit 1; }
+              ;;
+            rc)
+              [[ "$version" =~ $rc_version_re ]] || { echo "rc releases require X.Y.Z-rc.N: $version" >&2; exit 2; }
+              ;;
+            nightly)
+              [[ "$version" =~ $nightly_version_re ]] || { echo "nightly releases require X.Y.Z-nightly.N: $version" >&2; exit 2; }
+              ;;
+            *)
+              echo "invalid release channel: $channel" >&2
+              exit 2
+              ;;
+          esac
+
+          version_base="${version%%-*}"
+          [[ "$version_base" == "$cargo_base_version" ]] || { echo "Cargo.toml base version $cargo_base_version does not match release version $version" >&2; exit 1; }
+
+          short_sha="${source_sha:0:12}"
+          if [[ "$channel" == stable ]]; then
+            build_id="cadence-v${version}-${RUN_NUMBER}"
+          else
+            build_id="cadence-${channel}-${RUN_NUMBER}-${short_sha}"
+            if [[ "$tag_release" != true ]]; then
+              release_tag="$build_id"
+            fi
+          fi
+
+          create_github_release=false
+          if [[ "$tag_release" == true || ( "$channel" == nightly && -n "$release_tag" ) || "$channel" == rc ]]; then
+            create_github_release=true
+          fi
+
+          artifact_upload_name="cadence-v${version}-macos-arm64"
+          if [[ "$channel" != stable ]]; then
+            artifact_upload_name="cadence-${channel}-v${version}-macos-arm64"
+          fi
+
+          printf '%s\n' "channel=$channel" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "version=$version" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "build_id=$build_id" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "tag_release=$tag_release" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "create_github_release=$create_github_release" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "artifact_upload_name=$artifact_upload_name" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal --component clippy
+
+      - name: Install Apple Silicon Rust target
+        run: rustup target add --toolchain stable aarch64-apple-darwin
+
+      - name: Run Rust validation
+        run: |
+          cargo +stable test --locked
+          cargo +stable clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Verify Apple production secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in APPLE_DEVELOPER_ID_APPLICATION_CERT_BASE64 APPLE_DEVELOPER_ID_APPLICATION_CERT_PASSWORD APPLE_NOTARY_KEY_BASE64 APPLE_NOTARY_KEY_ID APPLE_NOTARY_ISSUER_ID; do
+            [[ -n "${!name:-}" ]] || { echo "Missing required Apple release secret: $name" >&2; exit 1; }
+          done
+
+      - name: Reuse existing release artifact when available
+        id: reuse_artifact
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ steps.release.outputs.artifact_upload_name }}
+          path: release-output
+          github-token: ${{ github.token }}
+          run-id: ${{ github.run_id }}
+
+      - name: Build, sign, notarize, and describe release
+        if: steps.reuse_artifact.outcome != 'success'
+        env:
+          RELEASE_CHANNEL: ${{ steps.release.outputs.channel }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          RELEASE_BUILD_ID: ${{ steps.release.outputs.build_id }}
+        run: |
+          set -euo pipefail
+          ./scripts/release/build_macos_release.sh \
+            --version "$RELEASE_VERSION" \
+            --channel "$RELEASE_CHANNEL" \
+            --build-id "$RELEASE_BUILD_ID"
+
+      - name: Upload immutable release artifact
+        if: steps.reuse_artifact.outcome != 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.release.outputs.artifact_upload_name }}
+          path: release-output/
+          if-no-files-found: error
+          overwrite: false
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    env:
+      CADENCE_RELEASE_UPLOAD_TOKEN: ${{ secrets.CADENCE_RELEASE_UPLOAD_TOKEN }}
+      PORTALSURFER_RELEASE_ENDPOINT: ${{ vars.PORTALSURFER_RELEASE_ENDPOINT || 'https://portalsurfer.org' }}
+      RELEASE_CHANNEL: ${{ needs.build.outputs.channel }}
+      RELEASE_VERSION: ${{ needs.build.outputs.version }}
+      RELEASE_BUILD_ID: ${{ needs.build.outputs.build_id }}
+      RELEASE_TAG: ${{ needs.build.outputs.release_tag }}
+      RELEASE_TAG_EXISTS: ${{ needs.build.outputs.tag_release }}
+      SOURCE_SHA: ${{ needs.build.outputs.source_sha }}
+    steps:
+      - name: Check out source for release publisher
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download exact release artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.artifact_upload_name }}
+          path: release-output
+          github-token: ${{ github.token }}
+          run-id: ${{ github.run_id }}
+
+      - name: Verify downloaded release metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest_path=release-output/cadence-release-manifest.json
+          artifact_path="release-output/cadence-v${RELEASE_VERSION}-macos-arm64.zip"
+          [[ -s "$manifest_path" ]] || { echo "downloaded release manifest is missing" >&2; exit 1; }
+          [[ -s "$artifact_path" ]] || { echo "downloaded release archive is missing" >&2; exit 1; }
+          jq -e \
+            --arg version "$RELEASE_VERSION" \
+            --arg channel "$RELEASE_CHANNEL" \
+            --arg build_id "$RELEASE_BUILD_ID" \
+            --arg git_sha "$SOURCE_SHA" \
+            '.version == $version and .channel == $channel and .build_id == $build_id and .source.git_sha == $git_sha' \
+            "$manifest_path" >/dev/null
+
+      - name: Verify PortalSurfer upload token
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -n "${CADENCE_RELEASE_UPLOAD_TOKEN:-}" ]] || { echo "Missing required release secret: CADENCE_RELEASE_UPLOAD_TOKEN" >&2; exit 1; }
+
+      - name: Create or verify GitHub release idempotently
+        if: needs.build.outputs.create_github_release == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          release_assets=(
+            "release-output/cadence-v${RELEASE_VERSION}-macos-arm64.zip"
+            "release-output/SHA256SUMS.txt"
+            "release-output/cadence-release-manifest.json"
+          )
+          for asset in "${release_assets[@]}"; do
+            [[ -s "$asset" ]] || { echo "release asset is missing: $asset" >&2; exit 1; }
+          done
+
+          if ! gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json tagName,isDraft,isPrerelease >/dev/null 2>&1; then
+            if [[ "$RELEASE_CHANNEL" == stable ]]; then
+              gh release create "$RELEASE_TAG" \
+                "${release_assets[@]}" \
+                --repo "$GITHUB_REPOSITORY" \
+                --verify-tag \
+                --generate-notes \
+                --title "Cadence ${RELEASE_VERSION}"
+            elif [[ "$RELEASE_TAG_EXISTS" == true ]]; then
+              gh release create "$RELEASE_TAG" \
+                "${release_assets[@]}" \
+                --repo "$GITHUB_REPOSITORY" \
+                --verify-tag \
+                --prerelease \
+                --generate-notes \
+                --title "Cadence ${RELEASE_VERSION} ${RELEASE_CHANNEL}"
+            else
+              gh release create "$RELEASE_TAG" \
+                "${release_assets[@]}" \
+                --repo "$GITHUB_REPOSITORY" \
+                --target "$SOURCE_SHA" \
+                --prerelease \
+                --generate-notes \
+                --title "Cadence ${RELEASE_VERSION} ${RELEASE_CHANNEL}"
+            fi
+          fi
+
+          expected_prerelease=false
+          if [[ "$RELEASE_CHANNEL" != stable ]]; then
+            expected_prerelease=true
+          fi
+          release_info="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft,isPrerelease)"
+          jq -e \
+            --arg tag "$RELEASE_TAG" \
+            --argjson expected_prerelease "$expected_prerelease" \
+            '.tagName == $tag and .isDraft == false and .isPrerelease == $expected_prerelease' \
+            <<<"$release_info" >/dev/null || {
+              echo "GitHub release metadata does not match the selected Cadence release" >&2
+              exit 1
+            }
+
+          verify_dir="$(mktemp -d)"
+          trap 'rm -rf "$verify_dir"' EXIT
+          for asset in "${release_assets[@]}"; do
+            asset_name="$(basename "$asset")"
+            gh release download "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --pattern "$asset_name" \
+              --dir "$verify_dir"
+            cmp -s "$asset" "$verify_dir/$asset_name" || {
+              echo "GitHub release asset differs from the immutable build: $asset_name" >&2
+              exit 1
+            }
+          done
+
+      - name: Publish exact release to PortalSurfer
+        run: node scripts/release/publish_release.mjs \
+          --manifest release-output/cadence-release-manifest.json \
+          --root release-output

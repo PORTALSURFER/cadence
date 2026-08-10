@@ -4,7 +4,7 @@ Cadence is a local-first track review desk: import audio, listen, capture a note
 
 ## Run locally
 
-On macOS, double-click [`Cadence.command`](./Cadence.command) to start the browser prototype from `web/`. The native Radiant app can be launched from the project root with `cargo run --release` or the compiled `target/release/cadence-native` binary; it opens a desktop window and stores its native library metadata under the normal Cadence application-support directory.
+On macOS, double-click [`Cadence.command`](./Cadence.command) to launch the native app through the existing Cargo/native runner. The canonical native development path is `cargo run` (or `cargo run --release`); Cargo stages the normal Cadence executable in a LaunchServices-visible `target/dev-app/Cadence.app` with the Cadence icon and bundle identifier, then launches that app. It stores native library metadata under the normal Cadence application-support directory.
 
 To run it from Terminal:
 
@@ -12,9 +12,58 @@ To run it from Terminal:
 ./Cadence.command
 ```
 
-The launcher normally opens the browser for you. To start the server without opening a browser, use `CADENCE_NO_OPEN=1 ./Cadence.command`.
+To explicitly build the native macOS release bundle with the Cadence icon:
 
-If that port is already occupied, choose another free port and open the matching URL. The launcher serves the dedicated `web/` directory automatically; port `4173` may belong to another local PortalSurfer site.
+```sh
+./scripts/build_native_app_bundle.sh
+open dist/Cadence.app
+```
+
+The raw `target/debug/cadence-native` and `target/release/cadence-native` binaries are diagnostic artifacts only; they are not LaunchServices-visible app bundles.
+
+## Production releases
+
+Pushing a `vX.Y.Z` tag runs [the release workflow](.github/workflows/release.yml) on an Apple Silicon macOS runner. It runs the Rust test and Clippy gates, creates a versioned `Cadence.app`, signs it with Developer ID Application, submits it to Apple for notarization, staples and validates the ticket, creates `cadence-vX.Y.Z-macos-arm64.zip`, and publishes the schema-2 application manifest with channel `stable` to `https://portalsurfer.org`. Stable releases keep the existing tag-driven behavior and require the Cargo package version to match the tag exactly.
+
+The same workflow runs nightly at `02:17 UTC` and can be started manually. Manual dispatch offers `stable` and `nightly`: stable requires an explicit `X.Y.Z` version (and only creates a GitHub release when dispatched from the matching `vX.Y.Z` tag), while nightly leaves the version blank. Nightly derives `X.Y.Z` from the numeric package version in `Cargo.toml`, appends `-nightly.<run-number>`, publishes manifest channel `nightly`, and uses the lowercase `cadence-nightly-<run-number>-<12-character-commit>` value for both its PortalSurfer build id and generated GitHub prerelease tag. A first tag-triggered nightly may instead use a tag such as `v0.1.0-nightly.1`; generated nightly tags do not begin with `v` and are targeted at the triggering commit, so they do not retrigger the tag workflow. Tags in the form `vX.Y.Z-rc.N` are also accepted as `rc` prereleases.
+
+Release versions are channel-specific: stable is `X.Y.Z`, RC is `X.Y.Z-rc.N`, and nightly is `X.Y.Z-nightly.N`. The full semantic version remains in the artifact name and manifest. Apple bundle metadata is separate: `CFBundleShortVersionString` is the numeric base `X.Y.Z`, while `CFBundleVersion` is the numeric build value (`X.Y.Z` for stable and `N` for RC/nightly).
+
+The GitHub repository needs these Actions secrets:
+
+- `APPLE_DEVELOPER_ID_APPLICATION_CERT_BASE64`: a base64-encoded Developer ID Application `.p12` export.
+- `APPLE_DEVELOPER_ID_APPLICATION_CERT_PASSWORD`: the `.p12` password.
+- `APPLE_NOTARY_KEY_BASE64`, `APPLE_NOTARY_KEY_ID`, and `APPLE_NOTARY_ISSUER_ID`: an App Store Connect API key and its identifiers.
+- `CADENCE_RELEASE_UPLOAD_TOKEN`: the product-specific PortalSurfer release token.
+
+The release build derives the ten-character Team ID from the trailing `(TEAMID)` in the selected imported Developer ID Application identity; configure no separate Team ID secret. It fails closed if the identity does not contain a valid suffix.
+
+GitHub Actions uses its built-in `GITHUB_TOKEN` for the GitHub release, so no separate GitHub release PAT is needed inside Actions. `CADENCE_RELEASE_UPLOAD_TOKEN` is still required for publishing the manifest and artifacts to PortalSurfer.
+
+Optionally set the repository variable `PORTALSURFER_RELEASE_ENDPOINT`; it defaults to `https://portalsurfer.org`. The publisher accepts only that production origin or an explicit HTTP loopback URL for local testing. It checks the server capability before staging the app zip, screenshot, and `CHANGELOG.md`, then commits their hashes in the manifest.
+
+The local scripts are intentionally production-gated. Check their syntax without contacting Apple or PortalSurfer:
+
+```sh
+bash -n scripts/build_native_app_bundle.sh scripts/release/build_macos_release.sh scripts/release/verify_macos_architecture.sh scripts/release/test_macos_architecture.sh
+node --check scripts/release/create_manifest.mjs
+node --check scripts/release/publish_release.mjs
+node --check scripts/release/test_release_scripts.mjs
+node --test scripts/release/test_release_scripts.mjs
+bash scripts/release/test_bundle_version.sh
+bash scripts/release/test_macos_architecture.sh
+./scripts/release/build_macos_release.sh --help
+```
+
+A real release requires macOS, the five Apple signing/notary secrets, a clean checkout, and the PortalSurfer upload token; the release tests exercise Team ID derivation with synthetic identities without Apple credentials. No ad-hoc signature is accepted by the production release script. Direct callers may pass `--channel stable`, `--channel rc`, or `--channel nightly`; omitting it preserves the stable default.
+
+To capture the current native window for visual refinement, run the macOS screenshot harness:
+
+```sh
+./scripts/capture_native_screenshot.sh artifacts/screenshots/cadence-native.png
+```
+
+It reuses an already-open Cadence native window or builds and launches the debug binary, then captures the titled window with macOS `screencapture`. Pass `--hover X Y` with screen coordinates before the output path to move the pointer and capture a hover state, for example `./scripts/capture_native_screenshot.sh --hover 150 210 --output artifacts/screenshots/import-hover.png`. Generated PNGs stay local under `artifacts/screenshots/`; the deterministic paint-plan tests remain the CI-safe visual contract.
 
 The browser app stores track metadata and review notes in `localStorage`, the imported audio blobs in IndexedDB, and the last browser session in a separate local storage record. Nothing is uploaded anywhere. Refreshing the page restores the selected track, listening position, playback intent when the browser permits autoplay, audition volume/mute state, search, and review filters. The bundled “Glass Echoes” entry is a local preview record used to make the review layout inspectable before importing a real file.
 
@@ -23,21 +72,28 @@ The native slice owns its library model and JSON persistence in the Cadence host
 ## First slice
 
 - Import audio through the button or by dragging files onto the page.
+- Drop multiple audio files onto the native workspace to queue them for serial import; each new track starts in Inbox.
 - Search and filter the local library.
 - Mark tracks as favorites with a persistent star toggle.
 - Move tracks through Sound design, Production / arrangement, Mixdown, and Mastering stages.
+- Move any track directly between the independent statuses Inbox, Refine, Release, Archive, and Maybe. Maybe captures an uncertain decision; Archive is a visible, reversible marker; Favorite remains a separate star.
 - Remove imported tracks from the library; native removal keeps the external source audio file in place.
 - Switch to the native finishing board: four columns derived from each track's current stage, with cards for review, favorites, and open comments. Drag cards between columns to update their workflow stage.
-- Play, pause, and seek with the native transport controls; browser-only audition volume remains separate.
+- Play, pause, seek, and adjust native audition volume with the transport controls; the LUFS meter reports K-weighted integrated LUFS from decoded audio.
+- Switch directly between the visible Review, Planner, and Audition tabs in the native workspace header. Audition filters the library by Inbox, Refine, Release, Archive, or Maybe, fixes a shuffled one-pass queue, and advances to the next matching track automatically; status changes made while listening update the queue.
+- Import one external reference track per native track; its independently decoded waveform is shown below the primary waveform at the same height without changing loudness analysis.
+- Play the imported and reference tracks from one synchronized transport, then use the compact icon source toggle to choose the audible source.
+- Drag across the reference waveform to paint a normalized loop range; the shared transport keeps both tracks synchronized and repeats the selected section.
+- Toggle loudness matching to apply the bounded LUFS-derived gain offset to the reference audition.
 - Drag the upper half of the shared waveform to scrub, then release to play from that point.
 - Use the lower half of the same waveform to open an inline comment composer at the exact hovered/clicked timestamp; saved comments appear as dots on the horizontal comment line.
 - Edit saved comments in place without changing their timestamp or completion state.
-- Watch the far-right K-weighted loudness meter while listening: 3-second short-term, live integrated, and full-file integrated readings are shown together. The live readings accumulate before the audition gain, so volume and mute do not affect them. The -7 to -6 LUFS hard-techno reference is a practical mix/master heuristic, not a universal delivery standard.
+- View the full-track integrated LUFS value beside the native waveform; it remains stable while stopped or playing.
 - Press `N` or click the lower comment rail to capture the current position and write a note.
 - Click a comment pin or note timestamp to return to that moment; check notes off as they are completed.
 - Use Open, All, and Done note views.
 
-The native planner is currently a single derived board over the library's four progress stages. Dragging a card between columns updates the existing persisted track stage; custom boards and board-specific status remain future slices.
+The native planner is currently a single derived board over the library's four progress stages. Dragging a card between columns updates the existing persisted track stage; the independent track status remains available from each library row, planner card, and selected-track header.
 
 ## Known limits
 
@@ -49,4 +105,4 @@ The browser prototype relies on the browser’s native audio codecs and local br
 
 The native slice persists library metadata and the original external audio-file paths as JSON under the Cadence application-support directory, then decodes the source file in a background worker to build a bounded retained waveform summary. Moving or deleting a source file therefore requires re-importing it. The native launcher takes a single-process lock around that local library, while the browser library remains separate.
 
-Native playback is responsive, host-controlled audition playback through Rodio. The playhead displays the latest Rodio-reported position at Radiant frame cadence; it is not a sample-accurate transport clock or a lock-free realtime audio engine. Rodio/CPAL may pull decoder data and service internal control state from the output callback, so occasional device-, decoder-, or system-load-related glitches remain possible. A future DSP, recording, monitoring, plugin-hosting, automation, low-latency scrubbing, or sample-accurate transport requirement would need a dedicated callback-safe backend. Native loudness metering remains a separate slice; the native planner supports drag-to-stage movement but does not yet persist custom boards or board-specific status.
+Native playback is responsive, host-controlled audition playback through Rodio. The playhead displays the latest Rodio-reported position at Radiant frame cadence; it is not a sample-accurate transport clock or a lock-free realtime audio engine. Rodio/CPAL may pull decoder data and service internal control state from the output callback, so occasional device-, decoder-, or system-load-related glitches remain possible. A future DSP, recording, monitoring, plugin-hosting, automation, low-latency scrubbing, or sample-accurate transport requirement would need a dedicated callback-safe backend. Native loudness uses bounded K-weighted integrated LUFS analysis decoded in the background; playback gain is applied after that analysis, so audition volume and reference matching do not change the meter. Reference tracks are stored as external paths and must be re-imported if moved or deleted; matching changes only reference audition gain and never rewrites either audio file. The native planner supports drag-to-stage movement but does not yet persist custom boards; track statuses are stored separately from production stages.
