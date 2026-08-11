@@ -1793,6 +1793,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 });
                 state.status =
                     format!("Editing comment at {}.", format_timestamp(note.time_millis));
+                context.focus(MAIN_COMMENT_EDITOR_ID);
                 context.request_repaint();
             }
         }
@@ -5931,7 +5932,10 @@ fn note_row(
     .fill_width();
     let row_key = select_id.clone();
     let hover_id = note.id.clone();
-    let row_actions = ui::row_actions().primary(move || Message::SelectNote(select_id.clone()));
+    let double_edit_id = note.id.clone();
+    let row_actions = ui::row_actions()
+        .primary(move || Message::SelectNote(select_id.clone()))
+        .double_activate(move || Message::EditNote(double_edit_id.clone()));
     let row_surface = ui::interactive_row_underlay(row)
         .selected(selected)
         .stable_row_identity(0xCAD3_0002, row_key)
@@ -5958,6 +5962,7 @@ fn reference_note_row(
 ) -> ui::View<Message> {
     let selected = selected_note_id == Some(note.id.as_str());
     let select_id = note.id.clone();
+    let double_edit_id = note.id.clone();
     let hover_id = note.id.clone();
     let hover_key = note.id.clone();
     let row = ui::list_row(
@@ -5984,8 +5989,9 @@ fn reference_note_row(
     )
     .fill_width();
     let row_key = select_id.clone();
-    let row_actions =
-        ui::row_actions().primary(move || Message::SelectReferenceNote(select_id.clone()));
+    let row_actions = ui::row_actions()
+        .primary(move || Message::SelectReferenceNote(select_id.clone()))
+        .double_activate(move || Message::EditReferenceNote(double_edit_id.clone()));
     let row_surface = ui::interactive_row_underlay(row)
         .selected(selected)
         .stable_row_identity(0xCAD3_0003, row_key)
@@ -6341,6 +6347,122 @@ mod tests {
             Some(640)
         );
         assert_eq!(state.status, "Comment at 00:00 — type a note below.");
+    }
+
+    #[test]
+    fn editing_existing_comment_populates_draft_and_focuses_main_editor() {
+        let track_id = String::from("edit-track");
+        let note_id = String::from("edit-note");
+        let mut state = AppState {
+            busy: false,
+            review_cursor_millis: 3_000,
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(track_id.clone());
+        state.library.tracks.push(Track {
+            id: track_id,
+            title: String::from("Edit track"),
+            original_name: String::from("edit-track.wav"),
+            path: PathBuf::from("/external/edit-track.wav"),
+            reference_path: None,
+            size: 0,
+            favorite: false,
+            stage: TrackStage::SoundDesign,
+            status: TrackStatus::Inbox,
+            notes: vec![Note {
+                id: note_id.clone(),
+                time_millis: 1_250,
+                body: String::from("Existing comment body"),
+                done: false,
+            }],
+        });
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut state, Message::EditNote(note_id.clone()), &mut context);
+
+        assert_eq!(state.selected_note_id.as_deref(), Some(note_id.as_str()));
+        assert_eq!(state.review_cursor_millis, 1_250);
+        let draft = state
+            .draft_note
+            .as_ref()
+            .expect("editing an existing comment should open the draft");
+        assert_eq!(draft.note_id.as_deref(), Some(note_id.as_str()));
+        assert_eq!(draft.time_millis, 1_250);
+        assert_eq!(draft.body, "Existing comment body");
+
+        let focus_command = context.into_command();
+        assert!(matches!(
+            focus_command,
+            radiant::runtime::Command::Batch(commands)
+                if commands.iter().any(|command| matches!(
+                    command,
+                    radiant::runtime::Command::Focus(id)
+                        if *id == super::MAIN_COMMENT_EDITOR_ID
+                ))
+        ));
+    }
+
+    #[test]
+    fn editing_existing_reference_comment_populates_draft_and_focuses_reference_editor() {
+        let track_id = String::from("reference-edit-track");
+        let note_id = String::from("reference-edit-note");
+        let reference_path = PathBuf::from("/external/reference-edit.wav");
+        let mut state = AppState {
+            busy: false,
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(track_id.clone());
+        state.library.tracks.push(Track {
+            id: track_id,
+            title: String::from("Reference edit track"),
+            original_name: String::from("reference-edit-main.wav"),
+            path: PathBuf::from("/external/reference-edit-main.wav"),
+            reference_path: Some(reference_path.clone()),
+            size: 0,
+            favorite: false,
+            stage: TrackStage::SoundDesign,
+            status: TrackStatus::Inbox,
+            notes: Vec::new(),
+        });
+        state.library.reference_tracks.push(ReferenceTrack {
+            path: reference_path,
+            notes: vec![Note {
+                id: note_id.clone(),
+                time_millis: 875,
+                body: String::from("Existing reference body"),
+                done: true,
+            }],
+        });
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::EditReferenceNote(note_id.clone()),
+            &mut context,
+        );
+
+        assert_eq!(
+            state.selected_reference_note_id.as_deref(),
+            Some(note_id.as_str())
+        );
+        let draft = state
+            .reference_draft_note
+            .as_ref()
+            .expect("editing an existing reference comment should open the draft");
+        assert_eq!(draft.note_id.as_deref(), Some(note_id.as_str()));
+        assert_eq!(draft.time_millis, 875);
+        assert_eq!(draft.body, "Existing reference body");
+
+        let focus_command = context.into_command();
+        assert!(matches!(
+            focus_command,
+            radiant::runtime::Command::Batch(commands)
+                if commands.iter().any(|command| matches!(
+                    command,
+                    radiant::runtime::Command::Focus(id)
+                        if *id == super::REFERENCE_COMMENT_EDITOR_ID
+                ))
+        ));
     }
 
     #[test]
@@ -8281,6 +8403,21 @@ mod tests {
                 .as_deref(),
             Some(note_id.as_str())
         );
+        assert!(
+            runtime.bridge().state().reference_draft_note.is_none(),
+            "a single click should select the reference comment without opening its editor"
+        );
+
+        runtime.dispatch_event(Event::primary_double_click(comment_point));
+        let draft = runtime
+            .bridge()
+            .state()
+            .reference_draft_note
+            .as_ref()
+            .expect("a double click on the reference comment body should open its editor");
+        assert_eq!(draft.note_id.as_deref(), Some(note_id.as_str()));
+        assert_eq!(draft.time_millis, 500);
+        assert_eq!(draft.body, "reference hover me");
 
         runtime.dispatch_event(Event::pointer_move(Point::new(10.0, 10.0)));
         assert_eq!(runtime.bridge().state().hovered_reference_note_id, None);
@@ -8544,6 +8681,21 @@ mod tests {
             runtime.bridge().state().selected_note_id.as_deref(),
             Some(note_id.as_str())
         );
+        assert!(
+            runtime.bridge().state().draft_note.is_none(),
+            "a single click should select the comment without opening its editor"
+        );
+
+        runtime.dispatch_event(Event::primary_double_click(comment_point));
+        let draft = runtime
+            .bridge()
+            .state()
+            .draft_note
+            .as_ref()
+            .expect("a double click on the comment body should open its editor");
+        assert_eq!(draft.note_id.as_deref(), Some(note_id.as_str()));
+        assert_eq!(draft.time_millis, 1_000);
+        assert_eq!(draft.body, "hover and select me");
 
         let waveform_away_point = Point::new(
             lower_waveform_rect.min.x + lower_waveform_rect.width() * 0.1,
