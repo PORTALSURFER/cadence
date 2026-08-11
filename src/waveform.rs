@@ -18,8 +18,7 @@ use radiant::{
 };
 use std::sync::Arc;
 
-const MAIN_COMMENT_RAIL_RATIO: f32 = 0.82;
-const REFERENCE_COMMENT_RAIL_RATIO: f32 = 0.74;
+const COMMENT_RAIL_RATIO: f32 = 0.82;
 const MARKER_RADIUS: f32 = 4.5;
 const DRAFT_MARKER_RADIUS: f32 = 5.5;
 const COMMENT_DRAG_HIT_RADIUS: f32 = 7.0;
@@ -420,7 +419,7 @@ impl WaveformWidget {
         if bounds.height() <= 0.0 {
             return false;
         }
-        position.y >= main_comment_rail_y(bounds)
+        position.y >= comment_rail_y(bounds)
     }
 
     fn draft_marker_hit(&self, bounds: Rect, position: Point) -> bool {
@@ -431,7 +430,7 @@ impl WaveformWidget {
             return false;
         }
         let marker_x = self.timeline.x_at(bounds, ratio);
-        let rail_y = main_comment_rail_y(bounds);
+        let rail_y = comment_rail_y(bounds);
         let hit_radius = DRAFT_MARKER_RADIUS + COMMENT_DRAG_HIT_RADIUS;
         (position.x - marker_x).abs() <= hit_radius && (position.y - rail_y).abs() <= hit_radius
     }
@@ -441,7 +440,7 @@ impl WaveformWidget {
             return None;
         }
 
-        let rail_y = main_comment_rail_y(bounds);
+        let rail_y = comment_rail_y(bounds);
         let hover_radius_squared = NOTE_HOVER_RADIUS * NOTE_HOVER_RADIUS;
         self.note_ratios
             .iter()
@@ -837,7 +836,7 @@ impl Widget for WaveformWidget {
 
         let colors = WaveformColors::from_theme(theme);
         let plot_bounds = self.timeline.plot_bounds(bounds);
-        let rail_y = main_comment_rail_y(bounds);
+        let rail_y = comment_rail_y(bounds);
         let bar_bounds = visible_bounds(plot_bounds, self.visible_ratio);
         let upper_bounds = Rect::from_min_max(bar_bounds.min, Point::new(bar_bounds.max.x, rail_y));
         let lower_bounds =
@@ -990,7 +989,7 @@ impl Widget for WaveformWidget {
         }
         let colors = WaveformColors::from_theme(theme);
         let plot_bounds = self.timeline.plot_bounds(bounds);
-        let rail_y = main_comment_rail_y(bounds);
+        let rail_y = comment_rail_y(bounds);
         let hovered_note_ratio = self.local_hovered_note_ratio();
         if let Some(ratio) = self.hover_ratio {
             let x = self.timeline.x_at(bounds, ratio);
@@ -1173,7 +1172,7 @@ impl ReferenceWaveformWidget {
     }
 
     fn comment_rail_contains(bounds: Rect, position: Point) -> bool {
-        position.y >= reference_comment_rail_y(bounds) && bounds.contains(position)
+        position.y >= comment_rail_y(bounds) && bounds.contains(position)
     }
 
     fn persisted_note_hit(&self, bounds: Rect, position: Point) -> Option<(usize, f32)> {
@@ -1181,7 +1180,7 @@ impl ReferenceWaveformWidget {
             return None;
         }
 
-        let rail_y = reference_comment_rail_y(bounds);
+        let rail_y = comment_rail_y(bounds);
         let hover_radius_squared = NOTE_HOVER_RADIUS * NOTE_HOVER_RADIUS;
         self.note_ratios
             .iter()
@@ -1437,8 +1436,10 @@ impl Widget for ReferenceWaveformWidget {
         fill_rect(primitives, self.common.id, bounds, theme.surface_base);
         let plot_bounds = self.timeline.plot_bounds(bounds);
         let bar_bounds = visible_bounds(plot_bounds, self.visible_ratio);
-        let rail_y = reference_comment_rail_y(bounds);
+        let rail_y = comment_rail_y(bounds);
         let upper_bounds = Rect::from_min_max(bar_bounds.min, Point::new(bar_bounds.max.x, rail_y));
+        let lower_bounds =
+            Rect::from_min_max(Point::new(bar_bounds.min.x, rail_y + 1.0), bar_bounds.max);
         let levels = display_bar_levels(&self.summary, display_bar_count(bar_bounds.width()));
         fill_rect(
             primitives,
@@ -1449,7 +1450,7 @@ impl Widget for ReferenceWaveformWidget {
         paint_bars(
             primitives,
             self.common.id,
-            upper_bounds,
+            bar_bounds,
             &levels,
             colors,
             BarPaintStyle {
@@ -1457,6 +1458,19 @@ impl Widget for ReferenceWaveformWidget {
                 hovered: false,
                 clip: upper_bounds,
                 tone: BarTone::Reference,
+            },
+        );
+        paint_bars(
+            primitives,
+            self.common.id,
+            bar_bounds,
+            &levels,
+            colors,
+            BarPaintStyle {
+                cursor_ratio: self.cursor_ratio,
+                hovered: self.common.state.hovered,
+                clip: lower_bounds,
+                tone: BarTone::Lower,
             },
         );
         fill_rect(
@@ -1474,44 +1488,15 @@ impl Widget for ReferenceWaveformWidget {
         if plot_bounds.has_finite_positive_area()
             && let Some((start_ratio, end_ratio)) = self.active_loop_selection()
         {
-            let start_x = self.timeline.x_at(bounds, start_ratio);
-            let end_x = self.timeline.x_at(bounds, end_ratio);
-            let selection_end_x = end_x.max(start_x + 1.0).min(plot_bounds.max.x);
-            if selection_end_x > start_x {
-                fill_rect(
-                    primitives,
-                    self.common.id,
-                    Rect::from_min_max(
-                        Point::new(start_x, plot_bounds.min.y),
-                        Point::new(selection_end_x, plot_bounds.max.y),
-                    ),
-                    colors.reference_selection_fill,
-                );
-            }
-            let start_edge_end = (start_x + 2.0).min(plot_bounds.max.x);
-            if start_edge_end > start_x {
-                fill_rect(
-                    primitives,
-                    self.common.id,
-                    Rect::from_min_max(
-                        Point::new(start_x, plot_bounds.min.y),
-                        Point::new(start_edge_end, plot_bounds.max.y),
-                    ),
-                    colors.reference_selection_edge,
-                );
-            }
-            let end_edge_start = (end_x - 2.0).max(plot_bounds.min.x);
-            if end_x > end_edge_start {
-                fill_rect(
-                    primitives,
-                    self.common.id,
-                    Rect::from_min_max(
-                        Point::new(end_edge_start, plot_bounds.min.y),
-                        Point::new(end_x, plot_bounds.max.y),
-                    ),
-                    colors.reference_selection_edge,
-                );
-            }
+            paint_loop_selection(
+                primitives,
+                self.common.id,
+                plot_bounds,
+                upper_bounds,
+                start_ratio,
+                end_ratio,
+                colors,
+            );
         }
         if let Some(ratio) = self.cursor_ratio {
             paint_cursor(
@@ -1519,7 +1504,7 @@ impl Widget for ReferenceWaveformWidget {
                 self.common.id,
                 plot_bounds,
                 ratio,
-                plot_bounds.max.y + CURSOR_GAP_ABOVE_RAIL,
+                rail_y,
                 colors.cursor,
             );
         }
@@ -1597,16 +1582,16 @@ impl Widget for ReferenceWaveformWidget {
         }
         let colors = WaveformColors::from_theme(theme);
         let plot_bounds = self.timeline.plot_bounds(bounds);
+        let rail_y = comment_rail_y(bounds);
         if let Some(ratio) = self.hover_ratio {
             paint_cursor(
                 primitives,
                 self.common.id,
                 plot_bounds,
                 ratio,
-                plot_bounds.max.y + CURSOR_GAP_ABOVE_RAIL,
+                rail_y,
                 colors.cursor,
             );
-            let rail_y = reference_comment_rail_y(bounds);
             if let Some(ratio) = self.local_hovered_note_ratio() {
                 paint_highlighted_note_marker(
                     primitives,
@@ -1805,12 +1790,8 @@ fn paint_bars(
     }
 }
 
-fn main_comment_rail_y(bounds: Rect) -> f32 {
-    bounds.y_for_ratio(MAIN_COMMENT_RAIL_RATIO)
-}
-
-fn reference_comment_rail_y(bounds: Rect) -> f32 {
-    bounds.y_for_ratio(REFERENCE_COMMENT_RAIL_RATIO)
+fn comment_rail_y(bounds: Rect) -> f32 {
+    bounds.y_for_ratio(COMMENT_RAIL_RATIO)
 }
 
 fn paint_loop_selection(
@@ -2010,7 +1991,7 @@ mod tests {
         let bounds = Rect::from_size(100.0, 100.0);
         let widget = WaveformWidget::new(Arc::new(test_waveform()), None, Vec::new());
         let paint_plan = widget.paint_plan_with_defaults(bounds);
-        let rail_y = main_comment_rail_y(bounds);
+        let rail_y = comment_rail_y(bounds);
 
         assert!(rail_y < bounds.max.y);
         assert!(paint_plan.primitives.iter().any(|primitive| {
@@ -2034,12 +2015,14 @@ mod tests {
     }
 
     #[test]
-    fn main_and_reference_use_separate_comment_rails() {
+    fn main_and_reference_share_the_comment_rail() {
         let bounds = Rect::from_size(160.0, 160.0);
+        let main_rail_y = comment_rail_y(bounds);
+        let reference_rail_y = comment_rail_y(bounds);
 
-        assert!((main_comment_rail_y(bounds) - 131.2).abs() < 0.0001);
-        assert!((reference_comment_rail_y(bounds) - 118.4).abs() < 0.0001);
-        assert!(main_comment_rail_y(bounds) > reference_comment_rail_y(bounds));
+        assert!((main_rail_y - 131.2).abs() < 0.0001);
+        assert!((reference_rail_y - 131.2).abs() < 0.0001);
+        assert_eq!(main_rail_y, reference_rail_y);
     }
 
     #[test]
@@ -2120,7 +2103,7 @@ mod tests {
     #[test]
     fn persisted_comment_hover_highlights_the_nearest_node_without_a_duplicate_marker() {
         let bounds = Rect::from_min_max(Point::new(10.0, 20.0), Point::new(110.0, 120.0));
-        let rail_y = main_comment_rail_y(bounds);
+        let rail_y = comment_rail_y(bounds);
         let mut widget = WaveformWidget::new(
             Arc::new(test_waveform()),
             None,
@@ -2190,7 +2173,7 @@ mod tests {
     #[test]
     fn persisted_comment_hover_state_survives_retained_widget_rebuilds() {
         let bounds = Rect::from_min_max(Point::new(10.0, 20.0), Point::new(110.0, 120.0));
-        let rail_y = main_comment_rail_y(bounds);
+        let rail_y = comment_rail_y(bounds);
         let pointer = Point::new(timeline_x(bounds, 0.4), rail_y);
         let mut previous = WaveformWidget::new(Arc::new(test_waveform()), None, vec![(0.4, false)]);
         previous.handle_input(bounds, WidgetInput::pointer_move(pointer));
@@ -2383,7 +2366,7 @@ mod tests {
     #[test]
     fn draft_comment_marker_is_visible_and_draggable_on_the_comment_rail() {
         let bounds = Rect::from_min_max(Point::new(10.0, 20.0), Point::new(110.0, 120.0));
-        let rail_y = main_comment_rail_y(bounds);
+        let rail_y = comment_rail_y(bounds);
         let mut upper_widget =
             WaveformWidget::new(Arc::new(test_waveform()), Some(0.4), Vec::new())
                 .with_draft_ratio(Some(0.4));
@@ -2438,7 +2421,7 @@ mod tests {
     #[test]
     fn persisted_comment_marker_starts_a_targeted_drag() {
         let bounds = Rect::from_min_max(Point::new(10.0, 20.0), Point::new(110.0, 120.0));
-        let rail_y = main_comment_rail_y(bounds);
+        let rail_y = comment_rail_y(bounds);
         let mut widget = WaveformWidget::new(
             Arc::new(test_waveform()),
             None,
@@ -2475,7 +2458,7 @@ mod tests {
     #[test]
     fn pointer_capture_cancellation_clears_comment_drag_state_and_emits_cancel() {
         let bounds = Rect::from_min_max(Point::new(10.0, 20.0), Point::new(110.0, 120.0));
-        let rail_y = main_comment_rail_y(bounds);
+        let rail_y = comment_rail_y(bounds);
         let mut comment_widget =
             WaveformWidget::new(Arc::new(test_waveform()), None, vec![(0.3, false)]);
         assert_eq!(
@@ -2524,16 +2507,24 @@ mod tests {
     }
 
     #[test]
-    fn reference_waveform_is_compact_and_supports_loop_selection() {
+    fn reference_waveform_paints_full_signal_and_supports_loop_selection() {
         let bounds = Rect::from_min_max(Point::new(10.0, 20.0), Point::new(110.0, 96.0));
         let mut widget = ReferenceWaveformWidget::new(Arc::new(test_waveform()), None, None);
         let paint_plan = widget.paint_plan_with_defaults(bounds);
-        let rail_y = reference_comment_rail_y(bounds);
+        let rail_y = comment_rail_y(bounds);
         let reference_bars = paint_plan
             .primitives
             .iter()
             .filter_map(|primitive| match primitive {
                 PaintPrimitive::FillRect(fill) if fill.color == colors().reference => Some(fill),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let lower_bars = paint_plan
+            .primitives
+            .iter()
+            .filter_map(|primitive| match primitive {
+                PaintPrimitive::FillRect(fill) if fill.color == colors().lower => Some(fill),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -2547,20 +2538,19 @@ mod tests {
                     if fill.rect == bounds && fill.color == ThemeTokens::default().surface_base
             )
         }));
+        assert!(!reference_bars.is_empty());
+        assert!(reference_bars.iter().all(|bar| bar.rect.max.y <= rail_y));
+        assert!(!lower_bars.is_empty());
+        assert!(lower_bars.iter().all(|bar| bar.rect.min.y > rail_y));
         assert!(paint_plan.primitives.iter().any(|primitive| {
             matches!(
-            primitive,
-            radiant::runtime::PaintPrimitive::FillRect(fill)
-                if fill.color == colors().reference
-                    && fill.rect.max.y <= bounds.max.y
+                primitive,
+                PaintPrimitive::FillRect(fill)
+                    if fill.color == colors().lower_background
+                        && fill.rect.min.y > rail_y
+                        && fill.rect.max.y == bounds.max.y
             )
         }));
-        assert_eq!(
-            reference_bars.len(),
-            display_bar_count(widget.timeline.plot_bounds(bounds).width()),
-            "the reference signal should be painted once above the comment rail"
-        );
-        assert!(reference_bars.iter().all(|bar| bar.rect.max.y <= rail_y));
 
         assert_eq!(
             widget.handle_input(
@@ -2590,13 +2580,21 @@ mod tests {
         let selected_paint =
             ReferenceWaveformWidget::new(Arc::new(test_waveform()), None, Some((0.2, 0.8)))
                 .paint_plan_with_defaults(bounds);
-        assert!(selected_paint.primitives.iter().any(|primitive| {
-            matches!(
-                primitive,
-                radiant::runtime::PaintPrimitive::FillRect(fill)
+        let selection_fills = selected_paint
+            .primitives
+            .iter()
+            .filter_map(|primitive| match primitive {
+                PaintPrimitive::FillRect(fill)
                     if fill.color == colors().reference_selection_fill
-            )
-        }));
+                        || fill.color == colors().reference_selection_edge =>
+                {
+                    Some(fill)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(!selection_fills.is_empty());
+        assert!(selection_fills.iter().all(|fill| fill.rect.max.y <= rail_y));
     }
 
     #[test]
@@ -2626,7 +2624,7 @@ mod tests {
     #[test]
     fn reference_waveform_lower_rail_emits_a_comment_click_without_starting_a_loop() {
         let bounds = Rect::from_min_max(Point::new(10.0, 20.0), Point::new(110.0, 96.0));
-        let rail_y = reference_comment_rail_y(bounds);
+        let rail_y = comment_rail_y(bounds);
         let mut widget = ReferenceWaveformWidget::new(Arc::new(test_waveform()), None, None)
             .with_note_ratios(vec![(0.2, false)]);
 
@@ -2764,6 +2762,7 @@ mod tests {
         let bounds = Rect::from_min_max(Point::new(10.0, 20.0), Point::new(110.0, 96.0));
         let widget = ReferenceWaveformWidget::new(Arc::new(test_waveform()), Some(0.5), None);
         let expected_x = timeline_x(bounds, 0.5);
+        let rail_y = comment_rail_y(bounds);
         let paint_plan = widget.paint_plan_with_defaults(bounds);
 
         assert!(paint_plan.primitives.iter().any(|primitive| {
@@ -2774,7 +2773,8 @@ mod tests {
                         && (fill.rect.min.x - (expected_x - 1.0)).abs() < f32::EPSILON
                         && (fill.rect.max.x - (expected_x + 1.0)).abs() < f32::EPSILON
                         && fill.rect.min.y == bounds.min.y
-                        && fill.rect.max.y == bounds.max.y
+                        && (fill.rect.max.y - (rail_y - CURSOR_GAP_ABOVE_RAIL)).abs()
+                            < f32::EPSILON
             )
         }));
     }
@@ -2787,7 +2787,7 @@ mod tests {
             .with_note_ratios(vec![(ratio, false)]);
 
         let expected_x = timeline_x(bounds, ratio);
-        let rail_y = reference_comment_rail_y(bounds);
+        let rail_y = comment_rail_y(bounds);
         let paint_plan = widget.paint_plan_with_defaults(bounds);
         let cursor_center_x = paint_plan
             .primitives
@@ -2905,6 +2905,7 @@ mod tests {
     #[test]
     fn reference_waveform_paints_a_cursor_at_mouse_hover_ratio() {
         let bounds = Rect::from_min_max(Point::new(10.0, 20.0), Point::new(110.0, 96.0));
+        let rail_y = comment_rail_y(bounds);
         let mut widget = ReferenceWaveformWidget::new(Arc::new(test_waveform()), None, None);
         assert!(
             widget
@@ -2927,7 +2928,8 @@ mod tests {
                         && (fill.rect.min.x - 69.0).abs() < f32::EPSILON
                         && (fill.rect.max.x - 71.0).abs() < f32::EPSILON
                         && fill.rect.min.y == bounds.min.y
-                        && fill.rect.max.y == bounds.max.y
+                        && (fill.rect.max.y - (rail_y - CURSOR_GAP_ABOVE_RAIL)).abs()
+                            < f32::EPSILON
             )
         }));
 
@@ -2948,6 +2950,7 @@ mod tests {
     #[test]
     fn reference_waveform_start_edge_clamps_hover_and_click_to_zero() {
         let bounds = Rect::from_min_max(Point::new(0.0, 20.0), Point::new(100.0, 96.0));
+        let rail_y = comment_rail_y(bounds);
         let mut widget = ReferenceWaveformWidget::new(Arc::new(test_waveform()), None, None);
 
         assert!(
@@ -2970,7 +2973,8 @@ mod tests {
                         && (fill.rect.min.x - 9.0).abs() < f32::EPSILON
                         && (fill.rect.max.x - 11.0).abs() < f32::EPSILON
                         && fill.rect.min.y == bounds.min.y
-                        && fill.rect.max.y == bounds.max.y
+                        && (fill.rect.max.y - (rail_y - CURSOR_GAP_ABOVE_RAIL)).abs()
+                            < f32::EPSILON
             )
         }));
 
@@ -3030,6 +3034,10 @@ mod tests {
                         && (fill.rect.min.x - (start_x - 1.0)).abs() < f32::EPSILON
                         && (fill.rect.max.x - (start_x + 1.0)).abs() < f32::EPSILON
                         && fill.rect.min.y == bounds.min.y
+                        && (fill.rect.max.y
+                            - (comment_rail_y(bounds) - CURSOR_GAP_ABOVE_RAIL))
+                            .abs()
+                            < f32::EPSILON
             )
         }));
 
@@ -3046,7 +3054,7 @@ mod tests {
     #[test]
     fn upper_start_gutter_keeps_playhead_semantics_for_ratio_zero_persisted_marker() {
         let bounds = Rect::from_min_max(Point::new(0.0, 20.0), Point::new(100.0, 120.0));
-        let rail_y = main_comment_rail_y(bounds);
+        let rail_y = comment_rail_y(bounds);
         let upper_gutter = Point::new(bounds.min.x + REFERENCE_START_HIT_SLOP * 0.5, rail_y - 1.0);
         let mut widget = WaveformWidget::new(Arc::new(test_waveform()), None, vec![(0.0, false)]);
 
@@ -3067,7 +3075,7 @@ mod tests {
         let bounds = Rect::from_min_max(Point::new(10.0, 20.0), Point::new(110.0, 120.0));
         let ratio = 0.5;
         let expected_x = timeline_x(bounds, ratio);
-        let rail_y = main_comment_rail_y(bounds);
+        let rail_y = comment_rail_y(bounds);
         let mut widget =
             WaveformWidget::new(Arc::new(test_waveform()), Some(ratio), vec![(ratio, false)]);
         let paint_plan = widget.paint_plan_with_defaults(bounds);
@@ -3368,7 +3376,7 @@ mod tests {
     #[test]
     fn lower_main_comment_latch_survives_movement_across_the_raised_rail() {
         let bounds = Rect::from_min_max(Point::new(10.0, 20.0), Point::new(110.0, 120.0));
-        let rail_y = main_comment_rail_y(bounds);
+        let rail_y = comment_rail_y(bounds);
         let mut widget = WaveformWidget::new(Arc::new(test_waveform()), Some(0.1), Vec::new());
 
         assert_eq!(
@@ -3401,7 +3409,7 @@ mod tests {
     #[test]
     fn main_loop_paint_is_clipped_above_the_comment_rail() {
         let bounds = Rect::from_min_max(Point::new(10.0, 20.0), Point::new(110.0, 180.0));
-        let rail_y = main_comment_rail_y(bounds);
+        let rail_y = comment_rail_y(bounds);
         let widget = WaveformWidget::new(Arc::new(test_waveform()), None, Vec::new())
             .with_loop_selection(Some((0.2, 0.8)));
         let paint_plan = widget.paint_plan_with_defaults(bounds);

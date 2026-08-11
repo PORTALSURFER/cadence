@@ -8869,8 +8869,64 @@ mod tests {
             !reference_bars.is_empty(),
             "the reference waveform should paint once"
         );
-        let distinct_bar_starts =
+        let lower_bars = frame
+            .paint_plan
+            .primitives
+            .iter()
+            .filter_map(|primitive| match primitive {
+                PaintPrimitive::FillRect(fill)
+                    if fill.color == ThemeTokens::default().text_muted.with_alpha(160) =>
+                {
+                    Some(fill.rect)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(!lower_bars.is_empty(), "the lower waveform should paint");
+        let reference_lower_background = frame
+            .paint_plan
+            .primitives
+            .iter()
+            .filter_map(|primitive| match primitive {
+                PaintPrimitive::FillRect(fill)
+                    if fill.color == ThemeTokens::default().bg_secondary
+                        && fill.rect.width() > 300.0
+                        && fill.rect.height() <= WAVEFORM_HEIGHT =>
+                {
+                    Some(fill.rect)
+                }
+                _ => None,
+            })
+            .filter(|rect| {
+                lower_bars
+                    .iter()
+                    .any(|bar| bar.min.y >= rect.min.y && bar.max.y <= rect.max.y)
+            })
+            .max_by(|left, right| left.min.y.total_cmp(&right.min.y))
+            .expect("the reference waveform should paint its lower background");
+        let reference_rail_y = reference_lower_background.min.y - 1.0;
+        assert!(
             reference_bars
+                .iter()
+                .all(|rect| rect.max.y <= reference_rail_y),
+            "reference bars should stay in the upper waveform band"
+        );
+        let reference_lower_bars = lower_bars
+            .iter()
+            .filter(|rect| rect.min.y >= reference_lower_background.min.y)
+            .collect::<Vec<_>>();
+        assert!(
+            !reference_lower_bars.is_empty(),
+            "the reference lower waveform should paint"
+        );
+        assert!(
+            reference_lower_bars
+                .iter()
+                .all(|rect| rect.min.y > reference_rail_y),
+            "reference lower bars should stay below the comment rail"
+        );
+        let distinct_lower_bar_starts =
+            reference_lower_bars
                 .iter()
                 .fold(Vec::<f32>::new(), |mut starts, rect| {
                     if !starts
@@ -8882,27 +8938,14 @@ mod tests {
                     starts
                 });
         assert_eq!(
-            distinct_bar_starts.len(),
-            reference_bars.len(),
-            "the reference signal must not be painted into a second waveform band"
+            distinct_lower_bar_starts.len(),
+            reference_lower_bars.len(),
+            "the reference lower signal should paint once per bar"
         );
-        let reference_rail_y = reference_bars
-            .iter()
-            .map(|rect| rect.max.y)
-            .fold(f32::NEG_INFINITY, f32::max)
-            + 1.0;
-        let reference_min_x = reference_bars
-            .iter()
-            .map(|rect| rect.min.x)
-            .fold(f32::INFINITY, f32::min);
-        let reference_max_x = reference_bars
-            .iter()
-            .map(|rect| rect.max.x)
-            .fold(f32::NEG_INFINITY, f32::max);
-        let rail_point = Point::new(
-            (reference_min_x + reference_max_x) * 0.5,
-            reference_rail_y + 8.0,
-        );
+        let reference_center_x = reference_lower_background.min.x
+            + waveform::REFERENCE_START_HIT_SLOP
+            + (reference_lower_background.width() - waveform::REFERENCE_START_HIT_SLOP) * 0.5;
+        let rail_point = Point::new(reference_center_x, reference_rail_y + 8.0);
 
         assert!(
             runtime.widget_at(rail_point).is_some(),
