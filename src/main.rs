@@ -6437,6 +6437,51 @@ mod tests {
     }
 
     #[test]
+    fn playhead_drag_at_ratio_zero_starts_playback_from_the_start() {
+        let mut state = AppState {
+            busy: false,
+            waveform: Some(WaveformData {
+                sample_rate: 48_000,
+                channels: 1,
+                duration_millis: 1_000,
+                render_frames: 48_000,
+                integrated_lufs: Some(-7.0),
+                loudness_profile: std::sync::Arc::from([]),
+                summary: Arc::new(
+                    radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                        &[0.1, 0.8, 0.2, 0.4],
+                        4,
+                        1,
+                    ),
+                ),
+            }),
+            ..AppState::default()
+        };
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::WaveformPlayheadDragStarted { ratio: 0.0 },
+            &mut context,
+        );
+        assert!(state.playhead_drag_active);
+        assert_eq!(state.review_cursor_millis, 0);
+        assert_eq!(state.transport_position_millis, 0);
+
+        update(
+            &mut state,
+            Message::WaveformPlayheadDragEnded { ratio: 0.0 },
+            &mut context,
+        );
+        assert!(!state.playhead_drag_active);
+        assert_eq!(state.review_cursor_millis, 0);
+        assert_eq!(state.transport_position_millis, 0);
+        assert!(state.transport_polling);
+        assert!(state.transport_waiting_token.is_some());
+        assert_eq!(state.status, "Playing from 00:00.");
+    }
+
+    #[test]
     fn playhead_drag_preserves_cursor_when_a_ready_snapshot_is_stale() {
         let mut state = AppState {
             playhead_drag_active: true,
@@ -8435,7 +8480,9 @@ mod tests {
             })
             .expect("the decoded main waveform should paint its lower rail");
         let marker_center = Point::new(
-            lower_waveform_rect.min.x + lower_waveform_rect.width() * 0.5,
+            lower_waveform_rect.min.x
+                + waveform::REFERENCE_START_HIT_SLOP
+                + (lower_waveform_rect.width() - waveform::REFERENCE_START_HIT_SLOP) * 0.5,
             lower_waveform_rect.min.y - 1.0,
         );
         let highlighted_marker_count = |primitives: &[PaintPrimitive], center: Point| {
