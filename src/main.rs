@@ -134,6 +134,7 @@ enum Message {
         start_ratio: f32,
         end_ratio: f32,
     },
+    ReferenceLoopDragCancelled,
     ReferenceWaveformClicked {
         ratio: f32,
     },
@@ -154,6 +155,16 @@ enum Message {
         ratio: f32,
     },
     WaveformPlayheadDragCancelled,
+    ReferencePlayheadDragStarted {
+        ratio: f32,
+    },
+    ReferencePlayheadDragMoved {
+        ratio: f32,
+    },
+    ReferencePlayheadDragEnded {
+        ratio: f32,
+    },
+    ReferencePlayheadDragCancelled,
     CommentDragStarted {
         ratio: f32,
         note_index: Option<usize>,
@@ -165,6 +176,17 @@ enum Message {
         ratio: f32,
     },
     CommentDragCancelled,
+    ReferenceCommentDragStarted {
+        ratio: f32,
+        note_index: Option<usize>,
+    },
+    ReferenceCommentDragMoved {
+        ratio: f32,
+    },
+    ReferenceCommentDragEnded {
+        ratio: f32,
+    },
+    ReferenceCommentDragCancelled,
     DraftNoteChanged(String),
     SaveDraftNote,
     CancelDraftNote,
@@ -263,6 +285,7 @@ struct AppState {
     loop_selection: Option<LoopSelection>,
     review_cursor_millis: u64,
     playhead_drag_active: bool,
+    reference_playhead_drag_active: bool,
     transport: transport::AudioTransport,
     transport_generation: u64,
     transport_position_millis: u64,
@@ -283,6 +306,7 @@ struct AppState {
     draft_note: Option<NoteDraft>,
     reference_draft_note: Option<NoteDraft>,
     persisted_note_drag: Option<PersistedNoteDrag>,
+    reference_persisted_note_drag: Option<PersistedNoteDrag>,
     selected_note_id: Option<String>,
     hovered_note_id: Option<String>,
     selected_reference_note_id: Option<String>,
@@ -352,6 +376,7 @@ impl Default for AppState {
             loop_selection: None,
             review_cursor_millis: 0,
             playhead_drag_active: false,
+            reference_playhead_drag_active: false,
             transport: transport::AudioTransport::spawn(),
             transport_generation: 0,
             transport_position_millis: 0,
@@ -372,6 +397,7 @@ impl Default for AppState {
             draft_note: None,
             reference_draft_note: None,
             persisted_note_drag: None,
+            reference_persisted_note_drag: None,
             selected_note_id: None,
             hovered_note_id: None,
             selected_reference_note_id: None,
@@ -452,6 +478,7 @@ fn main() -> radiant::Result {
                 || state.reference_transport_polling
                 || state.audition_pending_play_track_id.is_some()
                 || state.playhead_drag_active
+                || state.reference_playhead_drag_active
                 || state.planner_drag_source_track_id.is_some()
         })
         .on_frame(|| Message::Frame)
@@ -804,6 +831,8 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     state.draft_note = None;
                     state.reference_draft_note = None;
                     rollback_persisted_note_drag(state);
+                    rollback_reference_persisted_note_drag(state);
+                    state.reference_playhead_drag_active = false;
                     state.selected_note_id = None;
                     state.hovered_note_id = None;
                     state.selected_reference_note_id = None;
@@ -845,6 +874,8 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     state.draft_note = None;
                     state.reference_draft_note = None;
                     rollback_persisted_note_drag(state);
+                    rollback_reference_persisted_note_drag(state);
+                    state.reference_playhead_drag_active = false;
                     state.selected_note_id = None;
                     state.hovered_note_id = None;
                     state.selected_reference_note_id = None;
@@ -887,6 +918,8 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     state.draft_note = None;
                     state.reference_draft_note = None;
                     rollback_persisted_note_drag(state);
+                    rollback_reference_persisted_note_drag(state);
+                    state.reference_playhead_drag_active = false;
                     state.selected_note_id = None;
                     state.hovered_note_id = None;
                     state.selected_reference_note_id = None;
@@ -1517,6 +1550,8 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             if selected {
                 state.draft_note = None;
                 rollback_persisted_note_drag(state);
+                rollback_reference_persisted_note_drag(state);
+                state.reference_playhead_drag_active = false;
                 state.selected_note_id = None;
                 state.hovered_note_id = None;
                 state.library.selected_track_id =
@@ -1645,8 +1680,13 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             start_ratio,
             end_ratio,
         ),
+        Message::ReferenceLoopDragCancelled => {
+            state.loop_selection = None;
+            state.status = String::from("Reference loop selection canceled.");
+            context.request_repaint();
+        }
         Message::ReferenceWaveformClicked { ratio } => {
-            seek_reference_waveform_position(state, context, ratio)
+            seek_reference_waveform_position(state, context, ratio, true)
         }
         Message::ReferenceCommentClicked { ratio } => {
             start_reference_comment_draft(state, context, ratio)
@@ -1700,6 +1740,37 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             state.playhead_drag_active = false;
             context.request_repaint();
         }
+        Message::ReferencePlayheadDragStarted { ratio } => {
+            if state.busy || state.waveform_busy || state.reference_waveform_busy {
+                return;
+            }
+            if selected_reference_details(state).is_none() {
+                return;
+            }
+            rollback_reference_persisted_note_drag(state);
+            set_audition_source(state, AuditionSource::Reference);
+            state.reference_playhead_drag_active = true;
+            state.reference_draft_note = None;
+            state.hovered_reference_note_id = None;
+            seek_reference_waveform_position(state, context, ratio, false);
+        }
+        Message::ReferencePlayheadDragMoved { ratio } => {
+            if !state.reference_playhead_drag_active {
+                return;
+            }
+            seek_reference_waveform_position(state, context, ratio, false);
+        }
+        Message::ReferencePlayheadDragEnded { ratio } => {
+            if !state.reference_playhead_drag_active {
+                return;
+            }
+            state.reference_playhead_drag_active = false;
+            seek_reference_waveform_position(state, context, ratio, true);
+        }
+        Message::ReferencePlayheadDragCancelled => {
+            state.reference_playhead_drag_active = false;
+            context.request_repaint();
+        }
         Message::CommentDragStarted { ratio, note_index } => {
             if state.busy || state.waveform_busy {
                 return;
@@ -1738,6 +1809,46 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 state.draft_note = None;
             }
             state.status = String::from("Comment canceled.");
+            context.request_repaint();
+        }
+        Message::ReferenceCommentDragStarted { ratio, note_index } => {
+            if state.busy || state.waveform_busy || state.reference_waveform_busy {
+                return;
+            }
+            if let Some(note_index) = note_index {
+                start_reference_persisted_note_drag(state, context, note_index);
+            } else {
+                rollback_reference_persisted_note_drag(state);
+                move_reference_draft_note(state, context, ratio);
+            }
+        }
+        Message::ReferenceCommentDragMoved { ratio } => {
+            if state.busy || state.waveform_busy || state.reference_waveform_busy {
+                return;
+            }
+            if state.reference_persisted_note_drag.is_some() {
+                move_reference_persisted_note(state, context, ratio);
+            } else {
+                move_reference_draft_note(state, context, ratio);
+            }
+        }
+        Message::ReferenceCommentDragEnded { ratio } => {
+            if state.busy || state.waveform_busy || state.reference_waveform_busy {
+                return;
+            }
+            if state.reference_persisted_note_drag.is_some() {
+                finish_reference_persisted_note_drag(state, context, ratio);
+            } else {
+                move_reference_draft_note(state, context, ratio);
+            }
+        }
+        Message::ReferenceCommentDragCancelled => {
+            if state.reference_persisted_note_drag.is_some() {
+                rollback_reference_persisted_note_drag(state);
+            } else {
+                state.reference_draft_note = None;
+            }
+            state.status = String::from("Reference comment canceled.");
             context.request_repaint();
         }
         Message::DraftNoteChanged(body) => {
@@ -2123,6 +2234,7 @@ fn seek_reference_waveform_position(
     state: &mut AppState,
     context: &mut ui::UiUpdateContext<Message>,
     ratio: f32,
+    resume: bool,
 ) {
     if state.busy || state.waveform_busy || state.reference_waveform_busy {
         return;
@@ -2145,6 +2257,16 @@ fn seek_reference_waveform_position(
     state.draft_note = None;
     rollback_persisted_note_drag(state);
     state.selected_note_id = None;
+    if !resume {
+        state.reference_transport_position_millis = reference_position_millis;
+        state.reference_only_playback = false;
+        state.status = format!(
+            "Scrubbing reference at {}.",
+            format_timestamp(reference_position_millis)
+        );
+        context.request_repaint();
+        return;
+    }
     let reference_gain = reference_output_gain(state);
     let reference_transport = state
         .reference_transport
@@ -3128,6 +3250,208 @@ fn finish_persisted_note_drag(
     context.request_repaint();
 }
 
+fn move_reference_draft_note(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    ratio: f32,
+) {
+    let Some(duration_millis) = state
+        .reference_waveform
+        .as_ref()
+        .filter(|_| !state.reference_waveform_busy)
+        .map(|waveform| waveform.duration_millis)
+    else {
+        return;
+    };
+    let Some(draft) = state
+        .reference_draft_note
+        .as_mut()
+        .filter(|draft| draft.note_id.is_none())
+    else {
+        return;
+    };
+    let time_millis = waveform::millis_for_ratio(ratio, duration_millis);
+    draft.time_millis = time_millis;
+    state.reference_transport_position_millis = time_millis;
+    state.status = format!("Reference comment at {}.", format_timestamp(time_millis));
+    context.request_repaint();
+}
+
+fn start_reference_persisted_note_drag(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    note_index: usize,
+) {
+    rollback_reference_persisted_note_drag(state);
+    if state.busy {
+        return;
+    }
+    let Some(track_id) = state.library.selected_track_id.clone() else {
+        return;
+    };
+    let waveform_is_current = state.reference_waveform.is_some()
+        && state.reference_waveform_track_id.as_deref() == Some(track_id.as_str())
+        && !state.reference_waveform_busy;
+    let Some((note_id, time_millis)) = state
+        .library
+        .tracks
+        .iter()
+        .find(|track| track.id == track_id)
+        .filter(|_| waveform_is_current)
+        .and_then(|track| {
+            reference_notes_for_track(&state.library, track)
+                .get(note_index)
+                .map(|note| (note.id.clone(), note.time_millis))
+        })
+    else {
+        state.status = String::from("That reference comment no longer exists.");
+        context.request_repaint();
+        return;
+    };
+
+    if state
+        .reference_draft_note
+        .as_ref()
+        .is_some_and(|draft| draft.note_id.as_deref() == Some(note_id.as_str()))
+    {
+        if let Some(draft) = state.reference_draft_note.as_mut() {
+            draft.time_millis = time_millis;
+        }
+    } else {
+        state.reference_draft_note = None;
+    }
+    state.reference_persisted_note_drag = Some(PersistedNoteDrag {
+        track_id,
+        note_id: note_id.clone(),
+        original_time_millis: time_millis,
+        moved: false,
+    });
+    state.selected_reference_note_id = Some(note_id);
+    state.hovered_reference_note_id = None;
+    state.reference_transport_position_millis = time_millis;
+    state.status = format!(
+        "Dragging reference comment at {}…",
+        format_timestamp(time_millis)
+    );
+    context.request_repaint();
+}
+
+fn move_reference_persisted_note(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    ratio: f32,
+) {
+    let Some(drag) = state.reference_persisted_note_drag.clone() else {
+        return;
+    };
+    let Some(duration_millis) = state
+        .reference_waveform
+        .as_ref()
+        .filter(|_| {
+            !state.reference_waveform_busy
+                && state.reference_waveform_track_id.as_deref() == Some(drag.track_id.as_str())
+        })
+        .map(|waveform| waveform.duration_millis)
+    else {
+        rollback_reference_persisted_note_drag(state);
+        return;
+    };
+    let time_millis = waveform::millis_for_ratio(ratio, duration_millis);
+    let note_exists = selected_reference_track_mut(state)
+        .and_then(|reference| {
+            reference
+                .notes
+                .iter_mut()
+                .find(|note| note.id == drag.note_id)
+        })
+        .map(|note| note.time_millis = time_millis)
+        .is_some();
+    if !note_exists {
+        rollback_reference_persisted_note_drag(state);
+        state.status = String::from("That reference comment no longer exists.");
+        context.request_repaint();
+        return;
+    }
+    if let Some(active_drag) = state.reference_persisted_note_drag.as_mut() {
+        active_drag.moved |= time_millis != active_drag.original_time_millis;
+    }
+    if let Some(draft) = state
+        .reference_draft_note
+        .as_mut()
+        .filter(|draft| draft.note_id.as_deref() == Some(drag.note_id.as_str()))
+    {
+        draft.time_millis = time_millis;
+    }
+    state.reference_transport_position_millis = time_millis;
+    state.status = format!("Reference comment at {}.", format_timestamp(time_millis));
+    context.request_repaint();
+}
+
+fn finish_reference_persisted_note_drag(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    ratio: f32,
+) {
+    let Some(drag) = state.reference_persisted_note_drag.take() else {
+        return;
+    };
+    let Some(duration_millis) = state
+        .reference_waveform
+        .as_ref()
+        .filter(|_| {
+            !state.reference_waveform_busy
+                && state.reference_waveform_track_id.as_deref() == Some(drag.track_id.as_str())
+        })
+        .map(|waveform| waveform.duration_millis)
+    else {
+        return;
+    };
+    let time_millis = waveform::millis_for_ratio(ratio, duration_millis);
+    let Some(reference) = selected_reference_track_mut(state) else {
+        state.status = String::from("That reference track is no longer available.");
+        context.request_repaint();
+        return;
+    };
+    let Some(note) = reference
+        .notes
+        .iter_mut()
+        .find(|note| note.id == drag.note_id)
+    else {
+        state.status = String::from("That reference comment no longer exists.");
+        context.request_repaint();
+        return;
+    };
+    if drag.moved {
+        note.time_millis = time_millis;
+    }
+    let final_time_millis = note.time_millis;
+    let changed = final_time_millis != drag.original_time_millis;
+    reference.notes.sort_by_key(|note| note.time_millis);
+    if let Some(draft) = state
+        .reference_draft_note
+        .as_mut()
+        .filter(|draft| draft.note_id.as_deref() == Some(drag.note_id.as_str()))
+    {
+        draft.time_millis = final_time_millis;
+    }
+    state.reference_transport_position_millis = final_time_millis;
+    state.status = if changed {
+        format!(
+            "Reference comment moved to {} and saved locally.",
+            format_timestamp(final_time_millis)
+        )
+    } else {
+        format!(
+            "Selected reference comment at {}.",
+            format_timestamp(final_time_millis)
+        )
+    };
+    if changed {
+        schedule_library_save(state, context);
+    }
+    context.request_repaint();
+}
+
 fn request_import(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
     if state.busy {
         state.status = String::from("The library is still loading.");
@@ -3489,6 +3813,8 @@ fn reset_transport(state: &mut AppState) {
 
 fn reset_reference_transport(state: &mut AppState) {
     state.reference_transport_generation = state.reference_transport_generation.wrapping_add(1);
+    state.reference_playhead_drag_active = false;
+    rollback_reference_persisted_note_drag(state);
     state.reference_transport_position_millis = 0;
     state.loop_selection = None;
     state.audition_source = AuditionSource::Main;
@@ -3545,6 +3871,8 @@ fn update_reference_transport(state: &mut AppState) {
         state.reference_transport_waiting_token = None;
         state.reference_transport_loaded = false;
         state.reference_only_playback = false;
+        state.reference_playhead_drag_active = false;
+        rollback_reference_persisted_note_drag(state);
         state.status = error;
     } else if state
         .reference_transport_waiting_token
@@ -3557,7 +3885,9 @@ fn update_reference_transport(state: &mut AppState) {
 
 fn apply_reference_transport_snapshot(state: &mut AppState, snapshot: transport::Snapshot) {
     if snapshot.ready {
-        state.reference_transport_position_millis = snapshot.position_millis;
+        if !state.reference_playhead_drag_active {
+            state.reference_transport_position_millis = snapshot.position_millis;
+        }
         state.reference_transport_playing = snapshot.playing;
         state.reference_transport_polling = false;
     } else {
@@ -3705,6 +4035,9 @@ fn select_track_internal(
     state.draft_note = None;
     state.reference_draft_note = None;
     rollback_persisted_note_drag(state);
+    rollback_reference_persisted_note_drag(state);
+    state.playhead_drag_active = false;
+    state.reference_playhead_drag_active = false;
     state.selected_note_id = None;
     state.hovered_note_id = None;
     state.selected_reference_note_id = None;
@@ -4118,6 +4451,34 @@ fn rollback_persisted_note_drag(state: &mut AppState) {
     }
     if let Some(draft) = state
         .draft_note
+        .as_mut()
+        .filter(|draft| draft.note_id.as_deref() == Some(drag.note_id.as_str()))
+    {
+        draft.time_millis = drag.original_time_millis;
+    }
+}
+
+fn rollback_reference_persisted_note_drag(state: &mut AppState) {
+    let Some(drag) = state.reference_persisted_note_drag.take() else {
+        return;
+    };
+
+    let mut note_restored = false;
+    if let Some(reference) = selected_reference_track_mut(state)
+        && let Some(note) = reference
+            .notes
+            .iter_mut()
+            .find(|note| note.id == drag.note_id)
+    {
+        note.time_millis = drag.original_time_millis;
+        reference.notes.sort_by_key(|note| note.time_millis);
+        note_restored = true;
+    }
+    if note_restored && state.library.selected_track_id.as_deref() == Some(drag.track_id.as_str()) {
+        state.reference_transport_position_millis = drag.original_time_millis;
+    }
+    if let Some(draft) = state
+        .reference_draft_note
         .as_mut()
         .filter(|draft| draft.note_id.as_deref() == Some(drag.note_id.as_str()))
     {
@@ -5265,7 +5626,9 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
         .as_ref()
         .filter(|_| state.waveform_track_id.as_deref() == Some(track.id.as_str()))
     {
-        waveform::view_with_progress_and_loop(
+        waveform::view_with_source_progress_and_loop(
+            waveform::WaveformSource::Main,
+            state.waveform_generation,
             Arc::new(waveform.clone()),
             cursor_ratio,
             draft_ratio,
@@ -5748,38 +6111,68 @@ fn reference_waveform_section(state: &AppState, track: &storage::Track) -> ui::V
             });
         let hovered_note_ratio =
             reference_note_ratio_for_id(state, track, state.hovered_reference_note_id.as_deref());
-        waveform::reference_view_with_comments(
+        waveform::view_with_source_progress_and_loop(
+            waveform::WaveformSource::Reference,
+            state.reference_waveform_generation,
             Arc::new(waveform.clone()),
             reference_cursor_ratio,
+            draft_ratio,
+            note_ratios,
+            hovered_note_ratio,
+            reference_note_ratio_for_id(state, track, state.selected_reference_note_id.as_deref()),
             loop_selection,
             state
                 .reference_waveform_busy
                 .then_some(state.reference_waveform_progress)
                 .flatten(),
-            note_ratios,
-            draft_ratio,
-            hovered_note_ratio,
-            reference_note_ratio_for_id(state, track, state.selected_reference_note_id.as_deref()),
             |interaction| match interaction {
-                waveform::ReferenceWaveformInteraction::Clicked { ratio } => {
-                    Message::ReferenceWaveformClicked { ratio }
-                }
-                waveform::ReferenceWaveformInteraction::CommentClicked { ratio } => {
-                    Message::ReferenceCommentClicked { ratio }
-                }
-                waveform::ReferenceWaveformInteraction::Started { ratio } => {
+                waveform::WaveformInteraction::LoopDragStarted { ratio } => {
                     Message::ReferenceLoopDragStarted { ratio }
                 }
-                waveform::ReferenceWaveformInteraction::Moved { ratio } => {
+                waveform::WaveformInteraction::LoopDragMoved { ratio } => {
                     Message::ReferenceLoopDragMoved { ratio }
                 }
-                waveform::ReferenceWaveformInteraction::Ended {
+                waveform::WaveformInteraction::LoopDragEnded {
                     start_ratio,
                     end_ratio,
                 } => Message::ReferenceLoopDragEnded {
                     start_ratio,
                     end_ratio,
                 },
+                waveform::WaveformInteraction::LoopDragCancelled => {
+                    Message::ReferenceLoopDragCancelled
+                }
+                waveform::WaveformInteraction::Clicked { ratio, lower } => {
+                    if lower {
+                        Message::ReferenceCommentClicked { ratio }
+                    } else {
+                        Message::ReferenceWaveformClicked { ratio }
+                    }
+                }
+                waveform::WaveformInteraction::PlayheadDragStarted { ratio } => {
+                    Message::ReferencePlayheadDragStarted { ratio }
+                }
+                waveform::WaveformInteraction::PlayheadDragMoved { ratio } => {
+                    Message::ReferencePlayheadDragMoved { ratio }
+                }
+                waveform::WaveformInteraction::PlayheadDragEnded { ratio } => {
+                    Message::ReferencePlayheadDragEnded { ratio }
+                }
+                waveform::WaveformInteraction::PlayheadDragCancelled => {
+                    Message::ReferencePlayheadDragCancelled
+                }
+                waveform::WaveformInteraction::CommentDragStarted { ratio, note_index } => {
+                    Message::ReferenceCommentDragStarted { ratio, note_index }
+                }
+                waveform::WaveformInteraction::CommentDragMoved { ratio } => {
+                    Message::ReferenceCommentDragMoved { ratio }
+                }
+                waveform::WaveformInteraction::CommentDragEnded { ratio } => {
+                    Message::ReferenceCommentDragEnded { ratio }
+                }
+                waveform::WaveformInteraction::CommentDragCancelled => {
+                    Message::ReferenceCommentDragCancelled
+                }
             },
         )
         .fill_width()
@@ -7669,6 +8062,236 @@ mod tests {
         state
     }
 
+    fn reference_comment_drag_state() -> (AppState, String) {
+        let mut state = shared_reference_playback_state();
+        let note_id = String::from("reference-move-me");
+        let reference_path = state.library.tracks[0]
+            .reference_path
+            .clone()
+            .expect("the paired state should have a reference path");
+        state.library.reference_tracks.push(ReferenceTrack {
+            path: reference_path,
+            notes: vec![
+                Note {
+                    id: note_id.clone(),
+                    time_millis: 500,
+                    body: String::from("move this reference comment"),
+                    done: false,
+                },
+                Note {
+                    id: String::from("reference-anchor"),
+                    time_millis: 1_000,
+                    body: String::from("keep this reference comment"),
+                    done: false,
+                },
+            ],
+        });
+        (state, note_id)
+    }
+
+    #[test]
+    fn reference_playhead_drag_tracks_reference_position_and_preserves_main_transport() {
+        let mut state = shared_reference_playback_state();
+        state.review_cursor_millis = 600;
+        state.transport_position_millis = 600;
+        state.reference_transport_position_millis = 400;
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::ReferencePlayheadDragStarted { ratio: 0.25 },
+            &mut context,
+        );
+        assert!(state.reference_playhead_drag_active);
+        assert_eq!(state.reference_transport_position_millis, 1_000);
+        assert_eq!(state.review_cursor_millis, 600);
+        assert_eq!(state.transport_position_millis, 600);
+        assert_eq!(state.audition_source, AuditionSource::Reference);
+
+        update(
+            &mut state,
+            Message::ReferencePlayheadDragMoved { ratio: 0.75 },
+            &mut context,
+        );
+        assert_eq!(state.reference_transport_position_millis, 3_000);
+        assert_eq!(state.review_cursor_millis, 600);
+        assert_eq!(state.transport_position_millis, 600);
+
+        update(
+            &mut state,
+            Message::ReferencePlayheadDragEnded { ratio: 0.5 },
+            &mut context,
+        );
+        assert!(!state.reference_playhead_drag_active);
+        assert_eq!(state.reference_transport_position_millis, 2_000);
+        assert_eq!(state.review_cursor_millis, 600);
+        assert_eq!(state.transport_position_millis, 600);
+        assert!(state.reference_transport_polling);
+        assert!(state.reference_transport_waiting_token.is_some());
+        assert!(state.reference_only_playback);
+    }
+
+    #[test]
+    fn reference_draft_comment_drag_updates_reference_timestamp_without_main_cursor() {
+        let mut state = shared_reference_playback_state();
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::ReferenceCommentClicked { ratio: 0.25 },
+            &mut context,
+        );
+        assert_eq!(
+            state
+                .reference_draft_note
+                .as_ref()
+                .map(|draft| draft.time_millis),
+            Some(1_000)
+        );
+
+        update(
+            &mut state,
+            Message::ReferenceCommentDragStarted {
+                ratio: 0.25,
+                note_index: None,
+            },
+            &mut context,
+        );
+        update(
+            &mut state,
+            Message::ReferenceCommentDragMoved { ratio: 0.75 },
+            &mut context,
+        );
+        assert_eq!(
+            state
+                .reference_draft_note
+                .as_ref()
+                .map(|draft| draft.time_millis),
+            Some(3_000)
+        );
+        assert_eq!(state.reference_transport_position_millis, 3_000);
+        assert_eq!(state.review_cursor_millis, 0);
+        assert_eq!(state.transport_position_millis, 0);
+
+        update(
+            &mut state,
+            Message::ReferenceCommentDragEnded { ratio: 0.5 },
+            &mut context,
+        );
+        assert_eq!(
+            state
+                .reference_draft_note
+                .as_ref()
+                .map(|draft| draft.time_millis),
+            Some(2_000)
+        );
+        assert_eq!(state.reference_transport_position_millis, 2_000);
+    }
+
+    #[test]
+    fn reference_persisted_comment_drag_moves_and_saves_reference_note() {
+        let (mut state, note_id) = reference_comment_drag_state();
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::ReferenceCommentDragStarted {
+                ratio: 0.125,
+                note_index: Some(0),
+            },
+            &mut context,
+        );
+        assert_eq!(
+            state.selected_reference_note_id.as_deref(),
+            Some(note_id.as_str())
+        );
+        assert!(state.reference_persisted_note_drag.is_some());
+        assert_eq!(state.reference_transport_position_millis, 500);
+
+        update(
+            &mut state,
+            Message::ReferenceCommentDragMoved { ratio: 0.75 },
+            &mut context,
+        );
+        assert_eq!(
+            selected_reference_notes(&state)
+                .iter()
+                .find(|note| note.id == note_id)
+                .map(|note| note.time_millis),
+            Some(3_000)
+        );
+        assert_eq!(state.reference_transport_position_millis, 3_000);
+
+        update(
+            &mut state,
+            Message::ReferenceCommentDragEnded { ratio: 0.75 },
+            &mut context,
+        );
+        assert!(state.reference_persisted_note_drag.is_none());
+        assert!(state.save_in_flight);
+        assert_eq!(
+            state.status,
+            "Reference comment moved to 00:03 and saved locally."
+        );
+        assert_eq!(state.review_cursor_millis, 0);
+        assert_eq!(state.transport_position_millis, 0);
+    }
+
+    #[test]
+    fn reference_persisted_comment_drag_cancellation_rolls_back_without_saving() {
+        let (mut state, note_id) = reference_comment_drag_state();
+        state.reference_draft_note = Some(NoteDraft {
+            note_id: Some(note_id.clone()),
+            time_millis: 500,
+            body: String::from("edit this reference comment"),
+        });
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::ReferenceCommentDragStarted {
+                ratio: 0.125,
+                note_index: Some(0),
+            },
+            &mut context,
+        );
+        update(
+            &mut state,
+            Message::ReferenceCommentDragMoved { ratio: 0.75 },
+            &mut context,
+        );
+        assert_eq!(
+            selected_reference_notes(&state)
+                .iter()
+                .find(|note| note.id == note_id)
+                .map(|note| note.time_millis),
+            Some(3_000)
+        );
+
+        update(
+            &mut state,
+            Message::ReferenceCommentDragCancelled,
+            &mut context,
+        );
+        assert_eq!(
+            selected_reference_notes(&state)
+                .iter()
+                .find(|note| note.id == note_id)
+                .map(|note| note.time_millis),
+            Some(500)
+        );
+        assert_eq!(state.reference_transport_position_millis, 500);
+        assert_eq!(
+            state
+                .reference_draft_note
+                .as_ref()
+                .map(|draft| draft.time_millis),
+            Some(500)
+        );
+        assert!(state.reference_persisted_note_drag.is_none());
+        assert!(!state.save_in_flight);
+    }
+
     fn main_only_loop_state() -> AppState {
         let mut state = shared_reference_playback_state();
         state.reference_waveform = None;
@@ -8858,7 +9481,7 @@ mod tests {
             .iter()
             .filter_map(|primitive| match primitive {
                 PaintPrimitive::FillRect(fill)
-                    if fill.color == ThemeTokens::default().highlight_blue_soft =>
+                    if fill.color == ThemeTokens::default().text_primary =>
                 {
                     Some(fill.rect)
                 }
