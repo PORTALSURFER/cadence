@@ -235,6 +235,37 @@ struct LoopSelection {
     driver: AuditionSource,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct LoopSelections {
+    main: Option<LoopSelection>,
+    reference: Option<LoopSelection>,
+}
+
+impl LoopSelections {
+    fn get(self, source: AuditionSource) -> Option<LoopSelection> {
+        match source {
+            AuditionSource::Main => self.main,
+            AuditionSource::Reference => self.reference,
+        }
+    }
+
+    fn set(&mut self, source: AuditionSource, selection: Option<LoopSelection>) {
+        match source {
+            AuditionSource::Main => self.main = selection,
+            AuditionSource::Reference => self.reference = selection,
+        }
+    }
+
+    fn clear(&mut self, source: AuditionSource) {
+        self.set(source, None);
+    }
+
+    fn clear_all(&mut self) {
+        self.main = None;
+        self.reference = None;
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LoopBounds {
     main: (u64, u64),
@@ -282,7 +313,7 @@ struct AppState {
     reference_waveform_generation: u64,
     reference_waveform_cancellation: Option<ui::CancellationToken>,
     reference_waveform_progress: Option<f32>,
-    loop_selection: Option<LoopSelection>,
+    loop_selections: LoopSelections,
     review_cursor_millis: u64,
     playhead_drag_active: bool,
     reference_playhead_drag_active: bool,
@@ -373,7 +404,7 @@ impl Default for AppState {
             reference_waveform_generation: 0,
             reference_waveform_cancellation: None,
             reference_waveform_progress: None,
-            loop_selection: None,
+            loop_selections: LoopSelections::default(),
             review_cursor_millis: 0,
             playhead_drag_active: false,
             reference_playhead_drag_active: false,
@@ -552,7 +583,7 @@ fn schedule_waveform_decode(
     state.waveform = None;
     state.waveform_track_id = None;
     state.waveform_progress = None;
-    state.loop_selection = None;
+    state.loop_selections.clear(AuditionSource::Main);
     state.status = format!("Preparing MAIN waveform and loudness · {}…", path.display());
     let cache_path = storage::waveform_cache_path(&path);
     let progress_track_id = track_id.clone();
@@ -608,7 +639,7 @@ fn schedule_selected_waveform_decode(
         state.waveform = None;
         state.waveform_track_id = None;
         state.waveform_progress = None;
-        state.loop_selection = None;
+        state.loop_selections.clear(AuditionSource::Main);
         context.request_repaint();
     }
 }
@@ -628,7 +659,7 @@ fn schedule_reference_waveform_decode(
     state.reference_waveform = None;
     state.reference_waveform_track_id = None;
     state.reference_waveform_progress = None;
-    state.loop_selection = None;
+    state.loop_selections.clear(AuditionSource::Reference);
     let cache_path = storage::waveform_cache_path(&path);
     let progress_track_id = track_id.clone();
     let completion_track_id = track_id;
@@ -688,7 +719,7 @@ fn schedule_selected_reference_decode(
         state.reference_waveform = None;
         state.reference_waveform_track_id = None;
         state.reference_waveform_progress = None;
-        state.loop_selection = None;
+        state.loop_selections.clear(AuditionSource::Reference);
         context.request_repaint();
     }
 }
@@ -1185,7 +1216,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     .waveform
                     .as_ref()
                     .is_some_and(|waveform| snapshot.position_millis >= waveform.duration_millis);
-            if state.loop_selection.is_some() {
+            if loop_bounds(state).is_some() {
                 enforce_loop(state, was_shared_playing);
             } else if natural_audition_completion {
                 advance_audition(state, context);
@@ -1628,7 +1659,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
             disarm_audition_auto_advance(state);
             set_audition_source(state, AuditionSource::Main);
-            state.loop_selection = None;
+            state.loop_selections.clear(AuditionSource::Main);
             state.status = String::from("Paint a loop across the main waveform…");
             context.request_repaint();
         }
@@ -1643,7 +1674,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             end_ratio,
         } => finish_loop_selection(state, context, AuditionSource::Main, start_ratio, end_ratio),
         Message::WaveformLoopDragCancelled => {
-            state.loop_selection = None;
+            state.loop_selections.clear(AuditionSource::Main);
             state.status = String::from("Loop selection canceled.");
             context.request_repaint();
         }
@@ -1656,7 +1687,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
             disarm_audition_auto_advance(state);
             set_audition_source(state, AuditionSource::Reference);
-            state.loop_selection = None;
+            state.loop_selections.clear(AuditionSource::Reference);
             state.status = String::from("Paint a loop across the reference waveform…");
             context.request_repaint();
         }
@@ -1681,7 +1712,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             end_ratio,
         ),
         Message::ReferenceLoopDragCancelled => {
-            state.loop_selection = None;
+            state.loop_selections.clear(AuditionSource::Reference);
             state.status = String::from("Reference loop selection canceled.");
             context.request_repaint();
         }
@@ -1705,6 +1736,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 start_main_note_draft(state, context, time_millis);
             } else {
                 set_audition_source(state, AuditionSource::Main);
+                state.loop_selections.clear(AuditionSource::Main);
                 state.draft_note = None;
                 state.selected_note_id = None;
                 disarm_audition_auto_advance(state);
@@ -1718,6 +1750,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
             rollback_persisted_note_drag(state);
             set_audition_source(state, AuditionSource::Main);
+            state.loop_selections.clear(AuditionSource::Main);
             state.playhead_drag_active = true;
             state.draft_note = None;
             state.hovered_note_id = None;
@@ -1749,6 +1782,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
             rollback_reference_persisted_note_drag(state);
             set_audition_source(state, AuditionSource::Reference);
+            state.loop_selections.clear(AuditionSource::Reference);
             state.reference_playhead_drag_active = true;
             state.reference_draft_note = None;
             state.hovered_reference_note_id = None;
@@ -2128,7 +2162,7 @@ fn loop_bounds_for_selection(state: &AppState, selection: LoopSelection) -> Opti
 }
 
 fn loop_bounds(state: &AppState) -> Option<LoopBounds> {
-    loop_bounds_for_selection(state, state.loop_selection?)
+    loop_bounds_for_selection(state, state.loop_selections.get(state.audition_source)?)
 }
 
 fn loop_bounds_meet_minimum(bounds: LoopBounds) -> bool {
@@ -2242,6 +2276,7 @@ fn seek_reference_waveform_position(
     let Some((path, reference_duration_millis)) = selected_reference_details(state) else {
         return;
     };
+    state.loop_selections.clear(AuditionSource::Reference);
     disarm_audition_auto_advance(state);
     set_audition_source(state, AuditionSource::Reference);
     if let Some(reference_transport) = state.reference_transport.as_ref()
@@ -2341,13 +2376,13 @@ fn finish_loop_selection(
         driver,
     };
     let Some(bounds) = loop_bounds_for_selection(state, candidate_selection) else {
-        state.loop_selection = None;
+        state.loop_selections.clear(driver);
         state.status = String::from("Loop cleared.");
         context.request_repaint();
         return;
     };
     if !loop_bounds_meet_minimum(bounds) {
-        state.loop_selection = None;
+        state.loop_selections.clear(driver);
         state.status = String::from("Loop cleared — select at least 120 ms.");
         context.request_repaint();
         return;
@@ -2369,7 +2404,7 @@ fn finish_loop_selection(
         context.request_repaint();
         return;
     }
-    state.loop_selection = Some(candidate_selection);
+    state.loop_selections.set(driver, Some(candidate_selection));
     if !was_playing {
         state.transport_position_millis = main_start_millis;
         state.review_cursor_millis = main_start_millis;
@@ -3803,7 +3838,7 @@ fn reset_transport(state: &mut AppState) {
     state.audition_play_token = None;
     state.transport_position_millis = 0;
     state.review_cursor_millis = 0;
-    state.loop_selection = None;
+    state.loop_selections.clear(AuditionSource::Main);
     state.playhead_drag_active = false;
     state.transport_playing = false;
     state.transport_polling = false;
@@ -3816,7 +3851,7 @@ fn reset_reference_transport(state: &mut AppState) {
     state.reference_playhead_drag_active = false;
     rollback_reference_persisted_note_drag(state);
     state.reference_transport_position_millis = 0;
-    state.loop_selection = None;
+    state.loop_selections.clear(AuditionSource::Reference);
     state.audition_source = AuditionSource::Main;
     state.reference_transport_playing = false;
     state.reference_transport_polling = false;
@@ -3900,7 +3935,7 @@ fn enforce_loop(state: &mut AppState, was_shared_playing: bool) {
     if state.reference_only_playback {
         return;
     }
-    let Some(selection) = state.loop_selection else {
+    let Some(selection) = state.loop_selections.get(state.audition_source) else {
         return;
     };
     let Some(bounds) = loop_bounds(state) else {
@@ -3996,6 +4031,7 @@ fn select_track_internal(
         remove_audition_queue_entry_if_outside_filter(state, previous_id);
     }
     state.library.selected_track_id = Some(id.clone());
+    state.loop_selections.clear_all();
     if in_audition {
         if let Some(index) = state
             .audition_queue
@@ -5619,7 +5655,8 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
                 })
         });
     let loop_selection = state
-        .loop_selection
+        .loop_selections
+        .get(AuditionSource::Main)
         .map(|selection| (selection.start_ratio, selection.end_ratio));
     let waveform_view = if let Some(waveform) = state
         .waveform
@@ -5984,6 +6021,12 @@ fn reference_waveform_section(state: &AppState, track: &storage::Track) -> ui::V
         });
     let reference_integrated_lufs =
         reference_waveform.and_then(|waveform| waveform.integrated_lufs);
+    let reference_loop_bounds = reference_waveform.and_then(|waveform| {
+        state
+            .loop_selections
+            .get(AuditionSource::Reference)
+            .and_then(|selection| projected_loop_bounds(selection, waveform.duration_millis))
+    });
     let reference_meter_lufs = current_reference_lufs_meter_value(state, &track.id);
     let match_gain_db = current_loudness_match_gain_db(state);
     let reference_name = track.reference_path.as_ref().map_or_else(
@@ -5999,9 +6042,7 @@ fn reference_waveform_section(state: &AppState, track: &storage::Track) -> ui::V
     } else {
         String::from("REFERENCE TRACK")
     };
-    let reference_label = if let Some((start_millis, end_millis)) =
-        loop_bounds(state).and_then(|bounds| bounds.reference)
-    {
+    let reference_label = if let Some((start_millis, end_millis)) = reference_loop_bounds {
         format!(
             "{reference_label} · LOOP {}–{}",
             format_timestamp(start_millis),
@@ -6092,7 +6133,8 @@ fn reference_waveform_section(state: &AppState, track: &storage::Track) -> ui::V
     .height(header_height);
     let reference_body = if let Some(waveform) = reference_waveform {
         let loop_selection = state
-            .loop_selection
+            .loop_selections
+            .get(AuditionSource::Reference)
             .map(|selection| (selection.start_ratio, selection.end_ratio));
         let notes = reference_notes_for_track(&state.library, track);
         let note_ratios = notes
@@ -6636,17 +6678,18 @@ fn plural(count: usize) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, AuditionSource, ImportBatchProgress, LoopBounds, LoopSelection, Message,
-        NoteDraft, StatusMenuHost, WAVEFORM_HEIGHT, WorkspaceMode, apply_transport_snapshot,
-        audition_shuffle_seed, audition_statuses, current_loudness_match_gain_db,
-        current_lufs_meter_value, current_reference_lufs_meter_value, decode_result_is_current,
-        deterministic_shuffle, enforce_loop, loop_bounds, main_output_gain, native_launch_options,
-        note_editor, note_ratio_for_id, planner_drop_is_valid, playback_shortcut, project_surface,
+        AppState, AuditionSource, ImportBatchProgress, LoopBounds, LoopSelection, LoopSelections,
+        Message, NoteDraft, StatusMenuHost, WAVEFORM_HEIGHT, WorkspaceMode,
+        apply_transport_snapshot, audition_shuffle_seed, audition_statuses,
+        current_loudness_match_gain_db, current_lufs_meter_value,
+        current_reference_lufs_meter_value, decode_result_is_current, deterministic_shuffle,
+        enforce_loop, loop_bounds, main_output_gain, native_launch_options, note_editor,
+        note_ratio_for_id, planner_drop_is_valid, playback_shortcut, project_surface,
         rebuild_audition_queue, reconcile_audition_queue, reference_decode_result_is_current,
-        reference_output_gain, reset_reference_transport, reset_transport,
-        selected_reference_notes, selected_track, stage_dropdown, stage_menu_anchor_from_pointer,
-        stage_menu_popover, status_dropdown_for_host, sync_audition_queue_after_status_change,
-        tracks_in_stage, tracks_with_status, transport_command_is_confirmed, update,
+        reference_output_gain, selected_reference_notes, selected_track, stage_dropdown,
+        stage_menu_anchor_from_pointer, stage_menu_popover, status_dropdown_for_host,
+        sync_audition_queue_after_status_change, tracks_in_stage, tracks_with_status,
+        transport_command_is_confirmed, update,
     };
     use crate::transport::Snapshot;
     use crate::{
@@ -7732,6 +7775,18 @@ mod tests {
     #[test]
     fn playing_main_upper_click_keeps_paired_transport_in_sync() {
         let mut state = shared_reference_playback_state();
+        state.loop_selections = LoopSelections {
+            main: Some(LoopSelection {
+                start_ratio: 0.1,
+                end_ratio: 0.2,
+                driver: AuditionSource::Main,
+            }),
+            reference: Some(LoopSelection {
+                start_ratio: 0.7,
+                end_ratio: 0.8,
+                driver: AuditionSource::Reference,
+            }),
+        };
         state.transport_playing = true;
         state.reference_transport_playing = true;
         state.reference_transport_position_millis = 1_000;
@@ -7746,6 +7801,8 @@ mod tests {
             &mut context,
         );
 
+        assert!(state.loop_selections.main.is_none());
+        assert!(state.loop_selections.reference.is_some());
         assert_eq!(state.transport_position_millis, 500);
         assert_eq!(state.review_cursor_millis, 500);
         assert_eq!(state.reference_transport_position_millis, 1_000);
@@ -7786,11 +7843,18 @@ mod tests {
             reference_waveform_track_id: Some(track_id.clone()),
             reference_transport: Some(transport::AudioTransport::spawn()),
             reference_transport_loaded: true,
-            loop_selection: Some(LoopSelection {
-                start_ratio: 0.1,
-                end_ratio: 0.2,
-                driver: AuditionSource::Reference,
-            }),
+            loop_selections: LoopSelections {
+                main: Some(LoopSelection {
+                    start_ratio: 0.7,
+                    end_ratio: 0.8,
+                    driver: AuditionSource::Main,
+                }),
+                reference: Some(LoopSelection {
+                    start_ratio: 0.1,
+                    end_ratio: 0.2,
+                    driver: AuditionSource::Reference,
+                }),
+            },
             review_cursor_millis: 600,
             transport_position_millis: 600,
             ..AppState::default()
@@ -7816,6 +7880,8 @@ mod tests {
             &mut context,
         );
 
+        assert!(state.loop_selections.main.is_some());
+        assert!(state.loop_selections.reference.is_none());
         assert_eq!(state.review_cursor_millis, 600);
         assert_eq!(state.transport_position_millis, 600);
         assert_eq!(state.reference_transport_position_millis, 1_000);
@@ -7974,6 +8040,18 @@ mod tests {
             reference_transport_position_millis: 1_500,
             ..AppState::default()
         };
+        state.loop_selections = LoopSelections {
+            main: Some(LoopSelection {
+                start_ratio: 0.1,
+                end_ratio: 0.2,
+                driver: AuditionSource::Main,
+            }),
+            reference: Some(LoopSelection {
+                start_ratio: 0.7,
+                end_ratio: 0.8,
+                driver: AuditionSource::Reference,
+            }),
+        };
         state.library.selected_track_id = Some(track_id.clone());
         state.library.tracks.push(Track {
             id: track_id,
@@ -8000,7 +8078,8 @@ mod tests {
             &mut context,
         );
 
-        assert!(state.loop_selection.is_none());
+        assert!(state.loop_selections.main.is_none());
+        assert!(state.loop_selections.reference.is_some());
         assert!(state.transport_polling);
         assert!(state.transport_waiting_token.is_some());
         assert!(state.reference_transport_polling);
@@ -8092,6 +8171,18 @@ mod tests {
     #[test]
     fn reference_playhead_drag_tracks_reference_position_and_preserves_main_transport() {
         let mut state = shared_reference_playback_state();
+        state.loop_selections = LoopSelections {
+            main: Some(LoopSelection {
+                start_ratio: 0.1,
+                end_ratio: 0.2,
+                driver: AuditionSource::Main,
+            }),
+            reference: Some(LoopSelection {
+                start_ratio: 0.7,
+                end_ratio: 0.8,
+                driver: AuditionSource::Reference,
+            }),
+        };
         state.review_cursor_millis = 600;
         state.transport_position_millis = 600;
         state.reference_transport_position_millis = 400;
@@ -8102,6 +8193,8 @@ mod tests {
             Message::ReferencePlayheadDragStarted { ratio: 0.25 },
             &mut context,
         );
+        assert!(state.loop_selections.main.is_some());
+        assert!(state.loop_selections.reference.is_none());
         assert!(state.reference_playhead_drag_active);
         assert_eq!(state.reference_transport_position_millis, 1_000);
         assert_eq!(state.review_cursor_millis, 600);
@@ -8453,7 +8546,7 @@ mod tests {
         state.reference_transport_position_millis = 1_000;
         assert_eq!(state.reference_transport_position_millis, 1_000);
         assert!(!state.reference_transport_loaded);
-        assert!(state.loop_selection.is_none());
+        assert!(state.loop_selections == LoopSelections::default());
 
         let mut context = ui::UiUpdateContext::default();
         update(&mut state, Message::TogglePlayback, &mut context);
@@ -8528,13 +8621,14 @@ mod tests {
         );
 
         assert_eq!(
-            state.loop_selection,
+            state.loop_selections.reference,
             Some(LoopSelection {
                 start_ratio: 0.25,
                 end_ratio: 0.75,
                 driver: AuditionSource::Reference,
             })
         );
+        assert!(state.loop_selections.main.is_none());
         assert_eq!(state.transport_position_millis, 500);
         assert_eq!(state.reference_transport_position_millis, 1_000);
         assert_eq!(
@@ -8553,7 +8647,7 @@ mod tests {
             },
             &mut context,
         );
-        assert_eq!(state.loop_selection, None);
+        assert!(state.loop_selections.reference.is_none());
     }
 
     #[test]
@@ -8577,7 +8671,7 @@ mod tests {
 
         assert_eq!(state.audition_source, AuditionSource::Main);
         assert_eq!(
-            state.loop_selection,
+            state.loop_selections.main,
             Some(LoopSelection {
                 start_ratio: 0.2,
                 end_ratio: 0.8,
@@ -8610,7 +8704,7 @@ mod tests {
         );
 
         assert_eq!(
-            state.loop_selection,
+            state.loop_selections.main,
             Some(LoopSelection {
                 start_ratio: 0.25,
                 end_ratio: 0.75,
@@ -8642,7 +8736,7 @@ mod tests {
             &mut context,
         );
 
-        assert!(state.loop_selection.is_none());
+        assert!(state.loop_selections.main.is_none());
         assert!(state.status.contains("120 ms"));
 
         update(
@@ -8654,7 +8748,7 @@ mod tests {
             &mut context,
         );
 
-        assert!(state.loop_selection.is_some());
+        assert!(state.loop_selections.main.is_some());
         assert_eq!(
             loop_bounds(&state).map(|bounds| bounds.reference),
             Some(Some((1_000, 1_240)))
@@ -8664,7 +8758,7 @@ mod tests {
     #[test]
     fn loop_driver_controls_completion_when_transport_durations_differ() {
         let mut main_driver_state = shared_reference_playback_state();
-        main_driver_state.loop_selection = Some(LoopSelection {
+        main_driver_state.loop_selections.main = Some(LoopSelection {
             start_ratio: 0.25,
             end_ratio: 0.75,
             driver: AuditionSource::Main,
@@ -8681,11 +8775,12 @@ mod tests {
         assert!(main_driver_state.reference_transport_polling);
 
         let mut reference_driver_state = shared_reference_playback_state();
-        reference_driver_state.loop_selection = Some(LoopSelection {
+        reference_driver_state.loop_selections.reference = Some(LoopSelection {
             start_ratio: 0.25,
             end_ratio: 0.75,
             driver: AuditionSource::Reference,
         });
+        reference_driver_state.audition_source = AuditionSource::Reference;
         reference_driver_state.transport_playing = true;
         reference_driver_state.reference_transport_playing = true;
         reference_driver_state.transport_position_millis = 1_000;
@@ -8702,57 +8797,121 @@ mod tests {
     }
 
     #[test]
-    fn loop_source_switching_cancellation_and_reset_clear_stale_state() {
+    fn loop_source_switching_preserves_ranges_and_active_source_controls_transport() {
         let mut state = shared_reference_playback_state();
         let mut context = ui::UiUpdateContext::default();
 
         update(
             &mut state,
-            Message::ReferenceLoopDragEnded {
-                start_ratio: 0.25,
-                end_ratio: 0.75,
+            Message::WaveformLoopDragEnded {
+                start_ratio: 0.2,
+                end_ratio: 0.4,
             },
             &mut context,
         );
         assert_eq!(
-            state.loop_selection.map(|selection| selection.driver),
+            state.loop_selections.main.map(|selection| selection.driver),
+            Some(AuditionSource::Main)
+        );
+
+        update(
+            &mut state,
+            Message::ReferenceLoopDragEnded {
+                start_ratio: 0.6,
+                end_ratio: 0.9,
+            },
+            &mut context,
+        );
+        assert_eq!(state.audition_source, AuditionSource::Reference);
+        assert!(state.loop_selections.main.is_some());
+        assert_eq!(
+            state
+                .loop_selections
+                .reference
+                .map(|selection| selection.driver),
             Some(AuditionSource::Reference)
         );
+        assert_eq!(
+            loop_bounds(&state),
+            Some(LoopBounds {
+                main: (1_200, 1_800),
+                reference: Some((2_400, 3_600)),
+            })
+        );
+
+        update(
+            &mut state,
+            Message::SelectAuditionSource(AuditionSource::Main),
+            &mut context,
+        );
+        assert_eq!(state.audition_source, AuditionSource::Main);
+        assert_eq!(
+            loop_bounds(&state),
+            Some(LoopBounds {
+                main: (400, 800),
+                reference: Some((800, 1_600)),
+            })
+        );
+
+        update(
+            &mut state,
+            Message::SelectAuditionSource(AuditionSource::Reference),
+            &mut context,
+        );
+        assert!(state.loop_selections.main.is_some());
+        assert!(state.loop_selections.reference.is_some());
+
+        state.audition_source = AuditionSource::Main;
+        state.loop_selections.clear(AuditionSource::Main);
+        assert!(loop_bounds(&state).is_none());
+        assert!(state.loop_selections.reference.is_some());
+    }
+
+    #[test]
+    fn loop_drag_cancellation_and_undersized_ranges_clear_only_the_initiating_source() {
+        let mut state = shared_reference_playback_state();
+        state.loop_selections = LoopSelections {
+            main: Some(LoopSelection {
+                start_ratio: 0.2,
+                end_ratio: 0.4,
+                driver: AuditionSource::Main,
+            }),
+            reference: Some(LoopSelection {
+                start_ratio: 0.6,
+                end_ratio: 0.9,
+                driver: AuditionSource::Reference,
+            }),
+        };
+        let mut context = ui::UiUpdateContext::default();
 
         update(
             &mut state,
             Message::WaveformLoopDragStarted { ratio: 0.4 },
             &mut context,
         );
-        assert!(state.loop_selection.is_none());
-        assert_eq!(state.audition_source, AuditionSource::Main);
+        assert!(state.loop_selections.main.is_none());
+        assert!(state.loop_selections.reference.is_some());
+        update(&mut state, Message::WaveformLoopDragCancelled, &mut context);
+        assert!(state.loop_selections.main.is_none());
+        assert!(state.loop_selections.reference.is_some());
 
-        state.loop_selection = Some(LoopSelection {
-            start_ratio: 0.25,
-            end_ratio: 0.75,
-            driver: AuditionSource::Main,
-        });
-        state.waveform_track_id = Some(String::from("stale-track"));
-        assert!(loop_bounds(&state).is_none());
-
-        state.playhead_drag_active = true;
         update(
             &mut state,
-            Message::WaveformPlayheadDragCancelled,
+            Message::ReferenceLoopDragStarted { ratio: 0.6 },
             &mut context,
         );
-        assert!(!state.playhead_drag_active);
-
-        reset_transport(&mut state);
-        assert!(state.loop_selection.is_none());
-
-        state.loop_selection = Some(LoopSelection {
-            start_ratio: 0.25,
-            end_ratio: 0.75,
-            driver: AuditionSource::Reference,
-        });
-        reset_reference_transport(&mut state);
-        assert!(state.loop_selection.is_none());
+        assert!(state.loop_selections.main.is_none());
+        assert!(state.loop_selections.reference.is_none());
+        update(
+            &mut state,
+            Message::ReferenceLoopDragEnded {
+                start_ratio: 0.2,
+                end_ratio: 0.22,
+            },
+            &mut context,
+        );
+        assert!(state.loop_selections.main.is_none());
+        assert!(state.loop_selections.reference.is_none());
     }
 
     #[test]
@@ -8778,7 +8937,7 @@ mod tests {
             &mut context,
         );
 
-        assert!(state.loop_selection.is_none());
+        assert!(state.loop_selections.main.is_none());
         assert_eq!(state.status, transport::CONTROLS_BUSY_ERROR);
         assert_eq!(state.transport_position_millis, 700);
         assert_eq!(state.reference_transport_position_millis, 1_400);
@@ -9052,6 +9211,61 @@ mod tests {
             reference_rect.min.y > title_rect.min.y,
             "the reference section should be below the primary track header"
         );
+    }
+
+    #[test]
+    fn reference_header_uses_the_reference_loop_when_main_loop_is_active() {
+        let track_id = String::from("reference-loop-header-track");
+        let main_waveform = audition_waveform();
+        let reference_waveform = WaveformData {
+            duration_millis: 4_000,
+            render_frames: 192_000,
+            ..main_waveform.clone()
+        };
+        let mut state = AppState {
+            busy: false,
+            waveform: Some(main_waveform),
+            waveform_track_id: Some(track_id.clone()),
+            reference_waveform: Some(reference_waveform),
+            reference_waveform_track_id: Some(track_id.clone()),
+            loop_selections: LoopSelections {
+                main: Some(LoopSelection {
+                    start_ratio: 0.2,
+                    end_ratio: 0.4,
+                    driver: AuditionSource::Main,
+                }),
+                reference: Some(LoopSelection {
+                    start_ratio: 0.7,
+                    end_ratio: 0.9,
+                    driver: AuditionSource::Reference,
+                }),
+            },
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(track_id.clone());
+        state.library.tracks.push(Track {
+            id: track_id,
+            title: String::from("Reference loop header track"),
+            original_name: String::from("reference-loop-header.wav"),
+            path: PathBuf::from("/external/reference-loop-header.wav"),
+            reference_path: Some(PathBuf::from("/external/reference-header.wav")),
+            size: 0,
+            favorite: false,
+            stage: TrackStage::SoundDesign,
+            status: TrackStatus::Inbox,
+            notes: Vec::new(),
+        });
+
+        let frame = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1_000.0));
+        let labels = frame.paint_plan.text_label_strings();
+
+        assert!(labels.iter().any(|label| {
+            label == "REFERENCE · reference-header.wav · -7.0 LUFS · LOOP 00:02–00:03"
+        }));
+        assert!(!labels.iter().any(|label| {
+            label == "REFERENCE · reference-header.wav · -7.0 LUFS · LOOP 00:00–00:01"
+        }));
     }
 
     #[test]

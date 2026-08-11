@@ -16,7 +16,10 @@ use radiant::{
         WidgetInput, WidgetOutput,
     },
 };
-use std::sync::Arc;
+use std::{cell::RefCell, sync::Arc};
+
+#[cfg(test)]
+use std::cell::Cell;
 
 const COMMENT_RAIL_RATIO: f32 = 0.82;
 const MARKER_RADIUS: f32 = 4.5;
@@ -177,6 +180,15 @@ pub enum WaveformInteraction {
 pub enum WaveformSource {
     Main,
     Reference,
+}
+
+#[derive(Clone, Debug)]
+struct DisplayBarLevelsCache {
+    source: WaveformSource,
+    generation: u64,
+    summary: Arc<radiant::runtime::GpuSignalSummary>,
+    bar_count: usize,
+    levels: Arc<[f32]>,
 }
 
 #[allow(dead_code)]
@@ -346,6 +358,9 @@ struct WaveformWidget {
     source: WaveformSource,
     generation: u64,
     summary: Arc<radiant::runtime::GpuSignalSummary>,
+    display_bar_levels_cache: RefCell<Option<DisplayBarLevelsCache>>,
+    #[cfg(test)]
+    display_bar_levels_miss_count: Cell<usize>,
     cursor_ratio: Option<f32>,
     loop_selection: Option<(f32, f32)>,
     note_ratios: Vec<(f32, bool)>,
@@ -394,6 +409,9 @@ impl WaveformWidget {
             source,
             generation,
             summary: Arc::clone(&waveform.summary),
+            display_bar_levels_cache: RefCell::new(None),
+            #[cfg(test)]
+            display_bar_levels_miss_count: Cell::new(0),
             cursor_ratio: cursor_ratio.map(clamp_ratio),
             loop_selection: None,
             note_ratios,
@@ -533,6 +551,37 @@ impl WaveformWidget {
             .zip(self.loop_drag_current_ratio)
             .map(normalize_range)
             .or(self.loop_selection)
+    }
+
+    fn display_bar_levels(&self, bar_count: usize) -> Arc<[f32]> {
+        let bar_count = bar_count.max(1);
+        let cached_levels = self
+            .display_bar_levels_cache
+            .borrow()
+            .as_ref()
+            .filter(|cache| {
+                cache.source == self.source
+                    && cache.generation == self.generation
+                    && cache.bar_count == bar_count
+                    && Arc::ptr_eq(&cache.summary, &self.summary)
+            })
+            .map(|cache| Arc::clone(&cache.levels));
+        if let Some(levels) = cached_levels {
+            return levels;
+        }
+
+        #[cfg(test)]
+        self.display_bar_levels_miss_count
+            .set(self.display_bar_levels_miss_count.get().saturating_add(1));
+        let levels = display_bar_levels(&self.summary, bar_count);
+        *self.display_bar_levels_cache.borrow_mut() = Some(DisplayBarLevelsCache {
+            source: self.source,
+            generation: self.generation,
+            summary: Arc::clone(&self.summary),
+            bar_count,
+            levels: Arc::clone(&levels),
+        });
+        levels
     }
 
     fn movement_exceeded(start: Point, current: Point) -> bool {
@@ -837,6 +886,7 @@ impl Widget for WaveformWidget {
         {
             return;
         }
+        self.display_bar_levels_cache = previous.display_bar_levels_cache.clone();
         self.common.state = previous.common.state;
         self.hover_ratio = previous.hover_ratio;
         self.hover_lower = previous.hover_lower;
@@ -883,7 +933,7 @@ impl Widget for WaveformWidget {
         let upper_bounds = Rect::from_min_max(bar_bounds.min, Point::new(bar_bounds.max.x, rail_y));
         let lower_bounds =
             Rect::from_min_max(Point::new(bar_bounds.min.x, rail_y + 1.0), bar_bounds.max);
-        let bar_levels = display_bar_levels(&self.summary, display_bar_count(bar_bounds.width()));
+        let bar_levels = self.display_bar_levels(display_bar_count(bar_bounds.width()));
         fill_rect(
             primitives,
             self.common.id,
@@ -3470,6 +3520,51 @@ mod tests {
         assert!(levels[4] < levels[7]);
         assert!((levels[0] - 0.4).abs() < f32::EPSILON);
         assert!((levels[7] - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn waveform_display_levels_cache_reuses_retained_state_and_invalidates_identity() {
+        let waveform = Arc::new(test_waveform());
+        let widget = WaveformWidget::new_for_source(
+            WaveformSource::Main,
+            7,
+            Arc::clone(&waveform),
+            None,
+            Vec::new(),
+        );
+        let first = widget.display_bar_levels(32);
+        let second = widget.display_bar_levels(32);
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(widget.display_bar_levels_miss_count.get(), 1);
+
+        let mut retained_widget = WaveformWidget::new_for_source(
+            WaveformSource::Main,
+            7,
+            Arc::clone(&waveform),
+            None,
+            Vec::new(),
+        );
+        retained_widget.synchronize_from_previous(&widget);
+        let retained = retained_widget.display_bar_levels(32);
+        assert!(Arc::ptr_eq(&first, &retained));
+        assert_eq!(retained_widget.display_bar_levels_miss_count.get(), 0);
+
+        let mut changed_source_widget = WaveformWidget::new_for_source(
+            WaveformSource::Reference,
+            7,
+            waveform,
+            None,
+            Vec::new(),
+        );
+        changed_source_widget.synchronize_from_previous(&widget);
+        let changed_source = changed_source_widget.display_bar_levels(32);
+        assert!(!Arc::ptr_eq(&first, &changed_source));
+        assert_eq!(changed_source_widget.display_bar_levels_miss_count.get(), 1);
+
+        let changed_width = widget.display_bar_levels(33);
+        assert!(!Arc::ptr_eq(&first, &changed_width));
+        assert_eq!(widget.display_bar_levels_miss_count.get(), 2);
     }
 
     #[test]
