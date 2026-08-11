@@ -134,6 +134,7 @@ enum Message {
         start_ratio: f32,
         end_ratio: f32,
     },
+    ReferenceLoopDragCancelled,
     ReferenceWaveformClicked {
         ratio: f32,
     },
@@ -154,6 +155,16 @@ enum Message {
         ratio: f32,
     },
     WaveformPlayheadDragCancelled,
+    ReferencePlayheadDragStarted {
+        ratio: f32,
+    },
+    ReferencePlayheadDragMoved {
+        ratio: f32,
+    },
+    ReferencePlayheadDragEnded {
+        ratio: f32,
+    },
+    ReferencePlayheadDragCancelled,
     CommentDragStarted {
         ratio: f32,
         note_index: Option<usize>,
@@ -165,6 +176,17 @@ enum Message {
         ratio: f32,
     },
     CommentDragCancelled,
+    ReferenceCommentDragStarted {
+        ratio: f32,
+        note_index: Option<usize>,
+    },
+    ReferenceCommentDragMoved {
+        ratio: f32,
+    },
+    ReferenceCommentDragEnded {
+        ratio: f32,
+    },
+    ReferenceCommentDragCancelled,
     DraftNoteChanged(String),
     SaveDraftNote,
     CancelDraftNote,
@@ -210,13 +232,43 @@ enum AuditionSource {
 struct LoopSelection {
     start_ratio: f32,
     end_ratio: f32,
-    driver: AuditionSource,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct LoopSelections {
+    main: Option<LoopSelection>,
+    reference: Option<LoopSelection>,
+}
+
+impl LoopSelections {
+    fn get(self, source: AuditionSource) -> Option<LoopSelection> {
+        match source {
+            AuditionSource::Main => self.main,
+            AuditionSource::Reference => self.reference,
+        }
+    }
+
+    fn set(&mut self, source: AuditionSource, selection: Option<LoopSelection>) {
+        match source {
+            AuditionSource::Main => self.main = selection,
+            AuditionSource::Reference => self.reference = selection,
+        }
+    }
+
+    fn clear(&mut self, source: AuditionSource) {
+        self.set(source, None);
+    }
+
+    fn clear_all(&mut self) {
+        self.main = None;
+        self.reference = None;
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LoopBounds {
-    main: (u64, u64),
-    reference: Option<(u64, u64)>,
+    start_millis: u64,
+    end_millis: u64,
 }
 
 const LIBRARY_WIDTH: f32 = 252.0;
@@ -260,9 +312,10 @@ struct AppState {
     reference_waveform_generation: u64,
     reference_waveform_cancellation: Option<ui::CancellationToken>,
     reference_waveform_progress: Option<f32>,
-    loop_selection: Option<LoopSelection>,
+    loop_selections: LoopSelections,
     review_cursor_millis: u64,
     playhead_drag_active: bool,
+    reference_playhead_drag_active: bool,
     transport: transport::AudioTransport,
     transport_generation: u64,
     transport_position_millis: u64,
@@ -283,6 +336,7 @@ struct AppState {
     draft_note: Option<NoteDraft>,
     reference_draft_note: Option<NoteDraft>,
     persisted_note_drag: Option<PersistedNoteDrag>,
+    reference_persisted_note_drag: Option<PersistedNoteDrag>,
     selected_note_id: Option<String>,
     hovered_note_id: Option<String>,
     selected_reference_note_id: Option<String>,
@@ -349,9 +403,10 @@ impl Default for AppState {
             reference_waveform_generation: 0,
             reference_waveform_cancellation: None,
             reference_waveform_progress: None,
-            loop_selection: None,
+            loop_selections: LoopSelections::default(),
             review_cursor_millis: 0,
             playhead_drag_active: false,
+            reference_playhead_drag_active: false,
             transport: transport::AudioTransport::spawn(),
             transport_generation: 0,
             transport_position_millis: 0,
@@ -372,6 +427,7 @@ impl Default for AppState {
             draft_note: None,
             reference_draft_note: None,
             persisted_note_drag: None,
+            reference_persisted_note_drag: None,
             selected_note_id: None,
             hovered_note_id: None,
             selected_reference_note_id: None,
@@ -452,6 +508,7 @@ fn main() -> radiant::Result {
                 || state.reference_transport_polling
                 || state.audition_pending_play_track_id.is_some()
                 || state.playhead_drag_active
+                || state.reference_playhead_drag_active
                 || state.planner_drag_source_track_id.is_some()
         })
         .on_frame(|| Message::Frame)
@@ -525,7 +582,7 @@ fn schedule_waveform_decode(
     state.waveform = None;
     state.waveform_track_id = None;
     state.waveform_progress = None;
-    state.loop_selection = None;
+    state.loop_selections.clear(AuditionSource::Main);
     state.status = format!("Preparing MAIN waveform and loudness · {}…", path.display());
     let cache_path = storage::waveform_cache_path(&path);
     let progress_track_id = track_id.clone();
@@ -581,7 +638,7 @@ fn schedule_selected_waveform_decode(
         state.waveform = None;
         state.waveform_track_id = None;
         state.waveform_progress = None;
-        state.loop_selection = None;
+        state.loop_selections.clear(AuditionSource::Main);
         context.request_repaint();
     }
 }
@@ -601,7 +658,7 @@ fn schedule_reference_waveform_decode(
     state.reference_waveform = None;
     state.reference_waveform_track_id = None;
     state.reference_waveform_progress = None;
-    state.loop_selection = None;
+    state.loop_selections.clear(AuditionSource::Reference);
     let cache_path = storage::waveform_cache_path(&path);
     let progress_track_id = track_id.clone();
     let completion_track_id = track_id;
@@ -661,7 +718,7 @@ fn schedule_selected_reference_decode(
         state.reference_waveform = None;
         state.reference_waveform_track_id = None;
         state.reference_waveform_progress = None;
-        state.loop_selection = None;
+        state.loop_selections.clear(AuditionSource::Reference);
         context.request_repaint();
     }
 }
@@ -804,6 +861,8 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     state.draft_note = None;
                     state.reference_draft_note = None;
                     rollback_persisted_note_drag(state);
+                    rollback_reference_persisted_note_drag(state);
+                    state.reference_playhead_drag_active = false;
                     state.selected_note_id = None;
                     state.hovered_note_id = None;
                     state.selected_reference_note_id = None;
@@ -845,6 +904,8 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     state.draft_note = None;
                     state.reference_draft_note = None;
                     rollback_persisted_note_drag(state);
+                    rollback_reference_persisted_note_drag(state);
+                    state.reference_playhead_drag_active = false;
                     state.selected_note_id = None;
                     state.hovered_note_id = None;
                     state.selected_reference_note_id = None;
@@ -887,6 +948,8 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     state.draft_note = None;
                     state.reference_draft_note = None;
                     rollback_persisted_note_drag(state);
+                    rollback_reference_persisted_note_drag(state);
+                    state.reference_playhead_drag_active = false;
                     state.selected_note_id = None;
                     state.hovered_note_id = None;
                     state.selected_reference_note_id = None;
@@ -1105,8 +1168,8 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             let was_audition_playing = state.workspace_mode == WorkspaceMode::Audition
                 && state.audition_auto_advance
                 && state.transport_playing;
-            let was_shared_playing = !state.reference_only_playback
-                && (state.transport_playing || state.reference_transport_playing);
+            let was_main_playing = !state.reference_only_playback && state.transport_playing;
+            let was_reference_playing = state.reference_transport_playing;
             update_reference_transport(state);
             let snapshot = state.transport.snapshot();
             let audition_play_acknowledged = state.workspace_mode == WorkspaceMode::Audition
@@ -1152,14 +1215,12 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     .waveform
                     .as_ref()
                     .is_some_and(|waveform| snapshot.position_millis >= waveform.duration_millis);
-            if state.loop_selection.is_some() {
-                enforce_loop(state, was_shared_playing);
-            } else if natural_audition_completion {
+            if natural_audition_completion && state.loop_selections.main.is_none() {
                 advance_audition(state, context);
-            } else {
+            } else if state.loop_selections.main.is_none() {
                 maybe_start_pending_audition(state, context);
-                enforce_loop(state, was_shared_playing);
             }
+            enforce_loop(state, was_main_playing, was_reference_playing);
             context.request_repaint();
         }
         Message::LibrarySaved(result) => {
@@ -1517,6 +1578,8 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             if selected {
                 state.draft_note = None;
                 rollback_persisted_note_drag(state);
+                rollback_reference_persisted_note_drag(state);
+                state.reference_playhead_drag_active = false;
                 state.selected_note_id = None;
                 state.hovered_note_id = None;
                 state.library.selected_track_id =
@@ -1593,7 +1656,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
             disarm_audition_auto_advance(state);
             set_audition_source(state, AuditionSource::Main);
-            state.loop_selection = None;
+            state.loop_selections.clear(AuditionSource::Main);
             state.status = String::from("Paint a loop across the main waveform…");
             context.request_repaint();
         }
@@ -1608,7 +1671,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             end_ratio,
         } => finish_loop_selection(state, context, AuditionSource::Main, start_ratio, end_ratio),
         Message::WaveformLoopDragCancelled => {
-            state.loop_selection = None;
+            state.loop_selections.clear(AuditionSource::Main);
             state.status = String::from("Loop selection canceled.");
             context.request_repaint();
         }
@@ -1621,7 +1684,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
             disarm_audition_auto_advance(state);
             set_audition_source(state, AuditionSource::Reference);
-            state.loop_selection = None;
+            state.loop_selections.clear(AuditionSource::Reference);
             state.status = String::from("Paint a loop across the reference waveform…");
             context.request_repaint();
         }
@@ -1645,8 +1708,13 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             start_ratio,
             end_ratio,
         ),
+        Message::ReferenceLoopDragCancelled => {
+            state.loop_selections.clear(AuditionSource::Reference);
+            state.status = String::from("Reference loop selection canceled.");
+            context.request_repaint();
+        }
         Message::ReferenceWaveformClicked { ratio } => {
-            seek_reference_waveform_position(state, context, ratio)
+            seek_reference_waveform_position(state, context, ratio, true)
         }
         Message::ReferenceCommentClicked { ratio } => {
             start_reference_comment_draft(state, context, ratio)
@@ -1665,6 +1733,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 start_main_note_draft(state, context, time_millis);
             } else {
                 set_audition_source(state, AuditionSource::Main);
+                state.loop_selections.clear(AuditionSource::Main);
                 state.draft_note = None;
                 state.selected_note_id = None;
                 disarm_audition_auto_advance(state);
@@ -1678,6 +1747,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
             rollback_persisted_note_drag(state);
             set_audition_source(state, AuditionSource::Main);
+            state.loop_selections.clear(AuditionSource::Main);
             state.playhead_drag_active = true;
             state.draft_note = None;
             state.hovered_note_id = None;
@@ -1698,6 +1768,38 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
         }
         Message::WaveformPlayheadDragCancelled => {
             state.playhead_drag_active = false;
+            context.request_repaint();
+        }
+        Message::ReferencePlayheadDragStarted { ratio } => {
+            if state.busy || state.waveform_busy || state.reference_waveform_busy {
+                return;
+            }
+            if selected_reference_details(state).is_none() {
+                return;
+            }
+            rollback_reference_persisted_note_drag(state);
+            set_audition_source(state, AuditionSource::Reference);
+            state.loop_selections.clear(AuditionSource::Reference);
+            state.reference_playhead_drag_active = true;
+            state.reference_draft_note = None;
+            state.hovered_reference_note_id = None;
+            seek_reference_waveform_position(state, context, ratio, false);
+        }
+        Message::ReferencePlayheadDragMoved { ratio } => {
+            if !state.reference_playhead_drag_active {
+                return;
+            }
+            seek_reference_waveform_position(state, context, ratio, false);
+        }
+        Message::ReferencePlayheadDragEnded { ratio } => {
+            if !state.reference_playhead_drag_active {
+                return;
+            }
+            state.reference_playhead_drag_active = false;
+            seek_reference_waveform_position(state, context, ratio, true);
+        }
+        Message::ReferencePlayheadDragCancelled => {
+            state.reference_playhead_drag_active = false;
             context.request_repaint();
         }
         Message::CommentDragStarted { ratio, note_index } => {
@@ -1738,6 +1840,46 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 state.draft_note = None;
             }
             state.status = String::from("Comment canceled.");
+            context.request_repaint();
+        }
+        Message::ReferenceCommentDragStarted { ratio, note_index } => {
+            if state.busy || state.waveform_busy || state.reference_waveform_busy {
+                return;
+            }
+            if let Some(note_index) = note_index {
+                start_reference_persisted_note_drag(state, context, note_index);
+            } else {
+                rollback_reference_persisted_note_drag(state);
+                move_reference_draft_note(state, context, ratio);
+            }
+        }
+        Message::ReferenceCommentDragMoved { ratio } => {
+            if state.busy || state.waveform_busy || state.reference_waveform_busy {
+                return;
+            }
+            if state.reference_persisted_note_drag.is_some() {
+                move_reference_persisted_note(state, context, ratio);
+            } else {
+                move_reference_draft_note(state, context, ratio);
+            }
+        }
+        Message::ReferenceCommentDragEnded { ratio } => {
+            if state.busy || state.waveform_busy || state.reference_waveform_busy {
+                return;
+            }
+            if state.reference_persisted_note_drag.is_some() {
+                finish_reference_persisted_note_drag(state, context, ratio);
+            } else {
+                move_reference_draft_note(state, context, ratio);
+            }
+        }
+        Message::ReferenceCommentDragCancelled => {
+            if state.reference_persisted_note_drag.is_some() {
+                rollback_reference_persisted_note_drag(state);
+            } else {
+                state.reference_draft_note = None;
+            }
+            state.status = String::from("Reference comment canceled.");
             context.request_repaint();
         }
         Message::DraftNoteChanged(body) => {
@@ -2007,26 +2149,39 @@ fn projected_loop_bounds(selection: LoopSelection, duration_millis: u64) -> Opti
     (end_millis > start_millis).then_some((start_millis, end_millis))
 }
 
-fn loop_bounds_for_selection(state: &AppState, selection: LoopSelection) -> Option<LoopBounds> {
-    let main = projected_loop_bounds(selection, selected_main_duration(state)?)?;
-    let reference = match selected_reference_details(state) {
-        Some((_, duration_millis)) => Some(projected_loop_bounds(selection, duration_millis)?),
-        None => None,
-    };
-    Some(LoopBounds { main, reference })
+fn selected_duration_for_source(state: &AppState, source: AuditionSource) -> Option<u64> {
+    match source {
+        AuditionSource::Main => selected_main_duration(state),
+        AuditionSource::Reference => {
+            selected_reference_details(state).map(|(_, duration)| duration)
+        }
+    }
 }
 
+fn loop_bounds_for_selection(
+    state: &AppState,
+    source: AuditionSource,
+    selection: LoopSelection,
+) -> Option<LoopBounds> {
+    let (start_millis, end_millis) =
+        projected_loop_bounds(selection, selected_duration_for_source(state, source)?)?;
+    Some(LoopBounds {
+        start_millis,
+        end_millis,
+    })
+}
+
+fn loop_bounds_for_source(state: &AppState, source: AuditionSource) -> Option<LoopBounds> {
+    loop_bounds_for_selection(state, source, state.loop_selections.get(source)?)
+}
+
+#[cfg(test)]
 fn loop_bounds(state: &AppState) -> Option<LoopBounds> {
-    loop_bounds_for_selection(state, state.loop_selection?)
+    loop_bounds_for_source(state, state.audition_source)
 }
 
 fn loop_bounds_meet_minimum(bounds: LoopBounds) -> bool {
-    let main_span = bounds.main.1.saturating_sub(bounds.main.0);
-    let shortest_span = bounds
-        .reference
-        .map(|(start, end)| end.saturating_sub(start))
-        .map_or(main_span, |reference_span| main_span.min(reference_span));
-    shortest_span >= MIN_LOOP_MILLIS
+    bounds.end_millis.saturating_sub(bounds.start_millis) >= MIN_LOOP_MILLIS
 }
 
 fn seek_synchronized_positions(
@@ -2123,6 +2278,7 @@ fn seek_reference_waveform_position(
     state: &mut AppState,
     context: &mut ui::UiUpdateContext<Message>,
     ratio: f32,
+    resume: bool,
 ) {
     if state.busy || state.waveform_busy || state.reference_waveform_busy {
         return;
@@ -2130,6 +2286,7 @@ fn seek_reference_waveform_position(
     let Some((path, reference_duration_millis)) = selected_reference_details(state) else {
         return;
     };
+    state.loop_selections.clear(AuditionSource::Reference);
     disarm_audition_auto_advance(state);
     set_audition_source(state, AuditionSource::Reference);
     if let Some(reference_transport) = state.reference_transport.as_ref()
@@ -2145,6 +2302,16 @@ fn seek_reference_waveform_position(
     state.draft_note = None;
     rollback_persisted_note_drag(state);
     state.selected_note_id = None;
+    if !resume {
+        state.reference_transport_position_millis = reference_position_millis;
+        state.reference_only_playback = false;
+        state.status = format!(
+            "Scrubbing reference at {}.",
+            format_timestamp(reference_position_millis)
+        );
+        context.request_repaint();
+        return;
+    }
     let reference_gain = reference_output_gain(state);
     let reference_transport = state
         .reference_transport
@@ -2188,24 +2355,103 @@ fn seek_reference_waveform_position(
     context.request_repaint();
 }
 
+fn source_transport_is_active(state: &AppState, source: AuditionSource) -> bool {
+    match source {
+        AuditionSource::Main => {
+            state.transport_playing
+                || state.transport_polling
+                || state.transport_waiting_token.is_some()
+        }
+        AuditionSource::Reference => {
+            state.reference_transport_playing
+                || state.reference_transport_polling
+                || state.reference_transport_waiting_token.is_some()
+        }
+    }
+}
+
+fn set_source_position(state: &mut AppState, source: AuditionSource, position_millis: u64) {
+    match source {
+        AuditionSource::Main => {
+            state.transport_position_millis = position_millis;
+            state.review_cursor_millis = position_millis;
+        }
+        AuditionSource::Reference => {
+            state.reference_transport_position_millis = position_millis;
+        }
+    }
+}
+
+fn seek_loop_owner(
+    state: &mut AppState,
+    source: AuditionSource,
+    bounds: LoopBounds,
+) -> Result<(), String> {
+    let duration_millis = selected_duration_for_source(state, source)
+        .ok_or_else(|| String::from("Audio analysis is still pending."))?;
+    let position_millis = bounds.start_millis.min(duration_millis);
+    match source {
+        AuditionSource::Main => {
+            if state.transport_polling
+                || state.transport_waiting_token.is_some()
+                || state.transport.has_pending_load()
+                || !state.transport.has_command_capacity(1)
+            {
+                return Err(String::from(transport::CONTROLS_BUSY_ERROR));
+            }
+            let token = state.transport.seek(
+                state.transport_generation,
+                position_millis,
+                duration_millis,
+                true,
+            )?;
+            set_source_position(state, source, position_millis);
+            begin_transport_polling(state, token);
+        }
+        AuditionSource::Reference => {
+            let Some(reference_transport) = state.reference_transport.as_ref() else {
+                return Err(String::from(transport::CONTROLS_BUSY_ERROR));
+            };
+            if !state.reference_transport_loaded
+                || state.reference_transport_polling
+                || state.reference_transport_waiting_token.is_some()
+                || reference_transport.has_pending_load()
+                || !reference_transport.has_command_capacity(1)
+            {
+                return Err(String::from(transport::CONTROLS_BUSY_ERROR));
+            }
+            let token = reference_transport.seek(
+                state.reference_transport_generation,
+                position_millis,
+                duration_millis,
+                true,
+            )?;
+            set_source_position(state, source, position_millis);
+            state.reference_transport_waiting_token = Some(token);
+            state.reference_transport_polling = true;
+        }
+    }
+    Ok(())
+}
+
 fn finish_loop_selection(
     state: &mut AppState,
     context: &mut ui::UiUpdateContext<Message>,
-    driver: AuditionSource,
+    owner: AuditionSource,
     start_ratio: f32,
     end_ratio: f32,
 ) {
     if state.busy
         || state.waveform_busy
-        || (driver == AuditionSource::Reference && state.reference_waveform_busy)
+        || (owner == AuditionSource::Reference && state.reference_waveform_busy)
     {
         return;
     }
-    if driver == AuditionSource::Reference && selected_reference_details(state).is_none() {
+    if owner == AuditionSource::Reference && selected_reference_details(state).is_none() {
         return;
     }
     disarm_audition_auto_advance(state);
-    set_audition_source(state, driver);
+    set_audition_source(state, owner);
     let start_ratio = waveform::clamp_ratio(start_ratio);
     let end_ratio = waveform::clamp_ratio(end_ratio);
     let (start_ratio, end_ratio) = if start_ratio <= end_ratio {
@@ -2216,59 +2462,38 @@ fn finish_loop_selection(
     let candidate_selection = LoopSelection {
         start_ratio,
         end_ratio,
-        driver,
     };
-    let Some(bounds) = loop_bounds_for_selection(state, candidate_selection) else {
-        state.loop_selection = None;
+    let Some(bounds) = loop_bounds_for_selection(state, owner, candidate_selection) else {
+        state.loop_selections.clear(owner);
         state.status = String::from("Loop cleared.");
         context.request_repaint();
         return;
     };
     if !loop_bounds_meet_minimum(bounds) {
-        state.loop_selection = None;
+        state.loop_selections.clear(owner);
         state.status = String::from("Loop cleared — select at least 120 ms.");
         context.request_repaint();
         return;
     }
 
-    let (main_start_millis, _) = bounds.main;
-    let reference_start_millis = bounds
-        .reference
-        .map(|(start, _)| start)
-        .unwrap_or(state.reference_transport_position_millis);
-    let was_playing = state.reference_only_playback
-        || state.transport_playing
-        || state.reference_transport_playing;
-    if was_playing
-        && let Err(error) =
-            seek_synchronized_positions(state, main_start_millis, reference_start_millis, true)
-    {
+    let owner_was_active = source_transport_is_active(state, owner);
+    if owner_was_active && let Err(error) = seek_loop_owner(state, owner, bounds) {
         state.status = error;
         context.request_repaint();
         return;
     }
-    state.loop_selection = Some(candidate_selection);
-    if !was_playing {
-        state.transport_position_millis = main_start_millis;
-        state.review_cursor_millis = main_start_millis;
-        if bounds.reference.is_some() {
-            state.reference_transport_position_millis = reference_start_millis;
-        }
+    state.loop_selections.set(owner, Some(candidate_selection));
+    if !owner_was_active {
+        set_source_position(state, owner, bounds.start_millis);
     }
-    let (start_millis, end_millis) = match driver {
-        AuditionSource::Main => bounds.main,
-        AuditionSource::Reference => bounds
-            .reference
-            .expect("reference loop selection requires reference bounds"),
-    };
-    let label = match driver {
+    let label = match owner {
         AuditionSource::Main => "Main",
         AuditionSource::Reference => "Reference",
     };
     state.status = format!(
         "{label} loop {}–{}.",
-        format_timestamp(start_millis),
-        format_timestamp(end_millis),
+        format_timestamp(bounds.start_millis),
+        format_timestamp(bounds.end_millis),
     );
     context.request_repaint();
 }
@@ -2366,6 +2591,35 @@ fn play_audition(state: &mut AppState, context: &mut ui::UiUpdateContext<Message
     // only after the active-playback guard makes this a one-way Play command.
     state.audition_pending_play_track_id = None;
     toggle_playback(state, context);
+}
+
+fn source_position(state: &AppState, source: AuditionSource) -> u64 {
+    match source {
+        AuditionSource::Main => state.transport_position_millis,
+        AuditionSource::Reference => state.reference_transport_position_millis,
+    }
+}
+
+fn playback_start_position(
+    state: &AppState,
+    source: AuditionSource,
+    duration_millis: u64,
+    loop_bounds: Option<LoopBounds>,
+) -> u64 {
+    let stored_position_millis = source_position(state, source);
+    if let Some(bounds) = loop_bounds {
+        if stored_position_millis >= bounds.start_millis
+            && stored_position_millis < bounds.end_millis
+        {
+            stored_position_millis.min(duration_millis)
+        } else {
+            bounds.start_millis.min(duration_millis)
+        }
+    } else if stored_position_millis >= duration_millis {
+        0
+    } else {
+        stored_position_millis
+    }
 }
 
 fn previous_audition(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
@@ -2616,7 +2870,25 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
         state.reference_only_playback = false;
     } else {
         let duration_millis = waveform.duration_millis;
-        let loop_bounds = loop_bounds(state);
+        let main_loop_bounds = loop_bounds_for_source(state, AuditionSource::Main);
+        let reference_loop_bounds = loop_bounds_for_source(state, AuditionSource::Reference);
+        let main_position_millis = playback_start_position(
+            state,
+            AuditionSource::Main,
+            duration_millis,
+            main_loop_bounds,
+        );
+        let reference_position_millis = reference_details
+            .as_ref()
+            .map(|(_, duration_millis)| {
+                playback_start_position(
+                    state,
+                    AuditionSource::Reference,
+                    *duration_millis,
+                    reference_loop_bounds,
+                )
+            })
+            .unwrap_or(state.reference_transport_position_millis);
         if !state.transport.has_command_capacity(1) {
             state.status = String::from(transport::CONTROLS_BUSY_ERROR);
             context.request_repaint();
@@ -2642,51 +2914,14 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
                 return;
             }
         }
-        let (position_millis, reference_position_millis) = if let Some(bounds) = loop_bounds {
-            let (main_start_millis, main_end_millis) = bounds.main;
-            let main_position_in_loop = state.transport_position_millis >= main_start_millis
-                && state.transport_position_millis < main_end_millis;
-            let reference_position_in_loop =
-                bounds
-                    .reference
-                    .is_none_or(|(reference_start_millis, reference_end_millis)| {
-                        state.reference_transport_position_millis >= reference_start_millis
-                            && state.reference_transport_position_millis < reference_end_millis
-                    });
-            if main_position_in_loop && reference_position_in_loop {
-                (
-                    state.transport_position_millis,
-                    state.reference_transport_position_millis,
-                )
-            } else {
-                (
-                    main_start_millis,
-                    bounds
-                        .reference
-                        .map_or(state.reference_transport_position_millis, |(start, _)| {
-                            start
-                        }),
-                )
-            }
-        } else {
-            let main_position_millis = state.transport_position_millis;
-            (
-                if main_position_millis >= duration_millis {
-                    0
-                } else {
-                    main_position_millis
-                },
-                state.reference_transport_position_millis,
-            )
-        };
-        state.transport_position_millis = position_millis;
-        state.review_cursor_millis = position_millis;
         state.reference_only_playback = false;
 
-        let main_result = if loop_bounds.is_some() {
+        let main_result = if main_loop_bounds.is_some()
+            || main_position_millis != state.transport_position_millis
+        {
             state.transport.seek(
                 state.transport_generation,
-                position_millis,
+                main_position_millis,
                 duration_millis,
                 true,
             )
@@ -2705,6 +2940,7 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
                 return;
             }
         };
+        set_source_position(state, AuditionSource::Main, main_position_millis);
         if state.workspace_mode == WorkspaceMode::Audition {
             state.audition_auto_advance = true;
             state.audition_play_token = Some(main_token);
@@ -2712,8 +2948,6 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
         begin_transport_polling(state, main_token);
 
         if let Some((path, reference_duration_millis)) = reference_details {
-            let reference_position_millis =
-                reference_position_millis.min(reference_duration_millis);
             let reference_gain = reference_output_gain(state);
             let reference_transport = state
                 .reference_transport
@@ -2755,7 +2989,7 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
                         return;
                     }
                 };
-            state.reference_transport_position_millis = reference_position_millis;
+            set_source_position(state, AuditionSource::Reference, reference_position_millis);
             state.reference_transport_waiting_token = Some(reference_token);
             state.reference_transport_polling = true;
             state.status = if state.audition_source == AuditionSource::Reference {
@@ -3128,6 +3362,208 @@ fn finish_persisted_note_drag(
     context.request_repaint();
 }
 
+fn move_reference_draft_note(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    ratio: f32,
+) {
+    let Some(duration_millis) = state
+        .reference_waveform
+        .as_ref()
+        .filter(|_| !state.reference_waveform_busy)
+        .map(|waveform| waveform.duration_millis)
+    else {
+        return;
+    };
+    let Some(draft) = state
+        .reference_draft_note
+        .as_mut()
+        .filter(|draft| draft.note_id.is_none())
+    else {
+        return;
+    };
+    let time_millis = waveform::millis_for_ratio(ratio, duration_millis);
+    draft.time_millis = time_millis;
+    state.reference_transport_position_millis = time_millis;
+    state.status = format!("Reference comment at {}.", format_timestamp(time_millis));
+    context.request_repaint();
+}
+
+fn start_reference_persisted_note_drag(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    note_index: usize,
+) {
+    rollback_reference_persisted_note_drag(state);
+    if state.busy {
+        return;
+    }
+    let Some(track_id) = state.library.selected_track_id.clone() else {
+        return;
+    };
+    let waveform_is_current = state.reference_waveform.is_some()
+        && state.reference_waveform_track_id.as_deref() == Some(track_id.as_str())
+        && !state.reference_waveform_busy;
+    let Some((note_id, time_millis)) = state
+        .library
+        .tracks
+        .iter()
+        .find(|track| track.id == track_id)
+        .filter(|_| waveform_is_current)
+        .and_then(|track| {
+            reference_notes_for_track(&state.library, track)
+                .get(note_index)
+                .map(|note| (note.id.clone(), note.time_millis))
+        })
+    else {
+        state.status = String::from("That reference comment no longer exists.");
+        context.request_repaint();
+        return;
+    };
+
+    if state
+        .reference_draft_note
+        .as_ref()
+        .is_some_and(|draft| draft.note_id.as_deref() == Some(note_id.as_str()))
+    {
+        if let Some(draft) = state.reference_draft_note.as_mut() {
+            draft.time_millis = time_millis;
+        }
+    } else {
+        state.reference_draft_note = None;
+    }
+    state.reference_persisted_note_drag = Some(PersistedNoteDrag {
+        track_id,
+        note_id: note_id.clone(),
+        original_time_millis: time_millis,
+        moved: false,
+    });
+    state.selected_reference_note_id = Some(note_id);
+    state.hovered_reference_note_id = None;
+    state.reference_transport_position_millis = time_millis;
+    state.status = format!(
+        "Dragging reference comment at {}…",
+        format_timestamp(time_millis)
+    );
+    context.request_repaint();
+}
+
+fn move_reference_persisted_note(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    ratio: f32,
+) {
+    let Some(drag) = state.reference_persisted_note_drag.clone() else {
+        return;
+    };
+    let Some(duration_millis) = state
+        .reference_waveform
+        .as_ref()
+        .filter(|_| {
+            !state.reference_waveform_busy
+                && state.reference_waveform_track_id.as_deref() == Some(drag.track_id.as_str())
+        })
+        .map(|waveform| waveform.duration_millis)
+    else {
+        rollback_reference_persisted_note_drag(state);
+        return;
+    };
+    let time_millis = waveform::millis_for_ratio(ratio, duration_millis);
+    let note_exists = selected_reference_track_mut(state)
+        .and_then(|reference| {
+            reference
+                .notes
+                .iter_mut()
+                .find(|note| note.id == drag.note_id)
+        })
+        .map(|note| note.time_millis = time_millis)
+        .is_some();
+    if !note_exists {
+        rollback_reference_persisted_note_drag(state);
+        state.status = String::from("That reference comment no longer exists.");
+        context.request_repaint();
+        return;
+    }
+    if let Some(active_drag) = state.reference_persisted_note_drag.as_mut() {
+        active_drag.moved |= time_millis != active_drag.original_time_millis;
+    }
+    if let Some(draft) = state
+        .reference_draft_note
+        .as_mut()
+        .filter(|draft| draft.note_id.as_deref() == Some(drag.note_id.as_str()))
+    {
+        draft.time_millis = time_millis;
+    }
+    state.reference_transport_position_millis = time_millis;
+    state.status = format!("Reference comment at {}.", format_timestamp(time_millis));
+    context.request_repaint();
+}
+
+fn finish_reference_persisted_note_drag(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    ratio: f32,
+) {
+    let Some(drag) = state.reference_persisted_note_drag.take() else {
+        return;
+    };
+    let Some(duration_millis) = state
+        .reference_waveform
+        .as_ref()
+        .filter(|_| {
+            !state.reference_waveform_busy
+                && state.reference_waveform_track_id.as_deref() == Some(drag.track_id.as_str())
+        })
+        .map(|waveform| waveform.duration_millis)
+    else {
+        return;
+    };
+    let time_millis = waveform::millis_for_ratio(ratio, duration_millis);
+    let Some(reference) = selected_reference_track_mut(state) else {
+        state.status = String::from("That reference track is no longer available.");
+        context.request_repaint();
+        return;
+    };
+    let Some(note) = reference
+        .notes
+        .iter_mut()
+        .find(|note| note.id == drag.note_id)
+    else {
+        state.status = String::from("That reference comment no longer exists.");
+        context.request_repaint();
+        return;
+    };
+    if drag.moved {
+        note.time_millis = time_millis;
+    }
+    let final_time_millis = note.time_millis;
+    let changed = final_time_millis != drag.original_time_millis;
+    reference.notes.sort_by_key(|note| note.time_millis);
+    if let Some(draft) = state
+        .reference_draft_note
+        .as_mut()
+        .filter(|draft| draft.note_id.as_deref() == Some(drag.note_id.as_str()))
+    {
+        draft.time_millis = final_time_millis;
+    }
+    state.reference_transport_position_millis = final_time_millis;
+    state.status = if changed {
+        format!(
+            "Reference comment moved to {} and saved locally.",
+            format_timestamp(final_time_millis)
+        )
+    } else {
+        format!(
+            "Selected reference comment at {}.",
+            format_timestamp(final_time_millis)
+        )
+    };
+    if changed {
+        schedule_library_save(state, context);
+    }
+    context.request_repaint();
+}
+
 fn request_import(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
     if state.busy {
         state.status = String::from("The library is still loading.");
@@ -3479,7 +3915,7 @@ fn reset_transport(state: &mut AppState) {
     state.audition_play_token = None;
     state.transport_position_millis = 0;
     state.review_cursor_millis = 0;
-    state.loop_selection = None;
+    state.loop_selections.clear(AuditionSource::Main);
     state.playhead_drag_active = false;
     state.transport_playing = false;
     state.transport_polling = false;
@@ -3489,8 +3925,10 @@ fn reset_transport(state: &mut AppState) {
 
 fn reset_reference_transport(state: &mut AppState) {
     state.reference_transport_generation = state.reference_transport_generation.wrapping_add(1);
+    state.reference_playhead_drag_active = false;
+    rollback_reference_persisted_note_drag(state);
     state.reference_transport_position_millis = 0;
-    state.loop_selection = None;
+    state.loop_selections.clear(AuditionSource::Reference);
     state.audition_source = AuditionSource::Main;
     state.reference_transport_playing = false;
     state.reference_transport_polling = false;
@@ -3545,6 +3983,8 @@ fn update_reference_transport(state: &mut AppState) {
         state.reference_transport_waiting_token = None;
         state.reference_transport_loaded = false;
         state.reference_only_playback = false;
+        state.reference_playhead_drag_active = false;
+        rollback_reference_persisted_note_drag(state);
         state.status = error;
     } else if state
         .reference_transport_waiting_token
@@ -3557,7 +3997,9 @@ fn update_reference_transport(state: &mut AppState) {
 
 fn apply_reference_transport_snapshot(state: &mut AppState, snapshot: transport::Snapshot) {
     if snapshot.ready {
-        state.reference_transport_position_millis = snapshot.position_millis;
+        if !state.reference_playhead_drag_active {
+            state.reference_transport_position_millis = snapshot.position_millis;
+        }
         state.reference_transport_playing = snapshot.playing;
         state.reference_transport_polling = false;
     } else {
@@ -3566,43 +4008,40 @@ fn apply_reference_transport_snapshot(state: &mut AppState, snapshot: transport:
     }
 }
 
-fn enforce_loop(state: &mut AppState, was_shared_playing: bool) {
-    if state.reference_only_playback {
+fn enforce_loop(state: &mut AppState, was_main_playing: bool, was_reference_playing: bool) {
+    enforce_loop_for_source(state, AuditionSource::Main, was_main_playing);
+    enforce_loop_for_source(state, AuditionSource::Reference, was_reference_playing);
+}
+
+fn enforce_loop_for_source(state: &mut AppState, source: AuditionSource, was_playing: bool) {
+    if source == AuditionSource::Main && state.reference_only_playback {
         return;
     }
-    let Some(selection) = state.loop_selection else {
+    let Some(bounds) = loop_bounds_for_source(state, source) else {
         return;
     };
-    let Some(bounds) = loop_bounds(state) else {
-        return;
+    let source_is_playing = match source {
+        AuditionSource::Main => state.transport_playing,
+        AuditionSource::Reference => state.reference_transport_playing,
     };
-    if state.transport_polling
-        || state.reference_transport_polling
-        || !(was_shared_playing || state.transport_playing || state.reference_transport_playing)
-        || (bounds.reference.is_some() && !state.reference_transport_loaded)
-    {
+    let source_is_polling = match source {
+        AuditionSource::Main => state.transport_polling || state.transport_waiting_token.is_some(),
+        AuditionSource::Reference => {
+            state.reference_transport_polling || state.reference_transport_waiting_token.is_some()
+        }
+    };
+    if source_is_polling || !(was_playing || source_is_playing) {
         return;
     }
-    let (main_start_millis, main_end_millis) = bounds.main;
-    let loop_reached = match selection.driver {
-        AuditionSource::Main => state.transport_position_millis >= main_end_millis,
-        AuditionSource::Reference => bounds
-            .reference
-            .is_some_and(|(_, end)| state.reference_transport_position_millis >= end),
-    };
-    if !loop_reached {
+    if source == AuditionSource::Reference && !state.reference_transport_loaded {
         return;
     }
-    let reference_start_millis = bounds
-        .reference
-        .map(|(start, _)| start)
-        .unwrap_or(state.reference_transport_position_millis);
-    if let Err(error) =
-        seek_synchronized_positions(state, main_start_millis, reference_start_millis, true)
-    {
-        state.status = error;
-    } else {
-        state.status = String::from("Looping the selected section…");
+    if source_position(state, source) < bounds.end_millis {
+        return;
+    }
+    match seek_loop_owner(state, source, bounds) {
+        Ok(()) => state.status = String::from("Looping the selected section…"),
+        Err(error) => state.status = error,
     }
 }
 
@@ -3666,6 +4105,7 @@ fn select_track_internal(
         remove_audition_queue_entry_if_outside_filter(state, previous_id);
     }
     state.library.selected_track_id = Some(id.clone());
+    state.loop_selections.clear_all();
     if in_audition {
         if let Some(index) = state
             .audition_queue
@@ -3705,6 +4145,9 @@ fn select_track_internal(
     state.draft_note = None;
     state.reference_draft_note = None;
     rollback_persisted_note_drag(state);
+    rollback_reference_persisted_note_drag(state);
+    state.playhead_drag_active = false;
+    state.reference_playhead_drag_active = false;
     state.selected_note_id = None;
     state.hovered_note_id = None;
     state.selected_reference_note_id = None;
@@ -4118,6 +4561,34 @@ fn rollback_persisted_note_drag(state: &mut AppState) {
     }
     if let Some(draft) = state
         .draft_note
+        .as_mut()
+        .filter(|draft| draft.note_id.as_deref() == Some(drag.note_id.as_str()))
+    {
+        draft.time_millis = drag.original_time_millis;
+    }
+}
+
+fn rollback_reference_persisted_note_drag(state: &mut AppState) {
+    let Some(drag) = state.reference_persisted_note_drag.take() else {
+        return;
+    };
+
+    let mut note_restored = false;
+    if let Some(reference) = selected_reference_track_mut(state)
+        && let Some(note) = reference
+            .notes
+            .iter_mut()
+            .find(|note| note.id == drag.note_id)
+    {
+        note.time_millis = drag.original_time_millis;
+        reference.notes.sort_by_key(|note| note.time_millis);
+        note_restored = true;
+    }
+    if note_restored && state.library.selected_track_id.as_deref() == Some(drag.track_id.as_str()) {
+        state.reference_transport_position_millis = drag.original_time_millis;
+    }
+    if let Some(draft) = state
+        .reference_draft_note
         .as_mut()
         .filter(|draft| draft.note_id.as_deref() == Some(drag.note_id.as_str()))
     {
@@ -5258,14 +5729,17 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
                 })
         });
     let loop_selection = state
-        .loop_selection
+        .loop_selections
+        .get(AuditionSource::Main)
         .map(|selection| (selection.start_ratio, selection.end_ratio));
     let waveform_view = if let Some(waveform) = state
         .waveform
         .as_ref()
         .filter(|_| state.waveform_track_id.as_deref() == Some(track.id.as_str()))
     {
-        waveform::view_with_progress_and_loop(
+        waveform::view_with_source_progress_and_loop(
+            waveform::WaveformSource::Main,
+            state.waveform_generation,
             Arc::new(waveform.clone()),
             cursor_ratio,
             draft_ratio,
@@ -5621,6 +6095,12 @@ fn reference_waveform_section(state: &AppState, track: &storage::Track) -> ui::V
         });
     let reference_integrated_lufs =
         reference_waveform.and_then(|waveform| waveform.integrated_lufs);
+    let reference_loop_bounds = reference_waveform.and_then(|waveform| {
+        state
+            .loop_selections
+            .get(AuditionSource::Reference)
+            .and_then(|selection| projected_loop_bounds(selection, waveform.duration_millis))
+    });
     let reference_meter_lufs = current_reference_lufs_meter_value(state, &track.id);
     let match_gain_db = current_loudness_match_gain_db(state);
     let reference_name = track.reference_path.as_ref().map_or_else(
@@ -5636,9 +6116,7 @@ fn reference_waveform_section(state: &AppState, track: &storage::Track) -> ui::V
     } else {
         String::from("REFERENCE TRACK")
     };
-    let reference_label = if let Some((start_millis, end_millis)) =
-        loop_bounds(state).and_then(|bounds| bounds.reference)
-    {
+    let reference_label = if let Some((start_millis, end_millis)) = reference_loop_bounds {
         format!(
             "{reference_label} · LOOP {}–{}",
             format_timestamp(start_millis),
@@ -5729,7 +6207,8 @@ fn reference_waveform_section(state: &AppState, track: &storage::Track) -> ui::V
     .height(header_height);
     let reference_body = if let Some(waveform) = reference_waveform {
         let loop_selection = state
-            .loop_selection
+            .loop_selections
+            .get(AuditionSource::Reference)
             .map(|selection| (selection.start_ratio, selection.end_ratio));
         let notes = reference_notes_for_track(&state.library, track);
         let note_ratios = notes
@@ -5748,38 +6227,68 @@ fn reference_waveform_section(state: &AppState, track: &storage::Track) -> ui::V
             });
         let hovered_note_ratio =
             reference_note_ratio_for_id(state, track, state.hovered_reference_note_id.as_deref());
-        waveform::reference_view_with_comments(
+        waveform::view_with_source_progress_and_loop(
+            waveform::WaveformSource::Reference,
+            state.reference_waveform_generation,
             Arc::new(waveform.clone()),
             reference_cursor_ratio,
+            draft_ratio,
+            note_ratios,
+            hovered_note_ratio,
+            reference_note_ratio_for_id(state, track, state.selected_reference_note_id.as_deref()),
             loop_selection,
             state
                 .reference_waveform_busy
                 .then_some(state.reference_waveform_progress)
                 .flatten(),
-            note_ratios,
-            draft_ratio,
-            hovered_note_ratio,
-            reference_note_ratio_for_id(state, track, state.selected_reference_note_id.as_deref()),
             |interaction| match interaction {
-                waveform::ReferenceWaveformInteraction::Clicked { ratio } => {
-                    Message::ReferenceWaveformClicked { ratio }
-                }
-                waveform::ReferenceWaveformInteraction::CommentClicked { ratio } => {
-                    Message::ReferenceCommentClicked { ratio }
-                }
-                waveform::ReferenceWaveformInteraction::Started { ratio } => {
+                waveform::WaveformInteraction::LoopDragStarted { ratio } => {
                     Message::ReferenceLoopDragStarted { ratio }
                 }
-                waveform::ReferenceWaveformInteraction::Moved { ratio } => {
+                waveform::WaveformInteraction::LoopDragMoved { ratio } => {
                     Message::ReferenceLoopDragMoved { ratio }
                 }
-                waveform::ReferenceWaveformInteraction::Ended {
+                waveform::WaveformInteraction::LoopDragEnded {
                     start_ratio,
                     end_ratio,
                 } => Message::ReferenceLoopDragEnded {
                     start_ratio,
                     end_ratio,
                 },
+                waveform::WaveformInteraction::LoopDragCancelled => {
+                    Message::ReferenceLoopDragCancelled
+                }
+                waveform::WaveformInteraction::Clicked { ratio, lower } => {
+                    if lower {
+                        Message::ReferenceCommentClicked { ratio }
+                    } else {
+                        Message::ReferenceWaveformClicked { ratio }
+                    }
+                }
+                waveform::WaveformInteraction::PlayheadDragStarted { ratio } => {
+                    Message::ReferencePlayheadDragStarted { ratio }
+                }
+                waveform::WaveformInteraction::PlayheadDragMoved { ratio } => {
+                    Message::ReferencePlayheadDragMoved { ratio }
+                }
+                waveform::WaveformInteraction::PlayheadDragEnded { ratio } => {
+                    Message::ReferencePlayheadDragEnded { ratio }
+                }
+                waveform::WaveformInteraction::PlayheadDragCancelled => {
+                    Message::ReferencePlayheadDragCancelled
+                }
+                waveform::WaveformInteraction::CommentDragStarted { ratio, note_index } => {
+                    Message::ReferenceCommentDragStarted { ratio, note_index }
+                }
+                waveform::WaveformInteraction::CommentDragMoved { ratio } => {
+                    Message::ReferenceCommentDragMoved { ratio }
+                }
+                waveform::WaveformInteraction::CommentDragEnded { ratio } => {
+                    Message::ReferenceCommentDragEnded { ratio }
+                }
+                waveform::WaveformInteraction::CommentDragCancelled => {
+                    Message::ReferenceCommentDragCancelled
+                }
             },
         )
         .fill_width()
@@ -6243,17 +6752,18 @@ fn plural(count: usize) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, AuditionSource, ImportBatchProgress, LoopBounds, LoopSelection, Message,
-        NoteDraft, StatusMenuHost, WAVEFORM_HEIGHT, WorkspaceMode, apply_transport_snapshot,
-        audition_shuffle_seed, audition_statuses, current_loudness_match_gain_db,
-        current_lufs_meter_value, current_reference_lufs_meter_value, decode_result_is_current,
-        deterministic_shuffle, enforce_loop, loop_bounds, main_output_gain, native_launch_options,
-        note_editor, note_ratio_for_id, planner_drop_is_valid, playback_shortcut, project_surface,
+        AppState, AuditionSource, ImportBatchProgress, LoopBounds, LoopSelection, LoopSelections,
+        Message, NoteDraft, StatusMenuHost, WAVEFORM_HEIGHT, WorkspaceMode,
+        apply_transport_snapshot, audition_shuffle_seed, audition_statuses,
+        current_loudness_match_gain_db, current_lufs_meter_value,
+        current_reference_lufs_meter_value, decode_result_is_current, deterministic_shuffle,
+        enforce_loop, loop_bounds, main_output_gain, native_launch_options, note_editor,
+        note_ratio_for_id, planner_drop_is_valid, playback_shortcut, project_surface,
         rebuild_audition_queue, reconcile_audition_queue, reference_decode_result_is_current,
-        reference_output_gain, reset_reference_transport, reset_transport,
-        selected_reference_notes, selected_track, stage_dropdown, stage_menu_anchor_from_pointer,
-        stage_menu_popover, status_dropdown_for_host, sync_audition_queue_after_status_change,
-        tracks_in_stage, tracks_with_status, transport_command_is_confirmed, update,
+        reference_output_gain, selected_reference_notes, selected_track, stage_dropdown,
+        stage_menu_anchor_from_pointer, stage_menu_popover, status_dropdown_for_host,
+        sync_audition_queue_after_status_change, tracks_in_stage, tracks_with_status,
+        transport_command_is_confirmed, update,
     };
     use crate::transport::Snapshot;
     use crate::{
@@ -6302,7 +6812,7 @@ mod tests {
             title: String::from(id),
             original_name: format!("{id}.wav"),
             path: PathBuf::from(format!("/external/{id}.wav")),
-            reference_path: None,
+            reference_path: Some(PathBuf::from(format!("/external/{id}-reference.wav"))),
             size: 0,
             favorite: false,
             stage: TrackStage::Production,
@@ -7339,6 +7849,16 @@ mod tests {
     #[test]
     fn playing_main_upper_click_keeps_paired_transport_in_sync() {
         let mut state = shared_reference_playback_state();
+        state.loop_selections = LoopSelections {
+            main: Some(LoopSelection {
+                start_ratio: 0.1,
+                end_ratio: 0.2,
+            }),
+            reference: Some(LoopSelection {
+                start_ratio: 0.7,
+                end_ratio: 0.8,
+            }),
+        };
         state.transport_playing = true;
         state.reference_transport_playing = true;
         state.reference_transport_position_millis = 1_000;
@@ -7353,6 +7873,8 @@ mod tests {
             &mut context,
         );
 
+        assert!(state.loop_selections.main.is_none());
+        assert!(state.loop_selections.reference.is_some());
         assert_eq!(state.transport_position_millis, 500);
         assert_eq!(state.review_cursor_millis, 500);
         assert_eq!(state.reference_transport_position_millis, 1_000);
@@ -7363,7 +7885,7 @@ mod tests {
     }
 
     #[test]
-    fn reference_waveform_click_then_loop_selection_resumes_shared_playback() {
+    fn reference_only_loop_selection_seeks_only_the_reference_source() {
         let track_id = String::from("reference-click-track");
         let main_waveform = WaveformData {
             sample_rate: 48_000,
@@ -7393,11 +7915,16 @@ mod tests {
             reference_waveform_track_id: Some(track_id.clone()),
             reference_transport: Some(transport::AudioTransport::spawn()),
             reference_transport_loaded: true,
-            loop_selection: Some(LoopSelection {
-                start_ratio: 0.1,
-                end_ratio: 0.2,
-                driver: AuditionSource::Reference,
-            }),
+            loop_selections: LoopSelections {
+                main: Some(LoopSelection {
+                    start_ratio: 0.7,
+                    end_ratio: 0.8,
+                }),
+                reference: Some(LoopSelection {
+                    start_ratio: 0.1,
+                    end_ratio: 0.2,
+                }),
+            },
             review_cursor_millis: 600,
             transport_position_millis: 600,
             ..AppState::default()
@@ -7423,6 +7950,8 @@ mod tests {
             &mut context,
         );
 
+        assert!(state.loop_selections.main.is_some());
+        assert!(state.loop_selections.reference.is_none());
         assert_eq!(state.review_cursor_millis, 600);
         assert_eq!(state.transport_position_millis, 600);
         assert_eq!(state.reference_transport_position_millis, 1_000);
@@ -7442,6 +7971,10 @@ mod tests {
             Some(0.25)
         );
 
+        state.reference_transport_playing = true;
+        state.reference_transport_polling = false;
+        state.reference_transport_waiting_token = None;
+
         update(
             &mut state,
             Message::ReferenceLoopDragEnded {
@@ -7451,18 +7984,18 @@ mod tests {
             &mut context,
         );
 
-        assert!(!state.reference_only_playback);
-        assert!(state.transport_polling);
-        assert!(state.transport_waiting_token.is_some());
+        assert!(state.reference_only_playback);
+        assert!(!state.transport_polling);
+        assert!(state.transport_waiting_token.is_none());
         assert!(state.reference_transport_polling);
         assert!(state.reference_transport_waiting_token.is_some());
-        assert_eq!(state.review_cursor_millis, 500);
-        assert_eq!(state.transport_position_millis, 500);
+        assert_eq!(state.review_cursor_millis, 600);
+        assert_eq!(state.transport_position_millis, 600);
         assert_eq!(state.reference_transport_position_millis, 1_000);
 
         update(&mut state, Message::Frame, &mut context);
-        assert_eq!(state.review_cursor_millis, 500);
-        assert_eq!(state.transport_position_millis, 500);
+        assert_eq!(state.review_cursor_millis, 600);
+        assert_eq!(state.transport_position_millis, 600);
     }
 
     #[test]
@@ -7581,6 +8114,16 @@ mod tests {
             reference_transport_position_millis: 1_500,
             ..AppState::default()
         };
+        state.loop_selections = LoopSelections {
+            main: Some(LoopSelection {
+                start_ratio: 0.1,
+                end_ratio: 0.2,
+            }),
+            reference: Some(LoopSelection {
+                start_ratio: 0.7,
+                end_ratio: 0.8,
+            }),
+        };
         state.library.selected_track_id = Some(track_id.clone());
         state.library.tracks.push(Track {
             id: track_id,
@@ -7607,7 +8150,8 @@ mod tests {
             &mut context,
         );
 
-        assert!(state.loop_selection.is_none());
+        assert!(state.loop_selections.main.is_none());
+        assert!(state.loop_selections.reference.is_some());
         assert!(state.transport_polling);
         assert!(state.transport_waiting_token.is_some());
         assert!(state.reference_transport_polling);
@@ -7667,6 +8211,248 @@ mod tests {
             notes: Vec::new(),
         });
         state
+    }
+
+    fn reference_comment_drag_state() -> (AppState, String) {
+        let mut state = shared_reference_playback_state();
+        let note_id = String::from("reference-move-me");
+        let reference_path = state.library.tracks[0]
+            .reference_path
+            .clone()
+            .expect("the paired state should have a reference path");
+        state.library.reference_tracks.push(ReferenceTrack {
+            path: reference_path,
+            notes: vec![
+                Note {
+                    id: note_id.clone(),
+                    time_millis: 500,
+                    body: String::from("move this reference comment"),
+                    done: false,
+                },
+                Note {
+                    id: String::from("reference-anchor"),
+                    time_millis: 1_000,
+                    body: String::from("keep this reference comment"),
+                    done: false,
+                },
+            ],
+        });
+        (state, note_id)
+    }
+
+    #[test]
+    fn reference_playhead_drag_tracks_reference_position_and_preserves_main_transport() {
+        let mut state = shared_reference_playback_state();
+        state.loop_selections = LoopSelections {
+            main: Some(LoopSelection {
+                start_ratio: 0.1,
+                end_ratio: 0.2,
+            }),
+            reference: Some(LoopSelection {
+                start_ratio: 0.7,
+                end_ratio: 0.8,
+            }),
+        };
+        state.review_cursor_millis = 600;
+        state.transport_position_millis = 600;
+        state.reference_transport_position_millis = 400;
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::ReferencePlayheadDragStarted { ratio: 0.25 },
+            &mut context,
+        );
+        assert!(state.loop_selections.main.is_some());
+        assert!(state.loop_selections.reference.is_none());
+        assert!(state.reference_playhead_drag_active);
+        assert_eq!(state.reference_transport_position_millis, 1_000);
+        assert_eq!(state.review_cursor_millis, 600);
+        assert_eq!(state.transport_position_millis, 600);
+        assert_eq!(state.audition_source, AuditionSource::Reference);
+
+        update(
+            &mut state,
+            Message::ReferencePlayheadDragMoved { ratio: 0.75 },
+            &mut context,
+        );
+        assert_eq!(state.reference_transport_position_millis, 3_000);
+        assert_eq!(state.review_cursor_millis, 600);
+        assert_eq!(state.transport_position_millis, 600);
+
+        update(
+            &mut state,
+            Message::ReferencePlayheadDragEnded { ratio: 0.5 },
+            &mut context,
+        );
+        assert!(!state.reference_playhead_drag_active);
+        assert_eq!(state.reference_transport_position_millis, 2_000);
+        assert_eq!(state.review_cursor_millis, 600);
+        assert_eq!(state.transport_position_millis, 600);
+        assert!(state.reference_transport_polling);
+        assert!(state.reference_transport_waiting_token.is_some());
+        assert!(state.reference_only_playback);
+    }
+
+    #[test]
+    fn reference_draft_comment_drag_updates_reference_timestamp_without_main_cursor() {
+        let mut state = shared_reference_playback_state();
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::ReferenceCommentClicked { ratio: 0.25 },
+            &mut context,
+        );
+        assert_eq!(
+            state
+                .reference_draft_note
+                .as_ref()
+                .map(|draft| draft.time_millis),
+            Some(1_000)
+        );
+
+        update(
+            &mut state,
+            Message::ReferenceCommentDragStarted {
+                ratio: 0.25,
+                note_index: None,
+            },
+            &mut context,
+        );
+        update(
+            &mut state,
+            Message::ReferenceCommentDragMoved { ratio: 0.75 },
+            &mut context,
+        );
+        assert_eq!(
+            state
+                .reference_draft_note
+                .as_ref()
+                .map(|draft| draft.time_millis),
+            Some(3_000)
+        );
+        assert_eq!(state.reference_transport_position_millis, 3_000);
+        assert_eq!(state.review_cursor_millis, 0);
+        assert_eq!(state.transport_position_millis, 0);
+
+        update(
+            &mut state,
+            Message::ReferenceCommentDragEnded { ratio: 0.5 },
+            &mut context,
+        );
+        assert_eq!(
+            state
+                .reference_draft_note
+                .as_ref()
+                .map(|draft| draft.time_millis),
+            Some(2_000)
+        );
+        assert_eq!(state.reference_transport_position_millis, 2_000);
+    }
+
+    #[test]
+    fn reference_persisted_comment_drag_moves_and_saves_reference_note() {
+        let (mut state, note_id) = reference_comment_drag_state();
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::ReferenceCommentDragStarted {
+                ratio: 0.125,
+                note_index: Some(0),
+            },
+            &mut context,
+        );
+        assert_eq!(
+            state.selected_reference_note_id.as_deref(),
+            Some(note_id.as_str())
+        );
+        assert!(state.reference_persisted_note_drag.is_some());
+        assert_eq!(state.reference_transport_position_millis, 500);
+
+        update(
+            &mut state,
+            Message::ReferenceCommentDragMoved { ratio: 0.75 },
+            &mut context,
+        );
+        assert_eq!(
+            selected_reference_notes(&state)
+                .iter()
+                .find(|note| note.id == note_id)
+                .map(|note| note.time_millis),
+            Some(3_000)
+        );
+        assert_eq!(state.reference_transport_position_millis, 3_000);
+
+        update(
+            &mut state,
+            Message::ReferenceCommentDragEnded { ratio: 0.75 },
+            &mut context,
+        );
+        assert!(state.reference_persisted_note_drag.is_none());
+        assert!(state.save_in_flight);
+        assert_eq!(
+            state.status,
+            "Reference comment moved to 00:03 and saved locally."
+        );
+        assert_eq!(state.review_cursor_millis, 0);
+        assert_eq!(state.transport_position_millis, 0);
+    }
+
+    #[test]
+    fn reference_persisted_comment_drag_cancellation_rolls_back_without_saving() {
+        let (mut state, note_id) = reference_comment_drag_state();
+        state.reference_draft_note = Some(NoteDraft {
+            note_id: Some(note_id.clone()),
+            time_millis: 500,
+            body: String::from("edit this reference comment"),
+        });
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::ReferenceCommentDragStarted {
+                ratio: 0.125,
+                note_index: Some(0),
+            },
+            &mut context,
+        );
+        update(
+            &mut state,
+            Message::ReferenceCommentDragMoved { ratio: 0.75 },
+            &mut context,
+        );
+        assert_eq!(
+            selected_reference_notes(&state)
+                .iter()
+                .find(|note| note.id == note_id)
+                .map(|note| note.time_millis),
+            Some(3_000)
+        );
+
+        update(
+            &mut state,
+            Message::ReferenceCommentDragCancelled,
+            &mut context,
+        );
+        assert_eq!(
+            selected_reference_notes(&state)
+                .iter()
+                .find(|note| note.id == note_id)
+                .map(|note| note.time_millis),
+            Some(500)
+        );
+        assert_eq!(state.reference_transport_position_millis, 500);
+        assert_eq!(
+            state
+                .reference_draft_note
+                .as_ref()
+                .map(|draft| draft.time_millis),
+            Some(500)
+        );
+        assert!(state.reference_persisted_note_drag.is_none());
+        assert!(!state.save_in_flight);
     }
 
     fn main_only_loop_state() -> AppState {
@@ -7830,7 +8616,7 @@ mod tests {
         state.reference_transport_position_millis = 1_000;
         assert_eq!(state.reference_transport_position_millis, 1_000);
         assert!(!state.reference_transport_loaded);
-        assert!(state.loop_selection.is_none());
+        assert!(state.loop_selections == LoopSelections::default());
 
         let mut context = ui::UiUpdateContext::default();
         update(&mut state, Message::TogglePlayback, &mut context);
@@ -7850,7 +8636,7 @@ mod tests {
     }
 
     #[test]
-    fn reference_loop_selection_maps_to_both_track_timelines() {
+    fn reference_loop_selection_stays_on_the_reference_timeline() {
         let track_id = String::from("loop-track");
         let primary = WaveformData {
             sample_rate: 48_000,
@@ -7893,6 +8679,9 @@ mod tests {
             status: TrackStatus::Inbox,
             notes: Vec::new(),
         });
+        state.transport_position_millis = 500;
+        state.review_cursor_millis = 500;
+        state.reference_transport_position_millis = 1_400;
         let mut context = ui::UiUpdateContext::default();
 
         update(
@@ -7905,20 +8694,21 @@ mod tests {
         );
 
         assert_eq!(
-            state.loop_selection,
+            state.loop_selections.reference,
             Some(LoopSelection {
                 start_ratio: 0.25,
                 end_ratio: 0.75,
-                driver: AuditionSource::Reference,
             })
         );
+        assert!(state.loop_selections.main.is_none());
         assert_eq!(state.transport_position_millis, 500);
+        assert_eq!(state.review_cursor_millis, 500);
         assert_eq!(state.reference_transport_position_millis, 1_000);
         assert_eq!(
             loop_bounds(&state),
             Some(LoopBounds {
-                main: (500, 1_500),
-                reference: Some((1_000, 3_000)),
+                start_millis: 1_000,
+                end_millis: 3_000,
             })
         );
 
@@ -7930,7 +8720,7 @@ mod tests {
             },
             &mut context,
         );
-        assert_eq!(state.loop_selection, None);
+        assert!(state.loop_selections.reference.is_none());
     }
 
     #[test]
@@ -7954,18 +8744,17 @@ mod tests {
 
         assert_eq!(state.audition_source, AuditionSource::Main);
         assert_eq!(
-            state.loop_selection,
+            state.loop_selections.main,
             Some(LoopSelection {
                 start_ratio: 0.2,
                 end_ratio: 0.8,
-                driver: AuditionSource::Main,
             })
         );
         assert_eq!(
             loop_bounds(&state),
             Some(LoopBounds {
-                main: (400, 1_600),
-                reference: None,
+                start_millis: 400,
+                end_millis: 1_600,
             })
         );
         assert_eq!(state.transport_position_millis, 400);
@@ -7973,8 +8762,13 @@ mod tests {
     }
 
     #[test]
-    fn main_loop_selection_projects_one_normalized_range_to_both_timelines() {
+    fn main_loop_selection_stays_on_the_main_timeline() {
         let mut state = shared_reference_playback_state();
+        state.reference_transport_position_millis = 2_800;
+        state.loop_selections.reference = Some(LoopSelection {
+            start_ratio: 0.6,
+            end_ratio: 0.9,
+        });
         let mut context = ui::UiUpdateContext::default();
 
         update(
@@ -7987,26 +8781,27 @@ mod tests {
         );
 
         assert_eq!(
-            state.loop_selection,
+            state.loop_selections.main,
             Some(LoopSelection {
                 start_ratio: 0.25,
                 end_ratio: 0.75,
-                driver: AuditionSource::Main,
             })
         );
         assert_eq!(
             loop_bounds(&state),
             Some(LoopBounds {
-                main: (500, 1_500),
-                reference: Some((1_000, 3_000)),
+                start_millis: 500,
+                end_millis: 1_500,
             })
         );
         assert_eq!(state.transport_position_millis, 500);
-        assert_eq!(state.reference_transport_position_millis, 1_000);
+        assert_eq!(state.review_cursor_millis, 500);
+        assert_eq!(state.reference_transport_position_millis, 2_800);
+        assert!(state.loop_selections.reference.is_some());
     }
 
     #[test]
-    fn loop_selection_uses_shortest_duration_and_enforces_120_millisecond_minimum() {
+    fn main_loop_selection_enforces_120_millisecond_minimum_on_main_duration() {
         let mut state = shared_reference_playback_state();
         let mut context = ui::UiUpdateContext::default();
 
@@ -8019,7 +8814,7 @@ mod tests {
             &mut context,
         );
 
-        assert!(state.loop_selection.is_none());
+        assert!(state.loop_selections.main.is_none());
         assert!(state.status.contains("120 ms"));
 
         update(
@@ -8031,55 +8826,18 @@ mod tests {
             &mut context,
         );
 
-        assert!(state.loop_selection.is_some());
+        assert!(state.loop_selections.main.is_some());
         assert_eq!(
-            loop_bounds(&state).map(|bounds| bounds.reference),
-            Some(Some((1_000, 1_240)))
+            loop_bounds(&state),
+            Some(LoopBounds {
+                start_millis: 500,
+                end_millis: 620,
+            })
         );
     }
 
     #[test]
-    fn loop_driver_controls_completion_when_transport_durations_differ() {
-        let mut main_driver_state = shared_reference_playback_state();
-        main_driver_state.loop_selection = Some(LoopSelection {
-            start_ratio: 0.25,
-            end_ratio: 0.75,
-            driver: AuditionSource::Main,
-        });
-        main_driver_state.transport_playing = true;
-        main_driver_state.reference_transport_playing = true;
-        main_driver_state.transport_position_millis = 1_500;
-        main_driver_state.reference_transport_position_millis = 2_000;
-        enforce_loop(&mut main_driver_state, true);
-
-        assert_eq!(main_driver_state.transport_position_millis, 500);
-        assert_eq!(main_driver_state.reference_transport_position_millis, 1_000);
-        assert!(main_driver_state.transport_polling);
-        assert!(main_driver_state.reference_transport_polling);
-
-        let mut reference_driver_state = shared_reference_playback_state();
-        reference_driver_state.loop_selection = Some(LoopSelection {
-            start_ratio: 0.25,
-            end_ratio: 0.75,
-            driver: AuditionSource::Reference,
-        });
-        reference_driver_state.transport_playing = true;
-        reference_driver_state.reference_transport_playing = true;
-        reference_driver_state.transport_position_millis = 1_000;
-        reference_driver_state.reference_transport_position_millis = 3_000;
-        enforce_loop(&mut reference_driver_state, true);
-
-        assert_eq!(reference_driver_state.transport_position_millis, 500);
-        assert_eq!(
-            reference_driver_state.reference_transport_position_millis,
-            1_000
-        );
-        assert!(reference_driver_state.transport_polling);
-        assert!(reference_driver_state.reference_transport_polling);
-    }
-
-    #[test]
-    fn loop_source_switching_cancellation_and_reset_clear_stale_state() {
+    fn reference_loop_minimum_is_validated_without_projecting_to_main_duration() {
         let mut state = shared_reference_playback_state();
         let mut context = ui::UiUpdateContext::default();
 
@@ -8087,53 +8845,256 @@ mod tests {
             &mut state,
             Message::ReferenceLoopDragEnded {
                 start_ratio: 0.25,
-                end_ratio: 0.75,
+                end_ratio: 0.28,
             },
             &mut context,
         );
+
+        assert!(state.loop_selections.main.is_none());
+        assert!(state.loop_selections.reference.is_some());
         assert_eq!(
-            state.loop_selection.map(|selection| selection.driver),
-            Some(AuditionSource::Reference)
+            loop_bounds(&state),
+            Some(LoopBounds {
+                start_millis: 1_000,
+                end_millis: 1_120,
+            })
         );
+    }
+
+    #[test]
+    fn simultaneous_distinct_loops_wrap_independently_on_different_durations() {
+        let mut state = shared_reference_playback_state();
+        state.loop_selections = LoopSelections {
+            main: Some(LoopSelection {
+                start_ratio: 0.25,
+                end_ratio: 0.5,
+            }),
+            reference: Some(LoopSelection {
+                start_ratio: 0.5,
+                end_ratio: 0.75,
+            }),
+        };
+        state.transport_playing = true;
+        state.reference_transport_playing = true;
+        state.transport_position_millis = 1_000;
+        state.review_cursor_millis = 1_000;
+        state.reference_transport_position_millis = 3_000;
+
+        enforce_loop(&mut state, true, true);
+
+        assert_eq!(state.transport_position_millis, 500);
+        assert_eq!(state.review_cursor_millis, 500);
+        assert_eq!(state.reference_transport_position_millis, 2_000);
+        assert!(state.transport_polling);
+        assert!(state.reference_transport_polling);
+    }
+
+    #[test]
+    fn reference_only_playback_enforces_reference_loop_without_touching_main() {
+        let mut state = shared_reference_playback_state();
+        state.loop_selections = LoopSelections {
+            main: Some(LoopSelection {
+                start_ratio: 0.1,
+                end_ratio: 0.2,
+            }),
+            reference: Some(LoopSelection {
+                start_ratio: 0.5,
+                end_ratio: 0.75,
+            }),
+        };
+        state.reference_only_playback = true;
+        state.transport_playing = true;
+        state.reference_transport_playing = true;
+        state.transport_position_millis = 250;
+        state.review_cursor_millis = 250;
+        state.reference_transport_position_millis = 3_000;
+
+        enforce_loop(&mut state, false, true);
+
+        assert_eq!(state.transport_position_millis, 250);
+        assert_eq!(state.review_cursor_millis, 250);
+        assert!(!state.transport_polling);
+        assert_eq!(state.reference_transport_position_millis, 2_000);
+        assert!(state.reference_transport_polling);
+    }
+
+    #[test]
+    fn global_play_resumes_each_source_from_its_own_loop_or_stored_position() {
+        let mut state = shared_reference_playback_state();
+        state.loop_selections = LoopSelections {
+            main: Some(LoopSelection {
+                start_ratio: 0.25,
+                end_ratio: 0.5,
+            }),
+            reference: Some(LoopSelection {
+                start_ratio: 0.5,
+                end_ratio: 0.75,
+            }),
+        };
+        state.transport_position_millis = 700;
+        state.review_cursor_millis = 700;
+        state.reference_transport_position_millis = 3_500;
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut state, Message::TogglePlayback, &mut context);
+
+        assert_eq!(state.transport_position_millis, 700);
+        assert_eq!(state.review_cursor_millis, 700);
+        assert_eq!(state.reference_transport_position_millis, 2_000);
+        assert!(state.transport_polling);
+        assert!(state.reference_transport_polling);
+        assert!(state.transport_waiting_token.is_some());
+        assert!(state.reference_transport_waiting_token.is_some());
+    }
+
+    #[test]
+    fn each_loop_controls_only_its_own_completion_when_durations_differ() {
+        let mut main_driver_state = shared_reference_playback_state();
+        main_driver_state.loop_selections.main = Some(LoopSelection {
+            start_ratio: 0.25,
+            end_ratio: 0.75,
+        });
+        main_driver_state.transport_playing = true;
+        main_driver_state.reference_transport_playing = true;
+        main_driver_state.transport_position_millis = 1_500;
+        main_driver_state.reference_transport_position_millis = 2_000;
+        enforce_loop(&mut main_driver_state, true, true);
+
+        assert_eq!(main_driver_state.transport_position_millis, 500);
+        assert_eq!(main_driver_state.reference_transport_position_millis, 2_000);
+        assert!(main_driver_state.transport_polling);
+        assert!(!main_driver_state.reference_transport_polling);
+
+        let mut reference_driver_state = shared_reference_playback_state();
+        reference_driver_state.loop_selections.reference = Some(LoopSelection {
+            start_ratio: 0.25,
+            end_ratio: 0.75,
+        });
+        reference_driver_state.audition_source = AuditionSource::Reference;
+        reference_driver_state.transport_playing = true;
+        reference_driver_state.reference_transport_playing = true;
+        reference_driver_state.transport_position_millis = 1_000;
+        reference_driver_state.reference_transport_position_millis = 3_000;
+        enforce_loop(&mut reference_driver_state, true, true);
+
+        assert_eq!(reference_driver_state.transport_position_millis, 1_000);
+        assert_eq!(
+            reference_driver_state.reference_transport_position_millis,
+            1_000
+        );
+        assert!(!reference_driver_state.transport_polling);
+        assert!(reference_driver_state.reference_transport_polling);
+    }
+
+    #[test]
+    fn loop_source_switching_preserves_ranges_and_active_source_controls_transport() {
+        let mut state = shared_reference_playback_state();
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::WaveformLoopDragEnded {
+                start_ratio: 0.2,
+                end_ratio: 0.4,
+            },
+            &mut context,
+        );
+        assert!(state.loop_selections.main.is_some());
+
+        update(
+            &mut state,
+            Message::ReferenceLoopDragEnded {
+                start_ratio: 0.6,
+                end_ratio: 0.9,
+            },
+            &mut context,
+        );
+        assert_eq!(state.audition_source, AuditionSource::Reference);
+        assert!(state.loop_selections.main.is_some());
+        assert!(state.loop_selections.reference.is_some());
+        assert_eq!(
+            loop_bounds(&state),
+            Some(LoopBounds {
+                start_millis: 2_400,
+                end_millis: 3_600,
+            })
+        );
+
+        update(
+            &mut state,
+            Message::SelectAuditionSource(AuditionSource::Main),
+            &mut context,
+        );
+        assert_eq!(state.audition_source, AuditionSource::Main);
+        assert_eq!(
+            loop_bounds(&state),
+            Some(LoopBounds {
+                start_millis: 400,
+                end_millis: 800,
+            })
+        );
+
+        update(
+            &mut state,
+            Message::SelectAuditionSource(AuditionSource::Reference),
+            &mut context,
+        );
+        assert!(state.loop_selections.main.is_some());
+        assert!(state.loop_selections.reference.is_some());
+
+        state.audition_source = AuditionSource::Main;
+        state.loop_selections.clear(AuditionSource::Main);
+        assert!(loop_bounds(&state).is_none());
+        assert!(state.loop_selections.reference.is_some());
+    }
+
+    #[test]
+    fn loop_drag_cancellation_and_undersized_ranges_clear_only_the_initiating_source() {
+        let mut state = shared_reference_playback_state();
+        state.loop_selections = LoopSelections {
+            main: Some(LoopSelection {
+                start_ratio: 0.2,
+                end_ratio: 0.4,
+            }),
+            reference: Some(LoopSelection {
+                start_ratio: 0.6,
+                end_ratio: 0.9,
+            }),
+        };
+        let mut context = ui::UiUpdateContext::default();
 
         update(
             &mut state,
             Message::WaveformLoopDragStarted { ratio: 0.4 },
             &mut context,
         );
-        assert!(state.loop_selection.is_none());
-        assert_eq!(state.audition_source, AuditionSource::Main);
+        assert!(state.loop_selections.main.is_none());
+        assert!(state.loop_selections.reference.is_some());
+        update(&mut state, Message::WaveformLoopDragCancelled, &mut context);
+        assert!(state.loop_selections.main.is_none());
+        assert!(state.loop_selections.reference.is_some());
 
-        state.loop_selection = Some(LoopSelection {
-            start_ratio: 0.25,
-            end_ratio: 0.75,
-            driver: AuditionSource::Main,
-        });
-        state.waveform_track_id = Some(String::from("stale-track"));
-        assert!(loop_bounds(&state).is_none());
-
-        state.playhead_drag_active = true;
         update(
             &mut state,
-            Message::WaveformPlayheadDragCancelled,
+            Message::ReferenceLoopDragStarted { ratio: 0.6 },
             &mut context,
         );
-        assert!(!state.playhead_drag_active);
-
-        reset_transport(&mut state);
-        assert!(state.loop_selection.is_none());
-
-        state.loop_selection = Some(LoopSelection {
-            start_ratio: 0.25,
-            end_ratio: 0.75,
-            driver: AuditionSource::Reference,
-        });
-        reset_reference_transport(&mut state);
-        assert!(state.loop_selection.is_none());
+        assert!(state.loop_selections.main.is_none());
+        assert!(state.loop_selections.reference.is_none());
+        update(
+            &mut state,
+            Message::ReferenceLoopDragEnded {
+                start_ratio: 0.2,
+                end_ratio: 0.22,
+            },
+            &mut context,
+        );
+        assert!(state.loop_selections.main.is_none());
+        assert!(state.loop_selections.reference.is_none());
     }
 
     #[test]
-    fn main_loop_selection_keeps_paired_transport_commands_atomic() {
+    fn active_main_loop_creation_ignores_reference_queue_failure() {
         let mut state = shared_reference_playback_state();
         state.transport_playing = true;
         state.reference_transport_playing = true;
@@ -8155,11 +9116,12 @@ mod tests {
             &mut context,
         );
 
-        assert!(state.loop_selection.is_none());
-        assert_eq!(state.status, transport::CONTROLS_BUSY_ERROR);
-        assert_eq!(state.transport_position_millis, 700);
+        assert!(state.loop_selections.main.is_some());
+        assert_ne!(state.status, transport::CONTROLS_BUSY_ERROR);
+        assert_eq!(state.transport_position_millis, 500);
+        assert_eq!(state.review_cursor_millis, 500);
         assert_eq!(state.reference_transport_position_millis, 1_400);
-        assert!(!state.transport_polling);
+        assert!(state.transport_polling);
         assert!(!state.reference_transport_polling);
     }
 
@@ -8429,6 +9391,59 @@ mod tests {
             reference_rect.min.y > title_rect.min.y,
             "the reference section should be below the primary track header"
         );
+    }
+
+    #[test]
+    fn reference_header_uses_the_reference_loop_when_main_loop_is_active() {
+        let track_id = String::from("reference-loop-header-track");
+        let main_waveform = audition_waveform();
+        let reference_waveform = WaveformData {
+            duration_millis: 4_000,
+            render_frames: 192_000,
+            ..main_waveform.clone()
+        };
+        let mut state = AppState {
+            busy: false,
+            waveform: Some(main_waveform),
+            waveform_track_id: Some(track_id.clone()),
+            reference_waveform: Some(reference_waveform),
+            reference_waveform_track_id: Some(track_id.clone()),
+            loop_selections: LoopSelections {
+                main: Some(LoopSelection {
+                    start_ratio: 0.2,
+                    end_ratio: 0.4,
+                }),
+                reference: Some(LoopSelection {
+                    start_ratio: 0.7,
+                    end_ratio: 0.9,
+                }),
+            },
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(track_id.clone());
+        state.library.tracks.push(Track {
+            id: track_id,
+            title: String::from("Reference loop header track"),
+            original_name: String::from("reference-loop-header.wav"),
+            path: PathBuf::from("/external/reference-loop-header.wav"),
+            reference_path: Some(PathBuf::from("/external/reference-header.wav")),
+            size: 0,
+            favorite: false,
+            stage: TrackStage::SoundDesign,
+            status: TrackStatus::Inbox,
+            notes: Vec::new(),
+        });
+
+        let frame = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1_000.0));
+        let labels = frame.paint_plan.text_label_strings();
+
+        assert!(labels.iter().any(|label| {
+            label == "REFERENCE · reference-header.wav · -7.0 LUFS · LOOP 00:02–00:03"
+        }));
+        assert!(!labels.iter().any(|label| {
+            label == "REFERENCE · reference-header.wav · -7.0 LUFS · LOOP 00:00–00:01"
+        }));
     }
 
     #[test]
@@ -8858,7 +9873,7 @@ mod tests {
             .iter()
             .filter_map(|primitive| match primitive {
                 PaintPrimitive::FillRect(fill)
-                    if fill.color == ThemeTokens::default().highlight_blue_soft =>
+                    if fill.color == ThemeTokens::default().text_primary =>
                 {
                     Some(fill.rect)
                 }
@@ -11034,7 +12049,7 @@ mod tests {
     }
 
     #[test]
-    fn acknowledged_audition_play_advances_without_a_playing_frame() {
+    fn acknowledged_audition_play_advances_without_a_playing_frame_even_with_reference_loop() {
         let finished_id = String::from("finished-audition-track");
         let next_id = String::from("next-audition-track");
         let track = |id: &str| Track {
@@ -11042,7 +12057,7 @@ mod tests {
             title: String::from(id),
             original_name: format!("{id}.wav"),
             path: PathBuf::from(format!("/external/{id}.wav")),
-            reference_path: None,
+            reference_path: Some(PathBuf::from(format!("/external/{id}-reference.wav"))),
             size: 0,
             favorite: false,
             stage: TrackStage::Production,
@@ -11074,6 +12089,29 @@ mod tests {
                 ),
             }),
             waveform_track_id: Some(finished_id.clone()),
+            reference_waveform: Some(WaveformData {
+                sample_rate: 48_000,
+                channels: 1,
+                duration_millis: 1_000,
+                render_frames: 48_000,
+                integrated_lufs: Some(-7.0),
+                loudness_profile: Arc::from([]),
+                summary: Arc::new(
+                    radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                        &[0.0, 0.0, 0.0, 0.0],
+                        4,
+                        1,
+                    ),
+                ),
+            }),
+            reference_waveform_track_id: Some(finished_id.clone()),
+            loop_selections: LoopSelections {
+                main: None,
+                reference: Some(LoopSelection {
+                    start_ratio: 0.25,
+                    end_ratio: 0.75,
+                }),
+            },
             ..AppState::default()
         };
         state.library.selected_track_id = Some(finished_id.clone());
