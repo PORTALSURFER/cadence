@@ -308,6 +308,7 @@ const MAIN_COMMENT_EDITOR_ID: u64 = 0xCAD3_1001;
 const REFERENCE_COMMENT_EDITOR_ID: u64 = 0xCAD3_1002;
 const MAIN_INLINE_COMMENT_EDITOR_SCOPE: u64 = 0xCAD3_1003;
 const REFERENCE_INLINE_COMMENT_EDITOR_SCOPE: u64 = 0xCAD3_1004;
+const LIBRARY_TRACK_TITLE_ID_SCOPE: u64 = 0xCAD3_0004;
 const TRACK_CARD_CHAMFER: f32 = 8.0;
 const TRACK_CARD_RAIL_WIDTH: f32 = 4.0;
 const TRACK_CARD_RAIL_EDGE_INSET: f32 = 1.0;
@@ -1058,7 +1059,9 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             state.busy = false;
             clear_planner_drag(state);
             match result {
-                Ok(library) => {
+                Ok(mut library) => {
+                    let (startup_track_id, startup_selection_changed) =
+                        normalize_startup_track_selection(&mut library);
                     state.status = if library.tracks.is_empty() {
                         String::from("Ready — import a track to begin.")
                     } else {
@@ -1091,6 +1094,12 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     reset_transport(state);
                     reset_reference_transport(state);
                     state.reference_match_enabled = false;
+                    if startup_selection_changed {
+                        schedule_library_save(state, context);
+                    }
+                    if let Some(track_id) = startup_track_id.as_deref() {
+                        context.focus(library_track_title_id(track_id));
+                    }
                     schedule_selected_waveform_decode(state, context);
                     schedule_selected_reference_decode(state, context);
                 }
@@ -4905,6 +4914,10 @@ fn reference_inline_comment_editor_id(note_id: &str) -> u64 {
     ui::stable_widget_id(REFERENCE_INLINE_COMMENT_EDITOR_SCOPE, note_id)
 }
 
+fn library_track_title_id(track_id: &str) -> u64 {
+    ui::stable_widget_id(LIBRARY_TRACK_TITLE_ID_SCOPE, track_id)
+}
+
 fn project_surface(state: &AppState) -> ui::View<Message> {
     let workspace = match state.workspace_mode {
         WorkspaceMode::Review => ui::row([
@@ -6013,6 +6026,7 @@ fn track_row(
     let status_menu_open = status_menu_host == Some(StatusMenuHost::Library)
         && status_menu_track_id == Some(track.id.as_str());
     let remove_confirmation_open = remove_confirmation_track_id == Some(track.id.as_str());
+    let title_widget_id = library_track_title_id(&track.id);
     let remove_id = track.id.clone();
     let favorite_control =
         favorite_toggle(&track, selected, format!("library-favorite-{}", track.id));
@@ -6076,6 +6090,7 @@ fn track_row(
                         .style(ui::WidgetStyle::strong(ui::WidgetTone::Neutral))
                         .selected(selected)
                         .message(Message::SelectTrack(id))
+                        .id(title_widget_id)
                         .fill_width()
                         .height(28.0),
                 )
@@ -7140,6 +7155,19 @@ fn selected_track(state: &AppState) -> Option<&storage::Track> {
         .and_then(|id| state.library.tracks.iter().find(|track| &track.id == id))
 }
 
+fn normalize_startup_track_selection(library: &mut storage::Library) -> (Option<String>, bool) {
+    let previous_selected_id = library.selected_track_id.clone();
+    let startup_track_id = library
+        .selected_track_id
+        .as_deref()
+        .filter(|selected_id| library.tracks.iter().any(|track| track.id == *selected_id))
+        .map(String::from)
+        .or_else(|| library.tracks.first().map(|track| track.id.clone()));
+    let selection_changed = previous_selected_id.as_ref() != startup_track_id.as_ref();
+    library.selected_track_id = startup_track_id.clone();
+    (startup_track_id, selection_changed)
+}
+
 fn reference_notes_for_track<'a>(
     library: &'a storage::Library,
     track: &storage::Track,
@@ -7274,8 +7302,8 @@ mod tests {
         apply_transport_snapshot, audition_panel, audition_shuffle_seed, audition_statuses,
         current_loudness_match_gain_db, current_lufs_meter_value,
         current_reference_lufs_meter_value, decode_result_is_current, deterministic_shuffle,
-        enforce_loop, loop_bounds, main_output_gain, native_launch_options, note_editor,
-        note_ratio_for_id, planner_drop_is_valid, playback_shortcut, project_surface,
+        enforce_loop, library_track_title_id, loop_bounds, main_output_gain, native_launch_options,
+        note_editor, note_ratio_for_id, planner_drop_is_valid, playback_shortcut, project_surface,
         rebuild_audition_queue, reconcile_audition_queue, reference_decode_result_is_current,
         reference_output_gain, review_status_filter_message, selected_reference_notes,
         selected_track, stage_dropdown, stage_menu_anchor_from_pointer, stage_menu_popover,
@@ -7371,6 +7399,93 @@ mod tests {
         state.library.selected_track_id = selected_id;
         state.library.tracks = ids.iter().map(|id| audition_track(id)).collect();
         state
+    }
+
+    fn focus_request_id(command: &radiant::runtime::Command<Message>) -> Option<u64> {
+        match command {
+            radiant::runtime::Command::Focus(id) => Some(*id),
+            radiant::runtime::Command::Batch(commands) => {
+                commands.iter().find_map(focus_request_id)
+            }
+            _ => None,
+        }
+    }
+
+    fn assert_title_button_can_receive_focus(state: AppState, expected_id: u64) {
+        let bridge = DeclarativeOwnedRuntimeBridge::new(
+            state,
+            |state| project_surface(state).into_surface(),
+            |_state, _message| {},
+        );
+        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1180.0, 720.0));
+        runtime.execute_command(radiant::runtime::Command::focus(expected_id));
+        assert_eq!(runtime.focused_widget(), Some(expected_id));
+    }
+
+    #[test]
+    fn library_loaded_preserves_valid_saved_track_and_focuses_its_title() {
+        let saved_track = audition_track("saved-track");
+        let saved_track_id = saved_track.id.clone();
+        let library = Library {
+            tracks: vec![audition_track("first-track"), saved_track],
+            selected_track_id: Some(saved_track_id.clone()),
+            ..Library::default()
+        };
+        let mut state = AppState::default();
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::LibraryLoaded(Ok(library)),
+            &mut context,
+        );
+
+        assert_eq!(state.workspace_mode, WorkspaceMode::Review);
+        assert_eq!(
+            state.library.selected_track_id.as_deref(),
+            Some(saved_track_id.as_str())
+        );
+        let command = context.into_command();
+        let expected_focus_id = library_track_title_id(&saved_track_id);
+        assert_eq!(focus_request_id(&command), Some(expected_focus_id));
+        assert_eq!(command.business_task_priority("cadence-save-library"), None);
+        assert_title_button_can_receive_focus(state, expected_focus_id);
+    }
+
+    #[test]
+    fn library_loaded_falls_back_to_first_track_and_focuses_its_title_when_selection_is_invalid() {
+        for persisted_selection in [None, Some(String::from("missing-track"))] {
+            let first_track = audition_track("first-track");
+            let first_track_id = first_track.id.clone();
+            let library = Library {
+                tracks: vec![first_track, audition_track("second-track")],
+                selected_track_id: persisted_selection,
+                ..Library::default()
+            };
+            let mut state = AppState::default();
+            let mut context = ui::UiUpdateContext::default();
+
+            update(
+                &mut state,
+                Message::LibraryLoaded(Ok(library)),
+                &mut context,
+            );
+
+            assert_eq!(
+                state.library.selected_track_id.as_deref(),
+                Some(first_track_id.as_str())
+            );
+            assert!(state.save_in_flight);
+            let command = context.into_command();
+            let expected_focus_id = library_track_title_id(&first_track_id);
+            assert_eq!(focus_request_id(&command), Some(expected_focus_id));
+            assert!(
+                command
+                    .business_task_priority("cadence-save-library")
+                    .is_some()
+            );
+            assert_title_button_can_receive_focus(state, expected_focus_id);
+        }
     }
 
     fn dropdown_surface_rect(primitives: &[PaintPrimitive], anchor: Point) -> Option<Rect> {
