@@ -430,11 +430,11 @@ fn track_card_chrome(selected: bool) -> ui::View<Message> {
 #[derive(Clone, Debug)]
 struct StatusDropdownRailWidget {
     common: WidgetCommon,
-    status: storage::TrackStatus,
+    status: Option<storage::TrackStatus>,
 }
 
 impl StatusDropdownRailWidget {
-    fn new(status: storage::TrackStatus) -> Self {
+    fn new(status: Option<storage::TrackStatus>) -> Self {
         Self {
             common: WidgetCommon::fixed(0, STATUS_RAIL_WIDTH, 1.0).without_default_chrome(),
             status,
@@ -474,16 +474,22 @@ impl Widget for StatusDropdownRailWidget {
             primitives.push(PaintPrimitive::FillRect(PaintFillRect {
                 widget_id: self.common.id,
                 rect: bounds,
-                color: status_visual_color(self.status, theme),
+                color: self.status.map_or(theme.grid_strong, |status| {
+                    status_visual_color(status, theme)
+                }),
             }));
         }
     }
 }
 
 fn status_dropdown_rail(status: storage::TrackStatus) -> ui::View<Message> {
+    status_rail(Some(status), ui::dropdown_trigger_height())
+}
+
+fn status_rail(status: Option<storage::TrackStatus>, height: f32) -> ui::View<Message> {
     ui::custom_widget(StatusDropdownRailWidget::new(status), |_| None)
         .width(STATUS_RAIL_WIDTH)
-        .height(ui::dropdown_trigger_height())
+        .height(height)
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -5083,15 +5089,13 @@ fn audition_panel(state: &AppState) -> ui::View<Message> {
     let filter_buttons = audition_statuses()
         .into_iter()
         .map(|status| {
-            let selected = state.audition_status_filter == status;
-            let label = status.label().to_owned();
-            let input = ui::button(label.clone())
-                .selected(selected)
-                .message(Message::SetAuditionFilter(status))
-                .key(format!("audition-filter-{}", status.label()))
-                .fill_width()
-                .height(26.0);
-            input.fill_width().height(26.0)
+            status_filter_button(
+                Some(state.audition_status_filter),
+                "audition",
+                Some(status),
+                audition_status_filter_message,
+                true,
+            )
         })
         .collect::<Vec<_>>();
     let queue = if queue_tracks.is_empty() {
@@ -5263,19 +5267,22 @@ fn status_filter_button(
     message: fn(Option<storage::TrackStatus>) -> Message,
     fill_width: bool,
 ) -> ui::View<Message> {
-    let button = ui::button(status_filter_label(status))
-        .selected(selected == status)
-        .message(message(status))
-        .key(format!(
+    let width = (!fill_width).then_some(76.0);
+    colored_status_option(
+        status,
+        selected == status,
+        message(status),
+        format!(
             "{key_prefix}-status-filter-{}",
             status_filter_label(status).to_ascii_lowercase()
-        ))
-        .height(26.0);
-    if fill_width {
-        button.fill_width()
-    } else {
-        button.width(76.0)
-    }
+        ),
+        width,
+        26.0,
+    )
+}
+
+fn audition_status_filter_message(status: Option<storage::TrackStatus>) -> Message {
+    Message::SetAuditionFilter(status.expect("audition filters always select a status"))
 }
 
 fn status_filter_controls(
@@ -5299,35 +5306,102 @@ fn status_filter_dropdown(
     message: fn(Option<storage::TrackStatus>) -> Message,
     open: bool,
 ) -> ui::View<Message> {
-    let trigger = ui::dropdown_trigger(status_filter_label(selected), open)
-        .toggle_message(Message::ToggleReviewFilterMenu)
-        .build()
-        .key(format!("{key_prefix}-status-filter"))
-        .fill_width();
+    let trigger = ui::row([
+        status_rail(selected, ui::dropdown_trigger_height()),
+        ui::dropdown_trigger(status_filter_label(selected), open)
+            .toggle_message(Message::ToggleReviewFilterMenu)
+            .build()
+            .key(format!("{key_prefix}-status-filter"))
+            .fill_width(),
+    ])
+    .spacing(STATUS_RAIL_GAP)
+    .fill_width()
+    .height(ui::dropdown_trigger_height());
     if open {
         ui::column([
             trigger,
-            ui::dropdown_menu(
-                status_filter_options()
-                    .into_iter()
-                    .map(|status| {
-                        ui::DropdownOption::new(
-                            status_filter_label(status),
-                            selected == status,
-                            message(status),
-                        )
-                    })
-                    .collect(),
-            )
-            .key(format!("{key_prefix}-status-filter-menu"))
-            .fill_width()
-            .height(ui::dropdown_menu_height(status_filter_options().len())),
+            status_filter_menu(selected, key_prefix, message)
+                .fill_width()
+                .height(ui::dropdown_menu_height(status_filter_options().len())),
         ])
         .spacing(3.0)
         .fill_width()
     } else {
         ui::column([trigger]).fill_width()
     }
+}
+
+fn status_filter_menu(
+    selected: Option<storage::TrackStatus>,
+    key_prefix: &str,
+    message: fn(Option<storage::TrackStatus>) -> Message,
+) -> ui::View<Message> {
+    colored_status_menu(
+        format!("{key_prefix}-status-filter-menu"),
+        status_filter_options()
+            .into_iter()
+            .map(|status| {
+                (
+                    status,
+                    selected == status,
+                    message(status),
+                    format!(
+                        "{key_prefix}-status-filter-option-{}",
+                        status_filter_label(status).to_ascii_lowercase()
+                    ),
+                )
+            })
+            .collect(),
+    )
+}
+
+fn colored_status_option(
+    status: Option<storage::TrackStatus>,
+    selected: bool,
+    message: Message,
+    key: String,
+    width: Option<f32>,
+    height: f32,
+) -> ui::View<Message> {
+    let button_width = width.map(|width| (width - STATUS_RAIL_WIDTH - STATUS_RAIL_GAP).max(0.0));
+    let button = ui::button(status_filter_label(status))
+        .selected(selected)
+        .message(message)
+        .key(key)
+        .fill_width()
+        .height(height);
+    let button = if let Some(width) = button_width {
+        button.width(width)
+    } else {
+        button
+    };
+    let row = ui::row([status_rail(status, height), button]).spacing(STATUS_RAIL_GAP);
+    if let Some(width) = width {
+        row.width(width).height(height)
+    } else {
+        row.fill_width().height(height)
+    }
+}
+
+fn colored_status_menu(
+    key: String,
+    options: Vec<(Option<storage::TrackStatus>, bool, Message, String)>,
+) -> ui::View<Message> {
+    let option_count = options.len();
+    ui::column(
+        options
+            .into_iter()
+            .map(|(status, selected, message, option_key)| {
+                colored_status_option(status, selected, message, option_key, None, 22.0)
+            })
+            .collect::<Vec<_>>(),
+    )
+    .key(key)
+    .style(ui::WidgetStyle::strong(ui::WidgetTone::Neutral))
+    .padding(4.0)
+    .spacing(3.0)
+    .fill_width()
+    .height(ui::dropdown_menu_height(option_count))
 }
 
 fn review_status_filter_message(status: Option<storage::TrackStatus>) -> Message {
@@ -5669,29 +5743,6 @@ fn stage_dropdown_options(track: &storage::Track) -> Vec<ui::DropdownOption<Mess
     .collect()
 }
 
-fn status_dropdown_options(track: &storage::Track) -> Vec<ui::DropdownOption<Message>> {
-    let status_id = track.id.clone();
-    [
-        storage::TrackStatus::Inbox,
-        storage::TrackStatus::Refine,
-        storage::TrackStatus::Release,
-        storage::TrackStatus::Archive,
-        storage::TrackStatus::Maybe,
-    ]
-    .into_iter()
-    .map(|status| {
-        ui::DropdownOption::new(
-            status.label(),
-            track.status == status,
-            Message::SetStatus {
-                track_id: status_id.clone(),
-                status,
-            },
-        )
-    })
-    .collect()
-}
-
 fn status_visual_color(status: storage::TrackStatus, theme: &ThemeTokens) -> ui::Rgba8 {
     match status {
         storage::TrackStatus::Inbox => TRACK_CARD_SELECTED_CORAL,
@@ -5828,12 +5879,7 @@ fn status_dropdown_for_host(
 ) -> ui::View<Message> {
     let trigger = status_dropdown_trigger(track, open, host);
     if open {
-        let menu = ui::row([
-            ui::spacer().width(STATUS_RAIL_WIDTH + STATUS_RAIL_GAP),
-            status_menu(track, host),
-        ])
-        .spacing(0.0)
-        .fill_width();
+        let menu = status_menu(track, host);
         ui::column([trigger, menu]).spacing(3.0).fill_width()
     } else {
         ui::column([trigger])
@@ -5843,16 +5889,34 @@ fn status_dropdown_for_host(
 }
 
 fn status_menu(track: &storage::Track, host: StatusMenuHost) -> ui::View<Message> {
-    let options = status_dropdown_options(track);
-    let option_count = options.len();
-    ui::dropdown_menu(options)
-        .key(format!(
-            "status-menu-{}-{}",
-            track.id,
-            status_menu_host_key(host)
-        ))
-        .fill_width()
-        .height(ui::dropdown_menu_height(option_count))
+    let track_id = track.id.clone();
+    colored_status_menu(
+        format!("status-menu-{}-{}", track.id, status_menu_host_key(host)),
+        [
+            storage::TrackStatus::Inbox,
+            storage::TrackStatus::Refine,
+            storage::TrackStatus::Release,
+            storage::TrackStatus::Archive,
+            storage::TrackStatus::Maybe,
+        ]
+        .into_iter()
+        .map(|status| {
+            (
+                Some(status),
+                track.status == status,
+                Message::SetStatus {
+                    track_id: track_id.clone(),
+                    status,
+                },
+                format!(
+                    "status-menu-option-{}-{}",
+                    track.id,
+                    status.label().to_ascii_lowercase()
+                ),
+            )
+        })
+        .collect(),
+    )
 }
 
 const fn status_menu_host_key(host: StatusMenuHost) -> &'static str {
@@ -7204,16 +7268,16 @@ mod tests {
         AppState, AuditionSource, ImportBatchProgress, LoopBounds, LoopSelection, LoopSelections,
         Message, NoteDraft, REFERENCE_MENU_WIDTH, StatusMenuHost,
         TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER, WAVEFORM_HEIGHT, WorkspaceMode,
-        apply_transport_snapshot, audition_shuffle_seed, audition_statuses,
+        apply_transport_snapshot, audition_panel, audition_shuffle_seed, audition_statuses,
         current_loudness_match_gain_db, current_lufs_meter_value,
         current_reference_lufs_meter_value, decode_result_is_current, deterministic_shuffle,
         enforce_loop, loop_bounds, main_output_gain, native_launch_options, note_editor,
         note_ratio_for_id, planner_drop_is_valid, playback_shortcut, project_surface,
         rebuild_audition_queue, reconcile_audition_queue, reference_decode_result_is_current,
-        reference_output_gain, selected_reference_notes, selected_track, stage_dropdown,
-        stage_menu_anchor_from_pointer, stage_menu_popover, status_dropdown_for_host,
-        sync_audition_queue_after_status_change, tracks_in_stage, tracks_with_status,
-        transport_command_is_confirmed, update,
+        reference_output_gain, review_status_filter_message, selected_reference_notes,
+        selected_track, stage_dropdown, stage_menu_anchor_from_pointer, stage_menu_popover,
+        status_dropdown_for_host, status_filter_dropdown, sync_audition_queue_after_status_change,
+        tracks_in_stage, tracks_with_status, transport_command_is_confirmed, update,
     };
     use crate::transport::Snapshot;
     use crate::{
@@ -13565,6 +13629,68 @@ mod tests {
                         theme.accent_danger,
                     ]
                     .contains(&fill.color)
+            }));
+        }
+    }
+
+    #[test]
+    fn status_filter_picker_and_audition_rows_paint_semantic_rails() {
+        let theme = ThemeTokens::default();
+        let statuses = [
+            (Some(TrackStatus::Inbox), super::TRACK_CARD_SELECTED_CORAL),
+            (Some(TrackStatus::Refine), theme.accent_warning),
+            (Some(TrackStatus::Release), theme.highlight_cyan),
+            (Some(TrackStatus::Archive), theme.text_muted),
+            (Some(TrackStatus::Maybe), theme.accent_danger),
+        ];
+        let picker = ui::scene(status_filter_dropdown(
+            Some(TrackStatus::Refine),
+            "review",
+            review_status_filter_message,
+            true,
+        ))
+        .into_view()
+        .view_frame_at_size_with_default_theme(Vector2::new(260.0, 220.0));
+        for (status, expected_color) in statuses {
+            assert!(picker.paint_plan.fill_rects().any(|fill| {
+                fill.color == expected_color
+                    && (fill.rect.width() - super::STATUS_RAIL_WIDTH).abs() < 0.01
+                    && fill.rect.height() > 20.0
+            }));
+            let label = status.expect("filter option status").label();
+            assert!(
+                picker
+                    .paint_plan
+                    .text_label_strings()
+                    .iter()
+                    .any(|text| text == label)
+            );
+        }
+        assert!(
+            picker
+                .paint_plan
+                .text_label_strings()
+                .iter()
+                .any(|text| text == "All")
+        );
+        assert!(picker.paint_plan.fill_rects().any(|fill| {
+            fill.color == theme.grid_strong
+                && (fill.rect.width() - super::STATUS_RAIL_WIDTH).abs() < 0.01
+        }));
+
+        let state = AppState {
+            busy: false,
+            workspace_mode: WorkspaceMode::Audition,
+            ..AppState::default()
+        };
+        let audition = ui::scene(audition_panel(&state))
+            .into_view()
+            .view_frame_at_size_with_default_theme(Vector2::new(420.0, 720.0));
+        for (_, expected_color) in statuses {
+            assert!(audition.paint_plan.fill_rects().any(|fill| {
+                fill.color == expected_color
+                    && (fill.rect.width() - super::STATUS_RAIL_WIDTH).abs() < 0.01
+                    && fill.rect.height() >= 24.0
             }));
         }
     }
