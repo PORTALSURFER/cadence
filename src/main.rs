@@ -226,7 +226,6 @@ enum Message {
     ReferenceCommentHoverStarted(String),
     ReferenceCommentHoverEnded(String),
     EditNote(String),
-    ToggleNoteDone(String),
     DeleteNote(String),
     ReferenceDraftNoteChanged(String),
     SaveReferenceDraftNote,
@@ -234,7 +233,6 @@ enum Message {
     SelectReferenceNote(String),
     EditReferenceNote(String),
     FocusCommentEditor(u64),
-    ToggleReferenceNoteDone(String),
     DeleteReferenceNote(String),
 }
 
@@ -2465,18 +2463,6 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 );
             }
         }
-        Message::ToggleNoteDone(id) => {
-            if state.busy {
-                return;
-            }
-            if let Some(track) = selected_track_mut(state)
-                && let Some(note) = track.notes.iter_mut().find(|note| note.id == id)
-            {
-                note.done = !note.done;
-                schedule_library_save(state, context);
-                context.request_repaint();
-            }
-        }
         Message::DeleteNote(id) => {
             if state.busy {
                 return;
@@ -2576,16 +2562,6 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     Duration::from_millis(1),
                     Message::FocusCommentEditor(editor_id),
                 );
-            }
-        }
-        Message::ToggleReferenceNoteDone(id) => {
-            if state.busy {
-                return;
-            }
-            if let Some(note) = selected_reference_note_mut(state, &id) {
-                note.done = !note.done;
-                schedule_library_save(state, context);
-                context.request_repaint();
             }
         }
         Message::DeleteReferenceNote(id) => {
@@ -7464,7 +7440,6 @@ fn note_row(
     let note_id = note.id.clone();
     let note_body = note.body.clone();
     let note_time_millis = note.time_millis;
-    let note_done = note.done;
     let body = if editing {
         let draft = editing_note.expect("an editing row should have a matching draft");
         ui::text_input(draft.body.clone())
@@ -7481,27 +7456,26 @@ fn note_row(
     } else {
         ui::text(note_body).wrap().height(30.0).fill_width()
     };
-    let edit_or_save = if editing {
-        ui::button("Save")
-            .primary()
-            .message(Message::SaveDraftNote)
-            .height(28.0)
+    let trailing_control = if editing {
+        ui::row([
+            ui::button("Save")
+                .primary()
+                .message(Message::SaveDraftNote)
+                .height(28.0),
+            ui::button("Cancel")
+                .subtle()
+                .message(Message::CancelDraftNote)
+                .height(28.0),
+        ])
+        .spacing(4.0)
+        .height(28.0)
     } else {
-        ui::button("Edit")
-            .selected(selected)
-            .message(Message::EditNote(note_id.clone()))
-            .height(28.0)
-    };
-    let cancel_or_delete = if editing {
-        ui::button("Cancel")
+        ui::close_button()
             .subtle()
-            .message(Message::CancelDraftNote)
-            .height(28.0)
-    } else {
-        ui::button("Delete")
-            .selected(selected)
             .message(Message::DeleteNote(note_id.clone()))
-            .height(28.0)
+            .key(format!("comment-remove-{note_id}"))
+            .tooltip("Remove comment")
+            .size(28.0, 24.0)
     };
     let row = ui::list_row(
         index,
@@ -7511,12 +7485,7 @@ fn note_row(
                 .width(68.0)
                 .subtle(),
             body,
-            ui::button(if note_done { "Done" } else { "Open" })
-                .selected(selected)
-                .message(Message::ToggleNoteDone(note_id.clone()))
-                .height(28.0),
-            edit_or_save,
-            cancel_or_delete,
+            trailing_control,
         ],
     )
     .fill_width();
@@ -7557,7 +7526,6 @@ fn reference_note_row(
     let note_id = note.id.clone();
     let note_body = note.body.clone();
     let note_time_millis = note.time_millis;
-    let note_done = note.done;
     let body = if editing {
         let draft = editing_note.expect("an editing reference row should have a matching draft");
         ui::text_input(draft.body.clone())
@@ -7574,27 +7542,26 @@ fn reference_note_row(
     } else {
         ui::text(note_body).wrap().height(30.0).fill_width()
     };
-    let edit_or_save = if editing {
-        ui::button("Save")
-            .primary()
-            .message(Message::SaveReferenceDraftNote)
-            .height(28.0)
+    let trailing_control = if editing {
+        ui::row([
+            ui::button("Save")
+                .primary()
+                .message(Message::SaveReferenceDraftNote)
+                .height(28.0),
+            ui::button("Cancel")
+                .subtle()
+                .message(Message::CancelReferenceDraftNote)
+                .height(28.0),
+        ])
+        .spacing(4.0)
+        .height(28.0)
     } else {
-        ui::button("Edit")
-            .selected(selected)
-            .message(Message::EditReferenceNote(note_id.clone()))
-            .height(28.0)
-    };
-    let cancel_or_delete = if editing {
-        ui::button("Cancel")
+        ui::close_button()
             .subtle()
-            .message(Message::CancelReferenceDraftNote)
-            .height(28.0)
-    } else {
-        ui::button("Delete")
-            .selected(selected)
             .message(Message::DeleteReferenceNote(note_id.clone()))
-            .height(28.0)
+            .key(format!("reference-comment-remove-{note_id}"))
+            .tooltip("Remove comment")
+            .size(28.0, 24.0)
     };
     let row = ui::list_row(
         index,
@@ -7604,12 +7571,7 @@ fn reference_note_row(
                 .width(68.0)
                 .subtle(),
             body,
-            ui::button(if note_done { "Done" } else { "Open" })
-                .selected(selected)
-                .message(Message::ToggleReferenceNoteDone(note_id.clone()))
-                .height(28.0),
-            edit_or_save,
-            cancel_or_delete,
+            trailing_control,
         ],
     )
     .fill_width();
@@ -7693,16 +7655,6 @@ fn selected_reference_track_mut(state: &mut AppState) -> Option<&mut storage::Re
         .reference_tracks
         .iter_mut()
         .find(|reference| reference.path == path)
-}
-
-fn selected_reference_note_mut<'a>(
-    state: &'a mut AppState,
-    note_id: &str,
-) -> Option<&'a mut storage::Note> {
-    selected_reference_track_mut(state)?
-        .notes
-        .iter_mut()
-        .find(|note| note.id == note_id)
 }
 
 fn reference_track_name(path: &Path) -> String {
@@ -11121,7 +11073,7 @@ mod tests {
     }
 
     #[test]
-    fn rendered_comments_panel_shows_all_comments_and_delete_controls() {
+    fn rendered_comments_panel_shows_all_comments_with_compact_remove_controls() {
         let track_id = String::from("review-track");
         let mut state = AppState {
             busy: false,
@@ -11162,14 +11114,12 @@ mod tests {
         assert!(labels.iter().any(|label| label == "COMMENTS"));
         assert!(labels.iter().any(|label| label == "first comment"));
         assert!(labels.iter().any(|label| label == "second comment"));
-        assert_eq!(
-            labels
-                .iter()
-                .filter(|label| label.as_str() == "Delete")
-                .count(),
-            2,
-            "each rendered comment row should expose a Delete control"
-        );
+        for obsolete_action in ["Open", "Done", "Edit", "Delete"] {
+            assert!(
+                !labels.iter().any(|label| label == obsolete_action),
+                "comment rows should not render the {obsolete_action} action"
+            );
+        }
     }
 
     #[test]
