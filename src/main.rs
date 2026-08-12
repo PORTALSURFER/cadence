@@ -6,9 +6,15 @@ mod waveform;
 
 use radiant::{
     application::{AnchoredPopoverParts, anchored_popover_from_parts},
-    gui::types::{Point, Vector2},
+    gui::types::{Point, Rect, Vector2},
+    layout::LayoutOutput,
     prelude as ui,
-    runtime::{FileDialogRequest, NativeRunOptions, PlatformResponse, PlatformResult},
+    runtime::{
+        FileDialogRequest, NativeRunOptions, PaintFillPolygon, PaintFillRect, PaintPrimitive,
+        PaintStrokePolygon, PlatformResponse, PlatformResult,
+    },
+    theme::ThemeTokens,
+    widgets::{Widget, WidgetCommon, WidgetInput, WidgetOutput},
 };
 use std::{
     path::{Path, PathBuf},
@@ -80,6 +86,10 @@ enum Message {
         host: StatusMenuHost,
     },
     ToggleReferenceMenu(String),
+    ToggleReferenceMenuAt {
+        track_id: String,
+        position: Point,
+    },
     SetReferenceTrack {
         track_id: String,
         path: PathBuf,
@@ -110,6 +120,8 @@ enum Message {
     AuditionPrevious,
     AuditionNext,
     SelectAuditionSource(AuditionSource),
+    SelectCommentSource(CommentSource),
+    ToggleReviewFilterMenu,
     ToggleReferenceMatch,
     AuditionVolumeChanged(f32),
     Frame,
@@ -184,11 +196,17 @@ enum WorkspaceMode {
 enum StatusMenuHost {
     Library,
     Planner,
-    ReviewHeader,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum AuditionSource {
+    #[default]
+    Main,
+    Reference,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum CommentSource {
     #[default]
     Main,
     Reference,
@@ -201,18 +219,196 @@ struct ReferenceLoopSelection {
 }
 
 const LIBRARY_WIDTH: f32 = 252.0;
-// Keep the review panel footprint stable while giving both track waveforms
-// the same visual height.
-const WAVEFORM_HEIGHT: f32 = 160.0;
+// Keep workspace tabs clear of the native macOS traffic-light controls in the
+// integrated titlebar while leaving the right-side controls right-anchored.
+const TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER: f32 = 72.0;
+// Keep the review rails compact so the comments surface owns the majority of
+// the review panel while retaining enough height for the split waveform.
+const WAVEFORM_HEIGHT: f32 = 124.0;
 const REFERENCE_WAVEFORM_HEIGHT: f32 = WAVEFORM_HEIGHT;
-const REFERENCE_HEADER_HEIGHT: f32 = 26.0;
-const REFERENCE_SECTION_SPACING: f32 = 4.0;
-const WAVEFORM_SECTION_SPACING: f32 = 6.0;
-const AUDITION_SOURCE_SELECTOR_WIDTH: f32 = 84.0;
-const FAVORITE_CONTROL_WIDTH: f32 = 112.0;
+const WAVEFORM_SECTION_SPACING: f32 = 8.0;
+const AUDITION_SOURCE_SELECTOR_WIDTH: f32 = 28.0;
+const FAVORITE_CONTROL_WIDTH: f32 = 28.0;
 const MIN_REFERENCE_LOOP_MILLIS: u64 = 120;
 const MAIN_COMMENT_EDITOR_ID: u64 = 0xCAD3_1001;
 const REFERENCE_COMMENT_EDITOR_ID: u64 = 0xCAD3_1002;
+const TRACK_CARD_CHAMFER: f32 = 8.0;
+const TRACK_CARD_RAIL_WIDTH: f32 = 4.0;
+const TRACK_CARD_RAIL_EDGE_INSET: f32 = 1.0;
+const TRACK_CARD_RAIL_VERTICAL_INSET: f32 = 3.0;
+const TRACK_CARD_OUTLINE_WIDTH: f32 = 1.5;
+const TRACK_CARD_CONTENT_INSET: f32 = 12.0;
+const TRACK_CARD_CONTENT_SPACING: f32 = 3.0;
+const LIBRARY_LIST_INSET: f32 = 6.0;
+const LIBRARY_CARD_SPACING: f32 = 8.0;
+const STATUS_RAIL_WIDTH: f32 = 4.0;
+const STATUS_RAIL_GAP: f32 = 4.0;
+const TRACK_CARD_SELECTED_CORAL: ui::Rgba8 = ui::Rgba8::new(233, 88, 67, 255);
+
+#[derive(Clone, Debug)]
+struct TrackCardChromeWidget {
+    common: WidgetCommon,
+    selected: bool,
+}
+
+impl TrackCardChromeWidget {
+    fn new(selected: bool) -> Self {
+        Self {
+            common: WidgetCommon::fixed(0, 1.0, 1.0).without_default_chrome(),
+            selected,
+        }
+    }
+}
+
+impl Widget for TrackCardChromeWidget {
+    fn common(&self) -> &WidgetCommon {
+        &self.common
+    }
+
+    fn common_mut(&mut self) -> &mut WidgetCommon {
+        &mut self.common
+    }
+
+    fn accepts_pointer_move(&self) -> bool {
+        false
+    }
+
+    fn accepts_pointer_input(&self, _input: &WidgetInput) -> bool {
+        false
+    }
+
+    fn handle_input(&mut self, _bounds: Rect, _input: WidgetInput) -> Option<WidgetOutput> {
+        None
+    }
+
+    fn append_paint(
+        &self,
+        primitives: &mut Vec<PaintPrimitive>,
+        bounds: Rect,
+        _layout: &LayoutOutput,
+        theme: &ThemeTokens,
+    ) {
+        if !bounds.has_finite_positive_area() {
+            return;
+        }
+
+        let points = track_card_points(bounds);
+        primitives.push(PaintPrimitive::FillPolygon(PaintFillPolygon {
+            widget_id: self.common.id,
+            points: Arc::clone(&points),
+            color: theme.bg_primary,
+        }));
+        primitives.push(PaintPrimitive::StrokePolygon(PaintStrokePolygon {
+            widget_id: self.common.id,
+            points,
+            color: if self.selected {
+                TRACK_CARD_SELECTED_CORAL
+            } else {
+                theme.grid_strong
+            },
+            width: TRACK_CARD_OUTLINE_WIDTH,
+        }));
+        let rail_vertical_inset = TRACK_CARD_RAIL_VERTICAL_INSET.min(bounds.height() * 0.5);
+        let rail_edge_inset = TRACK_CARD_RAIL_EDGE_INSET.min(bounds.width());
+        let rail_width = TRACK_CARD_RAIL_WIDTH.min((bounds.width() - rail_edge_inset).max(0.0));
+        let rail = Rect::from_min_max(
+            Point::new(
+                bounds.min.x + rail_edge_inset,
+                bounds.min.y + rail_vertical_inset,
+            ),
+            Point::new(
+                bounds.min.x + rail_edge_inset + rail_width,
+                bounds.max.y - rail_vertical_inset,
+            ),
+        );
+        if rail.has_finite_positive_area() {
+            primitives.push(PaintPrimitive::FillRect(PaintFillRect {
+                widget_id: self.common.id,
+                rect: rail,
+                color: if self.selected {
+                    TRACK_CARD_SELECTED_CORAL
+                } else {
+                    theme.grid_strong
+                },
+            }));
+        }
+    }
+}
+
+fn track_card_points(bounds: Rect) -> Arc<[Point]> {
+    let chamfer = TRACK_CARD_CHAMFER.min(bounds.width().min(bounds.height()) * 0.5);
+    [
+        Point::new(bounds.min.x, bounds.min.y),
+        Point::new(bounds.max.x, bounds.min.y),
+        Point::new(bounds.max.x, bounds.max.y - chamfer),
+        Point::new(bounds.max.x - chamfer, bounds.max.y),
+        Point::new(bounds.min.x, bounds.max.y),
+    ]
+    .into()
+}
+
+fn track_card_chrome(selected: bool) -> ui::View<Message> {
+    ui::custom_widget(TrackCardChromeWidget::new(selected), |_| None).fill()
+}
+
+#[derive(Clone, Debug)]
+struct StatusDropdownRailWidget {
+    common: WidgetCommon,
+    status: storage::TrackStatus,
+}
+
+impl StatusDropdownRailWidget {
+    fn new(status: storage::TrackStatus) -> Self {
+        Self {
+            common: WidgetCommon::fixed(0, STATUS_RAIL_WIDTH, 1.0).without_default_chrome(),
+            status,
+        }
+    }
+}
+
+impl Widget for StatusDropdownRailWidget {
+    fn common(&self) -> &WidgetCommon {
+        &self.common
+    }
+
+    fn common_mut(&mut self) -> &mut WidgetCommon {
+        &mut self.common
+    }
+
+    fn accepts_pointer_move(&self) -> bool {
+        false
+    }
+
+    fn accepts_pointer_input(&self, _input: &WidgetInput) -> bool {
+        false
+    }
+
+    fn handle_input(&mut self, _bounds: Rect, _input: WidgetInput) -> Option<WidgetOutput> {
+        None
+    }
+
+    fn append_paint(
+        &self,
+        primitives: &mut Vec<PaintPrimitive>,
+        bounds: Rect,
+        _layout: &LayoutOutput,
+        theme: &ThemeTokens,
+    ) {
+        if bounds.has_finite_positive_area() {
+            primitives.push(PaintPrimitive::FillRect(PaintFillRect {
+                widget_id: self.common.id,
+                rect: bounds,
+                color: status_visual_color(self.status, theme),
+            }));
+        }
+    }
+}
+
+fn status_dropdown_rail(status: storage::TrackStatus) -> ui::View<Message> {
+    ui::custom_widget(StatusDropdownRailWidget::new(status), |_| None)
+        .width(STATUS_RAIL_WIDTH)
+        .height(ui::dropdown_trigger_height())
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ImportBatchProgress {
@@ -261,6 +457,8 @@ struct AppState {
     reference_transport_loaded: bool,
     reference_only_playback: bool,
     reference_match_enabled: bool,
+    comment_source: CommentSource,
+    comment_source_explicit: bool,
     draft_note: Option<NoteDraft>,
     reference_draft_note: Option<NoteDraft>,
     persisted_note_drag: Option<PersistedNoteDrag>,
@@ -277,6 +475,7 @@ struct AppState {
     planner_drag_target_stage: Option<storage::TrackStage>,
     planner_drag_pointer: Option<Point>,
     review_status_filter: Option<storage::TrackStatus>,
+    review_filter_menu_open: bool,
     planner_status_filter: Option<storage::TrackStatus>,
     audition_status_filter: storage::TrackStatus,
     audition_queue: Vec<String>,
@@ -292,6 +491,7 @@ struct AppState {
     pending_reference_track_id: Option<String>,
     reference_import_selected_path: Option<PathBuf>,
     reference_menu_track_id: Option<String>,
+    reference_menu_anchor: Option<Point>,
 }
 
 #[derive(Clone, Debug)]
@@ -350,6 +550,8 @@ impl Default for AppState {
             reference_transport_loaded: false,
             reference_only_playback: false,
             reference_match_enabled: false,
+            comment_source: CommentSource::Main,
+            comment_source_explicit: false,
             draft_note: None,
             reference_draft_note: None,
             persisted_note_drag: None,
@@ -366,6 +568,7 @@ impl Default for AppState {
             planner_drag_target_stage: None,
             planner_drag_pointer: None,
             review_status_filter: None,
+            review_filter_menu_open: false,
             planner_status_filter: None,
             audition_status_filter: storage::TrackStatus::Inbox,
             audition_queue: Vec::new(),
@@ -381,6 +584,7 @@ impl Default for AppState {
             pending_reference_track_id: None,
             reference_import_selected_path: None,
             reference_menu_track_id: None,
+            reference_menu_anchor: None,
         }
     }
 }
@@ -787,9 +991,11 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     state.hovered_note_id = None;
                     state.selected_reference_note_id = None;
                     state.hovered_reference_note_id = None;
+                    state.comment_source = CommentSource::Main;
+                    state.comment_source_explicit = false;
                     close_stage_menu(state);
                     close_status_menu(state);
-                    state.reference_menu_track_id = None;
+                    close_reference_menu(state);
                     state.remove_confirmation_track_id = None;
                     reset_transport(state);
                     reset_reference_transport(state);
@@ -828,9 +1034,11 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     state.hovered_note_id = None;
                     state.selected_reference_note_id = None;
                     state.hovered_reference_note_id = None;
+                    state.comment_source = CommentSource::Main;
+                    state.comment_source_explicit = false;
                     close_stage_menu(state);
                     close_status_menu(state);
-                    state.reference_menu_track_id = None;
+                    close_reference_menu(state);
                     state.remove_confirmation_track_id = None;
                     reset_transport(state);
                     reset_reference_transport(state);
@@ -872,7 +1080,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     state.hovered_reference_note_id = None;
                     close_stage_menu(state);
                     close_status_menu(state);
-                    state.reference_menu_track_id = None;
+                    close_reference_menu(state);
                     state.remove_confirmation_track_id = None;
                     reset_transport(state);
                     reset_reference_transport(state);
@@ -936,7 +1144,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 }
                 schedule_next_pending_import(state, context);
             }
-            state.reference_menu_track_id = None;
+            close_reference_menu(state);
             context.request_repaint();
         }
         Message::ToggleReferenceMenu(track_id) => {
@@ -947,12 +1155,34 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     .iter()
                     .any(|track| track.id == track_id)
             {
-                state.reference_menu_track_id =
-                    if state.reference_menu_track_id.as_deref() == Some(track_id.as_str()) {
-                        None
-                    } else {
-                        Some(track_id)
-                    };
+                if state.reference_menu_track_id.as_deref() == Some(track_id.as_str()) {
+                    close_reference_menu(state);
+                } else {
+                    close_stage_menu(state);
+                    close_status_menu(state);
+                    state.reference_menu_track_id = Some(track_id);
+                    state.reference_menu_anchor = Some(keyboard_reference_menu_anchor());
+                }
+                context.request_repaint();
+            }
+        }
+        Message::ToggleReferenceMenuAt { track_id, position } => {
+            if !state.busy
+                && state
+                    .library
+                    .tracks
+                    .iter()
+                    .any(|track| track.id == track_id)
+            {
+                if state.reference_menu_track_id.as_deref() == Some(track_id.as_str()) {
+                    close_reference_menu(state);
+                } else {
+                    close_stage_menu(state);
+                    close_status_menu(state);
+                    state.reference_menu_track_id = Some(track_id);
+                    state.reference_menu_anchor =
+                        Some(reference_menu_anchor_from_pointer(position));
+                }
                 context.request_repaint();
             }
         }
@@ -1198,6 +1428,11 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 close_stage_menu(state);
                 close_status_menu(state);
             }
+            state.review_filter_menu_open = false;
+            context.request_repaint();
+        }
+        Message::ToggleReviewFilterMenu => {
+            state.review_filter_menu_open = !state.review_filter_menu_open;
             context.request_repaint();
         }
         Message::SetPlannerStatusFilter(status) => {
@@ -1285,12 +1520,12 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     Ok(changed) => changed,
                     Err(error) => {
                         state.status = error;
-                        state.reference_menu_track_id = None;
+                        close_reference_menu(state);
                         context.request_repaint();
                         return;
                     }
                 };
-                state.reference_menu_track_id = None;
+                close_reference_menu(state);
                 if changed {
                     if selected {
                         reset_reference_transport(state);
@@ -1541,6 +1776,11 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
         Message::AuditionPrevious => previous_audition(state, context),
         Message::AuditionNext => next_audition(state, context),
         Message::SelectAuditionSource(source) => select_audition_source(state, context, source),
+        Message::SelectCommentSource(source) => {
+            state.comment_source = source;
+            state.comment_source_explicit = true;
+            context.request_repaint();
+        }
         Message::ToggleReferenceMatch => {
             let Some(gain_db) = current_loudness_match_gain_db(state) else {
                 state.status = String::from(
@@ -1597,6 +1837,8 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             seek_reference_waveform_position(state, context, ratio)
         }
         Message::ReferenceCommentClicked { ratio } => {
+            state.comment_source = CommentSource::Reference;
+            state.comment_source_explicit = true;
             start_reference_comment_draft(state, context, ratio)
         }
         Message::WaveformClicked { ratio, lower } => {
@@ -1608,6 +1850,10 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             };
             let duration_millis = waveform.duration_millis;
             let time_millis = waveform::millis_for_ratio(ratio, duration_millis);
+            if lower {
+                state.comment_source = CommentSource::Main;
+                state.comment_source_explicit = true;
+            }
             state.hovered_note_id = None;
             if lower {
                 start_main_note_draft(state, context, time_millis);
@@ -1725,6 +1971,8 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             if state.busy {
                 return;
             }
+            state.comment_source = CommentSource::Main;
+            state.comment_source_explicit = true;
             rollback_persisted_note_drag(state);
             let note = selected_track(state)
                 .and_then(|track| track.notes.iter().find(|note| note.id == id))
@@ -1779,6 +2027,8 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             if state.busy {
                 return;
             }
+            state.comment_source = CommentSource::Main;
+            state.comment_source_explicit = true;
             rollback_persisted_note_drag(state);
             let note = selected_track(state)
                 .and_then(|track| track.notes.iter().find(|note| note.id == id))
@@ -1862,6 +2112,8 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             if state.busy {
                 return;
             }
+            state.comment_source = CommentSource::Reference;
+            state.comment_source_explicit = true;
             let note = selected_reference_notes(state)
                 .iter()
                 .find(|note| note.id == id)
@@ -1880,6 +2132,8 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             if state.busy {
                 return;
             }
+            state.comment_source = CommentSource::Reference;
+            state.comment_source_explicit = true;
             let note = selected_reference_notes(state)
                 .iter()
                 .find(|note| note.id == id)
@@ -2738,6 +2992,8 @@ fn start_main_note_draft(
     time_millis: u64,
 ) {
     rollback_persisted_note_drag(state);
+    state.comment_source = CommentSource::Main;
+    state.comment_source_explicit = true;
     set_audition_source(state, AuditionSource::Main);
     state.review_cursor_millis = time_millis;
     state.draft_note = Some(NoteDraft {
@@ -3573,6 +3829,11 @@ fn close_stage_menu(state: &mut AppState) {
     state.stage_menu_anchor = None;
 }
 
+fn close_reference_menu(state: &mut AppState) {
+    state.reference_menu_track_id = None;
+    state.reference_menu_anchor = None;
+}
+
 fn select_track_internal(
     state: &mut AppState,
     context: &mut ui::UiUpdateContext<Message>,
@@ -3612,7 +3873,7 @@ fn select_track_internal(
     }
     close_stage_menu(state);
     close_status_menu(state);
-    state.reference_menu_track_id = None;
+    close_reference_menu(state);
     state.remove_confirmation_track_id = None;
     clear_planner_drag(state);
     if let Some(cancellation) = state.waveform_cancellation.take() {
@@ -3637,6 +3898,8 @@ fn select_track_internal(
     state.hovered_note_id = None;
     state.selected_reference_note_id = None;
     state.hovered_reference_note_id = None;
+    state.comment_source = CommentSource::Main;
+    state.comment_source_explicit = false;
     reset_transport(state);
     reset_reference_transport(state);
     state.reference_match_enabled = false;
@@ -3668,7 +3931,7 @@ fn set_workspace_mode(
     }
     close_stage_menu(state);
     close_status_menu(state);
-    state.reference_menu_track_id = None;
+    close_reference_menu(state);
     state.remove_confirmation_track_id = None;
     clear_planner_drag(state);
     context.request_repaint();
@@ -4105,6 +4368,19 @@ fn project_surface(state: &AppState) -> ui::View<Message> {
                 .find(|track| track.id == track_id)
                 .map(|track| stage_menu_popover(track, anchor))
         });
+    let reference_menu = state
+        .reference_menu_track_id
+        .as_deref()
+        .zip(state.reference_menu_anchor)
+        .and_then(|(track_id, anchor)| {
+            state
+                .library
+                .tracks
+                .iter()
+                .find(|track| track.id == track_id)
+                .filter(|track| !reference_dropdown_paths(state, track).is_empty())
+                .map(|track| reference_menu_popover(state, track, anchor))
+        });
     let workspace_tabs = [
         WorkspaceMode::Review,
         WorkspaceMode::Planner,
@@ -4121,12 +4397,20 @@ fn project_surface(state: &AppState) -> ui::View<Message> {
             .height(28.0)
     })
     .collect::<Vec<_>>();
+    let global_review_controls = match state.workspace_mode {
+        WorkspaceMode::Review | WorkspaceMode::Audition => selected_track(state)
+            .map(|track| review_global_controls(state, track))
+            .unwrap_or_else(|| ui::spacer().width(0.0)),
+        WorkspaceMode::Planner => ui::spacer().width(0.0),
+    };
     let header = ui::row([
-        ui::spacer().fill_width(),
+        ui::spacer().width(TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER),
         ui::row(workspace_tabs)
             .spacing(4.0)
             .width(254.0)
             .height(28.0),
+        ui::spacer().fill_width(),
+        global_review_controls,
     ])
     .fill_width()
     .height(36.0)
@@ -4202,6 +4486,7 @@ fn project_surface(state: &AppState) -> ui::View<Message> {
         ui::stack([content]).fill().overlays(
             ui::overlays()
                 .popover_opt(stage_menu)
+                .popover_opt(reference_menu)
                 .drag_preview_opt(drag_preview),
         ),
     )
@@ -4438,26 +4723,41 @@ fn status_filter_controls(
     .fill_width()
 }
 
-fn wrapped_status_filter_controls(
+fn status_filter_dropdown(
     selected: Option<storage::TrackStatus>,
     key_prefix: &str,
     message: fn(Option<storage::TrackStatus>) -> Message,
+    open: bool,
 ) -> ui::View<Message> {
-    let options = status_filter_options();
-    let rows = [options[..3].to_vec(), options[3..].to_vec()]
-        .into_iter()
-        .map(|options| {
-            ui::row(
-                options
+    let trigger = ui::dropdown_trigger(status_filter_label(selected), open)
+        .toggle_message(Message::ToggleReviewFilterMenu)
+        .build()
+        .key(format!("{key_prefix}-status-filter"))
+        .fill_width();
+    if open {
+        ui::column([
+            trigger,
+            ui::dropdown_menu(
+                status_filter_options()
                     .into_iter()
-                    .map(|status| status_filter_button(selected, key_prefix, status, message, true))
-                    .collect::<Vec<_>>(),
+                    .map(|status| {
+                        ui::DropdownOption::new(
+                            status_filter_label(status),
+                            selected == status,
+                            message(status),
+                        )
+                    })
+                    .collect(),
             )
-            .spacing(3.0)
+            .key(format!("{key_prefix}-status-filter-menu"))
             .fill_width()
-        })
-        .collect::<Vec<_>>();
-    ui::column(rows).spacing(3.0).fill_width()
+            .height(ui::dropdown_menu_height(status_filter_options().len())),
+        ])
+        .spacing(3.0)
+        .fill_width()
+    } else {
+        ui::column([trigger]).fill_width()
+    }
 }
 
 fn review_status_filter_message(status: Option<storage::TrackStatus>) -> Message {
@@ -4822,13 +5122,13 @@ fn status_dropdown_options(track: &storage::Track) -> Vec<ui::DropdownOption<Mes
     .collect()
 }
 
-const fn status_visual_tone(status: storage::TrackStatus) -> ui::WidgetTone {
+fn status_visual_color(status: storage::TrackStatus, theme: &ThemeTokens) -> ui::Rgba8 {
     match status {
-        storage::TrackStatus::Inbox => ui::WidgetTone::Accent,
-        storage::TrackStatus::Refine => ui::WidgetTone::Warning,
-        storage::TrackStatus::Release => ui::WidgetTone::Success,
-        storage::TrackStatus::Archive => ui::WidgetTone::Neutral,
-        storage::TrackStatus::Maybe => ui::WidgetTone::Danger,
+        storage::TrackStatus::Inbox => TRACK_CARD_SELECTED_CORAL,
+        storage::TrackStatus::Refine => theme.accent_warning,
+        storage::TrackStatus::Release => theme.highlight_cyan,
+        storage::TrackStatus::Archive => theme.text_muted,
+        storage::TrackStatus::Maybe => theme.accent_danger,
     }
 }
 
@@ -4845,31 +5145,26 @@ fn card_muted_text(_selected: bool, value: impl Into<ui::TextContent>) -> ui::Vi
 }
 
 fn favorite_toggle(track: &storage::Track, selected: bool, key: String) -> ui::View<Message> {
-    let label = if track.favorite {
-        "★ STARRED"
-    } else {
-        "☆ UNSTARRED"
-    };
-    let input = if track.favorite {
-        ui::button(label).primary()
-    } else {
-        ui::button(label).subtle()
-    };
-    input
+    ui::button(if track.favorite { "★" } else { "☆" })
+        .subtle()
         .active(track.favorite)
         .selected(selected)
         .message(Message::ToggleFavorite(track.id.clone()))
         .key(key)
-        .width(FAVORITE_CONTROL_WIDTH)
+        .tooltip(if track.favorite {
+            "Remove favorite"
+        } else {
+            "Mark favorite"
+        })
+        .size(FAVORITE_CONTROL_WIDTH, 24.0)
 }
 
-fn stage_dropdown(track: &storage::Track, open: bool, selected: bool) -> ui::View<Message> {
+fn stage_dropdown(track: &storage::Track, open: bool, _selected: bool) -> ui::View<Message> {
     let stage_id = track.id.clone();
     let label = track.stage.label().to_owned();
-    ui::button(label.clone())
-        .active(open)
-        .selected(selected)
-        .message(Message::ToggleStageMenu(stage_id.clone()))
+    ui::dropdown_trigger(label, open)
+        .toggle_message(Message::ToggleStageMenu(stage_id.clone()))
+        .build()
         .fill_width()
         .height(24.0)
         .pointer_target(
@@ -4902,6 +5197,36 @@ fn stage_menu_popover(track: &storage::Track, anchor: Point) -> ui::View<Message
     ))
 }
 
+const REFERENCE_MENU_WIDTH: f32 = 190.0;
+
+fn reference_menu_anchor_from_pointer(position: Point) -> Point {
+    Point::new(
+        position.x - REFERENCE_MENU_WIDTH * 0.5,
+        position.y + ui::dropdown_trigger_height() * 0.5,
+    )
+}
+
+fn keyboard_reference_menu_anchor() -> Point {
+    Point::new(700.0, 42.0)
+}
+
+fn reference_menu_popover(
+    state: &AppState,
+    track: &storage::Track,
+    anchor: Point,
+) -> ui::View<Message> {
+    let options = reference_dropdown_options(state, track);
+    let size = Vector2::new(
+        REFERENCE_MENU_WIDTH,
+        ui::dropdown_menu_height(options.len()),
+    );
+    anchored_popover_from_parts(AnchoredPopoverParts::below(
+        ui::dropdown_menu(options).key(format!("reference-menu-{}", track.id)),
+        ui::AnchoredPopoverAnchor::pointer(anchor),
+        size,
+    ))
+}
+
 fn status_dropdown_trigger(
     track: &storage::Track,
     open: bool,
@@ -4909,14 +5234,18 @@ fn status_dropdown_trigger(
 ) -> ui::View<Message> {
     let status_id = track.id.clone();
     let label = track.status.label().to_owned();
-    ui::dropdown_trigger(label, open)
+    let trigger = ui::dropdown_trigger(label, open)
         .toggle_message(Message::ToggleStatusMenuAt {
             track_id: status_id,
             host,
         })
         .build()
-        .style(ui::WidgetStyle::strong(status_visual_tone(track.status)))
+        .style(ui::WidgetStyle::strong(ui::WidgetTone::Neutral))
         .key(format!("status-dropdown-{}", track.id))
+        .fill_width()
+        .height(ui::dropdown_trigger_height());
+    ui::row([status_dropdown_rail(track.status), trigger])
+        .spacing(STATUS_RAIL_GAP)
         .fill_width()
         .height(ui::dropdown_trigger_height())
 }
@@ -4929,9 +5258,13 @@ fn status_dropdown_for_host(
 ) -> ui::View<Message> {
     let trigger = status_dropdown_trigger(track, open, host);
     if open {
-        ui::column([trigger, status_menu(track, host)])
-            .spacing(3.0)
-            .fill_width()
+        let menu = ui::row([
+            ui::spacer().width(STATUS_RAIL_WIDTH + STATUS_RAIL_GAP),
+            status_menu(track, host),
+        ])
+        .spacing(0.0)
+        .fill_width();
+        ui::column([trigger, menu]).spacing(3.0).fill_width()
     } else {
         ui::column([trigger])
             .fill_width()
@@ -4956,35 +5289,24 @@ const fn status_menu_host_key(host: StatusMenuHost) -> &'static str {
     match host {
         StatusMenuHost::Library => "library",
         StatusMenuHost::Planner => "planner",
-        StatusMenuHost::ReviewHeader => "review-header",
     }
 }
 
 fn library_panel(state: &AppState) -> ui::View<Message> {
     let selected_id = state.library.selected_track_id.clone();
     let tracks = tracks_with_status(&state.library.tracks, state.review_status_filter);
-    let track_count = tracks.len();
     let total_track_count = state.library.tracks.len();
     let content = ui::column([
-        ui::text("cadence").height(34.0).fill_width(),
-        ui::button("＋ Import track")
+        ui::button("Import")
             .primary()
             .message(Message::ImportPressed)
             .fill_width()
-            .height(36.0),
-        ui::text(format!(
-            "YOUR LIBRARY  ·  {} track{}",
-            track_count,
-            plural(track_count)
-        ))
-        .height(24.0)
-        .fill_width()
-        .subtle(),
-        ui::text("SHOW STATUS").height(18.0).fill_width().subtle(),
-        wrapped_status_filter_controls(
+            .height(34.0),
+        status_filter_dropdown(
             state.review_status_filter,
             "review",
             review_status_filter_message,
+            state.review_filter_menu_open,
         ),
         if tracks.is_empty() {
             if total_track_count == 0 {
@@ -5028,11 +5350,13 @@ fn library_panel(state: &AppState) -> ui::View<Message> {
                 )
             })
             .without_chrome()
+            .padding_x(LIBRARY_LIST_INSET)
+            .spacing(LIBRARY_CARD_SPACING)
             .fill_height()
         },
     ])
-    .padding(14.0)
-    .spacing(10.0)
+    .padding(10.0)
+    .spacing(8.0)
     .fill_height();
     ui::stack([ui::card().fill(), content]).fill_height()
 }
@@ -5055,6 +5379,19 @@ fn track_row(
     let remove_id = track.id.clone();
     let favorite_control =
         favorite_toggle(&track, selected, format!("library-favorite-{}", track.id));
+    let replace_id = track.id.clone();
+    let replace_control = ui::button("↻")
+        .subtle()
+        .message(Message::ReplacePressed(replace_id))
+        .key(format!("library-replace-{}", track.id))
+        .tooltip("Replace track")
+        .size(28.0, 24.0);
+    let remove_control = ui::close_button()
+        .subtle()
+        .message(Message::RequestRemoveTrack(remove_id.clone()))
+        .key(format!("library-remove-{}", track.id))
+        .tooltip("Remove track")
+        .size(28.0, 24.0);
     let stage_control = stage_dropdown(&track, stage_menu_open, selected);
     let status_control =
         status_dropdown_for_host(&track, status_menu_open, selected, StatusMenuHost::Library);
@@ -5080,22 +5417,19 @@ fn track_row(
         .spacing(4.0)
         .fill_width()
     } else {
-        card_control(
-            selected,
-            "Remove",
-            ui::button("Remove")
-                .message(Message::RequestRemoveTrack(remove_id))
-                .height(20.0)
-                .fill_width(),
-        )
-        .height(20.0)
-        .fill_width()
+        ui::spacer().fill_width().height(0.0)
     };
-    let row_background = ui::card()
+    let row_select_id = track.id.clone();
+    let row_background = ui::interactive_row_underlay(ui::spacer().fill())
+        .selected(selected)
         .style(ui::WidgetStyle::normal(ui::WidgetTone::Neutral))
+        .dense_chrome_palette(ui::DenseRowPalette::new())
+        .actions(ui::row_actions().primary(move || Message::SelectTrack(row_select_id.clone())))
+        .key(format!("library-track-input-{}", track.id))
         .fill();
     ui::stack([
         row_background,
+        track_card_chrome(selected),
         ui::column([
             ui::row([
                 card_control(
@@ -5109,19 +5443,21 @@ fn track_row(
                         .height(28.0),
                 )
                 .fill_width()
-                .height(28.0),
+                .height(26.0),
                 favorite_control,
+                replace_control,
+                remove_control,
             ])
-            .spacing(6.0)
+            .spacing(3.0)
             .fill_width()
-            .height(28.0),
+            .height(26.0),
             removal_controls,
             stage_control,
             status_control,
         ])
-        .padding(8.0)
+        .padding(TRACK_CARD_CONTENT_INSET)
         .fill_width()
-        .spacing(5.0),
+        .spacing(TRACK_CARD_CONTENT_SPACING),
     ])
     .key(format!("library-track-{}", track.id))
     .fill_width()
@@ -5132,14 +5468,11 @@ fn audition_source_choice(
     source: AuditionSource,
     active: bool,
 ) -> ui::View<Message> {
-    let value = if active {
-        format!("● {label}")
-    } else {
-        format!("○ {label}")
-    };
-    let input = ui::button(value.clone())
+    let input = ui::button(if active { "●" } else { "○" })
         .active(active)
         .message(Message::SelectAuditionSource(source))
+        .key(format!("audition-source-{}", label.to_ascii_lowercase()))
+        .tooltip(format!("Audition {label}"))
         .height(28.0);
     input.width(AUDITION_SOURCE_SELECTOR_WIDTH).height(28.0)
 }
@@ -5300,102 +5633,26 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
         .fill_width()
         .height(WAVEFORM_HEIGHT)
     };
-    let metadata = state
+    let (metadata, duration_millis) = state
         .waveform
         .as_ref()
         .filter(|_| state.waveform_track_id.as_deref() == Some(track.id.as_str()))
-        .map(|waveform| {
-            format!(
-                "{} Hz · {} channel{} · {}",
-                waveform.sample_rate,
-                waveform.channels,
-                if waveform.channels == 1 { "" } else { "s" },
-                format_duration(waveform.duration_millis),
-            )
-        })
-        .unwrap_or_else(|| String::from("Audio analysis pending"));
-    let duration_millis = state
-        .waveform
-        .as_ref()
-        .filter(|_| state.waveform_track_id.as_deref() == Some(track.id.as_str()))
-        .map_or(0, |waveform| waveform.duration_millis);
-    let meter_lufs = current_lufs_meter_value(state, &track.id);
-    let analysis_state = if duration_millis > 0 && !state.waveform_busy {
-        "READY"
-    } else if state.waveform_busy {
-        "BUILDING"
-    } else {
-        "WAITING"
-    };
-    let transport_controls = if duration_millis > 0 && !state.waveform_busy {
-        let shared_playing = state.transport_playing || state.reference_transport_playing;
-        let play_label = if shared_playing {
-            "Pause playback"
-        } else {
-            "Play track"
-        };
-        let play_control = ui::icon_button(review_transport_icon(
-            if shared_playing {
-                &REVIEW_PAUSE_ICON
-            } else {
-                &REVIEW_PLAY_ICON
+        .map_or_else(
+            || (String::from("Audio analysis pending"), 0),
+            |waveform| {
+                (
+                    format!(
+                        "{} Hz · {} channel{} · {}",
+                        waveform.sample_rate,
+                        waveform.channels,
+                        if waveform.channels == 1 { "" } else { "s" },
+                        format_duration(waveform.duration_millis),
+                    ),
+                    waveform.duration_millis,
+                )
             },
-            shared_playing,
-        ))
-        .active(shared_playing)
-        .message(Message::TogglePlayback)
-        .key("review-transport-play")
-        .tooltip(play_label)
-        .size(28.0, 24.0);
-        ui::row([
-            ui::text(format!(
-                "{metadata} · {} / {}",
-                format_timestamp(state.transport_position_millis.min(duration_millis)),
-                format_duration(duration_millis),
-            ))
-            .height(32.0)
-            .fill_width()
-            .subtle(),
-            ui::icon_button(review_transport_icon(&REVIEW_VOLUME_ICON, false))
-                .bare()
-                .focus(ui::FocusBehavior::None)
-                .passive::<Message>()
-                .key("review-transport-volume")
-                .tooltip(format!(
-                    "Volume {:02}",
-                    (state.audition_volume * 100.0).round() as u32
-                ))
-                .size(22.0, 24.0),
-            ui::slider(state.audition_volume)
-                .primary()
-                .compact()
-                .track_height(5.0)
-                .track_border()
-                .message(Message::AuditionVolumeChanged)
-                .key("native-audition-volume")
-                .height(24.0)
-                .width(128.0),
-            play_control,
-            ui::badge(analysis_state)
-                .passive()
-                .subtle()
-                .width(88.0)
-                .height(28.0),
-        ])
-        .spacing(8.0)
-        .fill_width()
-    } else {
-        ui::row([
-            ui::text(metadata).height(28.0).fill_width().subtle(),
-            ui::badge(analysis_state)
-                .passive()
-                .subtle()
-                .width(88.0)
-                .height(28.0),
-        ])
-        .spacing(8.0)
-        .fill_width()
-    };
+        );
+    let meter_lufs = current_lufs_meter_value(state, &track.id);
     let waveform_with_meter = ui::row([
         chrome::lufs_meter(meter_lufs, state.waveform_busy)
             .width(68.0)
@@ -5445,86 +5702,25 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
         .fill_width()
         .height(waveform_pair_height);
 
-    let mut waveform_section = vec![waveform_with_source];
-    if track.reference_path.is_some() {
-        waveform_section.push(reference_comments_panel(state, &track));
-    }
-    if let Some(draft) = state.draft_note.as_ref() {
-        waveform_section.push(note_editor(draft));
-    }
+    let waveform_status = ui::text(format!(
+        "{} · {metadata} · {} / {}",
+        track.title,
+        format_timestamp(state.transport_position_millis.min(duration_millis)),
+        format_duration(duration_millis),
+    ))
+    .key(format!("review-track-status-{}", track.id))
+    .truncate()
+    .height(18.0)
+    .fill_width()
+    .subtle();
+    let waveform_section = ui::column([waveform_with_source, waveform_status])
+        .spacing(4.0)
+        .fill_width();
 
-    let favorite_label = if track.favorite { "★" } else { "☆" };
-    let favorite_id = track.id.clone();
-    let replace_id = track.id.clone();
-    let favorite_input = ui::button(favorite_label)
-        .active(track.favorite)
-        .message(Message::ToggleFavorite(favorite_id))
-        .height(28.0);
-    let favorite_control = favorite_input;
-    let status_menu_open = state.status_menu_host == Some(StatusMenuHost::ReviewHeader)
-        && state.status_menu_track_id.as_deref() == Some(track.id.as_str());
-    let status_trigger =
-        status_dropdown_trigger(&track, status_menu_open, StatusMenuHost::ReviewHeader)
-            .width(126.0);
-    let mut track_header_rows = vec![
-        ui::row([
-            ui::text(track.title.clone())
-                .key(format!("review-track-title-{}", track.id))
-                .truncate()
-                .height(28.0)
-                .fill_width(),
-            ui::badge(track.stage.label().to_owned())
-                .passive()
-                .subtle()
-                .width(174.0)
-                .height(28.0),
-            status_trigger,
-            favorite_control.width(36.0).height(28.0),
-            ui::button("Replace")
-                .message(Message::ReplacePressed(replace_id))
-                .height(28.0)
-                .width(96.0)
-                .height(28.0),
-        ])
-        .fill_width()
+    let content = ui::column([waveform_section, comments_panel(state, &track)])
+        .padding(8.0)
         .spacing(8.0)
-        .height(ui::dropdown_trigger_height()),
-    ];
-    let options = status_dropdown_options(&track);
-    let menu_height = ui::dropdown_menu_height(options.len());
-    track_header_rows.push(
-        ui::row([
-            ui::spacer().fill_width().height(menu_height),
-            status_menu(&track, StatusMenuHost::ReviewHeader)
-                .width(126.0)
-                .height(menu_height),
-            ui::spacer().width(36.0 + 8.0 + 96.0).height(menu_height),
-        ])
-        .fill_width()
-        .key(format!("review-status-menu-{}", track.id))
-        .height(if status_menu_open { menu_height } else { 0.0 }),
-    );
-    track_header_rows.push(transport_controls);
-    let track_header_height = ui::dropdown_trigger_height()
-        + if status_menu_open { menu_height } else { 0.0 }
-        + 6.0
-        + 32.0;
-    let track_header = ui::column(track_header_rows)
-        .fill_width()
-        .height(track_header_height)
-        .spacing(3.0);
-
-    let content = ui::column([
-        track_header,
-        ui::column(waveform_section)
-            .padding(10.0)
-            .spacing(6.0)
-            .fill_width(),
-        comments_panel(state, &track),
-    ])
-    .padding(12.0)
-    .spacing(10.0)
-    .fill();
+        .fill();
     ui::stack([ui::card().fill(), content]).fill()
 }
 
@@ -5541,6 +5737,126 @@ fn reference_dropdown_paths(state: &AppState, track: &storage::Track) -> Vec<Pat
         paths.push(path.clone());
     }
     paths
+}
+
+fn review_reference_controls(state: &AppState, track: &storage::Track) -> ui::View<Message> {
+    let menu_open = reference_menu_is_open(state, track);
+    let selector_label = track
+        .reference_path
+        .as_ref()
+        .map_or("Choose reference".to_owned(), |path| {
+            reference_track_name(path)
+        });
+    let reference_id = track.id.clone();
+    let selector = ui::dropdown_trigger(selector_label, menu_open)
+        .toggle_message(Message::ToggleReferenceMenu(reference_id.clone()))
+        .build()
+        .key(format!("reference-dropdown-{}", track.id))
+        .width(REFERENCE_MENU_WIDTH)
+        .height(26.0)
+        .pointer_target(
+            ui::pointer_target(true)
+                .pointer_move(false)
+                .pointer_press(true)
+                .pointer_release(false)
+                .pointer_drop(false)
+                .wheel(false)
+                .filter_map(move |message| match message {
+                    ui::PointerShieldMessage::PointerPress { position, .. } => {
+                        Some(Message::ToggleReferenceMenuAt {
+                            track_id: reference_id.clone(),
+                            position,
+                        })
+                    }
+                    _ => None,
+                }),
+        );
+    let has_reference = track.reference_path.is_some();
+    let action = ui::button(if has_reference {
+        "Replace reference"
+    } else {
+        "Import reference"
+    })
+    .primary()
+    .message(Message::ReferencePressed(track.id.clone()))
+    .width(142.0)
+    .height(26.0);
+    let match_control = if state.reference_waveform.is_some() && !state.reference_waveform_busy {
+        ui::button("MATCH REF")
+            .active(state.reference_match_enabled)
+            .message(Message::ToggleReferenceMatch)
+            .width(112.0)
+            .height(26.0)
+    } else {
+        ui::button("MATCH REF")
+            .subtle()
+            .message(Message::ToggleReferenceMatch)
+            .width(112.0)
+            .height(26.0)
+    };
+    ui::row([
+        ui::text("REF")
+            .style(ui::WidgetStyle::strong(ui::WidgetTone::Accent))
+            .width(28.0)
+            .height(26.0),
+        selector,
+        match_control,
+        action,
+    ])
+    .spacing(8.0)
+    .height(26.0)
+}
+
+fn review_global_controls(state: &AppState, track: &storage::Track) -> ui::View<Message> {
+    let duration_millis = state
+        .waveform
+        .as_ref()
+        .filter(|_| state.waveform_track_id.as_deref() == Some(track.id.as_str()))
+        .map_or(0, |waveform| waveform.duration_millis);
+    let shared_playing = state.transport_playing || state.reference_transport_playing;
+    let play_control = ui::icon_button(review_transport_icon(
+        if shared_playing {
+            &REVIEW_PAUSE_ICON
+        } else {
+            &REVIEW_PLAY_ICON
+        },
+        shared_playing,
+    ))
+    .enabled(duration_millis > 0 && !state.waveform_busy)
+    .active(shared_playing)
+    .message(Message::TogglePlayback)
+    .key("review-transport-play")
+    .tooltip(if shared_playing {
+        "Pause playback"
+    } else {
+        "Play track"
+    })
+    .size(30.0, 26.0);
+    ui::row([
+        review_reference_controls(state, track),
+        ui::icon_button(review_transport_icon(&REVIEW_VOLUME_ICON, false))
+            .bare()
+            .focus(ui::FocusBehavior::None)
+            .passive::<Message>()
+            .key("review-transport-volume")
+            .tooltip(format!(
+                "Volume {:02}",
+                (state.audition_volume * 100.0).round() as u32
+            ))
+            .size(20.0, 26.0),
+        ui::slider(state.audition_volume)
+            .primary()
+            .compact()
+            .track_height(5.0)
+            .track_border()
+            .message(Message::AuditionVolumeChanged)
+            .key("native-audition-volume")
+            .height(26.0)
+            .width(180.0),
+        play_control,
+    ])
+    .spacing(6.0)
+    .height(26.0)
 }
 
 fn reference_dropdown_options(
@@ -5571,12 +5887,8 @@ fn reference_menu_is_open(state: &AppState, track: &storage::Track) -> bool {
 }
 
 fn reference_section_height(state: &AppState, track: &storage::Track) -> f32 {
-    let menu_height = if reference_menu_is_open(state, track) {
-        ui::dropdown_menu_height(reference_dropdown_paths(state, track).len()) + 3.0
-    } else {
-        0.0
-    };
-    REFERENCE_HEADER_HEIGHT + menu_height + REFERENCE_SECTION_SPACING + REFERENCE_WAVEFORM_HEIGHT
+    let _ = (state, track);
+    REFERENCE_WAVEFORM_HEIGHT
 }
 
 fn reference_waveform_section(state: &AppState, track: &storage::Track) -> ui::View<Message> {
@@ -5593,113 +5905,7 @@ fn reference_waveform_section(state: &AppState, track: &storage::Track) -> ui::V
                 waveform.duration_millis,
             )
         });
-    let reference_integrated_lufs =
-        reference_waveform.and_then(|waveform| waveform.integrated_lufs);
     let reference_meter_lufs = current_reference_lufs_meter_value(state, &track.id);
-    let match_gain_db = current_loudness_match_gain_db(state);
-    let reference_name = track.reference_path.as_ref().map_or_else(
-        || String::from("No reference track"),
-        |path| reference_track_name(path),
-    );
-    let reference_label = if let Some(reference_lufs) = reference_integrated_lufs {
-        format!("REFERENCE · {reference_name} · {reference_lufs:.1} LUFS")
-    } else if has_reference && state.reference_waveform_busy {
-        format!("REFERENCE · {reference_name} · BUILDING")
-    } else if has_reference {
-        format!("REFERENCE · {reference_name}")
-    } else {
-        String::from("REFERENCE TRACK")
-    };
-    let reference_label =
-        if let Some((_, _, start_millis, end_millis)) = reference_loop_bounds(state) {
-            format!(
-                "{reference_label} · LOOP {}–{}",
-                format_timestamp(start_millis),
-                format_timestamp(end_millis),
-            )
-        } else {
-            reference_label
-        };
-    let reference_paths = reference_dropdown_paths(state, track);
-    let menu_open = reference_menu_is_open(state, track);
-    let selector_label = track
-        .reference_path
-        .as_ref()
-        .map_or("Choose reference".to_owned(), |path| {
-            reference_track_name(path)
-        });
-    let selector_trigger = ui::dropdown_trigger(selector_label, menu_open)
-        .toggle_message(Message::ToggleReferenceMenu(track.id.clone()))
-        .build()
-        .key(format!("reference-dropdown-{}", track.id))
-        .width(190.0)
-        .height(26.0);
-    let selector = if menu_open {
-        ui::column([
-            selector_trigger,
-            ui::dropdown_menu(reference_dropdown_options(state, track))
-                .key(format!("reference-menu-{}", track.id))
-                .width(190.0)
-                .height(ui::dropdown_menu_height(reference_paths.len())),
-        ])
-        .spacing(3.0)
-        .width(190.0)
-        .height(ui::dropdown_menu_height(reference_paths.len()) + 29.0)
-    } else {
-        ui::column([selector_trigger]).width(190.0).height(26.0)
-    };
-    let action_label = if has_reference {
-        "Replace reference"
-    } else {
-        "Import reference"
-    };
-    let action = ui::button(action_label)
-        .primary()
-        .message(Message::ReferencePressed(track.id.clone()))
-        .width(142.0)
-        .height(26.0);
-    let reference_controls = if reference_waveform.is_some() && !state.reference_waveform_busy {
-        let match_label = match match_gain_db {
-            Some(gain_db) => format!("MATCH {gain_db:+.1} dB"),
-            None => String::from("MATCH REF"),
-        };
-        ui::row([
-            selector,
-            ui::button(match_label)
-                .active(state.reference_match_enabled && match_gain_db.is_some())
-                .message(Message::ToggleReferenceMatch)
-                .width(112.0)
-                .height(26.0),
-            action,
-        ])
-        .spacing(8.0)
-        .height(
-            reference_section_height(state, track)
-                - REFERENCE_SECTION_SPACING
-                - REFERENCE_WAVEFORM_HEIGHT,
-        )
-    } else {
-        ui::row([selector, action]).spacing(8.0).height(
-            reference_section_height(state, track)
-                - REFERENCE_SECTION_SPACING
-                - REFERENCE_WAVEFORM_HEIGHT,
-        )
-    };
-    let header_height = reference_section_height(state, track)
-        - REFERENCE_SECTION_SPACING
-        - REFERENCE_WAVEFORM_HEIGHT;
-    let header = ui::row([
-        ui::spacer().width(68.0).height(header_height),
-        ui::text(reference_label)
-            .truncate()
-            .height(24.0)
-            .fill_width()
-            .subtle(),
-        reference_controls,
-    ])
-    .spacing(8.0)
-    .fill_width()
-    .height(header_height);
     let reference_body = if let Some(waveform) = reference_waveform {
         let loop_selection = state
             .reference_loop_selection
@@ -5783,96 +5989,105 @@ fn reference_waveform_section(state: &AppState, track: &storage::Track) -> ui::V
         .spacing(0.0)
         .fill_width()
         .height(REFERENCE_WAVEFORM_HEIGHT);
-    ui::column([header, body])
-        .spacing(REFERENCE_SECTION_SPACING)
+    ui::column([body])
         .fill_width()
         .height(reference_section_height(state, track))
 }
 
-fn reference_comments_panel(state: &AppState, track: &storage::Track) -> ui::View<Message> {
-    let notes = reference_notes_for_track(&state.library, track).to_vec();
-    let open_count = notes.iter().filter(|note| !note.done).count();
-    let selected_note_id = state.selected_reference_note_id.clone();
-    let mut children = vec![
-        ui::row([
-            ui::text("REFERENCE COMMENTS / CLICK TO PIN")
-                .height(24.0)
-                .fill_width(),
-            ui::text(format!("{} total · {} open", notes.len(), open_count))
-                .height(24.0)
-                .subtle(),
-        ])
-        .fill_width()
-        .spacing(10.0),
-    ];
-    let list_height = if notes.is_empty() {
-        children.push(
-            ui::text("Click the lower reference waveform rail to add a comment for this file.")
-                .wrap()
-                .height(38.0)
-                .fill_width()
-                .subtle(),
-        );
-        38.0
-    } else {
-        let note_count = notes.len();
-        let list = ui::list(notes.into_iter().enumerate(), move |(index, note)| {
-            reference_note_row(index, note, selected_note_id.as_deref())
-        })
-        .without_chrome()
-        .fill_width()
-        .height(note_count as f32 * 44.0);
-        let height = note_count as f32 * 44.0;
-        children.push(list);
-        height
-    };
-    let editor_height = if let Some(draft) = state.reference_draft_note.as_ref() {
-        children.push(reference_note_editor(draft));
-        122.0
-    } else {
-        0.0
-    };
-    let height = 24.0 + 12.0 + 8.0 + list_height + editor_height;
-    ui::stack([
-        ui::card().fill(),
-        ui::column(children).padding(12.0).spacing(8.0).fill_width(),
-    ])
-    .fill_width()
-    .height(height)
-}
-
 fn comments_panel(state: &AppState, track: &storage::Track) -> ui::View<Message> {
-    let open_count = track.notes.iter().filter(|note| !note.done).count();
-    let selected_note_id = state.selected_note_id.clone();
+    let reference_available = track.reference_path.is_some();
+    let reference_notes = reference_notes_for_track(&state.library, track);
+    let source = if reference_available {
+        if state.comment_source == CommentSource::Reference
+            || (!state.comment_source_explicit
+                && track.notes.is_empty()
+                && !reference_notes.is_empty())
+        {
+            CommentSource::Reference
+        } else {
+            CommentSource::Main
+        }
+    } else {
+        CommentSource::Main
+    };
+    let (notes, selected_note_id, empty_message) = match source {
+        CommentSource::Main => (
+            track.notes.clone(),
+            state.selected_note_id.clone(),
+            "Click the lower main waveform rail to add a comment for this file.",
+        ),
+        CommentSource::Reference => (
+            reference_notes.to_vec(),
+            state.selected_reference_note_id.clone(),
+            "Click the lower reference waveform rail to add a comment for this file.",
+        ),
+    };
+    let open_count = notes.iter().filter(|note| !note.done).count();
+    let tabs = ui::row([
+        ui::button("MAIN")
+            .selected(source == CommentSource::Main)
+            .message(Message::SelectCommentSource(CommentSource::Main))
+            .key("comments-tab-main")
+            .width(76.0)
+            .height(28.0),
+        if reference_available {
+            ui::button("REFERENCE")
+                .selected(source == CommentSource::Reference)
+                .message(Message::SelectCommentSource(CommentSource::Reference))
+                .key("comments-tab-reference")
+                .width(112.0)
+                .height(28.0)
+        } else {
+            ui::text("REFERENCE").subtle().width(112.0).height(28.0)
+        },
+    ])
+    .spacing(4.0)
+    .height(28.0);
     let mut children = vec![
         ui::row([
-            ui::text("02  COMMENTS / CLICK TO PIN")
-                .height(24.0)
-                .fill_width(),
-            ui::text(format!("{} total · {} open", track.notes.len(), open_count))
-                .height(24.0)
+            ui::text("COMMENTS")
+                .style(ui::WidgetStyle::strong(ui::WidgetTone::Neutral))
+                .width(104.0)
+                .height(28.0),
+            tabs,
+            ui::spacer().fill_width(),
+            ui::text(format!("{} total · {} open", notes.len(), open_count))
+                .height(28.0)
                 .subtle(),
         ])
         .fill_width()
-        .spacing(10.0),
+        .spacing(8.0),
     ];
-    if track.notes.is_empty() {
+    if notes.is_empty() {
         children.push(
-            ui::text("Hover the lower waveform rail and click to place a timestamped comment.")
+            ui::text(empty_message)
                 .wrap()
                 .height(42.0)
                 .fill_width()
                 .subtle(),
         );
     } else {
-        let notes = track.notes.clone();
+        let note_count = notes.len();
+        let selected_note_id = selected_note_id.clone();
+        let source_for_rows = source;
         let list = ui::list(notes.into_iter().enumerate(), move |(index, note)| {
-            note_row(index, note, selected_note_id.as_deref())
+            if source_for_rows == CommentSource::Main {
+                note_row(index, note, selected_note_id.as_deref())
+            } else {
+                reference_note_row(index, note, selected_note_id.as_deref())
+            }
         })
         .without_chrome()
         .fill_width()
-        .fill_height();
+        .height(note_count as f32 * 44.0);
         children.push(list);
+    }
+    if source == CommentSource::Main {
+        if let Some(draft) = state.draft_note.as_ref() {
+            children.push(note_editor(draft));
+        }
+    } else if let Some(draft) = state.reference_draft_note.as_ref() {
+        children.push(reference_note_editor(draft));
     }
     let content = ui::column(children)
         .padding(12.0)
@@ -6216,17 +6431,18 @@ fn plural(count: usize) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, AuditionSource, ImportBatchProgress, Message, NoteDraft, ReferenceLoopSelection,
-        StatusMenuHost, WAVEFORM_HEIGHT, WorkspaceMode, apply_transport_snapshot,
-        audition_shuffle_seed, audition_statuses, current_loudness_match_gain_db,
-        current_lufs_meter_value, current_reference_lufs_meter_value, decode_result_is_current,
-        deterministic_shuffle, main_output_gain, native_launch_options, note_editor,
-        note_ratio_for_id, planner_drop_is_valid, playback_shortcut, project_surface,
-        rebuild_audition_queue, reconcile_audition_queue, reference_decode_result_is_current,
-        reference_loop_bounds, reference_output_gain, selected_reference_notes, selected_track,
-        stage_dropdown, stage_menu_anchor_from_pointer, stage_menu_popover,
-        status_dropdown_for_host, sync_audition_queue_after_status_change, tracks_in_stage,
-        tracks_with_status, transport_command_is_confirmed, update,
+        AppState, AuditionSource, ImportBatchProgress, Message, NoteDraft, REFERENCE_MENU_WIDTH,
+        ReferenceLoopSelection, StatusMenuHost, TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER,
+        WAVEFORM_HEIGHT, WorkspaceMode, apply_transport_snapshot, audition_shuffle_seed,
+        audition_statuses, current_loudness_match_gain_db, current_lufs_meter_value,
+        current_reference_lufs_meter_value, decode_result_is_current, deterministic_shuffle,
+        main_output_gain, native_launch_options, note_editor, note_ratio_for_id,
+        planner_drop_is_valid, playback_shortcut, project_surface, rebuild_audition_queue,
+        reconcile_audition_queue, reference_decode_result_is_current, reference_loop_bounds,
+        reference_output_gain, selected_reference_notes, selected_track, stage_dropdown,
+        stage_menu_anchor_from_pointer, stage_menu_popover, status_dropdown_for_host,
+        sync_audition_queue_after_status_change, tracks_in_stage, tracks_with_status,
+        transport_command_is_confirmed, update,
     };
     use crate::transport::Snapshot;
     use crate::{
@@ -7928,7 +8144,7 @@ mod tests {
             .expect("the draft editor should be visible after a lower click");
         let comments_rect = frame
             .paint_plan
-            .first_text_rect("02  COMMENTS / CLICK TO PIN")
+            .first_text_rect("COMMENTS")
             .expect("the lower comments panel should remain visible");
         let labels = frame.paint_plan.text_label_strings();
 
@@ -7948,8 +8164,8 @@ mod tests {
             "the draft editor should have one visible timestamp header"
         );
         assert!(
-            editor_rect.min.y < comments_rect.min.y,
-            "the draft editor should be rendered beneath the waveform and before the lower comments list"
+            comments_rect.min.y < editor_rect.min.y,
+            "the draft editor should be rendered inside the unified comments surface"
         );
         assert!(labels.iter().any(|label| label == "Save comment"));
         assert!(labels.iter().any(|label| label == "Cancel"));
@@ -8046,8 +8262,8 @@ mod tests {
             .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1_000.0));
         let reference_rect = frame
             .paint_plan
-            .first_text_rect("REFERENCE · reference.wav · -8.0 LUFS")
-            .expect("the reference track label should be visible");
+            .first_text_rect("reference.wav")
+            .expect("the global reference selector should be visible");
         let title_rect = frame
             .paint_plan
             .first_text_rect("Review track")
@@ -8066,6 +8282,7 @@ mod tests {
                 PaintPrimitive::FillRect(fill)
                     if fill.color == ThemeTokens::default().bg_secondary
                         && fill.rect.width() > 300.0
+                        && fill.rect.height() > 20.0
                         && fill.rect.height() <= WAVEFORM_HEIGHT =>
                 {
                     Some(fill.rect)
@@ -8082,9 +8299,9 @@ mod tests {
         let labels = frame.paint_plan.text_label_strings();
 
         assert!(labels.iter().any(|label| label == "Replace reference"));
-        assert!(labels.iter().any(|label| label == "● MAIN"));
-        assert!(labels.iter().any(|label| label == "○ REF"));
-        assert!(labels.iter().any(|label| label == "MATCH +0.0 dB"));
+        assert!(labels.iter().any(|label| label == "●"));
+        assert!(labels.iter().any(|label| label == "○"));
+        assert!(labels.iter().any(|label| label == "MATCH REF"));
         assert!(
             svg_count >= 3,
             "status, play, and volume icons should paint"
@@ -8105,20 +8322,14 @@ mod tests {
             labels
                 .iter()
                 .any(|label| label.contains("48000 Hz") && label.contains("00:00 / 00:02")),
-            "metadata and transport time should share the compact toolbar"
+            "metadata and transport time should share the compact waveform status line"
         );
+        assert!(reference_rect.min.y < main_waveform_rect.min.y);
         assert!(
-            (reference_rect.min.x - main_waveform_rect.min.x).abs() < 1.0,
-            "the reference label should align with the waveform body"
+            main_waveform_rect.min.y < metadata_rect.min.y,
+            "the transport metadata should sit below the compact waveform pair"
         );
-        assert!(
-            metadata_rect.min.y < main_waveform_rect.min.y,
-            "the transport metadata should remain in the top track header"
-        );
-        assert!(
-            reference_rect.min.y > title_rect.min.y,
-            "the reference section should be below the primary track header"
-        );
+        assert!(reference_rect.min.y < title_rect.min.y);
     }
 
     #[test]
@@ -8284,6 +8495,72 @@ mod tests {
     }
 
     #[test]
+    fn main_comment_draft_remains_visible_when_reference_comments_exist() {
+        let track_id = String::from("main-draft-with-reference-comments");
+        let reference_path = PathBuf::from("/external/reference-with-comments.wav");
+        let waveform = audition_waveform();
+        let mut state = AppState {
+            busy: false,
+            waveform: Some(waveform.clone()),
+            waveform_track_id: Some(track_id.clone()),
+            reference_waveform: Some(waveform),
+            reference_waveform_track_id: Some(track_id.clone()),
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(track_id.clone());
+        state.library.tracks.push(Track {
+            id: track_id.clone(),
+            title: String::from("Main draft track"),
+            original_name: String::from("main-draft.wav"),
+            path: PathBuf::from("/external/main-draft.wav"),
+            reference_path: Some(reference_path.clone()),
+            size: 0,
+            favorite: false,
+            stage: TrackStage::SoundDesign,
+            status: TrackStatus::Inbox,
+            notes: Vec::new(),
+        });
+        state.library.reference_tracks.push(ReferenceTrack {
+            path: reference_path,
+            notes: vec![Note {
+                id: String::from("reference-note"),
+                time_millis: 250,
+                body: String::from("Reference note"),
+                done: false,
+            }],
+        });
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::SelectCommentSource(super::CommentSource::Main),
+            &mut context,
+        );
+        update(
+            &mut state,
+            Message::WaveformClicked {
+                ratio: 0.5,
+                lower: true,
+            },
+            &mut context,
+        );
+
+        let labels = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(1_180.0, 1_000.0))
+            .paint_plan
+            .text_label_strings();
+        assert_eq!(state.comment_source, super::CommentSource::Main);
+        assert!(labels.iter().any(|label| label == "MAIN"));
+        assert!(labels.iter().any(|label| label == "COMMENT AT 00:00"));
+        assert!(labels.iter().any(|label| label == "Save comment"));
+        assert!(
+            !labels
+                .iter()
+                .any(|label| label == "REFERENCE COMMENT AT 00:00")
+        );
+    }
+
+    #[test]
     fn rendered_comments_panel_shows_all_comments_and_delete_controls() {
         let track_id = String::from("review-track");
         let mut state = AppState {
@@ -8322,11 +8599,7 @@ mod tests {
             .paint_plan
             .text_label_strings();
 
-        assert!(
-            labels
-                .iter()
-                .any(|label| label == "02  COMMENTS / CLICK TO PIN")
-        );
+        assert!(labels.iter().any(|label| label == "COMMENTS"));
         assert!(labels.iter().any(|label| label == "first comment"));
         assert!(labels.iter().any(|label| label == "second comment"));
         assert_eq!(
@@ -8687,6 +8960,7 @@ mod tests {
                 PaintPrimitive::FillRect(fill)
                     if fill.color == ThemeTokens::default().bg_secondary
                         && fill.rect.width() > 300.0
+                        && fill.rect.height() > 20.0
                         && fill.rect.height() <= WAVEFORM_HEIGHT =>
                 {
                     Some(fill.rect)
@@ -9681,6 +9955,100 @@ mod tests {
     }
 
     #[test]
+    fn expanded_reference_selector_is_clamped_and_interactive_at_1180px() {
+        let track_id = String::from("reference-selector-track");
+        let first_path = PathBuf::from("/external/first-reference.wav");
+        let second_path = PathBuf::from("/external/second-reference.wav");
+        let mut state = AppState {
+            busy: false,
+            workspace_mode: WorkspaceMode::Review,
+            reference_menu_track_id: Some(track_id.clone()),
+            reference_menu_anchor: Some(Point::new(1_080.0, 42.0)),
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(track_id.clone());
+        state.library.tracks.push(Track {
+            id: track_id.clone(),
+            title: String::from("Reference selector track"),
+            original_name: String::from("main.wav"),
+            path: PathBuf::from("/external/main.wav"),
+            reference_path: Some(first_path.clone()),
+            size: 0,
+            favorite: false,
+            stage: TrackStage::Production,
+            status: TrackStatus::Inbox,
+            notes: Vec::new(),
+        });
+        state.library.reference_tracks = vec![
+            ReferenceTrack {
+                path: first_path,
+                notes: Vec::new(),
+            },
+            ReferenceTrack {
+                path: second_path.clone(),
+                notes: Vec::new(),
+            },
+        ];
+        let bridge = DeclarativeOwnedRuntimeBridge::new(
+            state,
+            |state| project_surface(state).into_surface(),
+            |state, message| {
+                if let Message::SetReferenceTrack { track_id, path } = message {
+                    assert_eq!(track_id, "reference-selector-track");
+                    state.library.tracks[0].reference_path = Some(path);
+                    state.reference_menu_track_id = None;
+                    state.reference_menu_anchor = None;
+                }
+            },
+        );
+        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1_180.0, 1_000.0));
+        let frame = runtime.frame(&ThemeTokens::default());
+        let menu_rect = frame
+            .paint_plan
+            .primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                PaintPrimitive::FillRect(fill)
+                    if fill.color == ThemeTokens::default().surface_overlay
+                        && fill.rect.width() >= REFERENCE_MENU_WIDTH - 1.0 =>
+                {
+                    Some(fill.rect)
+                }
+                _ => None,
+            })
+            .expect("expanded reference selector should paint a menu surface");
+        assert!(menu_rect.min.x >= 0.0);
+        assert!(menu_rect.max.x <= 1_180.0);
+        assert!(menu_rect.min.y >= 0.0);
+        assert!(menu_rect.max.y <= 1_000.0);
+
+        let option_rect = frame
+            .paint_plan
+            .primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                PaintPrimitive::Text(text) if text.text.as_str() == "second-reference.wav" => {
+                    Some(text.rect)
+                }
+                _ => None,
+            })
+            .expect("expanded reference selector should paint the second option");
+        let option_point = Point::new(
+            option_rect.min.x + option_rect.width() * 0.5,
+            option_rect.min.y + option_rect.height() * 0.5,
+        );
+        assert!(runtime.widget_at(option_point).is_some());
+        runtime.dispatch_event(Event::primary_press(option_point));
+        runtime.dispatch_event(Event::primary_release(option_point));
+
+        assert_eq!(
+            runtime.bridge().state().library.tracks[0].reference_path,
+            Some(second_path)
+        );
+        assert!(runtime.bridge().state().reference_menu_track_id.is_none());
+    }
+
+    #[test]
     fn open_status_dropdown_projects_statuses_in_product_order() {
         let track = Track {
             id: String::from("status-menu"),
@@ -9872,13 +10240,14 @@ mod tests {
             .find_map(|primitive| match primitive {
                 PaintPrimitive::Text(text)
                     if text.text.as_str() == TrackStatus::Inbox.label()
-                        && text.rect.min.x > super::LIBRARY_WIDTH =>
+                        && text.rect.min.x < super::LIBRARY_WIDTH
+                        && text.rect.min.y > 40.0 =>
                 {
                     Some((text.widget_id, text.rect))
                 }
                 _ => None,
             })
-            .expect("the selected review header should paint its status trigger");
+            .expect("the selected library card should paint its status trigger");
         assert!(runtime.focus_widget(trigger));
         assert_eq!(
             runtime.dispatch_event(Event::key_press(ui::WidgetKey::Enter)),
@@ -10806,6 +11175,57 @@ mod tests {
     }
 
     #[test]
+    fn integrated_titlebar_keeps_workspace_tabs_clear_of_traffic_lights_and_global_controls_visible()
+     {
+        let track_id = String::from("titlebar-layout-track");
+        let mut state = AppState {
+            busy: false,
+            workspace_mode: WorkspaceMode::Review,
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(track_id.clone());
+        state.library.tracks.push(Track {
+            id: track_id,
+            title: String::from("Titlebar layout track"),
+            original_name: String::from("titlebar-layout-track.wav"),
+            path: PathBuf::from("/external/titlebar-layout-track.wav"),
+            reference_path: None,
+            size: 0,
+            favorite: false,
+            stage: TrackStage::Production,
+            status: TrackStatus::Inbox,
+            notes: Vec::new(),
+        });
+
+        let frame = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 720.0));
+        let text_bounds = |label: &str| {
+            frame
+                .paint_plan
+                .primitives
+                .iter()
+                .find_map(|primitive| match primitive {
+                    PaintPrimitive::Text(text) if text.text.as_str() == label => Some(text.rect),
+                    _ => None,
+                })
+        };
+        let first_tab = text_bounds("Review").expect("the Review workspace tab should render");
+        assert!(
+            first_tab.min.x >= TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER,
+            "the first workspace tab must start after the native traffic-light safe gutter: {first_tab:?}"
+        );
+
+        for label in ["MATCH REF", "Import reference"] {
+            let bounds = text_bounds(label)
+                .unwrap_or_else(|| panic!("the right-side global control {label:?} should render"));
+            assert!(
+                bounds.max.x <= 1180.0,
+                "the right-side global control {label:?} must remain inside the 1180px frame: {bounds:?}"
+            );
+        }
+    }
+
+    #[test]
     fn audition_surface_projects_filters_queue_and_shuffle_control() {
         let track = |id: &str, status: TrackStatus| Track {
             id: String::from(id),
@@ -10887,13 +11307,581 @@ mod tests {
                 .paint_plan
                 .text_label_strings();
             assert!(
-                labels.iter().any(|label| label == "★ STARRED"),
+                labels.iter().any(|label| label == "★"),
                 "missing starred marker in {mode:?}"
             );
             assert!(
-                labels.iter().any(|label| label == "☆ UNSTARRED"),
+                labels.iter().any(|label| label == "☆"),
                 "missing unstarred marker in {mode:?}"
             );
+        }
+    }
+
+    #[test]
+    fn library_track_cards_paint_persistent_rails_and_stronger_outlines() {
+        let mut state = AppState {
+            busy: false,
+            ..AppState::default()
+        };
+        let selected = audition_track("selected-track");
+        let unselected = audition_track("unselected-track");
+        state.library.selected_track_id = Some(selected.id.clone());
+        state.library.tracks = vec![selected, unselected];
+
+        let frame = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(800.0, 600.0));
+        let theme = ThemeTokens::default();
+        let is_track_card_polygon = |points: &[Point]| {
+            if points.len() != 5 {
+                return false;
+            }
+            let min_x = points
+                .iter()
+                .map(|point| point.x)
+                .fold(f32::INFINITY, f32::min);
+            let min_y = points
+                .iter()
+                .map(|point| point.y)
+                .fold(f32::INFINITY, f32::min);
+            let max_x = points
+                .iter()
+                .map(|point| point.x)
+                .fold(f32::NEG_INFINITY, f32::max);
+            let max_y = points
+                .iter()
+                .map(|point| point.y)
+                .fold(f32::NEG_INFINITY, f32::max);
+            max_x - min_x > 200.0 && max_y - min_y > 60.0
+        };
+        let card_fills = frame
+            .paint_plan
+            .fill_polygons()
+            .filter(|fill| fill.color == theme.bg_primary && is_track_card_polygon(&fill.points))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            card_fills.len(),
+            2,
+            "selected and unselected library cards should each paint one chamfered base"
+        );
+
+        let selected_card_widget_id = card_fills
+            .iter()
+            .find_map(|fill| {
+                frame.paint_plan.primitives.iter().find_map(|primitive| {
+                    matches!(
+                        primitive,
+                        PaintPrimitive::StrokePolygon(stroke)
+                            if stroke.widget_id == fill.widget_id
+                                && stroke.color == super::TRACK_CARD_SELECTED_CORAL
+                                && stroke.points.as_ref() == fill.points.as_ref()
+                    )
+                    .then_some(fill.widget_id)
+                })
+            })
+            .expect("selected library card should paint a coral polygon outline");
+        let unselected_card_widget_id = card_fills
+            .iter()
+            .find_map(|fill| {
+                frame.paint_plan.primitives.iter().find_map(|primitive| {
+                    matches!(
+                        primitive,
+                            PaintPrimitive::StrokePolygon(stroke)
+                                if stroke.widget_id == fill.widget_id
+                                && stroke.color == theme.grid_strong
+                                && stroke.points.as_ref() == fill.points.as_ref()
+                    )
+                    .then_some(fill.widget_id)
+                })
+            })
+            .expect("unselected library card should paint a neutral polygon outline");
+
+        let selected_card_points = card_fills
+            .iter()
+            .find(|fill| fill.widget_id == selected_card_widget_id)
+            .expect("selected card base should be paired with its outline")
+            .points
+            .clone();
+        let unselected_card_points = card_fills
+            .iter()
+            .find(|fill| fill.widget_id == unselected_card_widget_id)
+            .expect("unselected card base should be paired with its outline")
+            .points
+            .clone();
+        let assert_bottom_right_chamfer = |points: &[Point]| {
+            assert_eq!(points.len(), 5);
+            let min_x = points
+                .iter()
+                .map(|point| point.x)
+                .fold(f32::INFINITY, f32::min);
+            let min_y = points
+                .iter()
+                .map(|point| point.y)
+                .fold(f32::INFINITY, f32::min);
+            let max_x = points
+                .iter()
+                .map(|point| point.x)
+                .fold(f32::NEG_INFINITY, f32::max);
+            let max_y = points
+                .iter()
+                .map(|point| point.y)
+                .fold(f32::NEG_INFINITY, f32::max);
+            assert!((points[0].x - min_x).abs() < 0.01);
+            assert!((points[0].y - min_y).abs() < 0.01);
+            assert!((points[1].x - max_x).abs() < 0.01);
+            assert!((points[1].y - min_y).abs() < 0.01);
+            assert!((points[2].x - max_x).abs() < 0.01);
+            assert!((points[2].y - max_y).abs() > 0.01);
+            assert!((points[3].x - max_x).abs() > 0.01);
+            assert!((points[3].y - max_y).abs() < 0.01);
+            assert!((points[4].x - min_x).abs() < 0.01);
+            assert!((points[4].y - max_y).abs() < 0.01);
+            assert!((points[1].x - points[3].x) > 0.0);
+            assert!((points[4].y - points[2].y) > 0.0);
+            assert!(((points[1].x - points[3].x) - (points[4].y - points[2].y)).abs() < 0.01);
+        };
+        assert_bottom_right_chamfer(&selected_card_points);
+        assert_bottom_right_chamfer(&unselected_card_points);
+        assert!(
+            ((selected_card_points[1].x - selected_card_points[3].x)
+                - (unselected_card_points[1].x - unselected_card_points[3].x))
+                .abs()
+                < 0.01,
+            "selected and unselected cards should share one chamfer size"
+        );
+
+        let selected_card_stroke = frame
+            .paint_plan
+            .primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                PaintPrimitive::StrokePolygon(stroke)
+                    if stroke.widget_id == selected_card_widget_id =>
+                {
+                    Some(stroke)
+                }
+                _ => None,
+            })
+            .expect("selected library card should have one polygon outline");
+        assert_eq!(selected_card_stroke.color, super::TRACK_CARD_SELECTED_CORAL);
+        assert_eq!(selected_card_stroke.width, super::TRACK_CARD_OUTLINE_WIDTH);
+        let unselected_card_stroke = frame
+            .paint_plan
+            .primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                PaintPrimitive::StrokePolygon(stroke)
+                    if stroke.widget_id == unselected_card_widget_id =>
+                {
+                    Some(stroke)
+                }
+                _ => None,
+            })
+            .expect("unselected library card should have one polygon outline");
+        assert_eq!(unselected_card_stroke.color, theme.grid_strong);
+        assert_eq!(
+            unselected_card_stroke.width,
+            super::TRACK_CARD_OUTLINE_WIDTH
+        );
+        assert!(
+            !frame
+                .paint_plan
+                .fill_polygons_for_widget(selected_card_widget_id)
+                .any(|fill| fill.color == super::TRACK_CARD_SELECTED_CORAL)
+        );
+
+        let selected_rails = frame
+            .paint_plan
+            .fill_rects_for_widget(selected_card_widget_id)
+            .filter(|fill| fill.color == super::TRACK_CARD_SELECTED_CORAL)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            selected_rails.len(),
+            1,
+            "selected card should paint one coral rail"
+        );
+        assert_eq!(selected_rails[0].rect.width(), super::TRACK_CARD_RAIL_WIDTH);
+        assert_eq!(
+            selected_rails[0].rect.height(),
+            selected_card_points
+                .iter()
+                .map(|point| point.y)
+                .fold(f32::NEG_INFINITY, f32::max)
+                - selected_card_points
+                    .iter()
+                    .map(|point| point.y)
+                    .fold(f32::INFINITY, f32::min)
+                - (super::TRACK_CARD_RAIL_VERTICAL_INSET * 2.0)
+        );
+
+        let unselected_rails = frame
+            .paint_plan
+            .fill_rects_for_widget(unselected_card_widget_id)
+            .filter(|fill| fill.color == theme.grid_strong)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            unselected_rails.len(),
+            1,
+            "unselected card should paint one neutral strong-grid rail"
+        );
+        assert_eq!(
+            unselected_rails[0].rect.width(),
+            super::TRACK_CARD_RAIL_WIDTH
+        );
+
+        let selected_min_x = selected_card_points
+            .iter()
+            .map(|point| point.x)
+            .fold(f32::INFINITY, f32::min);
+        let selected_min_y = selected_card_points
+            .iter()
+            .map(|point| point.y)
+            .fold(f32::INFINITY, f32::min);
+        let selected_max_y = selected_card_points
+            .iter()
+            .map(|point| point.y)
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            frame.paint_plan.fill_rects().any(|fill| {
+                fill.color == super::TRACK_CARD_SELECTED_CORAL
+                    && (fill.rect.width() - super::TRACK_CARD_RAIL_WIDTH).abs() < 0.01
+                    && fill.rect.min.x >= selected_min_x
+                    && fill.rect.min.x
+                        <= selected_min_x
+                            + super::TRACK_CARD_RAIL_EDGE_INSET
+                            + super::TRACK_CARD_RAIL_WIDTH
+                    && fill.rect.min.y >= selected_min_y
+                    && fill.rect.max.y <= selected_max_y
+            }),
+            "the selected card should paint one leading coral rail"
+        );
+        assert!(!frame.paint_plan.primitives.iter().any(|primitive| {
+            primitive.widget_id() == Some(unselected_card_widget_id)
+                && matches!(
+                    primitive,
+                    PaintPrimitive::FillRect(fill)
+                        if fill.color == super::TRACK_CARD_SELECTED_CORAL
+                )
+                || primitive.widget_id() == Some(unselected_card_widget_id)
+                    && matches!(
+                        primitive,
+                        PaintPrimitive::FillPolygon(fill)
+                            if fill.color == super::TRACK_CARD_SELECTED_CORAL
+                    )
+                || primitive.widget_id() == Some(unselected_card_widget_id)
+                    && matches!(
+                        primitive,
+                    PaintPrimitive::StrokePolygon(stroke)
+                            if stroke.color == super::TRACK_CARD_SELECTED_CORAL
+                    )
+        }));
+        assert_eq!(
+            frame
+                .paint_plan
+                .fill_rects_for_widget(selected_card_widget_id)
+                .count(),
+            1,
+            "the interactive-row underlay must not duplicate the selected card rail"
+        );
+    }
+
+    #[test]
+    fn library_track_card_content_inset_grows_bounds_without_resizing_controls() {
+        let track_id = String::from("card-inset-track");
+        let mut state = AppState {
+            busy: false,
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(track_id.clone());
+        state.library.tracks = vec![audition_track(&track_id)];
+        let frame = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(800.0, 600.0));
+        let theme = ThemeTokens::default();
+        let card = frame
+            .paint_plan
+            .fill_polygons()
+            .find(|fill| {
+                fill.color == theme.bg_primary
+                    && fill.points.len() == 5
+                    && fill
+                        .points
+                        .iter()
+                        .map(|point| point.x)
+                        .fold(f32::NEG_INFINITY, f32::max)
+                        - fill
+                            .points
+                            .iter()
+                            .map(|point| point.x)
+                            .fold(f32::INFINITY, f32::min)
+                        > 200.0
+                    && fill
+                        .points
+                        .iter()
+                        .map(|point| point.y)
+                        .fold(f32::NEG_INFINITY, f32::max)
+                        - fill
+                            .points
+                            .iter()
+                            .map(|point| point.y)
+                            .fold(f32::INFINITY, f32::min)
+                        > 60.0
+            })
+            .expect("the track row should paint one card base");
+        let card_bounds = Rect::from_min_max(
+            Point::new(
+                card.points
+                    .iter()
+                    .map(|point| point.x)
+                    .fold(f32::INFINITY, f32::min),
+                card.points
+                    .iter()
+                    .map(|point| point.y)
+                    .fold(f32::INFINITY, f32::min),
+            ),
+            Point::new(
+                card.points
+                    .iter()
+                    .map(|point| point.x)
+                    .fold(f32::NEG_INFINITY, f32::max),
+                card.points
+                    .iter()
+                    .map(|point| point.y)
+                    .fold(f32::NEG_INFINITY, f32::max),
+            ),
+        );
+        let expected_height = 26.0
+            + (ui::dropdown_trigger_height() * 2.0)
+            + (super::TRACK_CARD_CONTENT_SPACING * 3.0)
+            + (super::TRACK_CARD_CONTENT_INSET * 2.0);
+        assert!(
+            (card_bounds.height() - expected_height).abs() < 0.01,
+            "card height should include the larger content inset: bounds={card_bounds:?}"
+        );
+
+        let control_bounds = |label: &str| {
+            let run = frame
+                .paint_plan
+                .text_runs()
+                .find(|run| {
+                    run.text.as_str() == label
+                        && run.rect.min.x < super::LIBRARY_WIDTH
+                        && run.rect.min.y >= card_bounds.min.y
+                        && run.rect.max.y <= card_bounds.max.y
+                })
+                .unwrap_or_else(|| panic!("missing {label:?} control label"));
+            frame
+                .layout
+                .rects
+                .get(&run.widget_id)
+                .copied()
+                .unwrap_or_else(|| panic!("missing {label:?} control bounds"))
+        };
+        let title_bounds = control_bounds(&track_id);
+        let stage_bounds = control_bounds("Production / arrangement");
+        let status_bounds = control_bounds("Inbox");
+        for (label, bounds) in [("title", title_bounds), ("stage", stage_bounds)] {
+            assert!(
+                (bounds.min.x - card_bounds.min.x - super::TRACK_CARD_CONTENT_INSET).abs() < 0.01,
+                "{label} should start at the card content inset: card={card_bounds:?}, control={bounds:?}"
+            );
+        }
+        assert!(
+            (status_bounds.min.x
+                - card_bounds.min.x
+                - super::TRACK_CARD_CONTENT_INSET
+                - super::STATUS_RAIL_WIDTH
+                - super::STATUS_RAIL_GAP)
+                .abs()
+                < 0.01,
+            "status trigger should follow its inset rail and gap: card={card_bounds:?}, control={status_bounds:?}"
+        );
+        assert_eq!(stage_bounds.height(), 24.0);
+        assert_eq!(status_bounds.height(), ui::dropdown_trigger_height());
+        let status_rail = frame
+            .paint_plan
+            .fill_rects()
+            .find(|fill| {
+                fill.rect.width() == super::STATUS_RAIL_WIDTH
+                    && fill.rect.height() == ui::dropdown_trigger_height()
+                    && fill.rect.min.x >= card_bounds.min.x
+                    && fill.rect.max.x <= card_bounds.max.x
+            })
+            .expect("the status dropdown should retain its compact semantic rail");
+        assert!(
+            (status_rail.rect.min.x - card_bounds.min.x - super::TRACK_CARD_CONTENT_INSET).abs()
+                < 0.01
+        );
+    }
+
+    #[test]
+    fn library_cards_are_inset_from_scrollbar_and_separated() {
+        let mut state = AppState {
+            busy: false,
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(String::from("track-0"));
+        state.library.tracks = (0..12)
+            .map(|index| audition_track(&format!("track-{index}")))
+            .collect();
+
+        let frame = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(800.0, 600.0));
+        let theme = ThemeTokens::default();
+        let mut card_rects = frame
+            .paint_plan
+            .fill_polygons()
+            .filter(|fill| {
+                fill.color == theme.bg_primary
+                    && fill.points.len() == 5
+                    && fill
+                        .points
+                        .iter()
+                        .map(|point| point.x)
+                        .fold(f32::NEG_INFINITY, f32::max)
+                        - fill
+                            .points
+                            .iter()
+                            .map(|point| point.x)
+                            .fold(f32::INFINITY, f32::min)
+                        > 200.0
+                    && fill
+                        .points
+                        .iter()
+                        .map(|point| point.y)
+                        .fold(f32::NEG_INFINITY, f32::max)
+                        - fill
+                            .points
+                            .iter()
+                            .map(|point| point.y)
+                            .fold(f32::INFINITY, f32::min)
+                        > 60.0
+            })
+            .map(|fill| {
+                Rect::from_min_max(
+                    Point::new(
+                        fill.points
+                            .iter()
+                            .map(|point| point.x)
+                            .fold(f32::INFINITY, f32::min),
+                        fill.points
+                            .iter()
+                            .map(|point| point.y)
+                            .fold(f32::INFINITY, f32::min),
+                    ),
+                    Point::new(
+                        fill.points
+                            .iter()
+                            .map(|point| point.x)
+                            .fold(f32::NEG_INFINITY, f32::max),
+                        fill.points
+                            .iter()
+                            .map(|point| point.y)
+                            .fold(f32::NEG_INFINITY, f32::max),
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        card_rects.sort_by(|left, right| left.min.y.total_cmp(&right.min.y));
+        assert!(
+            card_rects.len() >= 2,
+            "the frame should expose multiple library cards"
+        );
+
+        let first = card_rects[0];
+        let library_origin_x = 18.0;
+        assert!(
+            (first.min.x - (library_origin_x + 10.0 + super::LIBRARY_LIST_INSET)).abs() < 0.01,
+            "unexpected library card left inset: first={first:?} expected={}",
+            library_origin_x + 10.0 + super::LIBRARY_LIST_INSET
+        );
+        assert!(
+            (first.max.x
+                - (library_origin_x + super::LIBRARY_WIDTH - 10.0 - super::LIBRARY_LIST_INSET))
+                .abs()
+                < 0.01
+        );
+        for pair in card_rects.windows(2) {
+            assert!(
+                pair[1].min.y - pair[0].max.y >= super::LIBRARY_CARD_SPACING - 0.01,
+                "library cards should retain a visible vertical gap: {:?} then {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+
+        let scrollbar = frame
+            .paint_plan
+            .fill_rects()
+            .find(|fill| {
+                (fill.rect.width() - 3.0).abs() < 0.01
+                    && fill.rect.min.x > super::LIBRARY_WIDTH - 6.0
+            })
+            .expect("overflowing library content should paint a virtual scrollbar thumb");
+        assert!(
+            first.max.x < scrollbar.rect.min.x,
+            "card right border must remain left of the scrollbar: card={first:?}, scrollbar={:?}",
+            scrollbar.rect
+        );
+    }
+
+    #[test]
+    fn status_dropdown_uses_neutral_body_and_compact_semantic_rail() {
+        let theme = ThemeTokens::default();
+        let statuses = [
+            (TrackStatus::Inbox, super::TRACK_CARD_SELECTED_CORAL),
+            (TrackStatus::Refine, theme.accent_warning),
+            (TrackStatus::Release, theme.highlight_cyan),
+            (TrackStatus::Archive, theme.text_muted),
+            (TrackStatus::Maybe, theme.accent_danger),
+        ];
+
+        for (status, expected_rail_color) in statuses {
+            let mut track = audition_track("status-rail");
+            track.status = status;
+            let frame = ui::scene(status_dropdown_for_host(
+                &track,
+                false,
+                false,
+                StatusMenuHost::Library,
+            ))
+            .into_view()
+            .view_frame_at_size_with_default_theme(Vector2::new(240.0, 80.0));
+            let label = frame
+                .paint_plan
+                .text_runs()
+                .find(|run| run.text.as_str() == status.label())
+                .expect("status trigger should paint its selected label");
+            let body = frame
+                .paint_plan
+                .fill_polygons()
+                .find(|fill| {
+                    fill.widget_id == label.widget_id && fill.color == theme.surface_overlay
+                })
+                .expect("status trigger should use a neutral dark body");
+            let body_min_x = body
+                .points
+                .iter()
+                .map(|point| point.x)
+                .fold(f32::INFINITY, f32::min);
+            let rail = frame
+                .paint_plan
+                .fill_rects()
+                .find(|fill| {
+                    fill.color == expected_rail_color
+                        && (fill.rect.width() - super::STATUS_RAIL_WIDTH).abs() < 0.01
+                })
+                .expect("status trigger should paint one semantic color rail");
+            assert!(rail.rect.max.x <= body_min_x);
+            assert_eq!(rail.rect.height(), ui::dropdown_trigger_height());
+            assert!(!frame.paint_plan.fill_polygons().any(|fill| {
+                fill.widget_id == label.widget_id
+                    && [
+                        super::TRACK_CARD_SELECTED_CORAL,
+                        theme.accent_warning,
+                        theme.highlight_cyan,
+                        theme.accent_danger,
+                    ]
+                    .contains(&fill.color)
+            }));
         }
     }
 
