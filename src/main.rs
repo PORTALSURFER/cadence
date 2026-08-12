@@ -9,6 +9,7 @@ use radiant::{
         AnchoredPopoverParts, anchored_popover_from_parts, dismissible_anchored_popover_from_parts,
     },
     gui::{
+        list::DenseRowMarkerParts,
         svg::IconName,
         types::{Point, Rect, Vector2},
     },
@@ -7508,6 +7509,16 @@ fn note_row(
         .double_activate(move || Message::EditNote(double_edit_id.clone()));
     let row_surface = ui::interactive_row_underlay(row)
         .selected(selected)
+        .style(ui::WidgetStyle::subtle(ui::WidgetTone::Accent))
+        .leading_marker_if(
+            selected,
+            ui::DenseRowMarkerStyle::new(
+                DenseRowMarkerParts::leading(3.0)
+                    .edge_inset(1.0)
+                    .vertical_inset(3.0),
+                TRACK_CARD_SELECTED_CORAL,
+            ),
+        )
         .stable_row_identity(0xCAD3_0002, note_id.clone())
         .actions(row_actions)
         .fill_width()
@@ -7595,6 +7606,16 @@ fn reference_note_row(
         .double_activate(move || Message::EditReferenceNote(double_edit_id.clone()));
     let row_surface = ui::interactive_row_underlay(row)
         .selected(selected)
+        .style(ui::WidgetStyle::subtle(ui::WidgetTone::Accent))
+        .leading_marker_if(
+            selected,
+            ui::DenseRowMarkerStyle::new(
+                DenseRowMarkerParts::leading(3.0)
+                    .edge_inset(1.0)
+                    .vertical_inset(3.0),
+                TRACK_CARD_SELECTED_CORAL,
+            ),
+        )
         .stable_row_identity(0xCAD3_0003, note_id)
         .actions(row_actions)
         .fill_width()
@@ -7753,19 +7774,19 @@ mod tests {
     use super::{
         APP_VERSION_LABEL, AppState, AuditionSource, FavoriteMarkerWidget, ImportBatchProgress,
         LoopBounds, LoopSelection, LoopSelections, Message, NoteDraft, REFERENCE_MENU_WIDTH,
-        StatusMenuHost, TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER, WAVEFORM_HEIGHT, WorkspaceMode,
-        apply_transport_snapshot, audition_panel, audition_shuffle_seed, audition_statuses,
-        current_loudness_match_gain_db, current_lufs_meter_value,
-        current_reference_lufs_meter_value, decode_result_is_current, deterministic_shuffle,
-        enforce_loop, favorite_toggle, keyboard_settings_anchor, library_track_title_id,
-        loop_bounds, main_output_gain, native_launch_options, note_editor, note_ratio_for_id,
-        planner_drop_is_valid, playback_shortcut, project_surface, rebuild_audition_queue,
-        reconcile_audition_queue, reference_decode_result_is_current, reference_output_gain,
-        review_status_filter_message, selected_reference_notes, selected_track,
-        settings_anchor_from_pointer, stage_dropdown, stage_menu_anchor_from_pointer,
-        stage_menu_popover, status_dropdown_for_host, status_filter_dropdown,
-        sync_audition_queue_after_status_change, tracks_in_stage, tracks_with_status,
-        transport_command_is_confirmed, update,
+        StatusMenuHost, TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER, TRACK_CARD_SELECTED_CORAL,
+        WAVEFORM_HEIGHT, WorkspaceMode, apply_transport_snapshot, audition_panel,
+        audition_shuffle_seed, audition_statuses, current_loudness_match_gain_db,
+        current_lufs_meter_value, current_reference_lufs_meter_value, decode_result_is_current,
+        deterministic_shuffle, enforce_loop, favorite_toggle, keyboard_settings_anchor,
+        library_track_title_id, loop_bounds, main_output_gain, native_launch_options, note_editor,
+        note_ratio_for_id, planner_drop_is_valid, playback_shortcut, project_surface,
+        rebuild_audition_queue, reconcile_audition_queue, reference_decode_result_is_current,
+        reference_output_gain, review_status_filter_message, selected_reference_notes,
+        selected_track, settings_anchor_from_pointer, stage_dropdown,
+        stage_menu_anchor_from_pointer, stage_menu_popover, status_dropdown_for_host,
+        status_filter_dropdown, sync_audition_queue_after_status_change, tracks_in_stage,
+        tracks_with_status, transport_command_is_confirmed, update,
     };
     use crate::transport::Snapshot;
     use crate::{
@@ -11100,6 +11121,7 @@ mod tests {
         let track_id = String::from("review-track");
         let mut state = AppState {
             busy: false,
+            selected_note_id: Some(String::from("open-note")),
             ..AppState::default()
         };
         state.library.selected_track_id = Some(track_id.clone());
@@ -11129,10 +11151,9 @@ mod tests {
             ],
         });
 
-        let labels = project_surface(&state)
-            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1000.0))
-            .paint_plan
-            .text_label_strings();
+        let frame = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1000.0));
+        let labels = frame.paint_plan.text_label_strings();
 
         assert!(labels.iter().any(|label| label == "COMMENTS"));
         assert!(labels.iter().any(|label| label == "first comment"));
@@ -11143,6 +11164,90 @@ mod tests {
                 "comment rows should not render the {obsolete_action} action"
             );
         }
+        let theme = ThemeTokens::default();
+        let selected_row_id = ui::stable_widget_id(0xCAD3_0002, "open-note");
+        let unselected_row_id = ui::stable_widget_id(0xCAD3_0002, "done-note");
+        assert!(
+            frame
+                .paint_plan
+                .fill_rects_for_widget(selected_row_id)
+                .any(|fill| { fill.color == theme.accent_mint.with_alpha(120) }),
+            "selected main comment should paint an accent selection fill"
+        );
+        assert!(
+            frame
+                .paint_plan
+                .fill_rects_for_widget(selected_row_id)
+                .any(|fill| {
+                    fill.color == TRACK_CARD_SELECTED_CORAL
+                        && (fill.rect.width() - 3.0).abs() < 0.01
+                }),
+            "selected main comment should paint an orange leading marker"
+        );
+        assert!(
+            !frame
+                .paint_plan
+                .fill_rects_for_widget(unselected_row_id)
+                .any(|fill| fill.color == TRACK_CARD_SELECTED_CORAL),
+            "unselected main comment should not paint the orange selection marker"
+        );
+    }
+
+    #[test]
+    fn selected_reference_comment_row_paints_the_same_selection_treatment() {
+        let track_id = String::from("reference-comment-selection-track");
+        let reference_path = PathBuf::from("/external/reference-comment-selection.wav");
+        let mut state = AppState {
+            busy: false,
+            comment_source: super::CommentSource::Reference,
+            comment_source_explicit: true,
+            selected_reference_note_id: Some(String::from("selected-reference-note")),
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(track_id.clone());
+        state.library.tracks.push(Track {
+            id: track_id,
+            title: String::from("Reference comment selection track"),
+            original_name: String::from("reference-comment-selection.wav"),
+            path: PathBuf::from("/external/main-reference-comment-selection.wav"),
+            reference_path: Some(reference_path.clone()),
+            size: 0,
+            favorite: false,
+            stage: TrackStage::SoundDesign,
+            status: TrackStatus::Inbox,
+            notes: Vec::new(),
+        });
+        state.library.reference_tracks.push(ReferenceTrack {
+            path: reference_path,
+            notes: vec![Note {
+                id: String::from("selected-reference-note"),
+                time_millis: 1_000,
+                body: String::from("selected reference comment"),
+                done: false,
+            }],
+        });
+
+        let frame = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1000.0));
+        let theme = ThemeTokens::default();
+        let selected_row_id = ui::stable_widget_id(0xCAD3_0003, "selected-reference-note");
+        assert!(
+            frame
+                .paint_plan
+                .fill_rects_for_widget(selected_row_id)
+                .any(|fill| { fill.color == theme.accent_mint.with_alpha(120) }),
+            "selected reference comment should paint an accent selection fill"
+        );
+        assert!(
+            frame
+                .paint_plan
+                .fill_rects_for_widget(selected_row_id)
+                .any(|fill| {
+                    fill.color == TRACK_CARD_SELECTED_CORAL
+                        && (fill.rect.width() - 3.0).abs() < 0.01
+                }),
+            "selected reference comment should paint an orange leading marker"
+        );
     }
 
     #[test]
