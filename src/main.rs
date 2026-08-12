@@ -307,6 +307,7 @@ struct LoopBounds {
 }
 
 const LIBRARY_WIDTH: f32 = 252.0;
+const APP_VERSION_LABEL: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 // Keep workspace tabs clear of the native macOS traffic-light controls in the
 // integrated titlebar while leaving the right-side controls right-anchored.
 const TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER: f32 = 72.0;
@@ -5361,6 +5362,11 @@ fn project_surface(state: &AppState) -> ui::View<Message> {
                         .height(20.0)
                         .width(280.0)
                         .subtle(),
+                    ui::text(APP_VERSION_LABEL)
+                        .height(20.0)
+                        .width(48.0)
+                        .align_text(ui::TextAlign::Right)
+                        .subtle(),
                 ])
                 .fill_width()
                 .height(20.0)
@@ -5389,6 +5395,11 @@ fn project_surface(state: &AppState) -> ui::View<Message> {
                     ui::text("SPACE  play · ESC  stop · N  note")
                         .height(24.0)
                         .width(280.0)
+                        .subtle(),
+                    ui::text(APP_VERSION_LABEL)
+                        .height(24.0)
+                        .width(48.0)
+                        .align_text(ui::TextAlign::Right)
                         .subtle(),
                 ])
                 .padding_x(8.0)
@@ -7740,9 +7751,9 @@ fn plural(count: usize) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, AuditionSource, FavoriteMarkerWidget, ImportBatchProgress, LoopBounds,
-        LoopSelection, LoopSelections, Message, NoteDraft, REFERENCE_MENU_WIDTH, StatusMenuHost,
-        TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER, WAVEFORM_HEIGHT, WorkspaceMode,
+        APP_VERSION_LABEL, AppState, AuditionSource, FavoriteMarkerWidget, ImportBatchProgress,
+        LoopBounds, LoopSelection, LoopSelections, Message, NoteDraft, REFERENCE_MENU_WIDTH,
+        StatusMenuHost, TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER, WAVEFORM_HEIGHT, WorkspaceMode,
         apply_transport_snapshot, audition_panel, audition_shuffle_seed, audition_statuses,
         current_loudness_match_gain_db, current_lufs_meter_value,
         current_reference_lufs_meter_value, decode_result_is_current, deterministic_shuffle,
@@ -7767,7 +7778,7 @@ mod tests {
         gui::types::{Point, Rect, Vector2},
         prelude as ui,
         runtime::{
-            DeclarativeOwnedRuntimeBridge, Event, FocusTraversal, PaintPrimitive,
+            DeclarativeOwnedRuntimeBridge, Event, FocusTraversal, PaintPrimitive, PaintTextAlign,
             RuntimeUpdateSnapshot, SurfaceRuntime,
         },
         theme::ThemeTokens,
@@ -8186,10 +8197,10 @@ mod tests {
 
     #[test]
     fn project_surface_exposes_shell_context_and_playback_hints() {
-        let labels = project_surface(&AppState::default())
-            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 720.0))
-            .paint_plan
-            .text_label_strings();
+        let frame_size = Vector2::new(1180.0, 720.0);
+        let frame =
+            project_surface(&AppState::default()).view_frame_at_size_with_default_theme(frame_size);
+        let labels = frame.paint_plan.text_label_strings();
 
         assert!(!labels.iter().any(|label| label == "PORTALSURFER / CADENCE"));
         assert!(!labels.iter().any(|label| label == "LOCAL REVIEW DESK"));
@@ -8199,12 +8210,24 @@ mod tests {
             "Planner",
             "Audition",
             "SPACE  play · ESC  stop · N  note",
+            APP_VERSION_LABEL,
         ] {
             assert!(
                 labels.iter().any(|painted| painted == label),
                 "missing {label:?}"
             );
         }
+        let version_run = frame
+            .paint_plan
+            .text_runs()
+            .find(|run| run.text.as_str() == APP_VERSION_LABEL)
+            .expect("the normal status bar should render the app version");
+        assert_eq!(version_run.align, PaintTextAlign::Right);
+        assert!(
+            version_run.rect.max.x > frame_size.x - 100.0,
+            "the version label should stay at the far right of the status bar: {:?}",
+            version_run.rect
+        );
         assert!(!labels.iter().any(|label| label == "NATIVE · RADIANT"));
     }
 
@@ -14827,6 +14850,23 @@ mod tests {
             labels
                 .iter()
                 .any(|label| { label == "Importing 2 of 3 · 2 remaining · 1 failed" })
+        );
+        assert!(
+            labels
+                .iter()
+                .any(|label| label == "SPACE  play · ESC  stop · N  note")
+        );
+        assert!(labels.iter().any(|label| label == APP_VERSION_LABEL));
+        let version_run = frame
+            .paint_plan
+            .text_runs()
+            .find(|run| run.text.as_str() == APP_VERSION_LABEL)
+            .expect("the import-progress status bar should render the app version");
+        assert_eq!(version_run.align, PaintTextAlign::Right);
+        assert!(
+            version_run.rect.max.x > 1180.0 - 100.0,
+            "the import-progress version label should stay at the far right: {:?}",
+            version_run.rect
         );
 
         let fills = frame.paint_plan.fill_rects().collect::<Vec<_>>();
