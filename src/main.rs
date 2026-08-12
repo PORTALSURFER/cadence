@@ -6896,7 +6896,6 @@ fn comments_panel(state: &AppState, track: &storage::Track) -> ui::View<Message>
                 .subtle(),
         );
     } else {
-        let note_count = notes.len();
         let selected_note_id = selected_note_id.clone();
         let source_for_rows = source;
         let editing_note = match source {
@@ -6928,7 +6927,7 @@ fn comments_panel(state: &AppState, track: &storage::Track) -> ui::View<Message>
         })
         .without_chrome()
         .fill_width()
-        .height(note_count as f32 * 44.0);
+        .fill_height();
         children.push(list);
     }
     if source == CommentSource::Main {
