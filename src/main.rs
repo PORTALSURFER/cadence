@@ -11,7 +11,8 @@ use radiant::{
     prelude as ui,
     runtime::{
         FileDialogRequest, NativeRunOptions, PaintFillPolygon, PaintFillRect, PaintPrimitive,
-        PaintStrokePolygon, PlatformResponse, PlatformResult,
+        PaintStrokePolygon, PaintTextAlign, PaintTextMetrics, PlatformResponse, PlatformResult,
+        push_text_run_with_metrics,
     },
     theme::ThemeTokens,
     widgets::{Widget, WidgetCommon, WidgetInput, WidgetOutput},
@@ -491,6 +492,81 @@ fn status_rail(status: Option<storage::TrackStatus>, height: f32) -> ui::View<Me
     ui::custom_widget(StatusDropdownRailWidget::new(status), |_| None)
         .width(STATUS_RAIL_WIDTH)
         .height(height)
+}
+
+#[derive(Clone, Debug)]
+struct FavoriteMarkerWidget {
+    common: WidgetCommon,
+    marker: &'static str,
+    active: bool,
+}
+
+impl FavoriteMarkerWidget {
+    fn new(active: bool) -> Self {
+        Self {
+            common: WidgetCommon::fixed(0, FAVORITE_CONTROL_WIDTH, 24.0).without_default_chrome(),
+            marker: if active { "★" } else { "☆" },
+            active,
+        }
+    }
+}
+
+impl Widget for FavoriteMarkerWidget {
+    fn common(&self) -> &WidgetCommon {
+        &self.common
+    }
+
+    fn common_mut(&mut self) -> &mut WidgetCommon {
+        &mut self.common
+    }
+
+    fn accepts_pointer_move(&self) -> bool {
+        false
+    }
+
+    fn accepts_pointer_input(&self, _input: &WidgetInput) -> bool {
+        false
+    }
+
+    fn handle_input(&mut self, _bounds: Rect, _input: WidgetInput) -> Option<WidgetOutput> {
+        None
+    }
+
+    fn append_paint(
+        &self,
+        primitives: &mut Vec<PaintPrimitive>,
+        bounds: Rect,
+        _layout: &LayoutOutput,
+        theme: &ThemeTokens,
+    ) {
+        if !bounds.has_finite_positive_area() {
+            return;
+        }
+
+        let text_rect = Rect::from_min_max(
+            Point::new(bounds.min.x + 8.0, bounds.min.y + 4.0),
+            Point::new(bounds.max.x - 8.0, bounds.max.y - 4.0),
+        );
+        let font_size = 13.0;
+        let baseline = Some(text_rect.height() * 0.5 + font_size * 0.35);
+        push_text_run_with_metrics(
+            primitives,
+            self.common.id,
+            self.marker,
+            text_rect,
+            if self.active {
+                theme.highlight_orange
+            } else {
+                theme.text_muted
+            },
+            PaintTextAlign::Center,
+            PaintTextMetrics::new(font_size, baseline),
+        );
+    }
+}
+
+fn favorite_marker(active: bool) -> ui::View<Message> {
+    ui::widget(FavoriteMarkerWidget::new(active)).size(FAVORITE_CONTROL_WIDTH, 24.0)
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -5782,7 +5858,8 @@ fn card_muted_text(_selected: bool, value: impl Into<ui::TextContent>) -> ui::Vi
 }
 
 fn favorite_toggle(track: &storage::Track, selected: bool, key: String) -> ui::View<Message> {
-    ui::button(if track.favorite { "★" } else { "☆" })
+    let marker = if track.favorite { "★" } else { "☆" };
+    let control = ui::button(marker)
         .subtle()
         .active(track.favorite)
         .selected(selected)
@@ -5793,7 +5870,8 @@ fn favorite_toggle(track: &storage::Track, selected: bool, key: String) -> ui::V
         } else {
             "Mark favorite"
         })
-        .size(FAVORITE_CONTROL_WIDTH, 24.0)
+        .size(FAVORITE_CONTROL_WIDTH, 24.0);
+    ui::stack([control, favorite_marker(track.favorite)]).size(FAVORITE_CONTROL_WIDTH, 24.0)
 }
 
 fn stage_dropdown(track: &storage::Track, open: bool, _selected: bool) -> ui::View<Message> {
@@ -7296,19 +7374,20 @@ fn plural(count: usize) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, AuditionSource, ImportBatchProgress, LoopBounds, LoopSelection, LoopSelections,
-        Message, NoteDraft, REFERENCE_MENU_WIDTH, StatusMenuHost,
+        AppState, AuditionSource, FavoriteMarkerWidget, ImportBatchProgress, LoopBounds,
+        LoopSelection, LoopSelections, Message, NoteDraft, REFERENCE_MENU_WIDTH, StatusMenuHost,
         TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER, WAVEFORM_HEIGHT, WorkspaceMode,
         apply_transport_snapshot, audition_panel, audition_shuffle_seed, audition_statuses,
         current_loudness_match_gain_db, current_lufs_meter_value,
         current_reference_lufs_meter_value, decode_result_is_current, deterministic_shuffle,
-        enforce_loop, library_track_title_id, loop_bounds, main_output_gain, native_launch_options,
-        note_editor, note_ratio_for_id, planner_drop_is_valid, playback_shortcut, project_surface,
-        rebuild_audition_queue, reconcile_audition_queue, reference_decode_result_is_current,
-        reference_output_gain, review_status_filter_message, selected_reference_notes,
-        selected_track, stage_dropdown, stage_menu_anchor_from_pointer, stage_menu_popover,
-        status_dropdown_for_host, status_filter_dropdown, sync_audition_queue_after_status_change,
-        tracks_in_stage, tracks_with_status, transport_command_is_confirmed, update,
+        enforce_loop, favorite_toggle, library_track_title_id, loop_bounds, main_output_gain,
+        native_launch_options, note_editor, note_ratio_for_id, planner_drop_is_valid,
+        playback_shortcut, project_surface, rebuild_audition_queue, reconcile_audition_queue,
+        reference_decode_result_is_current, reference_output_gain, review_status_filter_message,
+        selected_reference_notes, selected_track, stage_dropdown, stage_menu_anchor_from_pointer,
+        stage_menu_popover, status_dropdown_for_host, status_filter_dropdown,
+        sync_audition_queue_after_status_change, tracks_in_stage, tracks_with_status,
+        transport_command_is_confirmed, update,
     };
     use crate::transport::Snapshot;
     use crate::{
@@ -7325,6 +7404,7 @@ mod tests {
             RuntimeUpdateSnapshot, SurfaceRuntime,
         },
         theme::ThemeTokens,
+        widgets::{PointerModifiers, Widget, WidgetInput},
     };
     use std::{path::PathBuf, sync::Arc, time::Duration};
 
@@ -13238,10 +13318,9 @@ mod tests {
             WorkspaceMode::Audition,
         ] {
             state.workspace_mode = mode;
-            let labels = project_surface(&state)
-                .view_frame_at_size_with_default_theme(Vector2::new(1_400.0, 900.0))
-                .paint_plan
-                .text_label_strings();
+            let frame = project_surface(&state)
+                .view_frame_at_size_with_default_theme(Vector2::new(1_400.0, 900.0));
+            let labels = frame.paint_plan.text_label_strings();
             assert!(
                 labels.iter().any(|label| label == "★"),
                 "missing starred marker in {mode:?}"
@@ -13250,7 +13329,91 @@ mod tests {
                 labels.iter().any(|label| label == "☆"),
                 "missing unstarred marker in {mode:?}"
             );
+            assert!(
+                frame.paint_plan.text_runs().any(|run| {
+                    run.text.as_str() == "★" && run.color == ThemeTokens::default().highlight_orange
+                }),
+                "active star should use the orange accent in {mode:?}"
+            );
+            assert!(
+                frame.paint_plan.text_runs().any(|run| {
+                    run.text.as_str() == "☆" && run.color == ThemeTokens::default().text_muted
+                }),
+                "inactive star should remain muted in {mode:?}"
+            );
         }
+    }
+
+    #[test]
+    fn favorite_marker_is_paint_only_and_uses_supplied_theme_color() {
+        let mut marker = FavoriteMarkerWidget::new(true);
+        let bounds = Rect::from_size(28.0, 24.0);
+        let theme = ThemeTokens::light();
+        let pointer_press = WidgetInput::PointerPress {
+            position: Point::new(14.0, 12.0),
+            button: ui::PointerButton::Primary,
+            modifiers: PointerModifiers::default(),
+            timestamp: None,
+        };
+
+        assert_eq!(marker.common().focus, ui::FocusBehavior::None);
+        assert!(!marker.accepts_pointer_move());
+        assert!(!marker.accepts_pointer_input(&pointer_press));
+        assert!(marker.handle_input(bounds, pointer_press).is_none());
+
+        let primitives =
+            marker.paint_primitives(bounds, &radiant::layout::LayoutOutput::default(), &theme);
+        let text_run = primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                PaintPrimitive::Text(run) => Some(run),
+                _ => None,
+            })
+            .expect("favorite marker should paint a text run");
+        assert_eq!(text_run.text.as_str(), "★");
+        assert_eq!(text_run.color, theme.highlight_orange);
+    }
+
+    #[test]
+    fn favorite_card_stack_routes_clicks_to_one_toggle_control() {
+        let track = audition_track("favorite-card-track");
+        let track_id = track.id.clone();
+        let bridge = DeclarativeOwnedRuntimeBridge::new(
+            track.clone(),
+            move |track| {
+                favorite_toggle(track, false, String::from("favorite-card-control")).into_surface()
+            },
+            |track, message| {
+                if let Message::ToggleFavorite(id) = message
+                    && id == track.id
+                {
+                    track.favorite = !track.favorite;
+                }
+            },
+        );
+        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(28.0, 24.0));
+        let frame = runtime.frame_with_default_theme();
+        let star = frame
+            .paint_plan
+            .text_runs()
+            .find(|run| run.text.as_str() == "☆")
+            .expect("the composed favorite control should paint its inactive marker");
+        let point = Point::new(
+            star.rect.min.x + star.rect.width() * 0.5,
+            star.rect.min.y + star.rect.height() * 0.5,
+        );
+        let targets = runtime.automation_target_snapshot();
+        let actionable_favorites = targets
+            .targets
+            .iter()
+            .filter(|target| target.interaction_target && target.label.as_deref() == Some("☆"))
+            .count();
+
+        assert_eq!(actionable_favorites, 1);
+        assert_eq!(runtime.widget_at(point), Some(star.widget_id));
+        runtime.dispatch_primary_click(point);
+        assert!(runtime.bridge().state().favorite);
+        assert_eq!(track_id, runtime.bridge().state().id);
     }
 
     #[test]
