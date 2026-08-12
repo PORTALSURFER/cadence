@@ -13,7 +13,7 @@ use radiant::{
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -169,6 +169,7 @@ enum Message {
     CancelReferenceDraftNote,
     SelectReferenceNote(String),
     EditReferenceNote(String),
+    FocusCommentEditor(u64),
     ToggleReferenceNoteDone(String),
     DeleteReferenceNote(String),
 }
@@ -213,6 +214,8 @@ const FAVORITE_CONTROL_WIDTH: f32 = 112.0;
 const MIN_REFERENCE_LOOP_MILLIS: u64 = 120;
 const MAIN_COMMENT_EDITOR_ID: u64 = 0xCAD3_1001;
 const REFERENCE_COMMENT_EDITOR_ID: u64 = 0xCAD3_1002;
+const MAIN_INLINE_COMMENT_EDITOR_SCOPE: u64 = 0xCAD3_1003;
+const REFERENCE_INLINE_COMMENT_EDITOR_SCOPE: u64 = 0xCAD3_1004;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ImportBatchProgress {
@@ -1775,6 +1778,10 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 context.request_repaint();
             }
         }
+        Message::FocusCommentEditor(editor_id) => {
+            context.focus(editor_id);
+            context.request_repaint();
+        }
         Message::EditNote(id) => {
             if state.busy {
                 return;
@@ -1784,6 +1791,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 .and_then(|track| track.notes.iter().find(|note| note.id == id))
                 .cloned();
             if let Some(note) = note {
+                let editor_id = main_inline_comment_editor_id(&note.id);
                 state.review_cursor_millis = note.time_millis;
                 state.selected_note_id = Some(note.id.clone());
                 state.draft_note = Some(NoteDraft {
@@ -1793,8 +1801,12 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 });
                 state.status =
                     format!("Editing comment at {}.", format_timestamp(note.time_millis));
-                context.focus(MAIN_COMMENT_EDITOR_ID);
                 context.request_repaint();
+                context.focus(editor_id);
+                context.after(
+                    Duration::from_millis(1),
+                    Message::FocusCommentEditor(editor_id),
+                );
             }
         }
         Message::ToggleNoteDone(id) => {
@@ -1885,6 +1897,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 .find(|note| note.id == id)
                 .cloned();
             if let Some(note) = note {
+                let editor_id = reference_inline_comment_editor_id(&note.id);
                 state.selected_reference_note_id = Some(note.id.clone());
                 state.reference_draft_note = Some(NoteDraft {
                     note_id: Some(note.id),
@@ -1895,8 +1908,12 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     "Editing reference comment at {}.",
                     format_timestamp(note.time_millis)
                 );
-                context.focus(REFERENCE_COMMENT_EDITOR_ID);
                 context.request_repaint();
+                context.focus(editor_id);
+                context.after(
+                    Duration::from_millis(1),
+                    Message::FocusCommentEditor(editor_id),
+                );
             }
         }
         Message::ToggleReferenceNoteDone(id) => {
@@ -4063,6 +4080,14 @@ fn drag_message_position(message: ui::DragHandleMessage) -> Option<Point> {
     })
 }
 
+fn main_inline_comment_editor_id(note_id: &str) -> u64 {
+    ui::stable_widget_id(MAIN_INLINE_COMMENT_EDITOR_SCOPE, note_id)
+}
+
+fn reference_inline_comment_editor_id(note_id: &str) -> u64 {
+    ui::stable_widget_id(REFERENCE_INLINE_COMMENT_EDITOR_SCOPE, note_id)
+}
+
 fn project_surface(state: &AppState) -> ui::View<Message> {
     let workspace = match state.workspace_mode {
         WorkspaceMode::Review => ui::row([
@@ -5449,7 +5474,11 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
     if track.reference_path.is_some() {
         waveform_section.push(reference_comments_panel(state, &track));
     }
-    if let Some(draft) = state.draft_note.as_ref() {
+    if let Some(draft) = state
+        .draft_note
+        .as_ref()
+        .filter(|draft| draft.note_id.is_none())
+    {
         waveform_section.push(note_editor(draft));
     }
 
@@ -5793,6 +5822,10 @@ fn reference_comments_panel(state: &AppState, track: &storage::Track) -> ui::Vie
     let notes = reference_notes_for_track(&state.library, track).to_vec();
     let open_count = notes.iter().filter(|note| !note.done).count();
     let selected_note_id = state.selected_reference_note_id.clone();
+    let editing_note = state
+        .reference_draft_note
+        .clone()
+        .filter(|draft| draft.note_id.is_some());
     let mut children = vec![
         ui::row([
             ui::text("REFERENCE COMMENTS / CLICK TO PIN")
@@ -5817,7 +5850,12 @@ fn reference_comments_panel(state: &AppState, track: &storage::Track) -> ui::Vie
     } else {
         let note_count = notes.len();
         let list = ui::list(notes.into_iter().enumerate(), move |(index, note)| {
-            reference_note_row(index, note, selected_note_id.as_deref())
+            reference_note_row(
+                index,
+                note,
+                selected_note_id.as_deref(),
+                editing_note.as_ref(),
+            )
         })
         .without_chrome()
         .fill_width()
@@ -5826,7 +5864,11 @@ fn reference_comments_panel(state: &AppState, track: &storage::Track) -> ui::Vie
         children.push(list);
         height
     };
-    let editor_height = if let Some(draft) = state.reference_draft_note.as_ref() {
+    let editor_height = if let Some(draft) = state
+        .reference_draft_note
+        .as_ref()
+        .filter(|draft| draft.note_id.is_none())
+    {
         children.push(reference_note_editor(draft));
         122.0
     } else {
@@ -5844,6 +5886,10 @@ fn reference_comments_panel(state: &AppState, track: &storage::Track) -> ui::Vie
 fn comments_panel(state: &AppState, track: &storage::Track) -> ui::View<Message> {
     let open_count = track.notes.iter().filter(|note| !note.done).count();
     let selected_note_id = state.selected_note_id.clone();
+    let editing_note = state
+        .draft_note
+        .clone()
+        .filter(|draft| draft.note_id.is_some());
     let mut children = vec![
         ui::row([
             ui::text("02  COMMENTS / CLICK TO PIN")
@@ -5867,7 +5913,12 @@ fn comments_panel(state: &AppState, track: &storage::Track) -> ui::View<Message>
     } else {
         let notes = track.notes.clone();
         let list = ui::list(notes.into_iter().enumerate(), move |(index, note)| {
-            note_row(index, note, selected_note_id.as_deref())
+            note_row(
+                index,
+                note,
+                selected_note_id.as_deref(),
+                editing_note.as_ref(),
+            )
         })
         .without_chrome()
         .fill_width()
@@ -5970,44 +6021,79 @@ fn note_row(
     index: usize,
     note: storage::Note,
     selected_note_id: Option<&str>,
+    editing_note: Option<&NoteDraft>,
 ) -> ui::View<Message> {
     let selected = selected_note_id == Some(note.id.as_str());
+    let editing =
+        editing_note.is_some_and(|draft| draft.note_id.as_deref() == Some(note.id.as_str()));
     let note_id = note.id.clone();
-    let select_id = note.id.clone();
-    let edit_id = note.id.clone();
-    let delete_id = note.id.clone();
+    let note_body = note.body.clone();
+    let note_time_millis = note.time_millis;
+    let note_done = note.done;
+    let body = if editing {
+        let draft = editing_note.expect("an editing row should have a matching draft");
+        ui::text_input(draft.body.clone())
+            .message_event(|input| {
+                if input.is_submitted() {
+                    Message::SaveDraftNote
+                } else {
+                    Message::DraftNoteChanged(input.into_value())
+                }
+            })
+            .id(main_inline_comment_editor_id(&note_id))
+            .fill_width()
+            .height(30.0)
+    } else {
+        ui::text(note_body).wrap().height(30.0).fill_width()
+    };
+    let edit_or_save = if editing {
+        ui::button("Save")
+            .primary()
+            .message(Message::SaveDraftNote)
+            .height(28.0)
+    } else {
+        ui::button("Edit")
+            .selected(selected)
+            .message(Message::EditNote(note_id.clone()))
+            .height(28.0)
+    };
+    let cancel_or_delete = if editing {
+        ui::button("Cancel")
+            .subtle()
+            .message(Message::CancelDraftNote)
+            .height(28.0)
+    } else {
+        ui::button("Delete")
+            .selected(selected)
+            .message(Message::DeleteNote(note_id.clone()))
+            .height(28.0)
+    };
     let row = ui::list_row(
         index,
         [
-            ui::text(format_timestamp(note.time_millis))
+            ui::text(format_timestamp(note_time_millis))
                 .height(30.0)
                 .width(68.0)
                 .subtle(),
-            ui::text(note.body).wrap().height(30.0).fill_width(),
-            ui::button(if note.done { "Done" } else { "Open" })
+            body,
+            ui::button(if note_done { "Done" } else { "Open" })
                 .selected(selected)
-                .message(Message::ToggleNoteDone(note_id))
+                .message(Message::ToggleNoteDone(note_id.clone()))
                 .height(28.0),
-            ui::button("Edit")
-                .selected(selected)
-                .message(Message::EditNote(edit_id))
-                .height(28.0),
-            ui::button("Delete")
-                .selected(selected)
-                .message(Message::DeleteNote(delete_id))
-                .height(28.0),
+            edit_or_save,
+            cancel_or_delete,
         ],
     )
     .fill_width();
-    let row_key = select_id.clone();
-    let hover_id = note.id.clone();
-    let double_edit_id = note.id.clone();
+    let row_key = note_id.clone();
+    let hover_id = note_id.clone();
+    let double_edit_id = note_id.clone();
     let row_actions = ui::row_actions()
-        .primary(move || Message::SelectNote(select_id.clone()))
+        .primary(move || Message::SelectNote(row_key.clone()))
         .double_activate(move || Message::EditNote(double_edit_id.clone()));
     let row_surface = ui::interactive_row_underlay(row)
         .selected(selected)
-        .stable_row_identity(0xCAD3_0002, row_key)
+        .stable_row_identity(0xCAD3_0002, note_id.clone())
         .actions(row_actions)
         .fill_width()
         .height(44.0);
@@ -6017,7 +6103,7 @@ fn note_row(
             Message::CommentHoverStarted(hover_id.clone()),
             Message::CommentHoverEnded(hover_id),
         )
-        .key(format!("comment-hover-{}", note.id))
+        .key(format!("comment-hover-{}", note_id))
         .fill(),
     ])
     .fill_width()
@@ -6028,42 +6114,80 @@ fn reference_note_row(
     index: usize,
     note: storage::Note,
     selected_note_id: Option<&str>,
+    editing_note: Option<&NoteDraft>,
 ) -> ui::View<Message> {
     let selected = selected_note_id == Some(note.id.as_str());
-    let select_id = note.id.clone();
-    let double_edit_id = note.id.clone();
-    let hover_id = note.id.clone();
-    let hover_key = note.id.clone();
+    let editing =
+        editing_note.is_some_and(|draft| draft.note_id.as_deref() == Some(note.id.as_str()));
+    let note_id = note.id.clone();
+    let note_body = note.body.clone();
+    let note_time_millis = note.time_millis;
+    let note_done = note.done;
+    let body = if editing {
+        let draft = editing_note.expect("an editing reference row should have a matching draft");
+        ui::text_input(draft.body.clone())
+            .message_event(|input| {
+                if input.is_submitted() {
+                    Message::SaveReferenceDraftNote
+                } else {
+                    Message::ReferenceDraftNoteChanged(input.into_value())
+                }
+            })
+            .id(reference_inline_comment_editor_id(&note_id))
+            .fill_width()
+            .height(30.0)
+    } else {
+        ui::text(note_body).wrap().height(30.0).fill_width()
+    };
+    let edit_or_save = if editing {
+        ui::button("Save")
+            .primary()
+            .message(Message::SaveReferenceDraftNote)
+            .height(28.0)
+    } else {
+        ui::button("Edit")
+            .selected(selected)
+            .message(Message::EditReferenceNote(note_id.clone()))
+            .height(28.0)
+    };
+    let cancel_or_delete = if editing {
+        ui::button("Cancel")
+            .subtle()
+            .message(Message::CancelReferenceDraftNote)
+            .height(28.0)
+    } else {
+        ui::button("Delete")
+            .selected(selected)
+            .message(Message::DeleteReferenceNote(note_id.clone()))
+            .height(28.0)
+    };
     let row = ui::list_row(
         index,
         [
-            ui::text(format_timestamp(note.time_millis))
+            ui::text(format_timestamp(note_time_millis))
                 .height(30.0)
                 .width(68.0)
                 .subtle(),
-            ui::text(note.body).wrap().height(30.0).fill_width(),
-            ui::button(if note.done { "Done" } else { "Open" })
+            body,
+            ui::button(if note_done { "Done" } else { "Open" })
                 .selected(selected)
-                .message(Message::ToggleReferenceNoteDone(note.id.clone()))
+                .message(Message::ToggleReferenceNoteDone(note_id.clone()))
                 .height(28.0),
-            ui::button("Edit")
-                .selected(selected)
-                .message(Message::EditReferenceNote(note.id.clone()))
-                .height(28.0),
-            ui::button("Delete")
-                .selected(selected)
-                .message(Message::DeleteReferenceNote(note.id))
-                .height(28.0),
+            edit_or_save,
+            cancel_or_delete,
         ],
     )
     .fill_width();
-    let row_key = select_id.clone();
+    let row_key = note_id.clone();
+    let double_edit_id = note_id.clone();
+    let hover_id = note_id.clone();
+    let hover_key = note_id.clone();
     let row_actions = ui::row_actions()
-        .primary(move || Message::SelectReferenceNote(select_id.clone()))
+        .primary(move || Message::SelectReferenceNote(row_key.clone()))
         .double_activate(move || Message::EditReferenceNote(double_edit_id.clone()));
     let row_surface = ui::interactive_row_underlay(row)
         .selected(selected)
-        .stable_row_identity(0xCAD3_0003, row_key)
+        .stable_row_identity(0xCAD3_0003, note_id)
         .actions(row_actions)
         .fill_width()
         .height(44.0);
@@ -6459,6 +6583,21 @@ mod tests {
         assert_eq!(draft.time_millis, 1_250);
         assert_eq!(draft.body, "Existing comment body");
 
+        let frame = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1000.0));
+        assert!(frame.paint_plan.primitives.iter().any(|primitive| {
+            matches!(
+                primitive,
+                PaintPrimitive::TextInput(input)
+                    if input.widget_id == super::main_inline_comment_editor_id(&note_id)
+                        && input.state.value.as_str() == "Existing comment body"
+            )
+        }));
+        let labels = frame.paint_plan.text_label_strings();
+        assert!(!labels.iter().any(|label| label.starts_with("COMMENT AT ")));
+        assert!(labels.iter().any(|label| label == "Save"));
+        assert!(labels.iter().any(|label| label == "Cancel"));
+
         let focus_command = context.into_command();
         assert!(matches!(
             focus_command,
@@ -6466,7 +6605,7 @@ mod tests {
                 if commands.iter().any(|command| matches!(
                     command,
                     radiant::runtime::Command::Focus(id)
-                        if *id == super::MAIN_COMMENT_EDITOR_ID
+                        if *id == super::main_inline_comment_editor_id(&note_id)
                 ))
         ));
     }
@@ -6522,6 +6661,25 @@ mod tests {
         assert_eq!(draft.time_millis, 875);
         assert_eq!(draft.body, "Existing reference body");
 
+        let frame = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1100.0));
+        assert!(frame.paint_plan.primitives.iter().any(|primitive| {
+            matches!(
+                primitive,
+                PaintPrimitive::TextInput(input)
+                    if input.widget_id == super::reference_inline_comment_editor_id(&note_id)
+                        && input.state.value.as_str() == "Existing reference body"
+            )
+        }));
+        let labels = frame.paint_plan.text_label_strings();
+        assert!(
+            !labels
+                .iter()
+                .any(|label| label.starts_with("REFERENCE COMMENT AT "))
+        );
+        assert!(labels.iter().any(|label| label == "Save"));
+        assert!(labels.iter().any(|label| label == "Cancel"));
+
         let focus_command = context.into_command();
         assert!(matches!(
             focus_command,
@@ -6529,7 +6687,7 @@ mod tests {
                 if commands.iter().any(|command| matches!(
                     command,
                     radiant::runtime::Command::Focus(id)
-                        if *id == super::REFERENCE_COMMENT_EDITOR_ID
+                        if *id == super::reference_inline_comment_editor_id(&note_id)
                 ))
         ));
     }
@@ -8774,6 +8932,22 @@ mod tests {
         assert_eq!(draft.note_id.as_deref(), Some(note_id.as_str()));
         assert_eq!(draft.time_millis, 1_000);
         assert_eq!(draft.body, "hover and select me");
+        let editing_frame = runtime.frame_with_default_theme();
+        assert!(editing_frame.paint_plan.primitives.iter().any(|primitive| {
+            matches!(
+                primitive,
+                PaintPrimitive::TextInput(input)
+                    if input.widget_id == super::main_inline_comment_editor_id(&note_id)
+                        && input.state.value.as_str() == "hover and select me"
+            )
+        }));
+        assert!(
+            !editing_frame
+                .paint_plan
+                .text_label_strings()
+                .iter()
+                .any(|label| label.starts_with("COMMENT AT "))
+        );
 
         let waveform_away_point = Point::new(
             lower_waveform_rect.min.x + lower_waveform_rect.width() * 0.1,
