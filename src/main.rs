@@ -5071,13 +5071,25 @@ fn project_surface(state: &AppState) -> ui::View<Message> {
             .unwrap_or_else(|| ui::spacer().width(0.0)),
         WorkspaceMode::Planner => ui::spacer().width(0.0),
     };
+    let global_review_title = match state.workspace_mode {
+        WorkspaceMode::Review | WorkspaceMode::Audition => selected_track(state)
+            .map(|track| {
+                ui::text(track.title.clone())
+                    .style(ui::WidgetStyle::strong(ui::WidgetTone::Neutral))
+                    .truncate()
+                    .fill_width()
+                    .height(28.0)
+            })
+            .unwrap_or_else(|| ui::spacer().width(0.0)),
+        WorkspaceMode::Planner => ui::spacer().width(0.0),
+    };
     let header = ui::row([
         ui::spacer().width(TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER),
         ui::row(workspace_tabs)
             .spacing(4.0)
             .width(254.0)
             .height(28.0),
-        ui::spacer().fill_width(),
+        global_review_title,
         global_review_controls,
     ])
     .fill_width()
@@ -6459,8 +6471,7 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
         .height(waveform_pair_height);
 
     let waveform_status = ui::text(format!(
-        "{} · {metadata} · {} / {}",
-        track.title,
+        "{metadata} · {} / {}",
         format_timestamp(state.transport_position_millis.min(duration_millis)),
         format_duration(duration_millis),
     ))
@@ -10154,6 +10165,12 @@ mod tests {
             .find(|run| run.text.as_str().contains("48000 Hz"))
             .map(|run| run.rect)
             .expect("the transport metadata should be visible");
+        let reference_header_rect = frame
+            .paint_plan
+            .text_runs()
+            .find(|run| run.text.as_str().starts_with("REFERENCE · reference.wav"))
+            .map(|run| run.rect)
+            .expect("the reference waveform header should be visible");
         let main_waveform_rect = frame
             .paint_plan
             .primitives
@@ -10209,7 +10226,14 @@ mod tests {
             main_waveform_rect.min.y < metadata_rect.min.y,
             "the transport metadata should sit below the compact waveform pair"
         );
-        assert!(reference_rect.min.y < title_rect.min.y);
+        assert!(
+            title_rect.min.y < main_waveform_rect.min.y,
+            "the primary track title should sit above the main waveform"
+        );
+        assert!(
+            main_waveform_rect.min.y < reference_header_rect.min.y,
+            "the reference header should remain below the main waveform"
+        );
     }
 
     #[test]
