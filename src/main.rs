@@ -1877,20 +1877,23 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             context.request_repaint();
         }
         Message::ToggleReferenceMatch => {
-            let Some(gain_db) = current_loudness_match_gain_db(state) else {
-                state.status = String::from(
-                    "Reference matching needs LUFS analysis for both the imported and reference tracks.",
-                );
-                context.request_repaint();
-                return;
-            };
-            state.reference_match_enabled = !state.reference_match_enabled;
-            sync_audition_output_gains(state);
-            state.status = if state.reference_match_enabled {
-                format!("Reference matched to the imported track · {gain_db:+.1} dB.")
+            if state.reference_match_enabled {
+                state.reference_match_enabled = false;
+                sync_audition_output_gains(state);
+                state.status = String::from("Reference loudness matching disabled.");
             } else {
-                String::from("Reference loudness matching disabled.")
-            };
+                let Some(gain_db) = current_loudness_match_gain_db(state) else {
+                    state.status = String::from(
+                        "Reference matching needs LUFS analysis for both the imported and reference tracks.",
+                    );
+                    context.request_repaint();
+                    return;
+                };
+                state.reference_match_enabled = true;
+                sync_audition_output_gains(state);
+                state.status =
+                    format!("Reference matched to the imported track · {gain_db:+.1} dB.");
+            }
             context.request_repaint();
         }
         Message::AuditionVolumeChanged(volume) => {
@@ -8221,7 +8224,7 @@ mod tests {
     }
 
     #[test]
-    fn reference_match_uses_raw_lufs_without_changing_primary_volume() {
+    fn reference_match_toggle_restores_original_reference_gain_without_changing_primary_volume() {
         let track_id = String::from("match-track");
         let primary = WaveformData {
             sample_rate: 48_000,
@@ -8277,7 +8280,77 @@ mod tests {
                 .and_then(|waveform| waveform.integrated_lufs),
             Some(-8.0)
         );
+        assert_eq!(main_output_gain(&state), 0.0);
         assert!((reference_output_gain(&state) - 0.9976).abs() < 0.002);
+
+        update(&mut state, Message::ToggleReferenceMatch, &mut context);
+
+        assert!(!state.reference_match_enabled);
+        assert_eq!(main_output_gain(&state), 0.0);
+        assert_eq!(reference_output_gain(&state), 0.5);
+    }
+
+    #[test]
+    fn reference_match_can_be_disabled_when_lufs_analysis_becomes_unavailable() {
+        let track_id = String::from("match-unavailable-track");
+        let primary = WaveformData {
+            sample_rate: 48_000,
+            channels: 2,
+            duration_millis: 1_000,
+            render_frames: 48_000,
+            integrated_lufs: Some(-8.0),
+            loudness_profile: std::sync::Arc::from([]),
+            summary: Arc::new(
+                radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                    &[0.1, 0.8, 0.2, 0.4],
+                    4,
+                    2,
+                ),
+            ),
+        };
+        let mut reference = primary.clone();
+        reference.integrated_lufs = Some(-14.0);
+        let mut state = AppState {
+            busy: false,
+            waveform: Some(primary),
+            waveform_track_id: Some(track_id.clone()),
+            reference_waveform: Some(reference),
+            reference_waveform_track_id: Some(track_id.clone()),
+            audition_volume: 0.5,
+            audition_source: AuditionSource::Reference,
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(track_id.clone());
+        state.library.tracks.push(Track {
+            id: track_id,
+            title: String::from("Match unavailable track"),
+            original_name: String::from("match-unavailable-track.wav"),
+            path: PathBuf::from("/external/match-unavailable-track.wav"),
+            reference_path: Some(PathBuf::from("/external/reference.wav")),
+            size: 0,
+            favorite: false,
+            stage: TrackStage::SoundDesign,
+            status: TrackStatus::Inbox,
+            notes: Vec::new(),
+        });
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut state, Message::ToggleReferenceMatch, &mut context);
+        assert!(state.reference_match_enabled);
+        assert!((reference_output_gain(&state) - 0.9976).abs() < 0.002);
+
+        state
+            .waveform
+            .as_mut()
+            .expect("the main waveform should remain loaded")
+            .integrated_lufs = None;
+        assert_eq!(current_loudness_match_gain_db(&state), None);
+
+        update(&mut state, Message::ToggleReferenceMatch, &mut context);
+
+        assert!(!state.reference_match_enabled);
+        assert_eq!(reference_output_gain(&state), 0.5);
+        assert_eq!(state.status, "Reference loudness matching disabled.");
     }
 
     #[test]
