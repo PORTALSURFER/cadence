@@ -264,6 +264,22 @@ pub fn set_reference_track(
     Ok(library)
 }
 
+/// Add an audio file to the global reference catalog without assigning it to
+/// any main track. The catalog stores the external path only; importing a
+/// reference never copies or mutates the user's audio file.
+pub fn add_reference_track(mut library: Library, path: PathBuf) -> Result<Library, String> {
+    validate_audio_path(&path)?;
+    let metadata = fs::metadata(&path)
+        .map_err(|error| format!("Could not inspect {}: {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("{} is not a file", path.display()));
+    }
+
+    ensure_reference_track(&mut library, path);
+    persist_library(&library)?;
+    Ok(library)
+}
+
 fn set_reference_track_metadata(
     library: &mut Library,
     track_id: &str,
@@ -356,6 +372,30 @@ pub fn remove_track(library: &mut Library, track_id: &str) -> Result<(usize, Tra
         .position(|track| track.id == track_id)
         .ok_or_else(|| String::from("That track is no longer in the library."))?;
     Ok((index, library.tracks.remove(index)))
+}
+
+/// Remove a path from the global reference catalog and clear every main-track
+/// assignment that points to it. The caller owns persistence so reducer-level
+/// state can be invalidated before the next whole-library snapshot is saved.
+pub fn remove_reference_track(library: &mut Library, path: &Path) -> Result<usize, String> {
+    let original_count = library.reference_tracks.len();
+    library
+        .reference_tracks
+        .retain(|reference| reference.path != path);
+    if library.reference_tracks.len() == original_count {
+        return Err(String::from(
+            "That reference track is no longer in the catalog.",
+        ));
+    }
+
+    let mut cleared_assignments = 0;
+    for track in &mut library.tracks {
+        if track.reference_path.as_deref() == Some(path) {
+            track.reference_path = None;
+            cleared_assignments += 1;
+        }
+    }
+    Ok(cleared_assignments)
 }
 
 pub fn set_track_stage(
@@ -765,6 +805,92 @@ mod tests {
             PathBuf::from("/external/reference.wav")
         );
         assert!(library.reference_tracks[0].notes.is_empty());
+    }
+
+    #[test]
+    fn adding_a_reference_catalog_entry_does_not_assign_main_tracks() {
+        let primary_path = PathBuf::from("/external/primary.wav");
+        let reference_path = PathBuf::from("/external/catalog-reference.wav");
+        let mut library = Library {
+            tracks: vec![Track {
+                id: String::from("track-1"),
+                title: String::from("Primary"),
+                original_name: String::from("primary.wav"),
+                path: primary_path.clone(),
+                reference_path: None,
+                size: 42,
+                favorite: false,
+                stage: TrackStage::SoundDesign,
+                status: TrackStatus::Inbox,
+                notes: Vec::new(),
+            }],
+            selected_track_id: Some(String::from("track-1")),
+            reference_tracks: Vec::new(),
+        };
+
+        ensure_reference_track(&mut library, reference_path.clone());
+
+        assert_eq!(library.reference_tracks.len(), 1);
+        assert_eq!(library.reference_tracks[0].path, reference_path);
+        assert_eq!(library.tracks[0].path, primary_path);
+        assert_eq!(library.tracks[0].reference_path, None);
+    }
+
+    #[test]
+    fn removing_a_reference_clears_all_matching_assignments_and_preserves_other_catalog_entries() {
+        let removed_path = PathBuf::from("/external/remove-reference.wav");
+        let retained_path = PathBuf::from("/external/keep-reference.wav");
+        let track = |id: &str, reference_path: Option<PathBuf>| Track {
+            id: id.to_string(),
+            title: id.to_string(),
+            original_name: format!("{id}.wav"),
+            path: PathBuf::from(format!("/external/{id}.wav")),
+            reference_path,
+            size: 0,
+            favorite: false,
+            stage: TrackStage::SoundDesign,
+            status: TrackStatus::Inbox,
+            notes: Vec::new(),
+        };
+        let mut library = Library {
+            tracks: vec![
+                track("assigned-1", Some(removed_path.clone())),
+                track("assigned-2", Some(removed_path.clone())),
+                track("retained", Some(retained_path.clone())),
+            ],
+            selected_track_id: Some(String::from("assigned-1")),
+            reference_tracks: vec![
+                ReferenceTrack {
+                    path: removed_path.clone(),
+                    notes: vec![Note {
+                        id: String::from("removed-note"),
+                        time_millis: 100,
+                        body: String::from("Discard with the catalog entry."),
+                        done: false,
+                    }],
+                },
+                ReferenceTrack {
+                    path: retained_path.clone(),
+                    notes: Vec::new(),
+                },
+            ],
+        };
+
+        assert_eq!(
+            remove_reference_track(&mut library, &removed_path)
+                .expect("catalog reference should exist"),
+            2
+        );
+        assert!(
+            library
+                .reference_tracks
+                .iter()
+                .all(|reference| reference.path != removed_path)
+        );
+        assert_eq!(library.reference_tracks.len(), 1);
+        assert_eq!(library.tracks[0].reference_path, None);
+        assert_eq!(library.tracks[1].reference_path, None);
+        assert_eq!(library.tracks[2].reference_path, Some(retained_path));
     }
 
     #[test]

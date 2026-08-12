@@ -5,8 +5,13 @@ mod transport;
 mod waveform;
 
 use radiant::{
-    application::{AnchoredPopoverParts, anchored_popover_from_parts},
-    gui::types::{Point, Rect, Vector2},
+    application::{
+        AnchoredPopoverParts, anchored_popover_from_parts, dismissible_anchored_popover_from_parts,
+    },
+    gui::{
+        svg::IconName,
+        types::{Point, Rect, Vector2},
+    },
     layout::LayoutOutput,
     prelude as ui,
     runtime::{
@@ -36,6 +41,12 @@ enum Message {
     ReferenceFilesPicked {
         track_id: String,
         paths: Vec<PathBuf>,
+    },
+    AddReferenceTracksPressed,
+    ReferenceCatalogFilesPicked(Vec<PathBuf>),
+    ReferenceCatalogImportCompleted {
+        path: PathBuf,
+        result: Result<storage::Library, String>,
     },
     FileDropped(ui::NativeFileDrop),
     LibraryLoaded(Result<storage::Library, String>),
@@ -91,6 +102,12 @@ enum Message {
         track_id: String,
         position: Point,
     },
+    ToggleSettings,
+    ToggleSettingsAt {
+        position: Point,
+    },
+    CloseSettings,
+    RemoveReferenceTrack(PathBuf),
     SetReferenceTrack {
         track_id: String,
         path: PathBuf,
@@ -651,8 +668,14 @@ struct AppState {
     pending_reference_paths: Vec<PathBuf>,
     pending_reference_track_id: Option<String>,
     reference_import_selected_path: Option<PathBuf>,
+    pending_reference_catalog_paths: Vec<PathBuf>,
+    reference_catalog_import_total: usize,
+    reference_catalog_import_completed: usize,
+    reference_catalog_import_failed: usize,
     reference_menu_track_id: Option<String>,
     reference_menu_anchor: Option<Point>,
+    settings_open: bool,
+    settings_anchor: Option<Point>,
 }
 
 #[derive(Clone, Debug)]
@@ -746,8 +769,14 @@ impl Default for AppState {
             pending_reference_paths: Vec::new(),
             pending_reference_track_id: None,
             reference_import_selected_path: None,
+            pending_reference_catalog_paths: Vec::new(),
+            reference_catalog_import_total: 0,
+            reference_catalog_import_completed: 0,
+            reference_catalog_import_failed: 0,
             reference_menu_track_id: None,
             reference_menu_anchor: None,
+            settings_open: false,
+            settings_anchor: None,
         }
     }
 }
@@ -1124,6 +1153,57 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
             context.request_repaint();
         }
+        Message::AddReferenceTracksPressed => request_add_reference_tracks(state, context),
+        Message::ReferenceCatalogFilesPicked(paths) => {
+            state.busy = false;
+            if paths.is_empty() {
+                state.status = String::from("Reference catalog import canceled.");
+            } else {
+                schedule_reference_catalog_import(state, context, paths);
+            }
+            context.request_repaint();
+        }
+        Message::ReferenceCatalogImportCompleted { path, result } => {
+            state.busy = false;
+            state.reference_catalog_import_completed = state
+                .reference_catalog_import_completed
+                .saturating_add(1)
+                .min(state.reference_catalog_import_total);
+            if result.is_err() {
+                state.reference_catalog_import_failed = state
+                    .reference_catalog_import_failed
+                    .saturating_add(1)
+                    .min(state.reference_catalog_import_completed);
+            }
+            match result {
+                Ok(library) => {
+                    state.library = library;
+                    state.status = format!(
+                        "Added {} to the reference catalog.",
+                        reference_track_name(&path)
+                    );
+                }
+                Err(error) => state.status = error,
+            }
+            if state.pending_reference_catalog_paths.is_empty() {
+                let total = state.reference_catalog_import_total;
+                let failed = state.reference_catalog_import_failed;
+                if total > 1 {
+                    state.status = format!(
+                        "Added {} of {} reference tracks; {} failed.",
+                        total.saturating_sub(failed),
+                        total,
+                        failed
+                    );
+                }
+                state.reference_catalog_import_total = 0;
+                state.reference_catalog_import_completed = 0;
+                state.reference_catalog_import_failed = 0;
+            } else {
+                schedule_next_reference_catalog_import(state, context);
+            }
+            context.request_repaint();
+        }
         Message::FileDropped(drop) => {
             if drop.phase == ui::NativeFileDropPhase::Drop
                 && let Some(path) = drop.path
@@ -1166,6 +1246,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     close_stage_menu(state);
                     close_status_menu(state);
                     close_reference_menu(state);
+                    close_settings(state);
                     state.remove_confirmation_track_id = None;
                     reset_transport(state);
                     reset_reference_transport(state);
@@ -1365,6 +1446,16 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 }
                 context.request_repaint();
             }
+        }
+        Message::ToggleSettings => {
+            toggle_settings(state, context, keyboard_settings_anchor());
+        }
+        Message::ToggleSettingsAt { position } => {
+            toggle_settings(state, context, settings_anchor_from_pointer(position));
+        }
+        Message::CloseSettings => {
+            close_settings(state);
+            context.request_repaint();
         }
         Message::DecodeProgress {
             track_id,
@@ -1685,6 +1776,49 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
         }
         Message::ToggleStatusMenuAt { track_id, host } => {
             toggle_status_menu(state, track_id, host, context);
+        }
+        Message::RemoveReferenceTrack(path) => {
+            if state.busy {
+                return;
+            }
+            let selected_affected = selected_track(state)
+                .and_then(|track| track.reference_path.as_ref())
+                .is_some_and(|selected_path| selected_path == &path);
+            let cleared_assignments =
+                match storage::remove_reference_track(&mut state.library, &path) {
+                    Ok(cleared_assignments) => cleared_assignments,
+                    Err(error) => {
+                        state.status = error;
+                        context.request_repaint();
+                        return;
+                    }
+                };
+            close_stage_menu(state);
+            close_status_menu(state);
+            close_reference_menu(state);
+            if selected_affected {
+                state.reference_draft_note = None;
+                state.selected_reference_note_id = None;
+                state.hovered_reference_note_id = None;
+                reset_reference_transport(state);
+                state.reference_match_enabled = false;
+                schedule_selected_reference_decode(state, context);
+            }
+            state.status = if cleared_assignments == 0 {
+                format!(
+                    "Removed {} from the reference catalog.",
+                    reference_track_name(&path)
+                )
+            } else {
+                format!(
+                    "Removed {} and cleared {} track assignment{}.",
+                    reference_track_name(&path),
+                    cleared_assignments,
+                    plural(cleared_assignments)
+                )
+            };
+            schedule_library_save(state, context);
+            context.request_repaint();
         }
         Message::SetReferenceTrack { track_id, path } => {
             if !state.busy {
@@ -2253,6 +2387,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             if let Some(note) = note {
                 state.selected_note_id = Some(note.id);
                 state.review_cursor_millis = note.time_millis;
+                state.transport_position_millis = note.time_millis;
                 state.draft_note = None;
                 state.status = format!(
                     "Selected comment at {}.",
@@ -2313,6 +2448,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             if let Some(note) = note {
                 let editor_id = main_inline_comment_editor_id(&note.id);
                 state.review_cursor_millis = note.time_millis;
+                state.transport_position_millis = note.time_millis;
                 state.selected_note_id = Some(note.id.clone());
                 state.draft_note = Some(NoteDraft {
                     note_id: Some(note.id),
@@ -2402,6 +2538,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 .cloned();
             if let Some(note) = note {
                 state.selected_reference_note_id = Some(note.id);
+                state.reference_transport_position_millis = note.time_millis;
                 state.reference_draft_note = None;
                 state.status = format!(
                     "Selected reference comment at {}.",
@@ -2423,6 +2560,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             if let Some(note) = note {
                 let editor_id = reference_inline_comment_editor_id(&note.id);
                 state.selected_reference_note_id = Some(note.id.clone());
+                state.reference_transport_position_millis = note.time_millis;
                 state.reference_draft_note = Some(NoteDraft {
                     note_id: Some(note.id),
                     time_millis: note.time_millis,
@@ -3617,6 +3755,7 @@ fn start_persisted_note_drag(
     state.selected_note_id = Some(note_id);
     state.hovered_note_id = None;
     state.review_cursor_millis = time_millis;
+    state.transport_position_millis = time_millis;
     state.status = format!("Dragging comment at {}…", format_timestamp(time_millis));
     context.request_repaint();
 }
@@ -3664,6 +3803,7 @@ fn move_persisted_note(
         draft.time_millis = time_millis;
     }
     state.review_cursor_millis = time_millis;
+    state.transport_position_millis = time_millis;
     state.status = format!("Comment at {}.", format_timestamp(time_millis));
     context.request_repaint();
 }
@@ -3714,6 +3854,7 @@ fn finish_persisted_note_drag(
         draft.time_millis = final_time_millis;
     }
     state.review_cursor_millis = final_time_millis;
+    state.transport_position_millis = final_time_millis;
     state.status = if changed {
         format!(
             "Comment moved to {} and saved locally.",
@@ -4015,6 +4156,30 @@ fn request_reference(
     context.request_repaint();
 }
 
+fn request_add_reference_tracks(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
+    if state.busy {
+        state.status = String::from("The library is still loading or importing.");
+        context.request_repaint();
+        return;
+    }
+    if state.save_in_flight {
+        state.status =
+            String::from("Saving the library — try adding references again in a moment.");
+        context.request_repaint();
+        return;
+    }
+    state.busy = true;
+    state.status = String::from("Choosing reference tracks…");
+    context
+        .business()
+        .blocking_io("cadence-pick-reference-catalog")
+        .run(
+            |_| pick_reference_tracks(),
+            Message::ReferenceCatalogFilesPicked,
+        );
+    context.request_repaint();
+}
+
 fn audio_file_dialog(title: &str) -> FileDialogRequest {
     FileDialogRequest::new().title(title).filter(
         "Audio",
@@ -4180,6 +4345,58 @@ fn schedule_next_pending_reference_import(
         return;
     };
     schedule_reference(state, context, track_id, path);
+}
+
+fn schedule_reference_catalog_import(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    paths: Vec<PathBuf>,
+) {
+    state.pending_reference_catalog_paths = paths;
+    state.reference_catalog_import_total = state.pending_reference_catalog_paths.len();
+    state.reference_catalog_import_completed = 0;
+    state.reference_catalog_import_failed = 0;
+    schedule_next_reference_catalog_import(state, context);
+}
+
+fn schedule_next_reference_catalog_import(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+) {
+    if state.busy || state.save_in_flight {
+        return;
+    }
+    let Some(path) = (!state.pending_reference_catalog_paths.is_empty())
+        .then(|| state.pending_reference_catalog_paths.remove(0))
+    else {
+        return;
+    };
+    start_reference_catalog_import(state, context, path);
+}
+
+fn start_reference_catalog_import(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    path: PathBuf,
+) {
+    state.busy = true;
+    state.status = format!(
+        "Adding {} to the reference catalog…",
+        reference_track_name(&path)
+    );
+    let library = state.library.clone();
+    let completion_path = path.clone();
+    context
+        .business()
+        .blocking_io("cadence-import-reference-catalog")
+        .run(
+            move |_| storage::add_reference_track(library, path),
+            move |result| Message::ReferenceCatalogImportCompleted {
+                path: completion_path,
+                result,
+            },
+        );
+    context.request_repaint();
 }
 
 fn schedule_replace(
@@ -4456,6 +4673,29 @@ fn close_stage_menu(state: &mut AppState) {
 fn close_reference_menu(state: &mut AppState) {
     state.reference_menu_track_id = None;
     state.reference_menu_anchor = None;
+}
+
+fn close_settings(state: &mut AppState) {
+    state.settings_open = false;
+    state.settings_anchor = None;
+}
+
+fn toggle_settings(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    anchor: Point,
+) {
+    if state.settings_open {
+        close_settings(state);
+    } else {
+        close_stage_menu(state);
+        close_status_menu(state);
+        close_reference_menu(state);
+        state.review_filter_menu_open = false;
+        state.settings_open = true;
+        state.settings_anchor = Some(anchor);
+    }
+    context.request_repaint();
 }
 
 fn select_track_internal(
@@ -4934,6 +5174,7 @@ fn rollback_persisted_note_drag(state: &mut AppState) {
     }
     if note_restored && state.library.selected_track_id.as_deref() == Some(drag.track_id.as_str()) {
         state.review_cursor_millis = drag.original_time_millis;
+        state.transport_position_millis = drag.original_time_millis;
     }
     if let Some(draft) = state
         .draft_note
@@ -4994,6 +5235,29 @@ fn library_track_title_id(track_id: &str) -> u64 {
     ui::stable_widget_id(LIBRARY_TRACK_TITLE_ID_SCOPE, track_id)
 }
 
+fn settings_trigger(state: &AppState) -> ui::View<Message> {
+    ui::icon_button(IconName::Settings.icon())
+        .active(state.settings_open)
+        .message(Message::ToggleSettings)
+        .key("global-settings")
+        .tooltip("Reference tracks")
+        .size(30.0, 26.0)
+        .pointer_target(
+            ui::pointer_target(true)
+                .pointer_move(false)
+                .pointer_press(true)
+                .pointer_release(false)
+                .pointer_drop(false)
+                .wheel(false)
+                .filter_map(|message| match message {
+                    ui::PointerShieldMessage::PointerPress { position, .. } => {
+                        Some(Message::ToggleSettingsAt { position })
+                    }
+                    _ => None,
+                }),
+        )
+}
+
 fn project_surface(state: &AppState) -> ui::View<Message> {
     let workspace = match state.workspace_mode {
         WorkspaceMode::Review => ui::row([
@@ -5049,6 +5313,11 @@ fn project_surface(state: &AppState) -> ui::View<Message> {
                 .filter(|track| !reference_dropdown_paths(state, track).is_empty())
                 .map(|track| reference_menu_popover(state, track, anchor))
         });
+    let settings_menu = state
+        .settings_open
+        .then_some(state.settings_anchor)
+        .flatten()
+        .map(|anchor| reference_settings_popover(state, anchor));
     let workspace_tabs = [
         WorkspaceMode::Review,
         WorkspaceMode::Planner,
@@ -5083,14 +5352,18 @@ fn project_surface(state: &AppState) -> ui::View<Message> {
             .unwrap_or_else(|| ui::spacer().width(0.0)),
         WorkspaceMode::Planner => ui::spacer().width(0.0),
     };
+    let review_header = ui::row([global_review_title, global_review_controls])
+        .fill_width()
+        .height(28.0)
+        .spacing(12.0);
     let header = ui::row([
         ui::spacer().width(TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER),
         ui::row(workspace_tabs)
             .spacing(4.0)
             .width(254.0)
             .height(28.0),
-        global_review_title,
-        global_review_controls,
+        review_header,
+        settings_trigger(state),
     ])
     .fill_width()
     .height(36.0)
@@ -5167,6 +5440,7 @@ fn project_surface(state: &AppState) -> ui::View<Message> {
             ui::overlays()
                 .popover_opt(stage_menu)
                 .popover_opt(reference_menu)
+                .popover_opt(settings_menu)
                 .drag_preview_opt(drag_preview),
         ),
     )
@@ -5809,6 +6083,9 @@ fn planner_drop_is_valid(
 }
 
 const STAGE_MENU_WIDTH: f32 = 174.0;
+const SETTINGS_POPOVER_WIDTH: f32 = 360.0;
+const SETTINGS_REFERENCE_ROW_HEIGHT: f32 = 42.0;
+const SETTINGS_REFERENCE_LIST_MAX_HEIGHT: f32 = 252.0;
 
 fn keyboard_stage_menu_anchor(state: &AppState) -> Point {
     match state.workspace_mode {
@@ -5922,6 +6199,133 @@ fn stage_menu_popover(track: &storage::Track, anchor: Point) -> ui::View<Message
         ui::AnchoredPopoverAnchor::pointer(anchor),
         size,
     ))
+}
+
+fn settings_anchor_from_pointer(position: Point) -> Point {
+    Point::new(
+        position.x - SETTINGS_POPOVER_WIDTH + 30.0,
+        position.y + ui::dropdown_trigger_height() * 0.5,
+    )
+}
+
+fn keyboard_settings_anchor() -> Point {
+    Point::new(1180.0 - SETTINGS_POPOVER_WIDTH - 18.0, 42.0)
+}
+
+fn reference_assignment_count(library: &storage::Library, path: &Path) -> usize {
+    library
+        .tracks
+        .iter()
+        .filter(|track| track.reference_path.as_deref() == Some(path))
+        .count()
+}
+
+fn settings_reference_row(
+    reference: storage::ReferenceTrack,
+    assignment_count: usize,
+    active: bool,
+    index: usize,
+) -> ui::View<Message> {
+    let path = reference.path;
+    let name = reference_track_name(&path);
+    let assignment_label = if active {
+        format!("{} assigned · ACTIVE", assignment_count,)
+    } else {
+        format!("{} assigned", assignment_count)
+    };
+    let remove_path = path.clone();
+    ui::list_row(
+        index,
+        [
+            ui::column([
+                ui::text(name).truncate().height(20.0).fill_width(),
+                ui::text(assignment_label)
+                    .truncate()
+                    .height(17.0)
+                    .fill_width()
+                    .subtle(),
+            ])
+            .spacing(1.0)
+            .fill_width()
+            .height(38.0),
+            ui::close_button()
+                .subtle()
+                .message(Message::RemoveReferenceTrack(remove_path))
+                .key(format!("settings-remove-reference-{index}"))
+                .tooltip("Remove reference track")
+                .size(28.0, 24.0),
+        ],
+    )
+    .fill_width()
+    .height(SETTINGS_REFERENCE_ROW_HEIGHT)
+}
+
+fn reference_settings_popover(state: &AppState, anchor: Point) -> ui::View<Message> {
+    let reference_count = state.library.reference_tracks.len();
+    let list_height = (reference_count as f32 * SETTINGS_REFERENCE_ROW_HEIGHT)
+        .min(SETTINGS_REFERENCE_LIST_MAX_HEIGHT);
+    let references = if reference_count == 0 {
+        ui::column([ui::text("No reference tracks cataloged yet.")
+            .wrap()
+            .height(36.0)
+            .fill_width()
+            .subtle()])
+        .padding(8.0)
+        .fill_width()
+        .height(44.0)
+    } else {
+        let selected_reference_path =
+            selected_track(state).and_then(|track| track.reference_path.clone());
+        let rows = state
+            .library
+            .reference_tracks
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, reference)| {
+                let assignment_count = reference_assignment_count(&state.library, &reference.path);
+                let active = selected_reference_path.as_ref() == Some(&reference.path);
+                (index, reference, assignment_count, active)
+            })
+            .collect::<Vec<_>>();
+        ui::list(rows, |(index, reference, assignment_count, active)| {
+            settings_reference_row(reference, assignment_count, active, index)
+        })
+        .without_chrome()
+        .fill_width()
+        .height(list_height)
+    };
+    let list_height = if reference_count == 0 {
+        44.0
+    } else {
+        list_height
+    };
+    let content_height = 12.0 + 24.0 + 8.0 + list_height + 8.0 + 30.0 + 12.0;
+    let content = ui::column([
+        ui::text("REFERENCE TRACKS")
+            .style(ui::WidgetStyle::strong(ui::WidgetTone::Neutral))
+            .height(24.0)
+            .fill_width(),
+        references,
+        ui::button("Add reference tracks")
+            .primary()
+            .message(Message::AddReferenceTracksPressed)
+            .key("settings-add-reference-tracks")
+            .fill_width()
+            .height(30.0),
+    ])
+    .padding(12.0)
+    .spacing(8.0)
+    .fill_width()
+    .height(content_height);
+    dismissible_anchored_popover_from_parts(
+        AnchoredPopoverParts::below(
+            content.key("reference-settings-popover"),
+            ui::AnchoredPopoverAnchor::pointer(anchor),
+            Vector2::new(SETTINGS_POPOVER_WIDTH, content_height),
+        ),
+        Message::CloseSettings,
+    )
 }
 
 const REFERENCE_MENU_WIDTH: f32 = 190.0;
@@ -7390,11 +7794,12 @@ mod tests {
         apply_transport_snapshot, audition_panel, audition_shuffle_seed, audition_statuses,
         current_loudness_match_gain_db, current_lufs_meter_value,
         current_reference_lufs_meter_value, decode_result_is_current, deterministic_shuffle,
-        enforce_loop, favorite_toggle, library_track_title_id, loop_bounds, main_output_gain,
-        native_launch_options, note_editor, note_ratio_for_id, planner_drop_is_valid,
-        playback_shortcut, project_surface, rebuild_audition_queue, reconcile_audition_queue,
-        reference_decode_result_is_current, reference_output_gain, review_status_filter_message,
-        selected_reference_notes, selected_track, stage_dropdown, stage_menu_anchor_from_pointer,
+        enforce_loop, favorite_toggle, keyboard_settings_anchor, library_track_title_id,
+        loop_bounds, main_output_gain, native_launch_options, note_editor, note_ratio_for_id,
+        planner_drop_is_valid, playback_shortcut, project_surface, rebuild_audition_queue,
+        reconcile_audition_queue, reference_decode_result_is_current, reference_output_gain,
+        review_status_filter_message, selected_reference_notes, selected_track,
+        settings_anchor_from_pointer, stage_dropdown, stage_menu_anchor_from_pointer,
         stage_menu_popover, status_dropdown_for_host, status_filter_dropdown,
         sync_audition_queue_after_status_change, tracks_in_stage, tracks_with_status,
         transport_command_is_confirmed, update,
@@ -7852,6 +8257,201 @@ mod tests {
     }
 
     #[test]
+    fn reference_catalog_settings_popover_preserves_catalog_order_and_projects_active_usage() {
+        let first_path = PathBuf::from("/external/first-reference.wav");
+        let second_path = PathBuf::from("/external/second-reference.wav");
+        let mut state = AppState {
+            busy: false,
+            settings_open: true,
+            settings_anchor: Some(Point::new(780.0, 42.0)),
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(String::from("selected"));
+        state.library.tracks = vec![Track {
+            id: String::from("selected"),
+            title: String::from("Selected"),
+            original_name: String::from("selected.wav"),
+            path: PathBuf::from("/external/selected.wav"),
+            reference_path: Some(second_path.clone()),
+            size: 0,
+            favorite: false,
+            stage: TrackStage::SoundDesign,
+            status: TrackStatus::Inbox,
+            notes: Vec::new(),
+        }];
+        state.library.tracks.push(Track {
+            id: String::from("assigned"),
+            title: String::from("Assigned"),
+            original_name: String::from("assigned.wav"),
+            path: PathBuf::from("/external/assigned.wav"),
+            reference_path: Some(first_path.clone()),
+            size: 0,
+            favorite: false,
+            stage: TrackStage::SoundDesign,
+            status: TrackStatus::Inbox,
+            notes: Vec::new(),
+        });
+        state.library.reference_tracks = vec![
+            ReferenceTrack {
+                path: first_path,
+                notes: Vec::new(),
+            },
+            ReferenceTrack {
+                path: second_path,
+                notes: Vec::new(),
+            },
+        ];
+
+        let labels = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 720.0))
+            .paint_plan
+            .text_label_strings();
+        let first_index = labels
+            .iter()
+            .rposition(|label| label == "first-reference.wav")
+            .expect("first catalog reference should be visible");
+        let second_index = labels
+            .iter()
+            .rposition(|label| label == "second-reference.wav")
+            .expect("second catalog reference should be visible");
+        assert!(first_index < second_index);
+        assert!(labels.iter().any(|label| label == "1 assigned"));
+        assert!(labels.iter().any(|label| label == "1 assigned · ACTIVE"));
+        assert!(labels.iter().any(|label| label == "Add reference tracks"));
+    }
+
+    #[test]
+    fn settings_toggle_supports_pointer_and_keyboard_anchors_and_outside_close() {
+        let mut state = AppState {
+            busy: false,
+            ..AppState::default()
+        };
+        let mut context = ui::UiUpdateContext::default();
+        let pointer = Point::new(1_108.0, 34.0);
+        update(
+            &mut state,
+            Message::ToggleSettingsAt { position: pointer },
+            &mut context,
+        );
+        assert!(state.settings_open);
+        assert_eq!(
+            state.settings_anchor,
+            Some(settings_anchor_from_pointer(pointer))
+        );
+
+        update(&mut state, Message::CloseSettings, &mut context);
+        assert!(!state.settings_open);
+        assert_eq!(state.settings_anchor, None);
+
+        update(&mut state, Message::ToggleSettings, &mut context);
+        assert!(state.settings_open);
+        assert_eq!(state.settings_anchor, Some(keyboard_settings_anchor()));
+    }
+
+    #[test]
+    fn catalog_reference_import_keeps_settings_open_without_assigning_a_main_track() {
+        let path = PathBuf::from("/external/catalog-only.wav");
+        let library = Library {
+            tracks: vec![Track {
+                id: String::from("main-track"),
+                title: String::from("Main track"),
+                original_name: String::from("main-track.wav"),
+                path: PathBuf::from("/external/main-track.wav"),
+                reference_path: None,
+                size: 0,
+                favorite: false,
+                stage: TrackStage::SoundDesign,
+                status: TrackStatus::Inbox,
+                notes: Vec::new(),
+            }],
+            selected_track_id: Some(String::from("main-track")),
+            reference_tracks: vec![ReferenceTrack {
+                path: path.clone(),
+                notes: Vec::new(),
+            }],
+        };
+        let mut state = AppState {
+            busy: true,
+            settings_open: true,
+            settings_anchor: Some(Point::new(780.0, 42.0)),
+            ..AppState::default()
+        };
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::ReferenceCatalogImportCompleted {
+                path,
+                result: Ok(library),
+            },
+            &mut context,
+        );
+
+        assert!(state.settings_open);
+        assert_eq!(state.library.tracks[0].reference_path, None);
+        assert_eq!(state.library.reference_tracks.len(), 1);
+        assert!(!state.busy);
+    }
+
+    #[test]
+    fn removing_selected_catalog_reference_clears_reference_runtime_state_and_keeps_popover_open() {
+        let reference_path = PathBuf::from("/external/selected-reference.wav");
+        let mut state = AppState {
+            busy: false,
+            settings_open: true,
+            settings_anchor: Some(Point::new(780.0, 42.0)),
+            reference_waveform: Some(audition_waveform()),
+            reference_waveform_track_id: Some(String::from("selected")),
+            reference_waveform_generation: 4,
+            reference_transport: Some(transport::AudioTransport::spawn()),
+            reference_transport_loaded: true,
+            reference_match_enabled: true,
+            reference_draft_note: Some(NoteDraft {
+                note_id: None,
+                time_millis: 200,
+                body: String::from("stale"),
+            }),
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(String::from("selected"));
+        state.library.tracks.push(Track {
+            id: String::from("selected"),
+            title: String::from("Selected"),
+            original_name: String::from("selected.wav"),
+            path: PathBuf::from("/external/selected.wav"),
+            reference_path: Some(reference_path.clone()),
+            size: 0,
+            favorite: false,
+            stage: TrackStage::SoundDesign,
+            status: TrackStatus::Inbox,
+            notes: Vec::new(),
+        });
+        state.library.reference_tracks.push(ReferenceTrack {
+            path: reference_path.clone(),
+            notes: Vec::new(),
+        });
+        let previous_generation = state.reference_waveform_generation;
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::RemoveReferenceTrack(reference_path),
+            &mut context,
+        );
+
+        assert!(state.settings_open);
+        assert!(state.library.reference_tracks.is_empty());
+        assert_eq!(state.library.tracks[0].reference_path, None);
+        assert!(state.reference_waveform.is_none());
+        assert!(state.reference_waveform_track_id.is_none());
+        assert!(!state.reference_match_enabled);
+        assert!(state.reference_draft_note.is_none());
+        assert!(!state.reference_transport_loaded);
+        assert!(state.reference_waveform_generation > previous_generation);
+        assert!(state.save_in_flight);
+    }
+
+    #[test]
     fn playback_shortcut_maps_unmodified_escape_to_stop_playback() {
         let state = AppState::default();
 
@@ -8066,6 +8666,7 @@ mod tests {
             &mut context,
         );
         assert_eq!(state.review_cursor_millis, 1_500);
+        assert_eq!(state.transport_position_millis, 1_500);
         assert_eq!(
             selected_track(&state)
                 .and_then(|track| track.notes.iter().find(|note| note.id == note_id))
@@ -8115,6 +8716,7 @@ mod tests {
             &mut context,
         );
         assert_eq!(state.review_cursor_millis, 1_500);
+        assert_eq!(state.transport_position_millis, 1_500);
         assert_eq!(
             state
                 .library
@@ -8138,6 +8740,7 @@ mod tests {
             Some(500)
         );
         assert_eq!(state.review_cursor_millis, 500);
+        assert_eq!(state.transport_position_millis, 500);
         assert_eq!(
             state.draft_note.as_ref().map(|draft| draft.time_millis),
             Some(500)
@@ -11151,6 +11754,83 @@ mod tests {
     }
 
     #[test]
+    fn selecting_a_main_comment_sets_the_next_playback_position() {
+        let track_id = String::from("comment-playback-track");
+        let mut state = AppState {
+            busy: false,
+            waveform: Some(audition_waveform()),
+            waveform_track_id: Some(track_id.clone()),
+            review_cursor_millis: 250,
+            transport_position_millis: 250,
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(track_id.clone());
+        state.library.tracks.push(Track {
+            id: track_id,
+            title: String::from("Comment playback track"),
+            original_name: String::from("comment-playback-track.wav"),
+            path: PathBuf::from("/external/comment-playback-track.wav"),
+            reference_path: None,
+            size: 0,
+            favorite: false,
+            stage: TrackStage::SoundDesign,
+            status: TrackStatus::Inbox,
+            notes: vec![Note {
+                id: String::from("play-from-main-comment"),
+                time_millis: 750,
+                body: String::from("start here"),
+                done: false,
+            }],
+        });
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::SelectNote(String::from("play-from-main-comment")),
+            &mut context,
+        );
+        assert_eq!(state.review_cursor_millis, 750);
+        assert_eq!(state.transport_position_millis, 750);
+
+        update(&mut state, Message::TogglePlayback, &mut context);
+
+        assert_eq!(state.transport_position_millis, 750);
+        assert!(state.transport_polling);
+    }
+
+    #[test]
+    fn selecting_a_reference_comment_sets_the_next_reference_playback_position() {
+        let mut state = shared_reference_playback_state();
+        let reference_path = state.library.tracks[0]
+            .reference_path
+            .clone()
+            .expect("the shared state should have a reference path");
+        state.library.reference_tracks.push(ReferenceTrack {
+            path: reference_path,
+            notes: vec![Note {
+                id: String::from("play-from-reference-comment"),
+                time_millis: 2_500,
+                body: String::from("start reference here"),
+                done: false,
+            }],
+        });
+        state.reference_transport_position_millis = 500;
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::SelectReferenceNote(String::from("play-from-reference-comment")),
+            &mut context,
+        );
+        assert_eq!(state.reference_transport_position_millis, 2_500);
+
+        update(&mut state, Message::TogglePlayback, &mut context);
+
+        assert_eq!(state.reference_transport_position_millis, 2_500);
+        assert!(state.reference_transport_polling);
+    }
+
+    #[test]
     fn waveform_completion_requires_the_current_generation_and_selection() {
         let mut state = AppState::default();
         state.library.selected_track_id = Some(String::from("track-a"));
@@ -13262,6 +13942,21 @@ mod tests {
                 "the right-side global control {label:?} must remain inside the 1180px frame: {bounds:?}"
             );
         }
+
+        let rightmost_header_icon = frame
+            .paint_plan
+            .primitives
+            .iter()
+            .filter_map(|primitive| match primitive {
+                PaintPrimitive::Svg(svg) if svg.rect.min.y < 60.0 => Some(svg.rect),
+                _ => None,
+            })
+            .max_by(|left, right| left.max.x.total_cmp(&right.max.x))
+            .expect("the settings cog should paint in the integrated titlebar");
+        assert!(
+            rightmost_header_icon.max.x > 1120.0 && rightmost_header_icon.max.x <= 1180.0,
+            "the settings cog should stay at the far right of the titlebar: {rightmost_header_icon:?}"
+        );
     }
 
     #[test]
