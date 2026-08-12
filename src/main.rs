@@ -4696,6 +4696,7 @@ fn planner_card(
                 selected,
                 track.title.clone(),
                 ui::button(track.title.clone())
+                    .style(ui::WidgetStyle::strong(ui::WidgetTone::Neutral))
                     .selected(selected)
                     .message(Message::SelectTrack(title_track_id))
                     .fill_width()
@@ -4725,7 +4726,9 @@ fn planner_card(
     .padding(10.0)
     .spacing(5.0)
     .fill_width();
-    let card_background = ui::card().fill();
+    let card_background = ui::card()
+        .style(ui::WidgetStyle::normal(ui::WidgetTone::Neutral))
+        .fill();
     ui::stack([card_background, card_content])
         .key(format!("planner-card-{}", track.id))
         .fill_width()
@@ -4819,6 +4822,16 @@ fn status_dropdown_options(track: &storage::Track) -> Vec<ui::DropdownOption<Mes
     .collect()
 }
 
+const fn status_visual_tone(status: storage::TrackStatus) -> ui::WidgetTone {
+    match status {
+        storage::TrackStatus::Inbox => ui::WidgetTone::Accent,
+        storage::TrackStatus::Refine => ui::WidgetTone::Warning,
+        storage::TrackStatus::Release => ui::WidgetTone::Success,
+        storage::TrackStatus::Archive => ui::WidgetTone::Neutral,
+        storage::TrackStatus::Maybe => ui::WidgetTone::Danger,
+    }
+}
+
 fn card_control(
     _selected: bool,
     _value: impl Into<ui::TextContent>,
@@ -4902,6 +4915,7 @@ fn status_dropdown_trigger(
             host,
         })
         .build()
+        .style(ui::WidgetStyle::strong(status_visual_tone(track.status)))
         .key(format!("status-dropdown-{}", track.id))
         .fill_width()
         .height(ui::dropdown_trigger_height())
@@ -5077,7 +5091,9 @@ fn track_row(
         .height(20.0)
         .fill_width()
     };
-    let row_background = ui::card().fill();
+    let row_background = ui::card()
+        .style(ui::WidgetStyle::normal(ui::WidgetTone::Neutral))
+        .fill();
     ui::stack([
         row_background,
         ui::column([
@@ -5086,6 +5102,7 @@ fn track_row(
                     selected,
                     track.title.clone(),
                     ui::button(track.title)
+                        .style(ui::WidgetStyle::strong(ui::WidgetTone::Neutral))
                         .selected(selected)
                         .message(Message::SelectTrack(id))
                         .fill_width()
@@ -5102,9 +5119,9 @@ fn track_row(
             stage_control,
             status_control,
         ])
-        .padding(6.0)
+        .padding(8.0)
         .fill_width()
-        .spacing(4.0),
+        .spacing(5.0),
     ])
     .key(format!("library-track-{}", track.id))
     .fill_width()
@@ -5125,6 +5142,37 @@ fn audition_source_choice(
         .message(Message::SelectAuditionSource(source))
         .height(28.0);
     input.width(AUDITION_SOURCE_SELECTOR_WIDTH).height(28.0)
+}
+
+const REVIEW_TRANSPORT_ICON_TINTS: ui::SvgIconTintPalette = ui::SvgIconTintPalette::new(
+    ui::Rgba8::new(216, 215, 211, 255),
+    ui::Rgba8::new(233, 88, 67, 255),
+    ui::Rgba8::new(153, 155, 154, 255),
+);
+
+static REVIEW_PLAY_ICON: ui::SvgIconTintCache = ui::SvgIconTintCache::new(
+    r#"<svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg" fill="currentColor">
+  <path d="M4 2.5 13 8l-9 5.5z"/>
+</svg>"#,
+);
+
+static REVIEW_PAUSE_ICON: ui::SvgIconTintCache = ui::SvgIconTintCache::new(
+    r#"<svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg" fill="currentColor">
+  <rect x="3" y="2.5" width="3" height="11"/>
+  <rect x="10" y="2.5" width="3" height="11"/>
+</svg>"#,
+);
+
+static REVIEW_VOLUME_ICON: ui::SvgIconTintCache = ui::SvgIconTintCache::new(
+    r#"<svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg" fill="currentColor">
+  <path d="M2 6h3l4-3v10l-4-3H2z"/>
+  <path d="M12 5.5a3.7 3.7 0 0 1 0 5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+  <path d="M14.2 3.5a6.7 6.7 0 0 1 0 9" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+</svg>"#,
+);
+
+fn review_transport_icon(icon: &'static ui::SvgIconTintCache, active: bool) -> ui::SvgIcon {
+    icon.icon_for_state(REVIEW_TRANSPORT_ICON_TINTS, true, active)
 }
 
 fn review_panel(state: &AppState) -> ui::View<Message> {
@@ -5281,11 +5329,24 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
     };
     let transport_controls = if duration_millis > 0 && !state.waveform_busy {
         let shared_playing = state.transport_playing || state.reference_transport_playing;
-        let play_label = if shared_playing { "Pause" } else { "Play" };
-        let play_control = ui::button(play_label)
-            .active(shared_playing)
-            .message(Message::TogglePlayback)
-            .height(32.0);
+        let play_label = if shared_playing {
+            "Pause playback"
+        } else {
+            "Play track"
+        };
+        let play_control = ui::icon_button(review_transport_icon(
+            if shared_playing {
+                &REVIEW_PAUSE_ICON
+            } else {
+                &REVIEW_PLAY_ICON
+            },
+            shared_playing,
+        ))
+        .active(shared_playing)
+        .message(Message::TogglePlayback)
+        .key("review-transport-play")
+        .tooltip(play_label)
+        .size(28.0, 24.0);
         ui::row([
             ui::text(format!(
                 "{metadata} · {} / {}",
@@ -5295,21 +5356,26 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
             .height(32.0)
             .fill_width()
             .subtle(),
-            ui::text(format!(
-                "VOL {:02}",
-                (state.audition_volume * 100.0).round() as u32
-            ))
-            .height(32.0)
-            .width(62.0)
-            .subtle(),
+            ui::icon_button(review_transport_icon(&REVIEW_VOLUME_ICON, false))
+                .bare()
+                .focus(ui::FocusBehavior::None)
+                .passive::<Message>()
+                .key("review-transport-volume")
+                .tooltip(format!(
+                    "Volume {:02}",
+                    (state.audition_volume * 100.0).round() as u32
+                ))
+                .size(22.0, 24.0),
             ui::slider(state.audition_volume)
                 .primary()
+                .compact()
                 .track_height(5.0)
+                .track_border()
                 .message(Message::AuditionVolumeChanged)
                 .key("native-audition-volume")
-                .height(28.0)
+                .height(24.0)
                 .width(128.0),
-            play_control.width(64.0).height(32.0),
+            play_control,
             ui::badge(analysis_state)
                 .passive()
                 .subtle()
@@ -5379,7 +5445,7 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
         .fill_width()
         .height(waveform_pair_height);
 
-    let mut waveform_section = vec![transport_controls, waveform_with_source];
+    let mut waveform_section = vec![waveform_with_source];
     if track.reference_path.is_some() {
         waveform_section.push(reference_comments_panel(state, &track));
     }
@@ -5438,8 +5504,11 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
         .key(format!("review-status-menu-{}", track.id))
         .height(if status_menu_open { menu_height } else { 0.0 }),
     );
-    let track_header_height =
-        ui::dropdown_trigger_height() + if status_menu_open { menu_height } else { 0.0 } + 3.0;
+    track_header_rows.push(transport_controls);
+    let track_header_height = ui::dropdown_trigger_height()
+        + if status_menu_open { menu_height } else { 0.0 }
+        + 6.0
+        + 32.0;
     let track_header = ui::column(track_header_rows)
         .fill_width()
         .height(track_header_height)
@@ -7983,15 +8052,13 @@ mod tests {
             .paint_plan
             .first_text_rect("Review track")
             .expect("the primary track title should be visible");
-        let play_rect = frame
+        let metadata_rect = frame
             .paint_plan
-            .first_text_rect("Play")
-            .expect("the play control should be visible");
-        let volume_rect = frame
-            .paint_plan
-            .first_text_rect("VOL 80")
-            .expect("the volume label should be visible");
-        let main_waveform_left = frame
+            .text_runs()
+            .find(|run| run.text.as_str().contains("48000 Hz"))
+            .map(|run| run.rect)
+            .expect("the transport metadata should be visible");
+        let main_waveform_rect = frame
             .paint_plan
             .primitives
             .iter()
@@ -8001,18 +8068,29 @@ mod tests {
                         && fill.rect.width() > 300.0
                         && fill.rect.height() <= WAVEFORM_HEIGHT =>
                 {
-                    Some(fill.rect.min.x)
+                    Some(fill.rect)
                 }
                 _ => None,
             })
             .expect("the main waveform should paint its lower rail");
+        let svg_count = frame
+            .paint_plan
+            .primitives
+            .iter()
+            .filter(|primitive| matches!(primitive, PaintPrimitive::Svg(_)))
+            .count();
         let labels = frame.paint_plan.text_label_strings();
 
         assert!(labels.iter().any(|label| label == "Replace reference"));
         assert!(labels.iter().any(|label| label == "● MAIN"));
         assert!(labels.iter().any(|label| label == "○ REF"));
-        assert!(labels.iter().any(|label| label == "Play"));
         assert!(labels.iter().any(|label| label == "MATCH +0.0 dB"));
+        assert!(
+            svg_count >= 3,
+            "status, play, and volume icons should paint"
+        );
+        assert!(!labels.iter().any(|label| label == "Play"));
+        assert!(!labels.iter().any(|label| label == "VOL 80"));
         assert!(
             !labels.iter().any(|label| label == "LOCAL TRACK"),
             "the redundant review-card section label should stay removed"
@@ -8030,12 +8108,12 @@ mod tests {
             "metadata and transport time should share the compact toolbar"
         );
         assert!(
-            play_rect.min.x > volume_rect.max.x,
-            "the play control should sit to the right of the volume label"
+            (reference_rect.min.x - main_waveform_rect.min.x).abs() < 1.0,
+            "the reference label should align with the waveform body"
         );
         assert!(
-            (reference_rect.min.x - main_waveform_left).abs() < 1.0,
-            "the reference label should align with the waveform body"
+            metadata_rect.min.y < main_waveform_rect.min.y,
+            "the transport metadata should remain in the top track header"
         );
         assert!(
             reference_rect.min.y > title_rect.min.y,
