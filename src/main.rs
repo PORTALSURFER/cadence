@@ -5759,6 +5759,7 @@ fn audition_queue_row(
     let title = format!("{:02}  {}", index + 1, track.title);
     let favorite_control =
         favorite_toggle(&track, selected, format!("audition-favorite-{}", track.id));
+    let replace_control = replace_toggle(&track, format!("audition-replace-{}", track.id));
     let remove_id = track.id.clone();
     let remove_control = ui::close_button()
         .subtle()
@@ -5802,6 +5803,7 @@ fn audition_queue_row(
         ui::row([
             input.fill_width().height(28.0),
             favorite_control,
+            replace_control,
             remove_control,
         ])
         .fill_width()
@@ -6222,6 +6224,7 @@ fn planner_card(
     let remove_id = track.id.clone();
     let favorite_control =
         favorite_toggle(&track, selected, format!("planner-favorite-{}", track.id));
+    let replace_control = replace_toggle(&track, format!("planner-replace-{}", track.id));
     let remove_control = ui::close_button()
         .subtle()
         .message(Message::RequestRemoveTrack(remove_id.clone()))
@@ -6284,6 +6287,7 @@ fn planner_card(
             .fill_width()
             .height(28.0),
             favorite_control,
+            replace_control,
             remove_control,
         ])
         .fill_width()
@@ -6426,6 +6430,15 @@ fn favorite_toggle(track: &storage::Track, selected: bool, key: String) -> ui::V
         })
         .size(FAVORITE_CONTROL_WIDTH, 24.0);
     ui::stack([control, favorite_marker(track.favorite)]).size(FAVORITE_CONTROL_WIDTH, 24.0)
+}
+
+fn replace_toggle(track: &storage::Track, key: String) -> ui::View<Message> {
+    ui::button("↻")
+        .subtle()
+        .message(Message::ReplacePressed(track.id.clone()))
+        .key(key)
+        .tooltip("Replace track")
+        .size(28.0, 24.0)
 }
 
 fn stage_dropdown(track: &storage::Track, open: bool, _selected: bool) -> ui::View<Message> {
@@ -6811,13 +6824,7 @@ fn track_row(
     let remove_id = track.id.clone();
     let favorite_control =
         favorite_toggle(&track, selected, format!("library-favorite-{}", track.id));
-    let replace_id = track.id.clone();
-    let replace_control = ui::button("↻")
-        .subtle()
-        .message(Message::ReplacePressed(replace_id))
-        .key(format!("library-replace-{}", track.id))
-        .tooltip("Replace track")
-        .size(28.0, 24.0);
+    let replace_control = replace_toggle(&track, format!("library-replace-{}", track.id));
     let remove_control = ui::close_button()
         .subtle()
         .message(Message::RequestRemoveTrack(remove_id.clone()))
@@ -8175,8 +8182,9 @@ mod tests {
         gui::types::{Point, Rect, Vector2},
         prelude as ui,
         runtime::{
-            DeclarativeOwnedRuntimeBridge, Event, FocusTraversal, PaintPrimitive, PaintTextAlign,
-            RuntimeUpdateSnapshot, SurfaceRuntime,
+            Command, DeclarativeOwnedRuntimeBridge, Event, FocusTraversal, PaintPrimitive,
+            PaintTextAlign, PlatformRequest, PlatformResponse, RuntimeUpdateSnapshot,
+            SurfaceRuntime,
         },
         theme::ThemeTokens,
         widgets::{PointerModifiers, Widget, WidgetInput},
@@ -15322,6 +15330,99 @@ mod tests {
 
         assert!(rail.rect.max.x <= status.rect.min.x);
         assert_eq!(rail.rect.height(), ui::dropdown_trigger_height());
+    }
+
+    #[test]
+    fn workspace_cards_paint_and_route_replace_controls() {
+        let track = audition_track("workspace-replace-card");
+        let track_id = track.id.clone();
+
+        for workspace_mode in [WorkspaceMode::Audition, WorkspaceMode::Planner] {
+            let mut state = AppState {
+                busy: false,
+                workspace_mode,
+                ..AppState::default()
+            };
+            state.library.tracks = vec![track.clone()];
+            if workspace_mode == WorkspaceMode::Audition {
+                state.audition_queue = vec![track_id.clone()];
+            }
+
+            let bridge = DeclarativeOwnedRuntimeBridge::new(
+                state,
+                |state| project_surface(state).into_surface(),
+                |state, message| {
+                    if let Message::ReplacePressed(id) = message {
+                        state.status = format!("replace requested: {id}");
+                    }
+                },
+            );
+            let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1_180.0, 900.0));
+            let frame = runtime.frame_with_default_theme();
+            let replace_runs = frame
+                .paint_plan
+                .text_runs()
+                .filter(|run| run.text.as_str() == "↻" && run.rect.min.y > 60.0)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                replace_runs.len(),
+                1,
+                "{workspace_mode:?} should paint one replace control in its card header"
+            );
+            let replace_run = replace_runs[0];
+            let actionable_replace_controls = runtime
+                .automation_target_snapshot()
+                .targets
+                .iter()
+                .filter(|target| target.interaction_target && target.label.as_deref() == Some("↻"))
+                .count();
+            assert_eq!(actionable_replace_controls, 1);
+
+            let replace_point = Point::new(
+                replace_run.rect.min.x + replace_run.rect.width() * 0.5,
+                replace_run.rect.min.y + replace_run.rect.height() * 0.5,
+            );
+            assert!(runtime.widget_at(replace_point).is_some());
+            runtime.dispatch_primary_click(replace_point);
+            assert_eq!(
+                runtime.bridge().state().status,
+                format!("replace requested: {track_id}")
+            );
+        }
+    }
+
+    #[test]
+    fn replace_control_uses_the_existing_file_picker_request() {
+        let track = audition_track("replace-picker-track");
+        let track_id = track.id.clone();
+        let mut state = AppState {
+            busy: false,
+            ..AppState::default()
+        };
+        state.library.tracks.push(track);
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::ReplacePressed(track_id.clone()),
+            &mut context,
+        );
+
+        let Command::PlatformRequest {
+            request: PlatformRequest::PickFile(request),
+            on_completed,
+        } = context.into_command()
+        else {
+            panic!("replace should queue the existing file-picker request");
+        };
+        assert_eq!(request.title.as_deref(), Some("Replace audio track"));
+        assert_eq!(
+            on_completed(Ok(PlatformResponse::Canceled)),
+            Message::ReplaceFilePicked {
+                track_id,
+                result: Ok(PlatformResponse::Canceled),
+            }
+        );
     }
 
     #[test]
