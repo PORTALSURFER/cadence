@@ -31,3 +31,4 @@ assert_bundle_versions() {
 assert_bundle_versions "0.1.0" "0.1.0" "0.1.0"
 assert_bundle_versions "0.1.0-rc.2" "0.1.0" "2"
 assert_bundle_versions "0.1.0-nightly.1" "0.1.0" "1"
+assert_bundle_versions "0.1.1-nightly.6" "0.1.1" "6"

@@ -11,12 +11,24 @@ import test from "node:test";
 
 const execFileAsync = promisify(execFile);
 const releaseDirectory = path.dirname(fileURLToPath(import.meta.url));
+const allocatorScript = path.join(releaseDirectory, "allocate_nightly_version.sh");
 const buildScript = path.join(releaseDirectory, "build_macos_release.sh");
 const manifestScript = path.join(releaseDirectory, "create_manifest.mjs");
 const workflowPath = path.join(releaseDirectory, "..", "..", ".github", "workflows", "release.yml");
 const gitSha = "a".repeat(40);
 const notarySubmissionId = "00000000-0000-4000-8000-000000000000";
 const png = Buffer.from("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489", "hex");
+
+function allocateNightlyVersion(cargoBaseVersion, releaseNames) {
+  return execFileAsync("bash", [
+    "-c",
+    'printf "%s" "$1" | "$2" "$3"',
+    "cadence-allocator-test",
+    releaseNames,
+    allocatorScript,
+    cargoBaseVersion,
+  ]).then(({ stdout }) => stdout.trim());
+}
 
 async function createInputDirectory(version) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cadence-manifest-test-"));
@@ -111,19 +123,88 @@ test("manifest rejects unknown channels and mismatched channel versions", async 
   }
 });
 
-test("release workflow keeps signing and publication on separate immutable jobs", async () => {
+test("nightly allocator advances the initial, consecutive, and cross-channel patch stream", async (t) => {
+  await t.test("initial release", async () => {
+    assert.equal(await allocateNightlyVersion("0.1.0", ""), "0.1.1");
+  });
+  await t.test("consecutive release", async () => {
+    assert.equal(
+      await allocateNightlyVersion("0.1.1", "Cadence 0.1.1-nightly.6 nightly\n"),
+      "0.1.2",
+    );
+  });
+  await t.test("stable, rc, and nightly share one high-water mark", async () => {
+    assert.equal(
+      await allocateNightlyVersion(
+        "0.1.2",
+        "Cadence 0.1.0\nCadence 0.1.1-rc.2 rc\nCadence 0.1.2-nightly.7 nightly\n",
+      ),
+      "0.1.3",
+    );
+  });
+});
+
+test("nightly allocator reuses a one-ahead Cargo reservation", async () => {
+  assert.equal(
+    await allocateNightlyVersion("0.1.2", "Cadence 0.1.1-nightly.8 nightly\n"),
+    "0.1.2",
+  );
+});
+
+test("nightly allocator fails closed for history drift, gaps, and malformed names", async (t) => {
+  for (const [label, cargoVersion, releaseNames, message] of [
+    ["Cargo behind", "0.1.0", "Cadence 0.1.1-nightly.1 nightly\n", "behind published release history"],
+    ["Cargo more than one patch ahead", "0.1.4", "Cadence 0.1.2-nightly.1 nightly\n", "patch steps"],
+    ["Cargo major-minor mismatch", "0.2.0", "Cadence 0.1.2\n", "not in the published patch-version stream"],
+    ["malformed release", "0.1.0", "Cadence 0.1.0-nightly.1\n", "Malformed published Cadence release name"],
+    ["empty release name", "0.1.0", "Cadence 0.1.0\n\n", "empty name"],
+  ]) {
+    await t.test(label, async () => {
+      await assert.rejects(
+        allocateNightlyVersion(cargoVersion, releaseNames),
+        (error) => error.code === 1 && error.stderr.includes(message),
+      );
+    });
+  }
+});
+
+test("release workflow reserves nightly versions before immutable builds", async () => {
   const workflow = await fs.readFile(workflowPath, "utf8");
+  const prepareMatch = workflow.match(/\n  prepare:\n([\s\S]*?)\n  build:\n/);
   const buildMatch = workflow.match(/\n  build:\n([\s\S]*?)\n  publish:\n/);
+  assert.ok(prepareMatch, "workflow must define a preparation job");
   assert.ok(buildMatch, "workflow must define build and publish jobs");
+  const prepareJob = prepareMatch[1];
   const buildJob = buildMatch[1];
   const publishJob = workflow.slice(buildMatch.index + buildMatch[0].length - "  publish:\n".length);
 
+  assert.match(prepareJob, /runs-on: ubuntu-latest/);
+  assert.match(prepareJob, /\n    permissions:\n      contents: write\n/);
+  assert.doesNotMatch(prepareJob, /actions: read/);
+  assert.match(prepareJob, /ref: \$\{\{ github\.sha \}\}/);
+  assert.match(prepareJob, /gh api --paginate/);
+  assert.match(prepareJob, /select\(\.draft == false and \.published_at != null\)/);
+  assert.match(prepareJob, /allocate_nightly_version\.sh/);
+  assert.match(prepareJob, /original_lock_version/);
+  assert.match(prepareJob, /Cargo\.toml and Cargo\.lock Cadence package versions differ/);
+  assert.match(prepareJob, /cadence-nightly-\$\{RUN_NUMBER\}-\$\{original_source_sha:0:12\}/);
+  assert.match(prepareJob, /refs\/heads\/main/);
+  assert.match(prepareJob, /write_reserved_package_version/);
+  assert.match(prepareJob, /git push --atomic origin HEAD:refs\/heads\/main "refs\/tags\/\$reservation_tag"/);
+  assert.match(prepareJob, /git add Cargo\.toml Cargo\.lock/);
+  assert.match(prepareJob, /git diff --cached --name-only/);
+
   for (const output of ["channel", "version", "build_id", "release_tag", "tag_release", "create_github_release", "artifact_upload_name", "source_sha"]) {
-    assert.match(buildJob, new RegExp(`${output}: \\$\\{\\{ steps\\.release\\.outputs\\.${output} \\}\\}`));
+    assert.match(prepareJob, new RegExp(`${output}: \\$\\{\\{ steps\\.release\\.outputs\\.${output} \\}\\}`));
+    assert.match(buildJob, new RegExp(`${output}: \\$\\{\\{ needs\\.prepare\\.outputs\\.${output} \\}\\}`));
   }
+  assert.match(buildJob, /needs: prepare/);
   assert.match(buildJob, /runs-on: macos-14/);
   assert.match(buildJob, /\n    permissions:\n      contents: read\n      actions: read\n/);
-  assert.match(buildJob, /- name: Check out source\n        uses: actions\/checkout@v4\n        with:\n          persist-credentials: false/);
+  assert.match(buildJob, /- name: Check out source\n        uses: actions\/checkout@v4\n        with:\n          ref: \$\{\{ needs\.prepare\.outputs\.source_sha \}\}\n          persist-credentials: false/);
+  assert.doesNotMatch(buildJob, /Select release metadata|github\.event_name|steps\.release/);
+  assert.match(buildJob, /GITHUB_SHA: \$\{\{ needs\.prepare\.outputs\.source_sha \}\}/);
+  assert.match(buildJob, /export GITHUB_SHA=/);
   assert.match(buildJob, /actions\/upload-artifact@v4/);
   assert.match(buildJob, /path: release-output\//);
   for (const secret of [
@@ -144,7 +225,7 @@ test("release workflow keeps signing and publication on separate immutable jobs"
   assert.match(reuseBlock, /id: reuse_artifact/);
   assert.match(reuseBlock, /continue-on-error: true/);
   assert.match(reuseBlock, /actions\/download-artifact@v4/);
-  assert.match(reuseBlock, /name: \$\{\{ steps\.release\.outputs\.artifact_upload_name \}\}/);
+  assert.match(reuseBlock, /name: \$\{\{ needs\.prepare\.outputs\.artifact_upload_name \}\}/);
   assert.match(reuseBlock, /path: release-output\n/);
   assert.match(reuseBlock, /github-token: \$\{\{ github\.token \}\}/);
   assert.match(reuseBlock, /run-id: \$\{\{ github\.run_id \}\}/);
@@ -159,7 +240,7 @@ test("release workflow keeps signing and publication on separate immutable jobs"
 
   assert.match(publishJob, /needs: build/);
   assert.match(publishJob, /\n    permissions:\n      contents: write\n      actions: read\n/);
-  assert.match(publishJob, /- name: Check out source for release publisher\n        uses: actions\/checkout@v4\n        with:\n          persist-credentials: false/);
+  assert.match(publishJob, /- name: Check out source for release publisher\n        uses: actions\/checkout@v4\n        with:\n          ref: \$\{\{ needs\.build\.outputs\.source_sha \}\}\n          persist-credentials: false/);
   assert.match(publishJob, /actions\/download-artifact@v4/);
   assert.match(publishJob, /name: \$\{\{ needs\.build\.outputs\.artifact_upload_name \}\}/);
   assert.match(publishJob, /github-token: \$\{\{ github\.token \}\}/);
@@ -169,6 +250,8 @@ test("release workflow keeps signing and publication on separate immutable jobs"
   assert.match(publishJob, /CADENCE_RELEASE_UPLOAD_TOKEN/);
   assert.match(publishJob, /gh release view/);
   assert.match(publishJob, /gh release create/);
+  assert.match(publishJob, /git\/ref\/tags\/\$RELEASE_TAG/);
+  assert.match(publishJob, /--verify-tag/);
   assert.match(publishJob, /gh release download/);
   assert.doesNotMatch(publishJob, /build_macos_release\.sh|cargo \+stable|cargo build/);
 

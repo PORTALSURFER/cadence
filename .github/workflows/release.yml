@@ -26,12 +26,11 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
-    name: Build and sign release
-    runs-on: macos-14
+  prepare:
+    name: Prepare release metadata
+    runs-on: ubuntu-latest
     permissions:
-      contents: read
-      actions: read
+      contents: write
     outputs:
       channel: ${{ steps.release.outputs.channel }}
       version: ${{ steps.release.outputs.version }}
@@ -41,20 +40,13 @@ jobs:
       create_github_release: ${{ steps.release.outputs.create_github_release }}
       artifact_upload_name: ${{ steps.release.outputs.artifact_upload_name }}
       source_sha: ${{ steps.release.outputs.source_sha }}
-    env:
-      CARGO_TERM_COLOR: always
-      APPLE_DEVELOPER_ID_APPLICATION_CERT_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_CERT_BASE64 }}
-      APPLE_DEVELOPER_ID_APPLICATION_CERT_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_CERT_PASSWORD }}
-      APPLE_NOTARY_KEY_BASE64: ${{ secrets.APPLE_NOTARY_KEY_BASE64 }}
-      APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
-      APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
     steps:
       - name: Check out source
         uses: actions/checkout@v4
         with:
-          persist-credentials: false
+          ref: ${{ github.sha }}
 
-      - name: Select release metadata
+      - name: Select and reserve release metadata
         id: release
         shell: bash
         env:
@@ -62,9 +54,10 @@ jobs:
           REF: ${{ github.ref }}
           REF_NAME: ${{ github.ref_name }}
           RUN_NUMBER: ${{ github.run_number }}
-          SOURCE_SHA: ${{ github.sha }}
+          ORIGINAL_SOURCE_SHA: ${{ github.sha }}
           INPUT_CHANNEL: ${{ inputs.channel || '' }}
           INPUT_VERSION: ${{ inputs.version || '' }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
@@ -72,17 +65,80 @@ jobs:
           stable_version_re="^${base_version_re}$"
           rc_version_re="^${base_version_re}-rc\.[1-9][0-9]*$"
           nightly_version_re="^${base_version_re}-nightly\.[1-9][0-9]*$"
-          cargo_version="$(sed -n '/^\[package\]/,/^\[/{ s/^version = "\([^\"]*\)"/\1/p; }' Cargo.toml | head -n 1)"
-          cargo_base_version="${cargo_version%%-*}"
-          [[ "$cargo_base_version" =~ $base_version_re ]] || { echo "Cargo.toml does not contain a numeric package version" >&2; exit 1; }
-          [[ "$SOURCE_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || { echo "GitHub did not provide a full commit SHA" >&2; exit 1; }
-          [[ "$RUN_NUMBER" =~ ^[1-9][0-9]*$ ]] || { echo "GitHub run number is not a positive integer" >&2; exit 1; }
+          cargo_version_from_file() {
+            sed -n '/^\[package\]/,/^\[/{ s/^version = "\([^"]*\)"/\1/p; }' "$1" | head -n 1
+          }
+          lock_version_from_file() {
+            awk '
+              /^\[\[package\]\]$/ { in_package=1; is_cadence=0; next }
+              in_package && /^\[/ { in_package=0 }
+              in_package && $0 == "name = \"cadence-native\"" { is_cadence=1; next }
+              in_package && is_cadence && /^version = / {
+                sub(/^version = "/, "")
+                sub(/"$/, "")
+                print
+                exit
+              }
+            ' "$1"
+          }
+          write_reserved_package_version() {
+            python3 - "$1" <<'PY'
+          import pathlib
+          import re
+          import sys
 
-          source_sha="$(printf '%s' "$SOURCE_SHA" | tr '[:upper:]' '[:lower:]')"
+          version = sys.argv[1]
+          patterns = {
+              pathlib.Path("Cargo.toml"): re.compile(
+                  r'(?ms)^\[package\]\nname = "cadence-native"\nversion = "[^"]+"'
+              ),
+              pathlib.Path("Cargo.lock"): re.compile(
+                  r'(?ms)^\[\[package\]\]\nname = "cadence-native"\nversion = "[^"]+"'
+              ),
+          }
+          for path, pattern in patterns.items():
+              text = path.read_text(encoding="utf-8")
+              matches = list(pattern.finditer(text))
+              if len(matches) != 1:
+                  raise SystemExit(f"expected exactly one Cadence package entry in {path}")
+              match = matches[0]
+              replacement = re.sub(r'version = "[^"]+"$', f'version = "{version}"', match.group(0))
+              path.write_text(text[:match.start()] + replacement + text[match.end():], encoding="utf-8")
+          PY
+          }
+          assert_package_versions() {
+            local expected="$1"
+            local toml_version
+            local lock_version
+            toml_version="$(cargo_version_from_file Cargo.toml)"
+            lock_version="$(lock_version_from_file Cargo.lock)"
+            [[ "$toml_version" == "$expected" ]] || { echo "Cargo.toml Cadence version $toml_version does not match $expected" >&2; exit 1; }
+            [[ "$lock_version" == "$expected" ]] || { echo "Cargo.lock Cadence version $lock_version does not match $expected" >&2; exit 1; }
+          }
+          write_output() {
+            printf '%s\n' "$1=$2" >> "$GITHUB_OUTPUT"
+          }
+
+          [[ "$ORIGINAL_SOURCE_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || { echo "GitHub did not provide a full commit SHA" >&2; exit 1; }
+          [[ "$RUN_NUMBER" =~ ^[1-9][0-9]*$ ]] || { echo "GitHub run number is not a positive integer" >&2; exit 1; }
+          original_source_sha="$(printf '%s' "$ORIGINAL_SOURCE_SHA" | tr '[:upper:]' '[:lower:]')"
+          original_cargo_version="$(cargo_version_from_file Cargo.toml)"
+          original_lock_version="$(lock_version_from_file Cargo.lock)"
+          original_cargo_base_version="${original_cargo_version%%-*}"
+          [[ "$original_cargo_base_version" =~ ^${base_version_re}$ ]] || { echo "Cargo.toml does not contain a numeric package version" >&2; exit 1; }
+          [[ "$original_lock_version" == "$original_cargo_version" ]] || {
+            echo "Cargo.toml and Cargo.lock Cadence package versions differ: $original_cargo_version vs $original_lock_version" >&2
+            exit 1
+          }
+
           channel=""
           version=""
+          build_id=""
           release_tag=""
           tag_release=false
+          create_github_release=false
+          source_sha="$original_source_sha"
+          automatic_nightly=false
 
           case "$EVENT_NAME" in
             push)
@@ -103,7 +159,7 @@ jobs:
               ;;
             schedule)
               channel=nightly
-              version="${cargo_base_version}-nightly.${RUN_NUMBER}"
+              automatic_nightly=true
               ;;
             workflow_dispatch)
               channel="$INPUT_CHANNEL"
@@ -113,8 +169,8 @@ jobs:
                   version="$INPUT_VERSION"
                   ;;
                 nightly)
-                  [[ -z "$INPUT_VERSION" ]] || { echo "nightly manual releases use Cargo.toml plus the run number; leave version blank" >&2; exit 2; }
-                  version="${cargo_base_version}-nightly.${RUN_NUMBER}"
+                  [[ -z "$INPUT_VERSION" ]] || { echo "nightly manual releases use the reserved Cargo base version plus the run number; leave version blank" >&2; exit 2; }
+                  automatic_nightly=true
                   ;;
                 *)
                   echo "invalid release channel: $channel" >&2
@@ -133,10 +189,84 @@ jobs:
               ;;
           esac
 
+          if [[ "$automatic_nightly" == true ]]; then
+            [[ "$REF" == refs/heads/main ]] || { echo "automatic nightly releases must run from the main branch" >&2; exit 1; }
+            reservation_tag="cadence-nightly-${RUN_NUMBER}-${original_source_sha:0:12}"
+            existing_tag_ref="$(git ls-remote --refs origin "refs/tags/$reservation_tag" | awk 'NF == 2 { print; found++ } END { if (found > 1) exit 1 }')"
+            if [[ -n "$existing_tag_ref" ]]; then
+              git fetch --no-tags origin "refs/tags/$reservation_tag:refs/tags/$reservation_tag"
+              [[ "$(git cat-file -t "refs/tags/$reservation_tag")" == commit ]] || {
+                echo "nightly reservation tag is not a lightweight commit tag: $reservation_tag" >&2
+                exit 1
+              }
+              source_sha="$(git rev-parse "refs/tags/$reservation_tag^{commit}")"
+              reserved_cargo_version="$(git show "$source_sha:Cargo.toml" | sed -n '/^\[package\]/,/^\[/{ s/^version = "\([^"]*\)"/\1/p; }' | head -n 1)"
+              reserved_lock_version="$(git show "$source_sha:Cargo.lock" | awk '
+                /^\[\[package\]\]$/ { in_package=1; is_cadence=0; next }
+                in_package && /^\[/ { in_package=0 }
+                in_package && $0 == "name = \"cadence-native\"" { is_cadence=1; next }
+                in_package && is_cadence && /^version = / {
+                  sub(/^version = "/, "")
+                  sub(/"$/, "")
+                  print
+                  exit
+                }
+              ')"
+              reserved_base_version="${reserved_cargo_version%%-*}"
+              [[ "$reserved_base_version" =~ ^${base_version_re}$ ]] || { echo "reservation tag does not contain a numeric Cadence package version" >&2; exit 1; }
+              [[ "$reserved_cargo_version" == "$reserved_base_version" ]] || { echo "reservation Cargo package version must be numeric: $reserved_cargo_version" >&2; exit 1; }
+              [[ "$reserved_lock_version" == "$reserved_cargo_version" ]] || { echo "reservation Cargo.toml and Cargo.lock versions differ" >&2; exit 1; }
+            else
+              git fetch --no-tags origin main
+              [[ "$(git rev-parse origin/main)" == "$original_source_sha" ]] || {
+                echo "main advanced after the nightly source was selected; refusing to reserve a version" >&2
+                exit 1
+              }
+              release_names="$(gh api --paginate \
+                -H 'Accept: application/vnd.github+json' \
+                "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+                --jq '.[] | select(.draft == false and .published_at != null) | .name')"
+              if [[ -n "$release_names" ]]; then
+                reserved_base_version="$(printf '%s' "$release_names" | ./scripts/release/allocate_nightly_version.sh "$original_cargo_base_version")"
+              else
+                reserved_base_version="$(./scripts/release/allocate_nightly_version.sh "$original_cargo_base_version")"
+              fi
+              write_reserved_package_version "$reserved_base_version"
+              assert_package_versions "$reserved_base_version"
+              unexpected_files="$(git diff --name-only | grep -v -E '^(Cargo\.toml|Cargo\.lock)$' || true)"
+              [[ -z "$unexpected_files" ]] || { echo "nightly reservation changed unexpected files: $unexpected_files" >&2; exit 1; }
+              if ! git diff --quiet -- Cargo.toml Cargo.lock; then
+                git config user.name "github-actions[bot]"
+                git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+                git add Cargo.toml Cargo.lock
+                [[ "$(git diff --cached --name-only)" == $'Cargo.lock\nCargo.toml' ]] || {
+                  echo "nightly reservation commit must contain only Cargo.toml and Cargo.lock" >&2
+                  exit 1
+                }
+                git commit -m "chore(release): reserve Cadence ${reserved_base_version} nightly"
+              fi
+              if git show-ref --verify --quiet "refs/tags/$reservation_tag"; then
+                echo "local nightly reservation tag already exists unexpectedly: $reservation_tag" >&2
+                exit 1
+              fi
+              if git ls-remote --exit-code --refs origin "refs/tags/$reservation_tag" >/dev/null 2>&1; then
+                echo "nightly reservation tag appeared concurrently: $reservation_tag" >&2
+                exit 1
+              fi
+              git tag "$reservation_tag"
+              git push --atomic origin HEAD:refs/heads/main "refs/tags/$reservation_tag"
+              source_sha="$(git rev-parse HEAD)"
+              assert_package_versions "$reserved_base_version"
+            fi
+            version="${reserved_base_version}-nightly.${RUN_NUMBER}"
+            release_tag="$reservation_tag"
+            tag_release=true
+          fi
+
           case "$channel" in
             stable)
               [[ "$version" =~ $stable_version_re ]] || { echo "stable releases require X.Y.Z: $version" >&2; exit 2; }
-              [[ "$cargo_version" == "$version" ]] || { echo "Cargo.toml version $cargo_version does not match stable version $version" >&2; exit 1; }
+              [[ "$original_cargo_version" == "$version" ]] || { echo "Cargo.toml version $original_cargo_version does not match stable version $version" >&2; exit 1; }
               ;;
             rc)
               [[ "$version" =~ $rc_version_re ]] || { echo "rc releases require X.Y.Z-rc.N: $version" >&2; exit 2; }
@@ -151,9 +281,13 @@ jobs:
           esac
 
           version_base="${version%%-*}"
-          [[ "$version_base" == "$cargo_base_version" ]] || { echo "Cargo.toml base version $cargo_base_version does not match release version $version" >&2; exit 1; }
+          if [[ "$automatic_nightly" == true ]]; then
+            [[ "$version_base" == "$reserved_base_version" ]] || { echo "reserved version $reserved_base_version does not match release version $version" >&2; exit 1; }
+          else
+            [[ "$version_base" == "$original_cargo_base_version" ]] || { echo "Cargo.toml base version $original_cargo_base_version does not match release version $version" >&2; exit 1; }
+          fi
 
-          short_sha="${source_sha:0:12}"
+          short_sha="${original_source_sha:0:12}"
           if [[ "$channel" == stable ]]; then
             build_id="cadence-v${version}-${RUN_NUMBER}"
           else
@@ -163,7 +297,6 @@ jobs:
             fi
           fi
 
-          create_github_release=false
           if [[ "$tag_release" == true || ( "$channel" == nightly && -n "$release_tag" ) || "$channel" == rc ]]; then
             create_github_release=true
           fi
@@ -173,14 +306,44 @@ jobs:
             artifact_upload_name="cadence-${channel}-v${version}-macos-arm64"
           fi
 
-          printf '%s\n' "channel=$channel" >> "$GITHUB_OUTPUT"
-          printf '%s\n' "version=$version" >> "$GITHUB_OUTPUT"
-          printf '%s\n' "build_id=$build_id" >> "$GITHUB_OUTPUT"
-          printf '%s\n' "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
-          printf '%s\n' "tag_release=$tag_release" >> "$GITHUB_OUTPUT"
-          printf '%s\n' "create_github_release=$create_github_release" >> "$GITHUB_OUTPUT"
-          printf '%s\n' "artifact_upload_name=$artifact_upload_name" >> "$GITHUB_OUTPUT"
-          printf '%s\n' "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
+          write_output channel "$channel"
+          write_output version "$version"
+          write_output build_id "$build_id"
+          write_output release_tag "$release_tag"
+          write_output tag_release "$tag_release"
+          write_output create_github_release "$create_github_release"
+          write_output artifact_upload_name "$artifact_upload_name"
+          write_output source_sha "$source_sha"
+
+  build:
+    name: Build and sign release
+    needs: prepare
+    runs-on: macos-14
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      channel: ${{ needs.prepare.outputs.channel }}
+      version: ${{ needs.prepare.outputs.version }}
+      build_id: ${{ needs.prepare.outputs.build_id }}
+      release_tag: ${{ needs.prepare.outputs.release_tag }}
+      tag_release: ${{ needs.prepare.outputs.tag_release }}
+      create_github_release: ${{ needs.prepare.outputs.create_github_release }}
+      artifact_upload_name: ${{ needs.prepare.outputs.artifact_upload_name }}
+      source_sha: ${{ needs.prepare.outputs.source_sha }}
+    env:
+      CARGO_TERM_COLOR: always
+      APPLE_DEVELOPER_ID_APPLICATION_CERT_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_CERT_BASE64 }}
+      APPLE_DEVELOPER_ID_APPLICATION_CERT_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_CERT_PASSWORD }}
+      APPLE_NOTARY_KEY_BASE64: ${{ secrets.APPLE_NOTARY_KEY_BASE64 }}
+      APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+      APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.source_sha }}
+          persist-credentials: false
 
       - name: Install stable Rust
         run: rustup toolchain install stable --profile minimal --component clippy
@@ -206,7 +369,7 @@ jobs:
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
-          name: ${{ steps.release.outputs.artifact_upload_name }}
+          name: ${{ needs.prepare.outputs.artifact_upload_name }}
           path: release-output
           github-token: ${{ github.token }}
           run-id: ${{ github.run_id }}
@@ -214,11 +377,13 @@ jobs:
       - name: Build, sign, notarize, and describe release
         if: steps.reuse_artifact.outcome != 'success'
         env:
-          RELEASE_CHANNEL: ${{ steps.release.outputs.channel }}
-          RELEASE_VERSION: ${{ steps.release.outputs.version }}
-          RELEASE_BUILD_ID: ${{ steps.release.outputs.build_id }}
+          RELEASE_CHANNEL: ${{ needs.prepare.outputs.channel }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          RELEASE_BUILD_ID: ${{ needs.prepare.outputs.build_id }}
+          GITHUB_SHA: ${{ needs.prepare.outputs.source_sha }}
         run: |
           set -euo pipefail
+          export GITHUB_SHA="${{ needs.prepare.outputs.source_sha }}"
           ./scripts/release/build_macos_release.sh \
             --version "$RELEASE_VERSION" \
             --channel "$RELEASE_CHANNEL" \
@@ -228,7 +393,7 @@ jobs:
         if: steps.reuse_artifact.outcome != 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.release.outputs.artifact_upload_name }}
+          name: ${{ needs.prepare.outputs.artifact_upload_name }}
           path: release-output/
           if-no-files-found: error
           overwrite: false
@@ -253,6 +418,7 @@ jobs:
       - name: Check out source for release publisher
         uses: actions/checkout@v4
         with:
+          ref: ${{ needs.build.outputs.source_sha }}
           persist-credentials: false
 
       - name: Download exact release artifact
@@ -301,6 +467,16 @@ jobs:
           for asset in "${release_assets[@]}"; do
             [[ -s "$asset" ]] || { echo "release asset is missing: $asset" >&2; exit 1; }
           done
+
+          if [[ "$RELEASE_CHANNEL" == nightly && "$RELEASE_TAG" == cadence-nightly-* && "$RELEASE_TAG_EXISTS" == true ]]; then
+            reservation_tag_info="$(gh api \
+              "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" \
+              --jq '[.object.type, .object.sha] | @tsv')"
+            [[ "$reservation_tag_info" == "commit	$SOURCE_SHA" ]] || {
+              echo "automatic nightly reservation tag does not resolve to the built commit: $RELEASE_TAG" >&2
+              exit 1
+            }
+          fi
 
           if ! gh release view "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
