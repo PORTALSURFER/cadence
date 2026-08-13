@@ -10,7 +10,6 @@ use radiant::{
     },
     gui::{
         list::DenseRowMarkerParts,
-        svg::IconName,
         types::{Point, Rect, Vector2},
     },
     layout::LayoutOutput,
@@ -138,7 +137,10 @@ enum Message {
     AuditionPlay,
     AuditionPrevious,
     AuditionNext,
+    // Retained for pure source-selection reducer coverage; source circles use activation.
+    #[cfg_attr(not(test), allow(dead_code))]
     SelectAuditionSource(AuditionSource),
+    ActivateAuditionSource(AuditionSource),
     SelectCommentSource(CommentSource),
     ToggleReviewFilterMenu,
     ToggleReferenceMatch,
@@ -1192,12 +1194,16 @@ fn current_reference_lufs_meter_value(state: &AppState, track_id: &str) -> Optio
 }
 
 fn reference_output_gain(state: &AppState) -> f32 {
+    reference_output_gain_for_source(state, state.audition_source)
+}
+
+fn reference_output_gain_for_source(state: &AppState, source: AuditionSource) -> f32 {
     let match_gain = state
         .reference_match_enabled
         .then(|| current_loudness_match_gain_db(state))
         .flatten()
         .map_or(1.0, audio::linear_gain_for_db);
-    if state.audition_source == AuditionSource::Reference {
+    if source == AuditionSource::Reference {
         transport::normalize_output_gain(state.audition_volume * match_gain)
     } else {
         0.0
@@ -2200,6 +2206,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
         Message::AuditionPrevious => previous_audition(state, context),
         Message::AuditionNext => next_audition(state, context),
         Message::SelectAuditionSource(source) => select_audition_source(state, context, source),
+        Message::ActivateAuditionSource(source) => activate_audition_source(state, context, source),
         Message::SelectCommentSource(source) => {
             state.comment_source = source;
             state.comment_source_explicit = true;
@@ -3119,6 +3126,167 @@ fn select_audition_source(
         };
     }
     context.request_repaint();
+}
+
+fn activate_audition_source(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    source: AuditionSource,
+) {
+    if state.busy {
+        return;
+    }
+    if source == AuditionSource::Reference {
+        if state.reference_waveform_busy {
+            state.status = String::from("Reference analysis is still pending.");
+            context.request_repaint();
+            return;
+        }
+        if selected_reference_details(state).is_none() {
+            state.status = String::from("Import and analyze a reference track first.");
+            context.request_repaint();
+            return;
+        }
+    }
+
+    let source_active = source_transport_is_active(state, source);
+    let playback_active = source_active
+        || source_transport_is_active(
+            state,
+            match source {
+                AuditionSource::Main => AuditionSource::Reference,
+                AuditionSource::Reference => AuditionSource::Main,
+            },
+        );
+    if !playback_active {
+        select_audition_source(state, context, source);
+        toggle_playback(state, context);
+    } else if source_active {
+        if state.audition_source == source {
+            stop_playback(state, context);
+        } else {
+            select_audition_source(state, context, source);
+        }
+    } else {
+        if let Err(error) = start_source_alongside_active(state, source) {
+            state.status = error;
+            context.request_repaint();
+            return;
+        }
+        state.reference_only_playback = false;
+        select_audition_source(state, context, source);
+    }
+}
+
+fn start_source_alongside_active(
+    state: &mut AppState,
+    source: AuditionSource,
+) -> Result<(), String> {
+    match source {
+        AuditionSource::Main => {
+            let duration_millis = selected_main_duration(state)
+                .ok_or_else(|| String::from("Audio analysis is still pending."))?;
+            if !state.transport.has_command_capacity(1) {
+                return Err(String::from(transport::CONTROLS_BUSY_ERROR));
+            }
+            let loop_bounds = loop_bounds_for_source(state, AuditionSource::Main);
+            let position_millis =
+                playback_start_position(state, AuditionSource::Main, duration_millis, loop_bounds);
+            state.transport.set_output_gain(state.audition_volume);
+            let result =
+                if loop_bounds.is_some() || position_millis != state.transport_position_millis {
+                    state.transport.seek(
+                        state.transport_generation,
+                        position_millis,
+                        duration_millis,
+                        true,
+                    )
+                } else {
+                    state.transport.play(state.transport_generation)
+                };
+            match result {
+                Ok(token) => {
+                    set_source_position(state, AuditionSource::Main, position_millis);
+                    begin_transport_polling(state, token);
+                    Ok(())
+                }
+                Err(error) => {
+                    sync_audition_output_gains(state);
+                    Err(error)
+                }
+            }
+        }
+        AuditionSource::Reference => {
+            let (path, duration_millis) = selected_reference_details(state)
+                .ok_or_else(|| String::from("Import and analyze a reference track first."))?;
+            let reference_was_loaded = state.reference_transport_loaded;
+            let required_slots = if reference_was_loaded { 2 } else { 3 };
+            let loop_bounds = loop_bounds_for_source(state, AuditionSource::Reference);
+            let position_millis = playback_start_position(
+                state,
+                AuditionSource::Reference,
+                duration_millis,
+                loop_bounds,
+            );
+            let reference_gain = reference_output_gain_for_source(state, AuditionSource::Reference);
+            let reference_transport = state
+                .reference_transport
+                .get_or_insert_with(transport::AudioTransport::spawn);
+            if reference_transport.has_pending_load() {
+                return Err(String::from(transport::CONTROLS_BUSY_ERROR));
+            }
+            if !reference_transport.has_command_capacity(required_slots) {
+                return Err(String::from(transport::CONTROLS_BUSY_ERROR));
+            }
+            let mut loaded = reference_was_loaded;
+            let result = {
+                reference_transport.set_output_gain(reference_gain);
+                let load_result = if !loaded {
+                    match reference_transport.load(
+                        state.reference_transport_generation,
+                        path,
+                        duration_millis,
+                    ) {
+                        Ok(_) if !reference_transport.has_pending_load() => {
+                            loaded = true;
+                            Ok(())
+                        }
+                        Ok(_) => Err(String::from(transport::CONTROLS_BUSY_ERROR)),
+                        Err(error) => Err(error),
+                    }
+                } else {
+                    Ok(())
+                };
+                load_result.and_then(|()| {
+                    reference_transport
+                        .seek(
+                            state.reference_transport_generation,
+                            position_millis,
+                            duration_millis,
+                            false,
+                        )
+                        .and_then(|_| {
+                            reference_transport.play(state.reference_transport_generation)
+                        })
+                })
+            };
+            if loaded {
+                state.reference_transport_loaded = true;
+            }
+            match result {
+                Ok(token) => {
+                    set_source_position(state, AuditionSource::Reference, position_millis);
+                    state.reference_transport_waiting_token = Some(token);
+                    state.reference_transport_polling = true;
+                    Ok(())
+                }
+                Err(error) => {
+                    sync_audition_output_gains(state);
+                    Err(error)
+                }
+            }
+        }
+    }
 }
 
 fn set_audition_source(state: &mut AppState, source: AuditionSource) {
@@ -5323,8 +5491,18 @@ fn library_track_title_id(track_id: &str) -> u64 {
     ui::stable_widget_id(LIBRARY_TRACK_TITLE_ID_SCOPE, track_id)
 }
 
+const SETTINGS_ICON_SVG: &str = r#"<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" fill="currentColor">
+  <path fill-rule="evenodd" d="M19.43 12.98c.04-.32.07-.65.07-.98s-.03-.66-.07-.98l2.11-1.65a.5.5 0 0 0 .12-.64l-2-3.46a.5.5 0 0 0-.6-.22l-2.49 1a7.3 7.3 0 0 0-1.69-.98l-.38-2.65A.5.5 0 0 0 14 2h-4a.5.5 0 0 0-.5.42l-.38 2.65c-.61.25-1.17.58-1.69.98l-2.49-1a.5.5 0 0 0-.6.22l-2 3.46a.5.5 0 0 0 .12.64l2.11 1.65c-.04.32-.08.65-.08.98s.03.66.08.98l-2.11 1.65a.5.5 0 0 0-.12.64l2 3.46a.5.5 0 0 0 .6.22l2.49-1c.52.4 1.08.73 1.69.98l.38 2.65A.5.5 0 0 0 10 22h4a.5.5 0 0 0 .5-.42l.38-2.65a7.3 7.3 0 0 0 1.69-.98l2.49 1a.5.5 0 0 0 .6-.22l2-3.46a.5.5 0 0 0-.12-.64zM12 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7z"/>
+</svg>"#;
+
+static SETTINGS_ICON: ui::SvgIconTintCache = ui::SvgIconTintCache::new(SETTINGS_ICON_SVG);
+
+fn settings_icon(active: bool) -> ui::SvgIcon {
+    SETTINGS_ICON.icon_for_state(REVIEW_TRANSPORT_ICON_TINTS, true, active)
+}
+
 fn settings_trigger(state: &AppState) -> ui::View<Message> {
-    ui::icon_button(IconName::Settings.icon())
+    ui::icon_button(settings_icon(state.settings_open))
         .active(state.settings_open)
         .message(Message::ToggleSettings)
         .key("global-settings")
@@ -6728,15 +6906,15 @@ fn track_row(
 fn audition_source_choice(
     label: &'static str,
     source: AuditionSource,
-    active: bool,
+    selected: bool,
+    transporting: bool,
 ) -> ui::View<Message> {
-    let input = ui::button(if active { "●" } else { "○" })
-        .active(active)
-        .message(Message::SelectAuditionSource(source))
+    ui::icon_button(audition_source_icon(transporting))
+        .active(selected)
+        .message(Message::ActivateAuditionSource(source))
         .key(format!("audition-source-{}", label.to_ascii_lowercase()))
         .tooltip(format!("Audition {label}"))
-        .height(28.0);
-    input.width(AUDITION_SOURCE_SELECTOR_WIDTH).height(28.0)
+        .size(AUDITION_SOURCE_SELECTOR_WIDTH, 28.0)
 }
 
 const REVIEW_TRANSPORT_ICON_TINTS: ui::SvgIconTintPalette = ui::SvgIconTintPalette::new(
@@ -6745,16 +6923,15 @@ const REVIEW_TRANSPORT_ICON_TINTS: ui::SvgIconTintPalette = ui::SvgIconTintPalet
     ui::Rgba8::new(153, 155, 154, 255),
 );
 
-static REVIEW_PLAY_ICON: ui::SvgIconTintCache = ui::SvgIconTintCache::new(
+static REVIEW_SOURCE_PLAY_ICON: ui::SvgIconTintCache = ui::SvgIconTintCache::new(
     r#"<svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg" fill="currentColor">
   <path d="M4 2.5 13 8l-9 5.5z"/>
 </svg>"#,
 );
 
-static REVIEW_PAUSE_ICON: ui::SvgIconTintCache = ui::SvgIconTintCache::new(
+static REVIEW_SOURCE_STOP_ICON: ui::SvgIconTintCache = ui::SvgIconTintCache::new(
     r#"<svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg" fill="currentColor">
-  <rect x="3" y="2.5" width="3" height="11"/>
-  <rect x="10" y="2.5" width="3" height="11"/>
+  <rect x="3" y="3" width="10" height="10" rx="1"/>
 </svg>"#,
 );
 
@@ -6765,6 +6942,15 @@ static REVIEW_VOLUME_ICON: ui::SvgIconTintCache = ui::SvgIconTintCache::new(
   <path d="M14.2 3.5a6.7 6.7 0 0 1 0 9" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
 </svg>"#,
 );
+
+fn audition_source_icon(transporting: bool) -> ui::SvgIcon {
+    let icon = if transporting {
+        &REVIEW_SOURCE_STOP_ICON
+    } else {
+        &REVIEW_SOURCE_PLAY_ICON
+    };
+    icon.icon_for_state(REVIEW_TRANSPORT_ICON_TINTS, true, transporting)
+}
 
 fn review_transport_icon(icon: &'static ui::SvgIconTintCache, active: bool) -> ui::SvgIcon {
     icon.icon_for_state(REVIEW_TRANSPORT_ICON_TINTS, true, active)
@@ -6959,16 +7145,18 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
     .spacing(WAVEFORM_SECTION_SPACING)
     .fill_width()
     .height(waveform_pair_height);
+    let main_choice = audition_source_choice(
+        "MAIN",
+        AuditionSource::Main,
+        state.audition_source == AuditionSource::Main,
+        source_transport_is_active(state, AuditionSource::Main),
+    );
     let audition_source_control = if track.reference_path.is_some() {
-        let main_choice = audition_source_choice(
-            "MAIN",
-            AuditionSource::Main,
-            state.audition_source == AuditionSource::Main,
-        );
         let reference_choice = audition_source_choice(
             "REF",
             AuditionSource::Reference,
             state.audition_source == AuditionSource::Reference,
+            source_transport_is_active(state, AuditionSource::Reference),
         );
         ui::column([
             ui::column([ui::spacer().fill(), main_choice, ui::spacer().fill()])
@@ -6981,9 +7169,13 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
         .width(AUDITION_SOURCE_SELECTOR_WIDTH)
         .height(waveform_pair_height)
     } else {
-        ui::spacer()
-            .width(AUDITION_SOURCE_SELECTOR_WIDTH)
-            .height(waveform_pair_height)
+        ui::column([
+            ui::column([ui::spacer().fill(), main_choice, ui::spacer().fill()])
+                .height(WAVEFORM_HEIGHT),
+            ui::spacer().fill(),
+        ])
+        .width(AUDITION_SOURCE_SELECTOR_WIDTH)
+        .height(waveform_pair_height)
     };
     let waveform_with_source = ui::row([audition_source_control, waveform_pair])
         .spacing(8.0)
@@ -7122,30 +7314,6 @@ fn review_reference_controls(state: &AppState, track: &storage::Track) -> ui::Vi
 }
 
 fn review_global_controls(state: &AppState, track: &storage::Track) -> ui::View<Message> {
-    let duration_millis = state
-        .waveform
-        .as_ref()
-        .filter(|_| state.waveform_track_id.as_deref() == Some(track.id.as_str()))
-        .map_or(0, |waveform| waveform.duration_millis);
-    let shared_playing = state.transport_playing || state.reference_transport_playing;
-    let play_control = ui::icon_button(review_transport_icon(
-        if shared_playing {
-            &REVIEW_PAUSE_ICON
-        } else {
-            &REVIEW_PLAY_ICON
-        },
-        shared_playing,
-    ))
-    .enabled(duration_millis > 0 && !state.waveform_busy)
-    .active(shared_playing)
-    .message(Message::TogglePlayback)
-    .key("review-transport-play")
-    .tooltip(if shared_playing {
-        "Pause playback"
-    } else {
-        "Play track"
-    })
-    .size(30.0, 26.0);
     ui::row([
         review_reference_controls(state, track),
         ui::icon_button(review_transport_icon(&REVIEW_VOLUME_ICON, false))
@@ -7167,7 +7335,6 @@ fn review_global_controls(state: &AppState, track: &storage::Track) -> ui::View<
             .key("native-audition-volume")
             .height(26.0)
             .width(180.0),
-        play_control,
     ])
     .spacing(6.0)
     .height(26.0)
@@ -8206,6 +8373,24 @@ mod tests {
         })
     }
 
+    fn paint_plan_contains_icon(primitives: &[PaintPrimitive], icon: &ui::SvgIcon) -> bool {
+        let mut expected_primitives = Vec::new();
+        icon.append_paint(
+            &mut expected_primitives,
+            0,
+            Rect::from_min_size(Point::new(0.0, 0.0), Vector2::new(16.0, 16.0)),
+        );
+        let Some(PaintPrimitive::Svg(expected)) = expected_primitives.first() else {
+            return false;
+        };
+        primitives.iter().any(|primitive| {
+            matches!(
+                primitive,
+                PaintPrimitive::Svg(actual) if actual.document == expected.document
+            )
+        })
+    }
+
     fn planner_drag_preview_rect(state: &AppState) -> Option<Rect> {
         project_surface(state)
             .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 720.0))
@@ -8501,6 +8686,26 @@ mod tests {
             minimum_version_run.rect
         );
         assert!(!labels.iter().any(|label| label == "NATIVE · RADIANT"));
+    }
+
+    #[test]
+    fn settings_trigger_paints_the_local_filled_cog_in_each_active_state() {
+        let idle_frame = project_surface(&AppState::default())
+            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 720.0));
+        assert!(paint_plan_contains_icon(
+            &idle_frame.paint_plan.primitives,
+            &super::settings_icon(false),
+        ));
+
+        let active_frame = project_surface(&AppState {
+            settings_open: true,
+            ..AppState::default()
+        })
+        .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 720.0));
+        assert!(paint_plan_contains_icon(
+            &active_frame.paint_plan.primitives,
+            &super::settings_icon(true),
+        ));
     }
 
     #[test]
@@ -10142,6 +10347,132 @@ mod tests {
     }
 
     #[test]
+    fn source_circle_starts_and_focuses_main_when_paused() {
+        let mut state = main_only_loop_state();
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::ActivateAuditionSource(AuditionSource::Main),
+            &mut context,
+        );
+
+        assert_eq!(state.audition_source, AuditionSource::Main);
+        assert!(state.transport_polling);
+        assert!(state.transport_waiting_token.is_some());
+        assert!(!state.reference_transport_polling);
+        assert!(state.reference_transport_waiting_token.is_none());
+    }
+
+    #[test]
+    fn source_circle_starts_and_focuses_reference_when_paused() {
+        let mut state = shared_reference_playback_state();
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::ActivateAuditionSource(AuditionSource::Reference),
+            &mut context,
+        );
+
+        assert_eq!(state.audition_source, AuditionSource::Reference);
+        assert!(state.transport_polling);
+        assert!(state.transport_waiting_token.is_some());
+        assert!(state.reference_transport_polling);
+        assert!(state.reference_transport_waiting_token.is_some());
+        assert!(!state.reference_only_playback);
+    }
+
+    #[test]
+    fn focused_source_circle_pauses_active_playback() {
+        let mut state = shared_reference_playback_state();
+        state.transport_playing = true;
+        state.reference_transport_playing = true;
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::ActivateAuditionSource(AuditionSource::Main),
+            &mut context,
+        );
+
+        assert_eq!(state.audition_source, AuditionSource::Main);
+        assert_eq!(state.status, "Stopping playback…");
+        assert!(state.transport_polling);
+        assert!(state.transport_waiting_token.is_some());
+        assert!(state.reference_transport_polling);
+        assert!(state.reference_transport_waiting_token.is_some());
+    }
+
+    #[test]
+    fn other_active_source_circle_changes_focus_without_pausing() {
+        let mut state = shared_reference_playback_state();
+        state.transport_playing = true;
+        state.reference_transport_playing = true;
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::ActivateAuditionSource(AuditionSource::Reference),
+            &mut context,
+        );
+
+        assert_eq!(state.audition_source, AuditionSource::Reference);
+        assert!(state.transport_playing);
+        assert!(state.reference_transport_playing);
+        assert!(!state.transport_polling);
+        assert!(!state.reference_transport_polling);
+        assert!(state.transport_waiting_token.is_none());
+        assert!(state.reference_transport_waiting_token.is_none());
+    }
+
+    #[test]
+    fn main_source_circle_promotes_reference_only_playback() {
+        let mut state = shared_reference_playback_state();
+        state.audition_source = AuditionSource::Reference;
+        state.reference_only_playback = true;
+        state.reference_transport_playing = true;
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::ActivateAuditionSource(AuditionSource::Main),
+            &mut context,
+        );
+
+        assert_eq!(state.audition_source, AuditionSource::Main);
+        assert!(state.transport_polling);
+        assert!(state.transport_waiting_token.is_some());
+        assert!(state.reference_transport_playing);
+        assert!(!state.reference_transport_polling);
+        assert!(state.reference_transport_waiting_token.is_none());
+        assert!(!state.reference_only_playback);
+    }
+
+    #[test]
+    fn focused_reference_circle_stops_reference_only_playback_without_main_command() {
+        let mut state = shared_reference_playback_state();
+        state.audition_source = AuditionSource::Reference;
+        state.reference_only_playback = true;
+        state.reference_transport_playing = true;
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::ActivateAuditionSource(AuditionSource::Reference),
+            &mut context,
+        );
+
+        assert_eq!(state.status, "Stopping playback…");
+        assert!(!state.transport_playing);
+        assert!(!state.transport_polling);
+        assert!(state.transport_waiting_token.is_none());
+        assert!(state.reference_transport_playing);
+        assert!(state.reference_transport_polling);
+        assert!(state.reference_transport_waiting_token.is_some());
+    }
+
+    #[test]
     fn shared_play_rejects_before_main_when_reference_queue_is_full() {
         let mut state = shared_reference_playback_state();
         let initial_position = state.transport_position_millis;
@@ -11054,12 +11385,18 @@ mod tests {
         let labels = frame.paint_plan.text_label_strings();
 
         assert!(labels.iter().any(|label| label == "Replace reference"));
-        assert!(labels.iter().any(|label| label == "●"));
-        assert!(labels.iter().any(|label| label == "○"));
+        assert!(paint_plan_contains_icon(
+            &frame.paint_plan.primitives,
+            &super::audition_source_icon(false),
+        ));
+        assert!(!paint_plan_contains_icon(
+            &frame.paint_plan.primitives,
+            &super::audition_source_icon(true),
+        ));
         assert!(labels.iter().any(|label| label == "MATCH REF"));
         assert!(
-            svg_count >= 3,
-            "status, play, and volume icons should paint"
+            svg_count >= 4,
+            "source, status, and volume icons should paint"
         );
         assert!(!labels.iter().any(|label| label == "Play"));
         assert!(!labels.iter().any(|label| label == "VOL 80"));
@@ -11098,6 +11435,56 @@ mod tests {
             main_waveform_rect.min.y < reference_header_rect.min.y,
             "the reference header should remain below the main waveform"
         );
+    }
+
+    #[test]
+    fn main_only_review_renders_the_paused_main_source_play_icon() {
+        let state = main_only_loop_state();
+        let frame = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1_000.0));
+
+        assert!(paint_plan_contains_icon(
+            &frame.paint_plan.primitives,
+            &super::audition_source_icon(false),
+        ));
+        assert!(!paint_plan_contains_icon(
+            &frame.paint_plan.primitives,
+            &super::audition_source_icon(true),
+        ));
+    }
+
+    #[test]
+    fn source_icons_render_stop_for_playing_polling_or_waiting_sources() {
+        let mut state = shared_reference_playback_state();
+        state.transport_playing = true;
+        state.reference_transport_polling = true;
+        state.reference_transport_waiting_token = Some(7);
+
+        let active_frame = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1_000.0));
+        assert!(paint_plan_contains_icon(
+            &active_frame.paint_plan.primitives,
+            &super::audition_source_icon(true),
+        ));
+        assert!(!paint_plan_contains_icon(
+            &active_frame.paint_plan.primitives,
+            &super::audition_source_icon(false),
+        ));
+
+        state.transport_playing = false;
+        state.reference_transport_polling = false;
+        state.reference_transport_waiting_token = None;
+        state.transport_waiting_token = Some(8);
+        let waiting_frame = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1_000.0));
+        assert!(paint_plan_contains_icon(
+            &waiting_frame.paint_plan.primitives,
+            &super::audition_source_icon(true),
+        ));
+        assert!(paint_plan_contains_icon(
+            &waiting_frame.paint_plan.primitives,
+            &super::audition_source_icon(false),
+        ));
     }
 
     #[test]
