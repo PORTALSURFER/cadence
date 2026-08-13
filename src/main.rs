@@ -5584,19 +5584,7 @@ fn project_surface(state: &AppState) -> ui::View<Message> {
             .unwrap_or_else(|| ui::spacer().width(0.0)),
         WorkspaceMode::Planner => ui::spacer().width(0.0),
     };
-    let global_review_title = match state.workspace_mode {
-        WorkspaceMode::Review | WorkspaceMode::Audition => selected_track(state)
-            .map(|track| {
-                ui::text(track.title.clone())
-                    .style(ui::WidgetStyle::strong(ui::WidgetTone::Neutral))
-                    .truncate()
-                    .fill_width()
-                    .height(28.0)
-            })
-            .unwrap_or_else(|| ui::spacer().width(0.0)),
-        WorkspaceMode::Planner => ui::spacer().width(0.0),
-    };
-    let review_header = ui::row([global_review_title, global_review_controls])
+    let review_header = ui::row([ui::spacer().fill_width(), global_review_controls])
         .fill_width()
         .height(28.0)
         .spacing(12.0);
@@ -14966,6 +14954,30 @@ mod tests {
         assert!(
             first_tab.min.x >= TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER,
             "the first workspace tab must start after the native traffic-light safe gutter: {first_tab:?}"
+        );
+
+        let selected_title_bounds = frame
+            .paint_plan
+            .primitives
+            .iter()
+            .filter_map(|primitive| match primitive {
+                PaintPrimitive::Text(text) if text.text.as_str() == "Titlebar layout track" => {
+                    Some(text.rect)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !selected_title_bounds
+                .iter()
+                .any(|bounds| bounds.min.y < 60.0),
+            "the selected title must not paint in the integrated titlebar band: {selected_title_bounds:?}"
+        );
+        assert!(
+            selected_title_bounds
+                .iter()
+                .any(|bounds| bounds.min.y >= 60.0),
+            "the selected title should remain visible in the library or waveform content"
         );
 
         for label in ["MATCH REF", "Import reference"] {
