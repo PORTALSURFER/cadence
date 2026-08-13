@@ -14,8 +14,8 @@ use radiant::{
     prelude as ui,
     runtime::{
         FileDialogRequest, NativeRunOptions, PaintFillPolygon, PaintFillRect, PaintPrimitive,
-        PaintStrokePolygon, PaintStrokeRect, PaintTextAlign, PaintTextMetrics, PlatformResponse,
-        PlatformResult, push_text_run_with_metrics,
+        PaintStrokePolygon, PaintTextAlign, PaintTextMetrics, PlatformResponse, PlatformResult,
+        push_text_run_with_metrics,
     },
     theme::ThemeTokens,
     widgets::{Widget, WidgetCommon, WidgetInput, WidgetOutput},
@@ -336,16 +336,12 @@ const TRACK_CARD_RAIL_VERTICAL_INSET: f32 = 3.0;
 const TRACK_CARD_OUTLINE_WIDTH: f32 = 1.5;
 const TRACK_CARD_CONTENT_INSET: f32 = 12.0;
 const TRACK_CARD_CONTENT_SPACING: f32 = 3.0;
+const TRACK_CARD_LIST_SPACING: f32 = 8.0;
 const LIBRARY_LIST_INSET: f32 = 6.0;
-const LIBRARY_CARD_SPACING: f32 = 8.0;
 const STATUS_RAIL_WIDTH: f32 = 4.0;
 const STATUS_RAIL_GAP: f32 = 4.0;
 const TRACK_CARD_SELECTED_CORAL: ui::Rgba8 = ui::Rgba8::new(233, 88, 67, 255);
 const TRACK_CARD_FAVORITE_FILL_BLEND: f32 = 0.18;
-// When a theme has no distinct lighter overlay surface, keep favorites on
-// the raised surface and gently recess non-favorites so the requested cue
-// remains visible without changing the global theme tokens.
-const PLANNER_CARD_NON_FAVORITE_LIGHT_BLEND: f32 = 0.22;
 
 #[derive(Clone, Debug)]
 struct TrackCardChromeWidget {
@@ -455,19 +451,6 @@ fn track_card_fill(favorite: bool, theme: &ThemeTokens) -> ui::Rgba8 {
     favorite_fill(theme.bg_primary, favorite, theme)
 }
 
-fn planner_card_fill(favorite: bool, theme: &ThemeTokens) -> ui::Rgba8 {
-    // Some palettes intentionally collapse raised and overlay surfaces. In
-    // that case, the only way to make a favorite card lighter is to derive a
-    // minimal recessed non-favorite surface locally.
-    if !favorite && theme.surface_raised == theme.surface_overlay {
-        theme
-            .surface_raised
-            .blend_toward(theme.bg_primary, PLANNER_CARD_NON_FAVORITE_LIGHT_BLEND)
-    } else {
-        favorite_fill(theme.surface_raised, favorite, theme)
-    }
-}
-
 fn favorite_fill(base: ui::Rgba8, favorite: bool, theme: &ThemeTokens) -> ui::Rgba8 {
     if favorite {
         base.blend_toward(theme.surface_overlay, TRACK_CARD_FAVORITE_FILL_BLEND)
@@ -478,74 +461,6 @@ fn favorite_fill(base: ui::Rgba8, favorite: bool, theme: &ThemeTokens) -> ui::Rg
 
 fn track_card_chrome(selected: bool, favorite: bool) -> ui::View<Message> {
     ui::custom_widget(TrackCardChromeWidget::new(selected, favorite), |_| None).fill()
-}
-
-#[derive(Clone, Debug)]
-struct PlannerCardBackgroundWidget {
-    common: WidgetCommon,
-    favorite: bool,
-}
-
-impl PlannerCardBackgroundWidget {
-    fn new(favorite: bool) -> Self {
-        let mut common = WidgetCommon::fixed(0, 1.0, 1.0);
-        common.paint.paints_focus = false;
-        common.paint.suppresses_container_hover = true;
-        common.style = ui::WidgetStyle::normal(ui::WidgetTone::Neutral);
-        Self { common, favorite }
-    }
-}
-
-impl Widget for PlannerCardBackgroundWidget {
-    fn common(&self) -> &WidgetCommon {
-        &self.common
-    }
-
-    fn common_mut(&mut self) -> &mut WidgetCommon {
-        &mut self.common
-    }
-
-    fn handle_input(&mut self, _bounds: Rect, _input: WidgetInput) -> Option<WidgetOutput> {
-        None
-    }
-
-    fn append_paint(
-        &self,
-        primitives: &mut Vec<PaintPrimitive>,
-        bounds: Rect,
-        _layout: &LayoutOutput,
-        theme: &ThemeTokens,
-    ) {
-        if !bounds.has_finite_positive_area() {
-            return;
-        }
-
-        let tokens = radiant::widgets::resolve_widget_visual_tokens(
-            theme,
-            self.common.style,
-            self.common.state,
-        );
-        let fill = if self.common.state.hovered || self.common.state.pressed {
-            tokens.fill
-        } else {
-            planner_card_fill(self.favorite, theme)
-        };
-        primitives.push(PaintPrimitive::FillRect(PaintFillRect {
-            widget_id: self.common.id,
-            rect: bounds,
-            color: fill,
-        }));
-        primitives.push(PaintPrimitive::StrokeRect(PaintStrokeRect {
-            widget_id: self.common.id,
-            rect: bounds,
-            color: tokens.border,
-            width: 1.0,
-        }));
-    }
-}
-
-fn planner_card_background(favorite: bool) -> ui::View<Message> {
-    ui::custom_widget(PlannerCardBackgroundWidget::new(favorite), |_| None).fill()
 }
 
 #[derive(Clone, Debug)]
@@ -5732,6 +5647,7 @@ fn audition_panel(state: &AppState) -> ui::View<Message> {
             audition_queue_row(index, track, selected_id)
         })
         .without_chrome()
+        .spacing(TRACK_CARD_LIST_SPACING)
         .fill_height()
     };
     let progress = if queue_count == 0 {
@@ -5834,7 +5750,7 @@ fn audition_queue_row(
     let row = ui::column([
         ui::row([input.fill_width().height(28.0), favorite_control])
             .fill_width()
-            .spacing(6.0)
+            .spacing(TRACK_CARD_CONTENT_SPACING)
             .height(28.0),
         ui::text(track.original_name)
             .truncate()
@@ -5842,10 +5758,10 @@ fn audition_queue_row(
             .fill_width()
             .subtle(),
     ])
-    .padding(7.0)
-    .spacing(2.0)
+    .padding(TRACK_CARD_CONTENT_INSET)
+    .spacing(TRACK_CARD_CONTENT_SPACING)
     .fill_width();
-    ui::stack([ui::card().fill(), row])
+    ui::stack([track_card_chrome(selected, track.favorite), row])
         .key(format!("audition-queue-row-{track_id}"))
         .fill_width()
 }
@@ -6192,6 +6108,7 @@ fn planner_column(
                 )
             })
             .without_chrome()
+            .spacing(TRACK_CARD_LIST_SPACING)
             .fill_height(),
         );
     }
@@ -6268,7 +6185,7 @@ fn planner_card(
             favorite_control,
         ])
         .fill_width()
-        .spacing(6.0),
+        .spacing(TRACK_CARD_CONTENT_SPACING),
         card_muted_text(selected, track.original_name.clone())
             .truncate()
             .height(20.0)
@@ -6284,11 +6201,10 @@ fn planner_card(
         stage_dropdown(&track, stage_menu_open, selected),
         status_dropdown_for_host(&track, status_menu_open, selected, StatusMenuHost::Planner),
     ])
-    .padding(10.0)
-    .spacing(5.0)
+    .padding(TRACK_CARD_CONTENT_INSET)
+    .spacing(TRACK_CARD_CONTENT_SPACING)
     .fill_width();
-    let card_background = planner_card_background(track.favorite);
-    ui::stack([card_background, card_content])
+    ui::stack([track_card_chrome(selected, track.favorite), card_content])
         .key(format!("planner-card-{}", track.id))
         .fill_width()
 }
@@ -6756,7 +6672,7 @@ fn library_panel(state: &AppState) -> ui::View<Message> {
             })
             .without_chrome()
             .padding_x(LIBRARY_LIST_INSET)
-            .spacing(LIBRARY_CARD_SPACING)
+            .spacing(TRACK_CARD_LIST_SPACING)
             .fill_height()
         },
     ])
@@ -15394,157 +15310,107 @@ mod tests {
         assert_eq!(text_run.color, theme.highlight_orange);
     }
 
-    #[test]
-    fn planner_card_background_preserves_card_contract_and_stateful_paint() {
-        let bounds = Rect::from_min_size(Point::new(10.0, 20.0), Vector2::new(200.0, 100.0));
-        let theme = ThemeTokens::default();
-        let widget = super::PlannerCardBackgroundWidget::new(true);
+    #[derive(Clone, Debug, PartialEq)]
+    struct TrackCardPaintSnapshot {
+        fill: ui::Rgba8,
+        outline: ui::Rgba8,
+        outline_width: f32,
+        rail: ui::Rgba8,
+        rail_width: f32,
+        points: Arc<[Point]>,
+    }
 
-        assert!(widget.accepts_pointer_move());
-        assert!(widget.accepts_pointer_input(&WidgetInput::primary_press(Point::new(20.0, 30.0,))));
-        assert!(widget.common().paint.suppresses_container_hover);
-        assert!(!widget.common().paint.paints_focus);
-        assert!(widget.common().paint.paints_state_layers);
-        assert_eq!(
-            widget.common().style,
-            ui::WidgetStyle::normal(ui::WidgetTone::Neutral)
-        );
-
-        let paint_colors = |widget: &super::PlannerCardBackgroundWidget| {
-            let mut primitives = Vec::new();
-            widget.append_paint(
-                &mut primitives,
-                bounds,
-                &radiant::layout::LayoutOutput::default(),
-                &theme,
-            );
-            let fill = primitives
-                .iter()
-                .find_map(|primitive| match primitive {
-                    PaintPrimitive::FillRect(fill) => Some(fill.color),
-                    _ => None,
+    fn track_card_paint_snapshots(primitives: &[PaintPrimitive]) -> Vec<TrackCardPaintSnapshot> {
+        primitives
+            .iter()
+            .filter_map(|primitive| {
+                let PaintPrimitive::FillPolygon(fill) = primitive else {
+                    return None;
+                };
+                if fill.points.len() != 5 {
+                    return None;
+                }
+                let (outline, outline_width) = primitives.iter().find_map(|primitive| {
+                    let PaintPrimitive::StrokePolygon(stroke) = primitive else {
+                        return None;
+                    };
+                    (stroke.widget_id == fill.widget_id
+                        && stroke.points.as_ref() == fill.points.as_ref()
+                        && (stroke.width - super::TRACK_CARD_OUTLINE_WIDTH).abs() < 0.01)
+                        .then_some((stroke.color, stroke.width))
+                })?;
+                let rail = primitives.iter().find_map(|primitive| {
+                    let PaintPrimitive::FillRect(rail) = primitive else {
+                        return None;
+                    };
+                    (rail.widget_id == fill.widget_id
+                        && (rail.rect.width() - super::TRACK_CARD_RAIL_WIDTH).abs() < 0.01)
+                        .then_some(rail)
+                })?;
+                Some(TrackCardPaintSnapshot {
+                    fill: fill.color,
+                    outline,
+                    outline_width,
+                    rail: rail.color,
+                    rail_width: rail.rect.width(),
+                    points: Arc::clone(&fill.points),
                 })
-                .expect("Planner card background should paint a fill");
-            let border = primitives
-                .iter()
-                .find_map(|primitive| match primitive {
-                    PaintPrimitive::StrokeRect(stroke) => Some(stroke.color),
-                    _ => None,
-                })
-                .expect("Planner card background should paint a border");
-            (fill, border)
-        };
-
-        let (idle_fill, idle_border) = paint_colors(&widget);
-        let idle_tokens = radiant::widgets::resolve_widget_visual_tokens(
-            &theme,
-            widget.common().style,
-            widget.common().state,
-        );
-        assert_eq!(idle_fill, super::planner_card_fill(true, &theme));
-        assert_eq!(idle_border, idle_tokens.border);
-
-        let non_favorite = super::PlannerCardBackgroundWidget::new(false);
-        assert_eq!(
-            paint_colors(&non_favorite).0,
-            super::planner_card_fill(false, &theme)
-        );
-
-        for (state_name, state) in [
-            (
-                "hover",
-                ui::WidgetState {
-                    hovered: true,
-                    ..ui::WidgetState::default()
-                },
-            ),
-            (
-                "pressed",
-                ui::WidgetState {
-                    pressed: true,
-                    ..ui::WidgetState::default()
-                },
-            ),
-        ] {
-            let mut stateful = super::PlannerCardBackgroundWidget::new(true);
-            stateful.common_mut().state = state;
-            let (fill, border) = paint_colors(&stateful);
-            let tokens = radiant::widgets::resolve_widget_visual_tokens(
-                &theme,
-                stateful.common().style,
-                state,
-            );
-            assert_eq!(
-                fill, tokens.fill,
-                "{state_name} fill should resolve from state"
-            );
-            assert_eq!(
-                border, tokens.border,
-                "{state_name} border should resolve from state"
-            );
-        }
+            })
+            .collect()
     }
 
     #[test]
-    fn favorite_card_fills_are_distinct_in_dark_and_light_themes() {
+    fn track_card_chrome_is_paint_only_and_uses_shared_style() {
+        let bounds = Rect::from_min_size(Point::new(10.0, 20.0), Vector2::new(200.0, 100.0));
+        let theme = ThemeTokens::default();
+        let widget = super::TrackCardChromeWidget::new(true, true);
+
+        assert!(!widget.accepts_pointer_move());
+        assert!(
+            !widget.accepts_pointer_input(&WidgetInput::primary_press(Point::new(20.0, 30.0,)))
+        );
+        assert!(!widget.common().paint.suppresses_container_hover);
+        assert!(!widget.common().paint.paints_focus);
+
+        let mut primitives = Vec::new();
+        widget.append_paint(
+            &mut primitives,
+            bounds,
+            &radiant::layout::LayoutOutput::default(),
+            &theme,
+        );
+        let snapshots = track_card_paint_snapshots(&primitives);
+        assert_eq!(snapshots.len(), 1);
+        let snapshot = &snapshots[0];
+        assert_eq!(snapshot.fill, super::track_card_fill(true, &theme));
+        assert_eq!(snapshot.outline, super::TRACK_CARD_SELECTED_CORAL);
+        assert_eq!(snapshot.outline_width, super::TRACK_CARD_OUTLINE_WIDTH);
+        assert_eq!(snapshot.rail, super::TRACK_CARD_SELECTED_CORAL);
+        assert_eq!(snapshot.rail_width, super::TRACK_CARD_RAIL_WIDTH);
+        assert_eq!(snapshot.points, super::track_card_points(bounds));
+    }
+
+    #[test]
+    fn favorite_track_card_fill_is_shared_in_dark_and_light_themes() {
         for (name, theme) in [
             ("dark", ThemeTokens::default()),
             ("light", ThemeTokens::light()),
         ] {
-            let library_favorite = super::track_card_fill(true, &theme);
-            let library_non_favorite = super::track_card_fill(false, &theme);
-            let planner_favorite = super::planner_card_fill(true, &theme);
-            let planner_non_favorite = super::planner_card_fill(false, &theme);
+            let favorite = super::track_card_fill(true, &theme);
+            let non_favorite = super::track_card_fill(false, &theme);
 
-            assert_eq!(library_non_favorite, theme.bg_primary);
-            if name == "light" {
-                assert_eq!(planner_favorite, theme.surface_raised);
-                assert_eq!(
-                    planner_non_favorite,
-                    theme.surface_raised.blend_toward(
-                        theme.bg_primary,
-                        super::PLANNER_CARD_NON_FAVORITE_LIGHT_BLEND,
-                    )
-                );
-            } else {
-                assert_eq!(planner_non_favorite, theme.surface_raised);
-            }
-            let distinct_surface_theme = ThemeTokens {
-                surface_overlay: theme.surface_overlay.blend_toward(theme.text_primary, 0.1),
-                ..theme
-            };
-            assert_eq!(
-                super::planner_card_fill(false, &distinct_surface_theme),
-                distinct_surface_theme.surface_raised,
-                "non-favorites should retain the raised baseline when a lighter overlay exists"
-            );
-            assert_ne!(
-                library_favorite, library_non_favorite,
-                "Library {name} fills should differ"
-            );
-            assert_ne!(
-                planner_favorite, planner_non_favorite,
-                "Planner {name} fills should differ"
-            );
-
+            assert_eq!(non_favorite, theme.bg_primary);
+            assert_ne!(favorite, non_favorite, "{name} card fills should differ");
             assert!(
-                library_favorite.r > library_non_favorite.r
-                    && library_favorite.g > library_non_favorite.g
-                    && library_favorite.b > library_non_favorite.b,
-                "favorite Library fill should be brighter in every RGB channel in {name} theme"
-            );
-            assert!(
-                planner_favorite.r > planner_non_favorite.r
-                    && planner_favorite.g > planner_non_favorite.g
-                    && planner_favorite.b > planner_non_favorite.b,
-                "favorite Planner fill should be brighter in every RGB channel in {name} theme"
+                favorite.r > non_favorite.r
+                    && favorite.g > non_favorite.g
+                    && favorite.b > non_favorite.b,
+                "favorite fill should be brighter in every RGB channel in {name} theme"
             );
             if name == "light" {
                 assert!(
-                    library_favorite.r >= 247
-                        && library_favorite.g >= 247
-                        && library_favorite.b >= 247,
-                    "light favorite Library fill should remain near-white"
+                    favorite.r >= 247 && favorite.g >= 247 && favorite.b >= 247,
+                    "light favorite fill should remain near-white"
                 );
             }
         }
@@ -15889,65 +15755,99 @@ mod tests {
     }
 
     #[test]
-    fn planner_track_cards_paint_lighter_favorite_fill() {
-        let mut favorite = audition_track("favorite-planner-card");
+    fn all_track_card_contexts_paint_shared_chrome_and_selection_states() {
+        let mut favorite = audition_track("favorite-track-card");
         favorite.favorite = true;
         favorite.stage = TrackStage::Production;
-        let mut non_favorite = audition_track("non-favorite-planner-card");
-        non_favorite.stage = TrackStage::Production;
+        let mut selected = audition_track("selected-track-card");
+        selected.stage = TrackStage::Production;
         let mut state = AppState {
             busy: false,
-            workspace_mode: WorkspaceMode::Planner,
             ..AppState::default()
         };
-        state.library.tracks = vec![favorite, non_favorite];
-
-        let frame = project_surface(&state)
-            .view_frame_at_size_with_default_theme(Vector2::new(1_400.0, 900.0));
+        state.library.selected_track_id = Some(selected.id.clone());
+        state.library.tracks = vec![favorite.clone(), selected.clone()];
+        state.audition_queue = vec![favorite.id.clone(), selected.id.clone()];
         let theme = ThemeTokens::default();
-        let planner_card_fills = frame
-            .paint_plan
-            .fill_rects()
-            .filter(|fill| {
-                fill.rect.width() > 120.0
-                    && fill.rect.height() > 100.0
-                    && fill.rect.height() < 300.0
-                    && frame.paint_plan.primitives.iter().any(|primitive| {
-                        matches!(
-                            primitive,
-                            PaintPrimitive::StrokeRect(stroke)
-                                if stroke.widget_id == fill.widget_id
-                                    && stroke.rect == fill.rect
-                                    && stroke.color == theme.border
-                                    && stroke.width == 1.0
-                        )
-                    })
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            planner_card_fills.len(),
-            2,
-            "Planner should paint one background fill for each track card"
-        );
+        let mut expected_styles = None;
 
-        let favorite_fill = planner_card_fills
-            .iter()
-            .find(|fill| fill.color == super::planner_card_fill(true, &theme))
-            .expect("favorite Planner card should use the lighter fill");
-        let non_favorite_fill = planner_card_fills
-            .iter()
-            .find(|fill| fill.color == super::planner_card_fill(false, &theme))
-            .expect("non-favorite Planner card should retain the baseline fill");
-        assert_ne!(
-            favorite_fill.color, non_favorite_fill.color,
-            "favorite and non-favorite Planner card fills should differ"
-        );
-        assert!(
-            favorite_fill.color.r > non_favorite_fill.color.r
-                && favorite_fill.color.g > non_favorite_fill.color.g
-                && favorite_fill.color.b > non_favorite_fill.color.b,
-            "favorite Planner card fill should be lighter in every RGB channel"
-        );
+        for mode in [
+            WorkspaceMode::Review,
+            WorkspaceMode::Audition,
+            WorkspaceMode::Planner,
+        ] {
+            state.workspace_mode = mode;
+            let frame = project_surface(&state)
+                .view_frame_at_size_with_default_theme(Vector2::new(1_400.0, 900.0));
+            let cards = track_card_paint_snapshots(&frame.paint_plan.primitives);
+            assert_eq!(
+                cards.len(),
+                2,
+                "{mode:?} should paint one shared card chrome for each track"
+            );
+
+            let selected_card = cards
+                .iter()
+                .find(|card| card.outline == super::TRACK_CARD_SELECTED_CORAL)
+                .expect("selected track should have the coral card outline");
+            assert_eq!(selected_card.fill, super::track_card_fill(false, &theme));
+            assert_eq!(selected_card.rail, super::TRACK_CARD_SELECTED_CORAL);
+
+            let favorite_card = cards
+                .iter()
+                .find(|card| card.fill == super::track_card_fill(true, &theme))
+                .expect("favorite track should have the lighter card fill");
+            assert_eq!(favorite_card.outline, theme.grid_strong);
+            assert_eq!(favorite_card.rail, theme.grid_strong);
+
+            for card in &cards {
+                assert_eq!(card.outline_width, super::TRACK_CARD_OUTLINE_WIDTH);
+                assert_eq!(card.rail_width, super::TRACK_CARD_RAIL_WIDTH);
+                assert_eq!(card.rail, card.outline);
+                assert_eq!(card.points.len(), 5);
+                assert!(
+                    ((card.points[1].x - card.points[3].x) - super::TRACK_CARD_CHAMFER).abs()
+                        < 0.01,
+                    "{mode:?} card should use the shared bottom-right chamfer"
+                );
+            }
+
+            let mut styles = cards
+                .iter()
+                .map(|card| {
+                    (
+                        card.fill,
+                        card.outline,
+                        card.outline_width.to_bits(),
+                        card.rail,
+                        card.rail_width.to_bits(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            styles.sort_by_key(|(fill, outline, outline_width, rail, rail_width)| {
+                (
+                    fill.r,
+                    fill.g,
+                    fill.b,
+                    outline.r,
+                    outline.g,
+                    outline.b,
+                    *outline_width,
+                    rail.r,
+                    rail.g,
+                    rail.b,
+                    *rail_width,
+                )
+            });
+            if let Some(expected_styles) = &expected_styles {
+                assert_eq!(
+                    &styles, expected_styles,
+                    "{mode:?} should reuse Review's card chrome colors and dimensions"
+                );
+            } else {
+                expected_styles = Some(styles);
+            }
+        }
     }
 
     #[test]
@@ -16168,7 +16068,7 @@ mod tests {
         );
         for pair in card_rects.windows(2) {
             assert!(
-                pair[1].min.y - pair[0].max.y >= super::LIBRARY_CARD_SPACING - 0.01,
+                pair[1].min.y - pair[0].max.y >= super::TRACK_CARD_LIST_SPACING - 0.01,
                 "library cards should retain a visible vertical gap: {:?} then {:?}",
                 pair[0],
                 pair[1]
