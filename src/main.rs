@@ -309,6 +309,7 @@ struct LoopBounds {
 
 const LIBRARY_WIDTH: f32 = 252.0;
 const APP_VERSION_LABEL: &str = concat!("v", env!("CARGO_PKG_VERSION"));
+const STATUS_BAR_VERSION_WIDTH: f32 = 64.0;
 // Keep workspace tabs clear of the native macOS traffic-light controls in the
 // integrated titlebar while leaving the right-side controls right-anchored.
 const TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER: f32 = 72.0;
@@ -610,6 +611,14 @@ fn status_rail(status: Option<storage::TrackStatus>, height: f32) -> ui::View<Me
     ui::custom_widget(StatusDropdownRailWidget::new(status), |_| None)
         .width(STATUS_RAIL_WIDTH)
         .height(height)
+}
+
+fn status_bar_version_label(height: f32) -> ui::View<Message> {
+    ui::text(APP_VERSION_LABEL)
+        .height(height)
+        .width(STATUS_BAR_VERSION_WIDTH)
+        .align_text(ui::TextAlign::Right)
+        .subtle()
 }
 
 #[derive(Clone, Debug)]
@@ -5464,11 +5473,7 @@ fn project_surface(state: &AppState) -> ui::View<Message> {
                         .height(20.0)
                         .width(280.0)
                         .subtle(),
-                    ui::text(APP_VERSION_LABEL)
-                        .height(20.0)
-                        .width(48.0)
-                        .align_text(ui::TextAlign::Right)
-                        .subtle(),
+                    status_bar_version_label(20.0),
                 ])
                 .fill_width()
                 .height(20.0)
@@ -5498,11 +5503,7 @@ fn project_surface(state: &AppState) -> ui::View<Message> {
                         .height(24.0)
                         .width(280.0)
                         .subtle(),
-                    ui::text(APP_VERSION_LABEL)
-                        .height(24.0)
-                        .width(48.0)
-                        .align_text(ui::TextAlign::Right)
-                        .subtle(),
+                    status_bar_version_label(24.0),
                 ])
                 .padding_x(8.0)
                 .fill_width()
@@ -7972,9 +7973,9 @@ mod tests {
     use super::{
         APP_VERSION_LABEL, AppState, AuditionSource, FavoriteMarkerWidget, ImportBatchProgress,
         LoopBounds, LoopSelection, LoopSelections, Message, NoteDraft, REFERENCE_MENU_WIDTH,
-        StatusMenuHost, TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER, TRACK_CARD_SELECTED_CORAL,
-        WAVEFORM_HEIGHT, WorkspaceMode, apply_transport_snapshot, audition_panel,
-        audition_shuffle_seed, audition_statuses, current_loudness_match_gain_db,
+        STATUS_BAR_VERSION_WIDTH, StatusMenuHost, TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER,
+        TRACK_CARD_SELECTED_CORAL, WAVEFORM_HEIGHT, WorkspaceMode, apply_transport_snapshot,
+        audition_panel, audition_shuffle_seed, audition_statuses, current_loudness_match_gain_db,
         current_lufs_meter_value, current_reference_lufs_meter_value, decode_result_is_current,
         deterministic_shuffle, enforce_loop, favorite_toggle, keyboard_settings_anchor,
         library_track_title_id, loop_bounds, main_output_gain, native_launch_options, note_editor,
@@ -8446,6 +8447,58 @@ mod tests {
             version_run.rect.max.x > frame_size.x - 100.0,
             "the version label should stay at the far right of the status bar: {:?}",
             version_run.rect
+        );
+        assert!(
+            (version_run.rect.width() - STATUS_BAR_VERSION_WIDTH).abs() < 0.01,
+            "the version label should reserve the shared width: {:?}",
+            version_run.rect
+        );
+        assert!(
+            (version_run.rect.max.x - (frame_size.x - 26.0)).abs() < 0.01,
+            "the version label should reach the status bar's right edge: {:?}",
+            version_run.rect
+        );
+        let shortcut_run = frame
+            .paint_plan
+            .text_runs()
+            .find(|run| run.text.as_str() == "SPACE  play · ESC  stop · N  note")
+            .expect("the normal status bar should render the shortcut hint");
+        assert!(
+            shortcut_run.rect.max.x <= version_run.rect.min.x,
+            "the shortcut hint must not overlap the version label: shortcut={:?}, version={:?}",
+            shortcut_run.rect,
+            version_run.rect
+        );
+
+        let minimum_frame_size = Vector2::new(900.0, 560.0);
+        let minimum_frame = project_surface(&AppState::default())
+            .view_frame_at_size_with_default_theme(minimum_frame_size);
+        let minimum_version_run = minimum_frame
+            .paint_plan
+            .text_runs()
+            .find(|run| run.text.as_str() == APP_VERSION_LABEL)
+            .expect("the minimum-size status bar should render the app version");
+        let minimum_shortcut_run = minimum_frame
+            .paint_plan
+            .text_runs()
+            .find(|run| run.text.as_str() == "SPACE  play · ESC  stop · N  note")
+            .expect("the minimum-size status bar should render the shortcut hint");
+        assert_eq!(minimum_version_run.align, PaintTextAlign::Right);
+        assert!(
+            (minimum_version_run.rect.width() - STATUS_BAR_VERSION_WIDTH).abs() < 0.01,
+            "the minimum-size version label should reserve the shared width: {:?}",
+            minimum_version_run.rect
+        );
+        assert!(
+            (minimum_version_run.rect.max.x - (minimum_frame_size.x - 26.0)).abs() < 0.01,
+            "the minimum-size version label should reach the status bar's right edge: {:?}",
+            minimum_version_run.rect
+        );
+        assert!(
+            minimum_shortcut_run.rect.max.x <= minimum_version_run.rect.min.x,
+            "the minimum-size shortcut hint must not overlap the version label: shortcut={:?}, version={:?}",
+            minimum_shortcut_run.rect,
+            minimum_version_run.rect
         );
         assert!(!labels.iter().any(|label| label == "NATIVE · RADIANT"));
     }
@@ -15492,6 +15545,58 @@ mod tests {
             version_run.rect.max.x > 1180.0 - 100.0,
             "the import-progress version label should stay at the far right: {:?}",
             version_run.rect
+        );
+        assert!(
+            (version_run.rect.width() - STATUS_BAR_VERSION_WIDTH).abs() < 0.01,
+            "the import-progress version label should reserve the shared width: {:?}",
+            version_run.rect
+        );
+        assert!(
+            (version_run.rect.max.x - (1180.0 - 26.0)).abs() < 0.01,
+            "the import-progress version label should reach the status bar's right edge: {:?}",
+            version_run.rect
+        );
+        let shortcut_run = frame
+            .paint_plan
+            .text_runs()
+            .find(|run| run.text.as_str() == "SPACE  play · ESC  stop · N  note")
+            .expect("the import-progress status bar should render the shortcut hint");
+        assert!(
+            shortcut_run.rect.max.x <= version_run.rect.min.x,
+            "the import-progress shortcut hint must not overlap the version label: shortcut={:?}, version={:?}",
+            shortcut_run.rect,
+            version_run.rect
+        );
+
+        let minimum_frame_size = Vector2::new(900.0, 560.0);
+        let minimum_frame =
+            project_surface(&state).view_frame_at_size_with_default_theme(minimum_frame_size);
+        let minimum_version_run = minimum_frame
+            .paint_plan
+            .text_runs()
+            .find(|run| run.text.as_str() == APP_VERSION_LABEL)
+            .expect("the minimum-size import-progress status bar should render the app version");
+        let minimum_shortcut_run = minimum_frame
+            .paint_plan
+            .text_runs()
+            .find(|run| run.text.as_str() == "SPACE  play · ESC  stop · N  note")
+            .expect("the minimum-size import-progress status bar should render the shortcut hint");
+        assert_eq!(minimum_version_run.align, PaintTextAlign::Right);
+        assert!(
+            (minimum_version_run.rect.width() - STATUS_BAR_VERSION_WIDTH).abs() < 0.01,
+            "the minimum-size import-progress version label should reserve the shared width: {:?}",
+            minimum_version_run.rect
+        );
+        assert!(
+            (minimum_version_run.rect.max.x - (minimum_frame_size.x - 26.0)).abs() < 0.01,
+            "the minimum-size import-progress version label should reach the status bar's right edge: {:?}",
+            minimum_version_run.rect
+        );
+        assert!(
+            minimum_shortcut_run.rect.max.x <= minimum_version_run.rect.min.x,
+            "the minimum-size import-progress shortcut hint must not overlap the version label: shortcut={:?}, version={:?}",
+            minimum_shortcut_run.rect,
+            minimum_version_run.rect
         );
 
         let fills = frame.paint_plan.fill_rects().collect::<Vec<_>>();
