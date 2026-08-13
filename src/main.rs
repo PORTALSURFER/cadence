@@ -10,7 +10,6 @@ use radiant::{
     },
     gui::{
         list::DenseRowMarkerParts,
-        svg::IconName,
         types::{Point, Rect, Vector2},
     },
     layout::LayoutOutput,
@@ -5492,8 +5491,18 @@ fn library_track_title_id(track_id: &str) -> u64 {
     ui::stable_widget_id(LIBRARY_TRACK_TITLE_ID_SCOPE, track_id)
 }
 
+const SETTINGS_ICON_SVG: &str = r#"<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" fill="currentColor">
+  <path fill-rule="evenodd" d="M19.43 12.98c.04-.32.07-.65.07-.98s-.03-.66-.07-.98l2.11-1.65a.5.5 0 0 0 .12-.64l-2-3.46a.5.5 0 0 0-.6-.22l-2.49 1a7.3 7.3 0 0 0-1.69-.98l-.38-2.65A.5.5 0 0 0 14 2h-4a.5.5 0 0 0-.5.42l-.38 2.65c-.61.25-1.17.58-1.69.98l-2.49-1a.5.5 0 0 0-.6.22l-2 3.46a.5.5 0 0 0 .12.64l2.11 1.65c-.04.32-.08.65-.08.98s.03.66.08.98l-2.11 1.65a.5.5 0 0 0-.12.64l2 3.46a.5.5 0 0 0 .6.22l2.49-1c.52.4 1.08.73 1.69.98l.38 2.65A.5.5 0 0 0 10 22h4a.5.5 0 0 0 .5-.42l.38-2.65a7.3 7.3 0 0 0 1.69-.98l2.49 1a.5.5 0 0 0 .6-.22l2-3.46a.5.5 0 0 0-.12-.64zM12 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7z"/>
+</svg>"#;
+
+static SETTINGS_ICON: ui::SvgIconTintCache = ui::SvgIconTintCache::new(SETTINGS_ICON_SVG);
+
+fn settings_icon(active: bool) -> ui::SvgIcon {
+    SETTINGS_ICON.icon_for_state(REVIEW_TRANSPORT_ICON_TINTS, true, active)
+}
+
 fn settings_trigger(state: &AppState) -> ui::View<Message> {
-    ui::icon_button(IconName::Settings.icon())
+    ui::icon_button(settings_icon(state.settings_open))
         .active(state.settings_open)
         .message(Message::ToggleSettings)
         .key("global-settings")
@@ -6897,21 +6906,33 @@ fn track_row(
 fn audition_source_choice(
     label: &'static str,
     source: AuditionSource,
-    active: bool,
+    selected: bool,
+    transporting: bool,
 ) -> ui::View<Message> {
-    let input = ui::button(if active { "●" } else { "○" })
-        .active(active)
+    ui::icon_button(audition_source_icon(transporting))
+        .active(selected)
         .message(Message::ActivateAuditionSource(source))
         .key(format!("audition-source-{}", label.to_ascii_lowercase()))
         .tooltip(format!("Audition {label}"))
-        .height(28.0);
-    input.width(AUDITION_SOURCE_SELECTOR_WIDTH).height(28.0)
+        .size(AUDITION_SOURCE_SELECTOR_WIDTH, 28.0)
 }
 
 const REVIEW_TRANSPORT_ICON_TINTS: ui::SvgIconTintPalette = ui::SvgIconTintPalette::new(
     ui::Rgba8::new(216, 215, 211, 255),
     ui::Rgba8::new(233, 88, 67, 255),
     ui::Rgba8::new(153, 155, 154, 255),
+);
+
+static REVIEW_SOURCE_PLAY_ICON: ui::SvgIconTintCache = ui::SvgIconTintCache::new(
+    r#"<svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg" fill="currentColor">
+  <path d="M4 2.5 13 8l-9 5.5z"/>
+</svg>"#,
+);
+
+static REVIEW_SOURCE_STOP_ICON: ui::SvgIconTintCache = ui::SvgIconTintCache::new(
+    r#"<svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg" fill="currentColor">
+  <rect x="3" y="3" width="10" height="10" rx="1"/>
+</svg>"#,
 );
 
 static REVIEW_VOLUME_ICON: ui::SvgIconTintCache = ui::SvgIconTintCache::new(
@@ -6921,6 +6942,15 @@ static REVIEW_VOLUME_ICON: ui::SvgIconTintCache = ui::SvgIconTintCache::new(
   <path d="M14.2 3.5a6.7 6.7 0 0 1 0 9" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
 </svg>"#,
 );
+
+fn audition_source_icon(transporting: bool) -> ui::SvgIcon {
+    let icon = if transporting {
+        &REVIEW_SOURCE_STOP_ICON
+    } else {
+        &REVIEW_SOURCE_PLAY_ICON
+    };
+    icon.icon_for_state(REVIEW_TRANSPORT_ICON_TINTS, true, transporting)
+}
 
 fn review_transport_icon(icon: &'static ui::SvgIconTintCache, active: bool) -> ui::SvgIcon {
     icon.icon_for_state(REVIEW_TRANSPORT_ICON_TINTS, true, active)
@@ -7119,12 +7149,14 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
         "MAIN",
         AuditionSource::Main,
         state.audition_source == AuditionSource::Main,
+        source_transport_is_active(state, AuditionSource::Main),
     );
     let audition_source_control = if track.reference_path.is_some() {
         let reference_choice = audition_source_choice(
             "REF",
             AuditionSource::Reference,
             state.audition_source == AuditionSource::Reference,
+            source_transport_is_active(state, AuditionSource::Reference),
         );
         ui::column([
             ui::column([ui::spacer().fill(), main_choice, ui::spacer().fill()])
@@ -8341,6 +8373,24 @@ mod tests {
         })
     }
 
+    fn paint_plan_contains_icon(primitives: &[PaintPrimitive], icon: &ui::SvgIcon) -> bool {
+        let mut expected_primitives = Vec::new();
+        icon.append_paint(
+            &mut expected_primitives,
+            0,
+            Rect::from_min_size(Point::new(0.0, 0.0), Vector2::new(16.0, 16.0)),
+        );
+        let Some(PaintPrimitive::Svg(expected)) = expected_primitives.first() else {
+            return false;
+        };
+        primitives.iter().any(|primitive| {
+            matches!(
+                primitive,
+                PaintPrimitive::Svg(actual) if actual.document == expected.document
+            )
+        })
+    }
+
     fn planner_drag_preview_rect(state: &AppState) -> Option<Rect> {
         project_surface(state)
             .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 720.0))
@@ -8636,6 +8686,26 @@ mod tests {
             minimum_version_run.rect
         );
         assert!(!labels.iter().any(|label| label == "NATIVE · RADIANT"));
+    }
+
+    #[test]
+    fn settings_trigger_paints_the_local_filled_cog_in_each_active_state() {
+        let idle_frame = project_surface(&AppState::default())
+            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 720.0));
+        assert!(paint_plan_contains_icon(
+            &idle_frame.paint_plan.primitives,
+            &super::settings_icon(false),
+        ));
+
+        let active_frame = project_surface(&AppState {
+            settings_open: true,
+            ..AppState::default()
+        })
+        .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 720.0));
+        assert!(paint_plan_contains_icon(
+            &active_frame.paint_plan.primitives,
+            &super::settings_icon(true),
+        ));
     }
 
     #[test]
@@ -11315,10 +11385,19 @@ mod tests {
         let labels = frame.paint_plan.text_label_strings();
 
         assert!(labels.iter().any(|label| label == "Replace reference"));
-        assert!(labels.iter().any(|label| label == "●"));
-        assert!(labels.iter().any(|label| label == "○"));
+        assert!(paint_plan_contains_icon(
+            &frame.paint_plan.primitives,
+            &super::audition_source_icon(false),
+        ));
+        assert!(!paint_plan_contains_icon(
+            &frame.paint_plan.primitives,
+            &super::audition_source_icon(true),
+        ));
         assert!(labels.iter().any(|label| label == "MATCH REF"));
-        assert!(svg_count >= 2, "status and volume icons should paint");
+        assert!(
+            svg_count >= 4,
+            "source, status, and volume icons should paint"
+        );
         assert!(!labels.iter().any(|label| label == "Play"));
         assert!(!labels.iter().any(|label| label == "VOL 80"));
         assert!(
@@ -11359,18 +11438,53 @@ mod tests {
     }
 
     #[test]
-    fn main_only_review_renders_the_main_source_circle() {
+    fn main_only_review_renders_the_paused_main_source_play_icon() {
         let state = main_only_loop_state();
-        let labels = project_surface(&state)
-            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1_000.0))
-            .paint_plan
-            .text_label_strings();
+        let frame = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1_000.0));
 
-        assert_eq!(
-            labels.iter().filter(|label| label.as_str() == "●").count(),
-            1
-        );
-        assert!(!labels.iter().any(|label| label == "○"));
+        assert!(paint_plan_contains_icon(
+            &frame.paint_plan.primitives,
+            &super::audition_source_icon(false),
+        ));
+        assert!(!paint_plan_contains_icon(
+            &frame.paint_plan.primitives,
+            &super::audition_source_icon(true),
+        ));
+    }
+
+    #[test]
+    fn source_icons_render_stop_for_playing_polling_or_waiting_sources() {
+        let mut state = shared_reference_playback_state();
+        state.transport_playing = true;
+        state.reference_transport_polling = true;
+        state.reference_transport_waiting_token = Some(7);
+
+        let active_frame = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1_000.0));
+        assert!(paint_plan_contains_icon(
+            &active_frame.paint_plan.primitives,
+            &super::audition_source_icon(true),
+        ));
+        assert!(!paint_plan_contains_icon(
+            &active_frame.paint_plan.primitives,
+            &super::audition_source_icon(false),
+        ));
+
+        state.transport_playing = false;
+        state.reference_transport_polling = false;
+        state.reference_transport_waiting_token = None;
+        state.transport_waiting_token = Some(8);
+        let waiting_frame = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1_000.0));
+        assert!(paint_plan_contains_icon(
+            &waiting_frame.paint_plan.primitives,
+            &super::audition_source_icon(true),
+        ));
+        assert!(paint_plan_contains_icon(
+            &waiting_frame.paint_plan.primitives,
+            &super::audition_source_icon(false),
+        ));
     }
 
     #[test]
