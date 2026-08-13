@@ -133,7 +133,7 @@ struct LufsMeterWidget {
 impl LufsMeterWidget {
     fn new(value: Option<f32>, analyzing: bool) -> Self {
         Self {
-            common: WidgetCommon::fixed(0, 68.0, 250.0),
+            common: WidgetCommon::fixed(0, 76.0, 250.0),
             value: value.filter(|value| value.is_finite()),
             analyzing,
         }
@@ -188,7 +188,7 @@ impl Widget for LufsMeterWidget {
         primitives.push(PaintPrimitive::FillPolygon(PaintFillPolygon {
             widget_id: self.common.id,
             points: rounded_corner_points(bounds, METER_RADIUS),
-            color: theme.surface_base,
+            color: theme.surface_overlay,
         }));
 
         push_text_run_with_metrics(
@@ -201,7 +201,7 @@ impl Widget for LufsMeterWidget {
             ),
             theme.text_muted,
             PaintTextAlign::Center,
-            PaintTextMetrics::new(8.0, Some(10.0)),
+            PaintTextMetrics::new(9.0, Some(11.0)),
         );
         push_text_run_with_metrics(
             primitives,
@@ -213,7 +213,7 @@ impl Widget for LufsMeterWidget {
             ),
             theme.text_primary,
             PaintTextAlign::Center,
-            PaintTextMetrics::new(11.0, Some(14.0)),
+            PaintTextMetrics::new(12.0, Some(15.0)),
         );
 
         let track = Rect::from_min_max(
@@ -300,7 +300,7 @@ impl Widget for LufsMeterWidget {
             ),
             theme.text_muted,
             PaintTextAlign::Center,
-            PaintTextMetrics::new(6.0, Some(8.0)),
+            PaintTextMetrics::new(7.0, Some(9.0)),
         );
     }
 }
@@ -384,7 +384,7 @@ mod tests {
         assert!(labels.iter().any(|label| label == "TECHNO"));
         assert!(meter.primitives.iter().any(|primitive| matches!(
             primitive,
-            PaintPrimitive::FillPolygon(fill) if fill.color == theme.surface_base
+            PaintPrimitive::FillPolygon(fill) if fill.color == theme.surface_overlay
         )));
         assert!(meter.primitives.iter().any(|primitive| matches!(
             primitive,

@@ -67,7 +67,7 @@ struct WaveformColors {
 impl WaveformColors {
     fn from_theme(theme: &ThemeTokens) -> Self {
         Self {
-            lower_background: theme.bg_secondary,
+            lower_background: theme.surface_overlay.blend_toward(theme.bg_primary, 0.45),
             upper_bar: theme.text_primary,
             lower_bar: theme.text_muted.with_alpha(160),
             bar_played: theme.highlight_orange,
@@ -1593,7 +1593,10 @@ mod tests {
         let colors = colors();
         assert_eq!(colors.upper_bar, theme.text_primary);
         assert_eq!(colors.lower_bar, theme.text_muted.with_alpha(160));
-        assert_eq!(colors.lower_background, theme.bg_secondary);
+        assert_eq!(
+            colors.lower_background,
+            theme.surface_overlay.blend_toward(theme.bg_primary, 0.45)
+        );
         assert_eq!(colors.bar_played, theme.highlight_orange);
         assert_eq!(colors.cursor, theme.highlight_orange_soft);
 
