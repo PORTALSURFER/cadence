@@ -14,8 +14,8 @@ use radiant::{
     prelude as ui,
     runtime::{
         FileDialogRequest, NativeRunOptions, PaintFillPolygon, PaintFillRect, PaintPrimitive,
-        PaintStrokePolygon, PaintStrokeRect, PaintTextAlign, PaintTextMetrics, PlatformResponse,
-        PlatformResult, push_text_run_with_metrics,
+        PaintStrokePolygon, PaintTextAlign, PaintTextMetrics, PlatformResponse, PlatformResult,
+        push_text_run_with_metrics,
     },
     theme::ThemeTokens,
     widgets::{Widget, WidgetCommon, WidgetInput, WidgetOutput},
@@ -245,6 +245,7 @@ enum WorkspaceMode {
 enum StatusMenuHost {
     Library,
     Planner,
+    Audition,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -319,6 +320,8 @@ const LUFS_METER_WIDTH: f32 = 76.0;
 const REFERENCE_HEADER_HEIGHT: f32 = 26.0;
 const REFERENCE_SECTION_SPACING: f32 = 4.0;
 const WAVEFORM_SECTION_SPACING: f32 = 8.0;
+const WORKSPACE_PANEL_PADDING: f32 = 12.0;
+const WORKSPACE_PANEL_SPACING: f32 = 8.0;
 const AUDITION_SOURCE_SELECTOR_WIDTH: f32 = 28.0;
 const FAVORITE_CONTROL_WIDTH: f32 = 28.0;
 const MIN_LOOP_MILLIS: u64 = 120;
@@ -334,16 +337,12 @@ const TRACK_CARD_RAIL_VERTICAL_INSET: f32 = 3.0;
 const TRACK_CARD_OUTLINE_WIDTH: f32 = 1.5;
 const TRACK_CARD_CONTENT_INSET: f32 = 12.0;
 const TRACK_CARD_CONTENT_SPACING: f32 = 3.0;
+const TRACK_CARD_LIST_SPACING: f32 = 8.0;
 const LIBRARY_LIST_INSET: f32 = 6.0;
-const LIBRARY_CARD_SPACING: f32 = 8.0;
 const STATUS_RAIL_WIDTH: f32 = 4.0;
 const STATUS_RAIL_GAP: f32 = 4.0;
 const TRACK_CARD_SELECTED_CORAL: ui::Rgba8 = ui::Rgba8::new(233, 88, 67, 255);
 const TRACK_CARD_FAVORITE_FILL_BLEND: f32 = 0.18;
-// When a theme has no distinct lighter overlay surface, keep favorites on
-// the raised surface and gently recess non-favorites so the requested cue
-// remains visible without changing the global theme tokens.
-const PLANNER_CARD_NON_FAVORITE_LIGHT_BLEND: f32 = 0.22;
 
 #[derive(Clone, Debug)]
 struct TrackCardChromeWidget {
@@ -453,19 +452,6 @@ fn track_card_fill(favorite: bool, theme: &ThemeTokens) -> ui::Rgba8 {
     favorite_fill(theme.bg_primary, favorite, theme)
 }
 
-fn planner_card_fill(favorite: bool, theme: &ThemeTokens) -> ui::Rgba8 {
-    // Some palettes intentionally collapse raised and overlay surfaces. In
-    // that case, the only way to make a favorite card lighter is to derive a
-    // minimal recessed non-favorite surface locally.
-    if !favorite && theme.surface_raised == theme.surface_overlay {
-        theme
-            .surface_raised
-            .blend_toward(theme.bg_primary, PLANNER_CARD_NON_FAVORITE_LIGHT_BLEND)
-    } else {
-        favorite_fill(theme.surface_raised, favorite, theme)
-    }
-}
-
 fn favorite_fill(base: ui::Rgba8, favorite: bool, theme: &ThemeTokens) -> ui::Rgba8 {
     if favorite {
         base.blend_toward(theme.surface_overlay, TRACK_CARD_FAVORITE_FILL_BLEND)
@@ -476,74 +462,6 @@ fn favorite_fill(base: ui::Rgba8, favorite: bool, theme: &ThemeTokens) -> ui::Rg
 
 fn track_card_chrome(selected: bool, favorite: bool) -> ui::View<Message> {
     ui::custom_widget(TrackCardChromeWidget::new(selected, favorite), |_| None).fill()
-}
-
-#[derive(Clone, Debug)]
-struct PlannerCardBackgroundWidget {
-    common: WidgetCommon,
-    favorite: bool,
-}
-
-impl PlannerCardBackgroundWidget {
-    fn new(favorite: bool) -> Self {
-        let mut common = WidgetCommon::fixed(0, 1.0, 1.0);
-        common.paint.paints_focus = false;
-        common.paint.suppresses_container_hover = true;
-        common.style = ui::WidgetStyle::normal(ui::WidgetTone::Neutral);
-        Self { common, favorite }
-    }
-}
-
-impl Widget for PlannerCardBackgroundWidget {
-    fn common(&self) -> &WidgetCommon {
-        &self.common
-    }
-
-    fn common_mut(&mut self) -> &mut WidgetCommon {
-        &mut self.common
-    }
-
-    fn handle_input(&mut self, _bounds: Rect, _input: WidgetInput) -> Option<WidgetOutput> {
-        None
-    }
-
-    fn append_paint(
-        &self,
-        primitives: &mut Vec<PaintPrimitive>,
-        bounds: Rect,
-        _layout: &LayoutOutput,
-        theme: &ThemeTokens,
-    ) {
-        if !bounds.has_finite_positive_area() {
-            return;
-        }
-
-        let tokens = radiant::widgets::resolve_widget_visual_tokens(
-            theme,
-            self.common.style,
-            self.common.state,
-        );
-        let fill = if self.common.state.hovered || self.common.state.pressed {
-            tokens.fill
-        } else {
-            planner_card_fill(self.favorite, theme)
-        };
-        primitives.push(PaintPrimitive::FillRect(PaintFillRect {
-            widget_id: self.common.id,
-            rect: bounds,
-            color: fill,
-        }));
-        primitives.push(PaintPrimitive::StrokeRect(PaintStrokeRect {
-            widget_id: self.common.id,
-            rect: bounds,
-            color: tokens.border,
-            width: 1.0,
-        }));
-    }
-}
-
-fn planner_card_background(favorite: bool) -> ui::View<Message> {
-    ui::custom_widget(PlannerCardBackgroundWidget::new(favorite), |_| None).fill()
 }
 
 #[derive(Clone, Debug)]
@@ -1774,6 +1692,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 return;
             }
             state.audition_status_filter = status;
+            close_status_menu(state);
             state.audition_shuffle_round = 0;
             state.audition_auto_advance = false;
             state.audition_play_token = None;
@@ -5502,6 +5421,12 @@ fn settings_trigger(state: &AppState) -> ui::View<Message> {
         )
 }
 
+fn workspace_surface(content: ui::View<Message>) -> ui::View<Message> {
+    content
+        .style(ui::WidgetStyle::strong(ui::WidgetTone::Neutral))
+        .fill()
+}
+
 fn project_surface(state: &AppState) -> ui::View<Message> {
     let workspace = match state.workspace_mode {
         WorkspaceMode::Review => ui::row([
@@ -5677,6 +5602,9 @@ fn project_surface(state: &AppState) -> ui::View<Message> {
 
 fn audition_panel(state: &AppState) -> ui::View<Message> {
     let selected_id = state.library.selected_track_id.as_deref();
+    let status_menu_track_id = state.status_menu_track_id.as_deref();
+    let status_menu_host = state.status_menu_host;
+    let remove_confirmation_track_id = state.remove_confirmation_track_id.as_deref();
     let queue_tracks = state
         .audition_queue
         .iter()
@@ -5721,9 +5649,17 @@ fn audition_panel(state: &AppState) -> ui::View<Message> {
         .fill_width()
     } else {
         ui::list(queue_tracks, move |(index, track)| {
-            audition_queue_row(index, track, selected_id)
+            audition_queue_row(
+                index,
+                track,
+                selected_id,
+                status_menu_track_id,
+                status_menu_host,
+                remove_confirmation_track_id,
+            )
         })
         .without_chrome()
+        .spacing(TRACK_CARD_LIST_SPACING)
         .fill_height()
     };
     let progress = if queue_count == 0 {
@@ -5767,12 +5703,13 @@ fn audition_panel(state: &AppState) -> ui::View<Message> {
         ui::row([
             ui::column([
                 ui::text("AUDITION / PLAYLIST")
+                    .style(ui::WidgetStyle::strong(ui::WidgetTone::Neutral))
                     .height(18.0)
-                    .fill_width()
-                    .subtle(),
+                    .fill_width(),
                 ui::text("Fixed shuffle · one pass")
                     .height(26.0)
-                    .fill_width(),
+                    .fill_width()
+                    .muted_text(),
             ])
             .fill_width(),
             ui::button("Shuffle")
@@ -5800,22 +5737,62 @@ fn audition_panel(state: &AppState) -> ui::View<Message> {
         .height(22.0),
         queue,
     ])
-    .padding(14.0)
-    .spacing(8.0)
+    .padding(WORKSPACE_PANEL_PADDING)
+    .spacing(WORKSPACE_PANEL_SPACING)
     .fill_height();
-    ui::stack([ui::card().fill(), content]).fill_height()
+    workspace_surface(content)
 }
 
 fn audition_queue_row(
     index: usize,
     track: storage::Track,
     selected_id: Option<&str>,
+    status_menu_track_id: Option<&str>,
+    status_menu_host: Option<StatusMenuHost>,
+    remove_confirmation_track_id: Option<&str>,
 ) -> ui::View<Message> {
     let selected = selected_id == Some(track.id.as_str());
     let track_id = track.id.clone();
+    let status_menu_open = status_menu_host == Some(StatusMenuHost::Audition)
+        && status_menu_track_id == Some(track.id.as_str());
+    let remove_confirmation_open = remove_confirmation_track_id == Some(track.id.as_str());
     let title = format!("{:02}  {}", index + 1, track.title);
     let favorite_control =
         favorite_toggle(&track, selected, format!("audition-favorite-{}", track.id));
+    let replace_control = replace_toggle(&track, format!("audition-replace-{}", track.id));
+    let remove_id = track.id.clone();
+    let remove_control = ui::close_button()
+        .subtle()
+        .message(Message::RequestRemoveTrack(remove_id.clone()))
+        .key(format!("audition-remove-{}", track.id))
+        .tooltip("Remove track")
+        .size(28.0, 24.0);
+    let status_control =
+        status_dropdown_for_host(&track, status_menu_open, selected, StatusMenuHost::Audition);
+    let removal_controls = if remove_confirmation_open {
+        ui::row([
+            card_control(
+                selected,
+                "Confirm",
+                ui::button("Confirm")
+                    .message(Message::ConfirmRemoveTrack(remove_id.clone()))
+                    .height(20.0),
+            )
+            .height(20.0),
+            card_control(
+                selected,
+                "Cancel",
+                ui::button("Cancel")
+                    .message(Message::CancelRemoveTrack)
+                    .height(20.0),
+            )
+            .height(20.0),
+        ])
+        .spacing(4.0)
+        .fill_width()
+    } else {
+        ui::spacer().fill_width().height(0.0)
+    };
     let input = ui::button(title.clone())
         .selected(selected)
         .message(Message::SelectTrack(track_id.clone()))
@@ -5823,20 +5800,27 @@ fn audition_queue_row(
         .fill_width()
         .height(28.0);
     let row = ui::column([
-        ui::row([input.fill_width().height(28.0), favorite_control])
-            .fill_width()
-            .spacing(6.0)
-            .height(28.0),
+        ui::row([
+            input.fill_width().height(28.0),
+            favorite_control,
+            replace_control,
+            remove_control,
+        ])
+        .fill_width()
+        .spacing(TRACK_CARD_CONTENT_SPACING)
+        .height(28.0),
         ui::text(track.original_name)
             .truncate()
             .height(18.0)
             .fill_width()
             .subtle(),
+        removal_controls,
+        status_control,
     ])
-    .padding(7.0)
-    .spacing(2.0)
+    .padding(TRACK_CARD_CONTENT_INSET)
+    .spacing(TRACK_CARD_CONTENT_SPACING)
     .fill_width();
-    ui::stack([ui::card().fill(), row])
+    ui::stack([track_card_chrome(selected, track.favorite), row])
         .key(format!("audition-queue-row-{track_id}"))
         .fill_width()
 }
@@ -6055,6 +6039,7 @@ fn planner_panel(state: &AppState) -> ui::View<Message> {
                 stage_menu_track_id: state.stage_menu_track_id.as_deref(),
                 status_menu_track_id: state.status_menu_track_id.as_deref(),
                 status_menu_host: state.status_menu_host,
+                remove_confirmation_track_id: state.remove_confirmation_track_id.as_deref(),
             },
             drag_active,
             drag_source_stage,
@@ -6062,16 +6047,17 @@ fn planner_panel(state: &AppState) -> ui::View<Message> {
         )
     });
     let track_count = filtered_tracks.len();
-    ui::column([
+    let content = ui::column([
         ui::row([
             ui::column([
                 ui::text("FINISHING BOARD")
+                    .style(ui::WidgetStyle::strong(ui::WidgetTone::Neutral))
                     .height(18.0)
-                    .fill_width()
-                    .subtle(),
+                    .fill_width(),
                 ui::text("Move every track toward release.")
                     .height(30.0)
-                    .fill_width(),
+                    .fill_width()
+                    .muted_text(),
             ])
             .fill_width(),
             status_filter_controls(
@@ -6092,9 +6078,10 @@ fn planner_panel(state: &AppState) -> ui::View<Message> {
         .spacing(12.0),
         ui::row(columns).spacing(10.0).fill(),
     ])
-    .padding(18.0)
-    .spacing(14.0)
-    .fill()
+    .padding(WORKSPACE_PANEL_PADDING)
+    .spacing(WORKSPACE_PANEL_SPACING)
+    .fill();
+    workspace_surface(content)
 }
 
 struct PlannerColumnContext<'a> {
@@ -6102,6 +6089,7 @@ struct PlannerColumnContext<'a> {
     stage_menu_track_id: Option<&'a str>,
     status_menu_track_id: Option<&'a str>,
     status_menu_host: Option<StatusMenuHost>,
+    remove_confirmation_track_id: Option<&'a str>,
 }
 
 fn planner_column(
@@ -6118,6 +6106,7 @@ fn planner_column(
         stage_menu_track_id,
         status_menu_track_id,
         status_menu_host,
+        remove_confirmation_track_id,
     } = context;
     let count = tracks.len();
     let candidate = drag_active && planner_drop_is_valid(drag_source_stage, stage);
@@ -6127,7 +6116,7 @@ fn planner_column(
             ui::text(if current_target {
                 "DROP HERE"
             } else {
-                stage.label()
+                planner_column_heading(stage)
             })
             .height(24.0)
             .fill_width(),
@@ -6178,9 +6167,11 @@ fn planner_column(
                     stage_menu_track_id,
                     status_menu_track_id,
                     status_menu_host,
+                    remove_confirmation_track_id,
                 )
             })
             .without_chrome()
+            .spacing(TRACK_CARD_LIST_SPACING)
             .fill_height(),
         );
     }
@@ -6208,22 +6199,63 @@ fn planner_column(
     }
 }
 
+fn planner_column_heading(stage: storage::TrackStage) -> &'static str {
+    match stage {
+        storage::TrackStage::SoundDesign => "Backlog",
+        _ => stage.label(),
+    }
+}
+
 fn planner_card(
     track: storage::Track,
     selected_id: Option<&str>,
     stage_menu_track_id: Option<&str>,
     status_menu_track_id: Option<&str>,
     status_menu_host: Option<StatusMenuHost>,
+    remove_confirmation_track_id: Option<&str>,
 ) -> ui::View<Message> {
     let selected = selected_id == Some(track.id.as_str());
     let stage_menu_open = stage_menu_track_id == Some(track.id.as_str());
     let status_menu_open = status_menu_host == Some(StatusMenuHost::Planner)
         && status_menu_track_id == Some(track.id.as_str());
+    let remove_confirmation_open = remove_confirmation_track_id == Some(track.id.as_str());
     let title_track_id = track.id.clone();
     let drag_track_id = track.id.clone();
+    let remove_id = track.id.clone();
     let favorite_control =
         favorite_toggle(&track, selected, format!("planner-favorite-{}", track.id));
+    let replace_control = replace_toggle(&track, format!("planner-replace-{}", track.id));
+    let remove_control = ui::close_button()
+        .subtle()
+        .message(Message::RequestRemoveTrack(remove_id.clone()))
+        .key(format!("planner-remove-{}", track.id))
+        .tooltip("Remove track")
+        .size(28.0, 24.0);
     let open_comments = track.notes.iter().filter(|note| !note.done).count();
+    let removal_controls = if remove_confirmation_open {
+        ui::row([
+            card_control(
+                selected,
+                "Confirm",
+                ui::button("Confirm")
+                    .message(Message::ConfirmRemoveTrack(remove_id.clone()))
+                    .height(20.0),
+            )
+            .height(20.0),
+            card_control(
+                selected,
+                "Cancel",
+                ui::button("Cancel")
+                    .message(Message::CancelRemoveTrack)
+                    .height(20.0),
+            )
+            .height(20.0),
+        ])
+        .spacing(4.0)
+        .fill_width()
+    } else {
+        ui::spacer().fill_width().height(0.0)
+    };
     let card_content = ui::column([
         ui::row([
             card_control(
@@ -6255,14 +6287,17 @@ fn planner_card(
             .fill_width()
             .height(28.0),
             favorite_control,
+            replace_control,
+            remove_control,
         ])
         .fill_width()
-        .spacing(6.0),
+        .spacing(TRACK_CARD_CONTENT_SPACING),
         card_muted_text(selected, track.original_name.clone())
             .truncate()
             .height(20.0)
             .fill_width()
             .subtle(),
+        removal_controls,
         card_muted_text(
             selected,
             format!("{} open comment{}", open_comments, plural(open_comments)),
@@ -6273,11 +6308,10 @@ fn planner_card(
         stage_dropdown(&track, stage_menu_open, selected),
         status_dropdown_for_host(&track, status_menu_open, selected, StatusMenuHost::Planner),
     ])
-    .padding(10.0)
-    .spacing(5.0)
+    .padding(TRACK_CARD_CONTENT_INSET)
+    .spacing(TRACK_CARD_CONTENT_SPACING)
     .fill_width();
-    let card_background = planner_card_background(track.favorite);
-    ui::stack([card_background, card_content])
+    ui::stack([track_card_chrome(selected, track.favorite), card_content])
         .key(format!("planner-card-{}", track.id))
         .fill_width()
 }
@@ -6332,8 +6366,8 @@ fn keyboard_stage_menu_anchor(state: &AppState) -> Point {
 
 fn stage_menu_anchor_from_pointer(position: Point) -> Point {
     Point::new(
-        position.x - STAGE_MENU_WIDTH * 0.5,
-        position.y + ui::dropdown_trigger_height() * 0.5,
+        (position.x - STAGE_MENU_WIDTH * 0.5).floor(),
+        (position.y + ui::dropdown_trigger_height() * 0.5).floor(),
     )
 }
 
@@ -6396,6 +6430,15 @@ fn favorite_toggle(track: &storage::Track, selected: bool, key: String) -> ui::V
         })
         .size(FAVORITE_CONTROL_WIDTH, 24.0);
     ui::stack([control, favorite_marker(track.favorite)]).size(FAVORITE_CONTROL_WIDTH, 24.0)
+}
+
+fn replace_toggle(track: &storage::Track, key: String) -> ui::View<Message> {
+    ui::button("↻")
+        .subtle()
+        .message(Message::ReplacePressed(track.id.clone()))
+        .key(key)
+        .tooltip("Replace track")
+        .size(28.0, 24.0)
 }
 
 fn stage_dropdown(track: &storage::Track, open: bool, _selected: bool) -> ui::View<Message> {
@@ -6566,8 +6609,8 @@ const REFERENCE_MENU_WIDTH: f32 = 190.0;
 
 fn reference_menu_anchor_from_pointer(position: Point) -> Point {
     Point::new(
-        position.x - REFERENCE_MENU_WIDTH * 0.5,
-        position.y + ui::dropdown_trigger_height() * 0.5,
+        (position.x - REFERENCE_MENU_WIDTH * 0.5).floor(),
+        (position.y + ui::dropdown_trigger_height() * 0.5).floor(),
     )
 }
 
@@ -6667,6 +6710,7 @@ const fn status_menu_host_key(host: StatusMenuHost) -> &'static str {
     match host {
         StatusMenuHost::Library => "library",
         StatusMenuHost::Planner => "planner",
+        StatusMenuHost::Audition => "audition",
     }
 }
 
@@ -6745,7 +6789,7 @@ fn library_panel(state: &AppState) -> ui::View<Message> {
             })
             .without_chrome()
             .padding_x(LIBRARY_LIST_INSET)
-            .spacing(LIBRARY_CARD_SPACING)
+            .spacing(TRACK_CARD_LIST_SPACING)
             .fill_height()
         },
     ])
@@ -6780,13 +6824,7 @@ fn track_row(
     let remove_id = track.id.clone();
     let favorite_control =
         favorite_toggle(&track, selected, format!("library-favorite-{}", track.id));
-    let replace_id = track.id.clone();
-    let replace_control = ui::button("↻")
-        .subtle()
-        .message(Message::ReplacePressed(replace_id))
-        .key(format!("library-replace-{}", track.id))
-        .tooltip("Replace track")
-        .size(28.0, 24.0);
+    let replace_control = replace_toggle(&track, format!("library-replace-{}", track.id));
     let remove_control = ui::close_button()
         .subtle()
         .message(Message::RequestRemoveTrack(remove_id.clone()))
@@ -6929,16 +6967,17 @@ fn review_transport_icon(icon: &'static ui::SvgIconTintCache, active: bool) -> u
 
 fn review_panel(state: &AppState) -> ui::View<Message> {
     let Some(track) = selected_track(state).cloned() else {
-        return ui::column([
+        let content = ui::column([
             ui::text("Your review desk").height(30.0).fill_width(),
             ui::text("Import a track to begin reviewing.")
                 .height(28.0)
                 .fill_width(),
             ui::spacer().fill(),
         ])
-        .padding(18.0)
-        .spacing(12.0)
+        .padding(WORKSPACE_PANEL_PADDING)
+        .spacing(WORKSPACE_PANEL_SPACING)
         .fill();
+        return workspace_surface(content);
     };
 
     let note_ratios = state
@@ -7163,16 +7202,10 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
         .height(waveform_pair_height);
 
     let content = ui::column([waveform_with_source, comments_panel(state, &track)])
-        .padding(8.0)
-        .spacing(8.0)
+        .padding(WORKSPACE_PANEL_PADDING)
+        .spacing(WORKSPACE_PANEL_SPACING)
         .fill();
-    ui::stack([
-        ui::card()
-            .style(ui::WidgetStyle::strong(ui::WidgetTone::Neutral))
-            .fill(),
-        content,
-    ])
-    .fill()
+    workspace_surface(content)
 }
 
 fn reference_dropdown_paths(state: &AppState, track: &storage::Track) -> Vec<PathBuf> {
@@ -8149,8 +8182,9 @@ mod tests {
         gui::types::{Point, Rect, Vector2},
         prelude as ui,
         runtime::{
-            DeclarativeOwnedRuntimeBridge, Event, FocusTraversal, PaintPrimitive, PaintTextAlign,
-            RuntimeUpdateSnapshot, SurfaceRuntime,
+            Command, DeclarativeOwnedRuntimeBridge, Event, FocusTraversal, PaintPrimitive,
+            PaintTextAlign, PlatformRequest, PlatformResponse, RuntimeUpdateSnapshot,
+            SurfaceRuntime,
         },
         theme::ThemeTokens,
         widgets::{PointerModifiers, Widget, WidgetInput},
@@ -15257,6 +15291,445 @@ mod tests {
     }
 
     #[test]
+    fn audition_cards_paint_status_triggers_and_semantic_rails() {
+        let mut track = audition_track("audition-status-card");
+        track.status = TrackStatus::Refine;
+        let mut state = AppState {
+            busy: false,
+            workspace_mode: WorkspaceMode::Audition,
+            audition_status_filter: TrackStatus::Refine,
+            ..AppState::default()
+        };
+        state.library.tracks = vec![track];
+        rebuild_audition_queue(&mut state);
+
+        let frame = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(1_180.0, 900.0));
+        let title = frame
+            .paint_plan
+            .first_text_run("01  audition-status-card")
+            .expect("the Audition queue card should paint its title");
+        let status = frame
+            .paint_plan
+            .text_runs()
+            .find(|run| {
+                run.text.as_str() == TrackStatus::Refine.label()
+                    && run.rect.min.y > title.rect.max.y
+            })
+            .expect("the Audition queue card should paint its status trigger");
+        let rail = frame
+            .paint_plan
+            .fill_rects()
+            .find(|fill| {
+                fill.color == ThemeTokens::default().accent_warning
+                    && (fill.rect.width() - super::STATUS_RAIL_WIDTH).abs() < 0.01
+                    && fill.rect.min.y < status.rect.max.y
+                    && fill.rect.max.y > status.rect.min.y
+            })
+            .expect("the Audition status trigger should paint its semantic rail");
+
+        assert!(rail.rect.max.x <= status.rect.min.x);
+        assert_eq!(rail.rect.height(), ui::dropdown_trigger_height());
+    }
+
+    #[test]
+    fn workspace_cards_paint_and_route_replace_controls() {
+        let track = audition_track("workspace-replace-card");
+        let track_id = track.id.clone();
+
+        for workspace_mode in [WorkspaceMode::Audition, WorkspaceMode::Planner] {
+            let mut state = AppState {
+                busy: false,
+                workspace_mode,
+                ..AppState::default()
+            };
+            state.library.tracks = vec![track.clone()];
+            if workspace_mode == WorkspaceMode::Audition {
+                state.audition_queue = vec![track_id.clone()];
+            }
+
+            let bridge = DeclarativeOwnedRuntimeBridge::new(
+                state,
+                |state| project_surface(state).into_surface(),
+                |state, message| {
+                    if let Message::ReplacePressed(id) = message {
+                        state.status = format!("replace requested: {id}");
+                    }
+                },
+            );
+            let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1_180.0, 900.0));
+            let frame = runtime.frame_with_default_theme();
+            let replace_runs = frame
+                .paint_plan
+                .text_runs()
+                .filter(|run| run.text.as_str() == "↻" && run.rect.min.y > 60.0)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                replace_runs.len(),
+                1,
+                "{workspace_mode:?} should paint one replace control in its card header"
+            );
+            let replace_run = replace_runs[0];
+            let actionable_replace_controls = runtime
+                .automation_target_snapshot()
+                .targets
+                .iter()
+                .filter(|target| target.interaction_target && target.label.as_deref() == Some("↻"))
+                .count();
+            assert_eq!(actionable_replace_controls, 1);
+
+            let replace_point = Point::new(
+                replace_run.rect.min.x + replace_run.rect.width() * 0.5,
+                replace_run.rect.min.y + replace_run.rect.height() * 0.5,
+            );
+            assert!(runtime.widget_at(replace_point).is_some());
+            runtime.dispatch_primary_click(replace_point);
+            assert_eq!(
+                runtime.bridge().state().status,
+                format!("replace requested: {track_id}")
+            );
+        }
+    }
+
+    #[test]
+    fn replace_control_uses_the_existing_file_picker_request() {
+        let track = audition_track("replace-picker-track");
+        let track_id = track.id.clone();
+        let mut state = AppState {
+            busy: false,
+            ..AppState::default()
+        };
+        state.library.tracks.push(track);
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::ReplacePressed(track_id.clone()),
+            &mut context,
+        );
+
+        let Command::PlatformRequest {
+            request: PlatformRequest::PickFile(request),
+            on_completed,
+        } = context.into_command()
+        else {
+            panic!("replace should queue the existing file-picker request");
+        };
+        assert_eq!(request.title.as_deref(), Some("Replace audio track"));
+        assert_eq!(
+            on_completed(Ok(PlatformResponse::Canceled)),
+            Message::ReplaceFilePicked {
+                track_id,
+                result: Ok(PlatformResponse::Canceled),
+            }
+        );
+    }
+
+    #[test]
+    fn audition_status_menu_is_interactive_and_uses_a_distinct_host() {
+        let mut track = audition_track("audition-status-menu");
+        track.status = TrackStatus::Refine;
+        let track_id = track.id.clone();
+        let mut state = AppState {
+            busy: false,
+            workspace_mode: WorkspaceMode::Audition,
+            audition_status_filter: TrackStatus::Refine,
+            ..AppState::default()
+        };
+        state.library.tracks = vec![track];
+        rebuild_audition_queue(&mut state);
+        let bridge = DeclarativeOwnedRuntimeBridge::new(
+            state,
+            |state| project_surface(state).into_surface(),
+            |state, message| {
+                let mut context = ui::UiUpdateContext::default();
+                update(state, message, &mut context);
+            },
+        );
+        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1_180.0, 900.0));
+        let frame = runtime.frame_with_default_theme();
+        let title = frame
+            .paint_plan
+            .first_text_run("01  audition-status-menu")
+            .expect("the Audition queue card should paint its title");
+        let (_trigger, trigger_rect) = frame
+            .paint_plan
+            .text_runs()
+            .find_map(|run| {
+                (run.text.as_str() == TrackStatus::Refine.label()
+                    && run.rect.min.y > title.rect.max.y)
+                    .then_some((run.widget_id, run.rect))
+            })
+            .expect("the Audition queue card should paint a focusable status trigger");
+        let trigger_point = Point::new(
+            trigger_rect.min.x + trigger_rect.width() * 0.5,
+            trigger_rect.min.y + trigger_rect.height() * 0.5,
+        );
+
+        assert!(runtime.widget_at(trigger_point).is_some());
+        runtime.dispatch_primary_click(trigger_point);
+        assert_eq!(
+            runtime.bridge().state().status_menu_track_id.as_deref(),
+            Some(track_id.as_str())
+        );
+        assert_eq!(
+            runtime.bridge().state().status_menu_host,
+            Some(StatusMenuHost::Audition)
+        );
+        assert_eq!(
+            super::status_menu_host_key(StatusMenuHost::Audition),
+            "audition"
+        );
+
+        let opened_frame = runtime.frame_with_default_theme();
+        let option_rect = opened_frame
+            .paint_plan
+            .text_runs()
+            .find_map(|run| {
+                (run.text.as_str() == TrackStatus::Release.label()
+                    && run.rect.min.y > trigger_rect.max.y)
+                    .then_some(run.rect)
+            })
+            .expect("the open Audition status menu should paint the Release option");
+        let option_point = Point::new(
+            option_rect.min.x + option_rect.width() * 0.5,
+            option_rect.min.y + option_rect.height() * 0.5,
+        );
+        assert!(runtime.widget_at(option_point).is_some());
+        runtime.dispatch_primary_click(option_point);
+
+        assert_eq!(
+            runtime.bridge().state().library.tracks[0].status,
+            TrackStatus::Release
+        );
+        assert!(runtime.bridge().state().status_menu_track_id.is_none());
+        assert!(runtime.bridge().state().status_menu_host.is_none());
+    }
+
+    fn rightmost_svg_rect_after(primitives: &[PaintPrimitive], min_y: f32) -> Rect {
+        primitives
+            .iter()
+            .filter_map(|primitive| match primitive {
+                PaintPrimitive::Svg(svg) if svg.rect.max.y > min_y => Some(svg.rect),
+                _ => None,
+            })
+            .max_by(|left, right| left.max.x.total_cmp(&right.max.x))
+            .expect("the track card should paint its close control")
+    }
+
+    #[test]
+    fn audition_card_removal_control_opens_and_cancels_confirmation() {
+        let track = audition_track("audition-remove-card");
+        let track_id = track.id.clone();
+        let mut state = AppState {
+            busy: false,
+            workspace_mode: WorkspaceMode::Audition,
+            ..AppState::default()
+        };
+        state.library.tracks = vec![track];
+        rebuild_audition_queue(&mut state);
+        let bridge = DeclarativeOwnedRuntimeBridge::new(
+            state,
+            |state| project_surface(state).into_surface(),
+            |state, message| {
+                let mut context = ui::UiUpdateContext::default();
+                update(state, message, &mut context);
+            },
+        );
+        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1_180.0, 900.0));
+        let frame = runtime.frame_with_default_theme();
+        let title = frame
+            .paint_plan
+            .first_text_run("01  audition-remove-card")
+            .expect("the Audition queue card should paint its title");
+        let remove_rect = rightmost_svg_rect_after(&frame.paint_plan.primitives, title.rect.min.y);
+        let remove_point = Point::new(
+            remove_rect.min.x + remove_rect.width() * 0.5,
+            remove_rect.min.y + remove_rect.height() * 0.5,
+        );
+
+        assert!(runtime.widget_at(remove_point).is_some());
+        runtime.dispatch_primary_click(remove_point);
+        assert_eq!(
+            runtime
+                .bridge()
+                .state()
+                .remove_confirmation_track_id
+                .as_deref(),
+            Some(track_id.as_str())
+        );
+
+        let opened_frame = runtime.frame_with_default_theme();
+        assert!(
+            opened_frame
+                .paint_plan
+                .text_label_strings()
+                .iter()
+                .any(|label| label == "Confirm")
+        );
+        let cancel_rect = opened_frame
+            .paint_plan
+            .text_runs()
+            .find(|run| run.text.as_str() == "Cancel")
+            .expect("the Audition card should paint a Cancel control")
+            .rect;
+        let cancel_point = Point::new(
+            cancel_rect.min.x + cancel_rect.width() * 0.5,
+            cancel_rect.min.y + cancel_rect.height() * 0.5,
+        );
+        assert!(runtime.widget_at(cancel_point).is_some());
+        runtime.dispatch_primary_click(cancel_point);
+
+        assert!(
+            runtime
+                .bridge()
+                .state()
+                .remove_confirmation_track_id
+                .is_none()
+        );
+        assert_eq!(runtime.bridge().state().library.tracks.len(), 1);
+    }
+
+    #[test]
+    fn planner_card_removal_control_opens_and_confirms_removal() {
+        let mut track = audition_track("planner-remove-card");
+        track.stage = TrackStage::SoundDesign;
+        let track_id = track.id.clone();
+        let mut state = AppState {
+            busy: false,
+            workspace_mode: WorkspaceMode::Planner,
+            ..AppState::default()
+        };
+        state.library.tracks = vec![track];
+        let bridge = DeclarativeOwnedRuntimeBridge::new(
+            state,
+            |state| project_surface(state).into_surface(),
+            |state, message| {
+                let mut context = ui::UiUpdateContext::default();
+                update(state, message, &mut context);
+            },
+        );
+        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1_180.0, 900.0));
+        let frame = runtime.frame_with_default_theme();
+        let title = frame
+            .paint_plan
+            .first_text_run("planner-remove-card")
+            .expect("the Planner card should paint its title");
+        let remove_rect = rightmost_svg_rect_after(&frame.paint_plan.primitives, title.rect.min.y);
+        let remove_point = Point::new(
+            remove_rect.min.x + remove_rect.width() * 0.5,
+            remove_rect.min.y + remove_rect.height() * 0.5,
+        );
+
+        assert!(runtime.widget_at(remove_point).is_some());
+        runtime.dispatch_primary_click(remove_point);
+        assert_eq!(
+            runtime
+                .bridge()
+                .state()
+                .remove_confirmation_track_id
+                .as_deref(),
+            Some(track_id.as_str())
+        );
+
+        let opened_frame = runtime.frame_with_default_theme();
+        let confirm_rect = opened_frame
+            .paint_plan
+            .text_runs()
+            .find(|run| run.text.as_str() == "Confirm")
+            .expect("the Planner card should paint a Confirm control")
+            .rect;
+        let confirm_point = Point::new(
+            confirm_rect.min.x + confirm_rect.width() * 0.5,
+            confirm_rect.min.y + confirm_rect.height() * 0.5,
+        );
+        assert!(runtime.widget_at(confirm_point).is_some());
+        runtime.dispatch_primary_click(confirm_point);
+
+        assert!(
+            runtime
+                .bridge()
+                .state()
+                .remove_confirmation_track_id
+                .is_none()
+        );
+        assert!(runtime.bridge().state().library.tracks.is_empty());
+    }
+
+    #[test]
+    fn planner_uses_backlog_for_the_sound_design_column_heading() {
+        let state = AppState {
+            busy: false,
+            workspace_mode: WorkspaceMode::Planner,
+            ..AppState::default()
+        };
+        let labels = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(1_180.0, 900.0))
+            .paint_plan
+            .text_label_strings();
+
+        assert!(labels.iter().any(|label| label == "Backlog"));
+        assert!(!labels.iter().any(|label| label == "Sound design"));
+        assert_eq!(TrackStage::SoundDesign.label(), "Sound design");
+        assert_eq!(
+            super::planner_column_heading(TrackStage::SoundDesign),
+            "Backlog"
+        );
+    }
+
+    #[test]
+    fn workspace_modes_paint_shared_surfaces_and_text_hierarchy() {
+        let theme = ThemeTokens::default();
+        let mut state = AppState {
+            busy: false,
+            ..AppState::default()
+        };
+        for (mode, eyebrow, subtitle) in [
+            (WorkspaceMode::Review, "Your review desk", None),
+            (
+                WorkspaceMode::Planner,
+                "FINISHING BOARD",
+                Some("Move every track toward release."),
+            ),
+            (
+                WorkspaceMode::Audition,
+                "AUDITION / PLAYLIST",
+                Some("Fixed shuffle · one pass"),
+            ),
+        ] {
+            state.workspace_mode = mode;
+            let frame = project_surface(&state)
+                .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 720.0));
+            let heading = frame
+                .paint_plan
+                .first_text_run(eyebrow)
+                .unwrap_or_else(|| panic!("missing {eyebrow:?} in {mode:?}"));
+            let surface = frame.paint_plan.fill_rects().find(|fill| {
+                fill.color == theme.surface_overlay
+                    && heading.rect.min.x >= fill.rect.min.x
+                    && heading.rect.min.y >= fill.rect.min.y
+                    && heading.rect.max.x <= fill.rect.max.x
+                    && heading.rect.max.y <= fill.rect.max.y
+                    && (heading.rect.min.x - (fill.rect.min.x + super::WORKSPACE_PANEL_PADDING))
+                        .abs()
+                        < 0.01
+            });
+            assert!(
+                surface.is_some(),
+                "{mode:?} should paint a strong-neutral workspace surface with the shared inset"
+            );
+            assert_eq!(heading.color, theme.text_primary);
+            if let Some(subtitle) = subtitle {
+                assert_eq!(
+                    frame.paint_plan.first_text_color(subtitle),
+                    Some(theme.text_muted),
+                    "{mode:?} subtitle should remain subtle"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn favorite_state_is_immediately_visible_in_all_track_lists() {
         let mut starred = audition_track("starred-track");
         starred.favorite = true;
@@ -15336,157 +15809,107 @@ mod tests {
         assert_eq!(text_run.color, theme.highlight_orange);
     }
 
-    #[test]
-    fn planner_card_background_preserves_card_contract_and_stateful_paint() {
-        let bounds = Rect::from_min_size(Point::new(10.0, 20.0), Vector2::new(200.0, 100.0));
-        let theme = ThemeTokens::default();
-        let widget = super::PlannerCardBackgroundWidget::new(true);
+    #[derive(Clone, Debug, PartialEq)]
+    struct TrackCardPaintSnapshot {
+        fill: ui::Rgba8,
+        outline: ui::Rgba8,
+        outline_width: f32,
+        rail: ui::Rgba8,
+        rail_width: f32,
+        points: Arc<[Point]>,
+    }
 
-        assert!(widget.accepts_pointer_move());
-        assert!(widget.accepts_pointer_input(&WidgetInput::primary_press(Point::new(20.0, 30.0,))));
-        assert!(widget.common().paint.suppresses_container_hover);
-        assert!(!widget.common().paint.paints_focus);
-        assert!(widget.common().paint.paints_state_layers);
-        assert_eq!(
-            widget.common().style,
-            ui::WidgetStyle::normal(ui::WidgetTone::Neutral)
-        );
-
-        let paint_colors = |widget: &super::PlannerCardBackgroundWidget| {
-            let mut primitives = Vec::new();
-            widget.append_paint(
-                &mut primitives,
-                bounds,
-                &radiant::layout::LayoutOutput::default(),
-                &theme,
-            );
-            let fill = primitives
-                .iter()
-                .find_map(|primitive| match primitive {
-                    PaintPrimitive::FillRect(fill) => Some(fill.color),
-                    _ => None,
+    fn track_card_paint_snapshots(primitives: &[PaintPrimitive]) -> Vec<TrackCardPaintSnapshot> {
+        primitives
+            .iter()
+            .filter_map(|primitive| {
+                let PaintPrimitive::FillPolygon(fill) = primitive else {
+                    return None;
+                };
+                if fill.points.len() != 5 {
+                    return None;
+                }
+                let (outline, outline_width) = primitives.iter().find_map(|primitive| {
+                    let PaintPrimitive::StrokePolygon(stroke) = primitive else {
+                        return None;
+                    };
+                    (stroke.widget_id == fill.widget_id
+                        && stroke.points.as_ref() == fill.points.as_ref()
+                        && (stroke.width - super::TRACK_CARD_OUTLINE_WIDTH).abs() < 0.01)
+                        .then_some((stroke.color, stroke.width))
+                })?;
+                let rail = primitives.iter().find_map(|primitive| {
+                    let PaintPrimitive::FillRect(rail) = primitive else {
+                        return None;
+                    };
+                    (rail.widget_id == fill.widget_id
+                        && (rail.rect.width() - super::TRACK_CARD_RAIL_WIDTH).abs() < 0.01)
+                        .then_some(rail)
+                })?;
+                Some(TrackCardPaintSnapshot {
+                    fill: fill.color,
+                    outline,
+                    outline_width,
+                    rail: rail.color,
+                    rail_width: rail.rect.width(),
+                    points: Arc::clone(&fill.points),
                 })
-                .expect("Planner card background should paint a fill");
-            let border = primitives
-                .iter()
-                .find_map(|primitive| match primitive {
-                    PaintPrimitive::StrokeRect(stroke) => Some(stroke.color),
-                    _ => None,
-                })
-                .expect("Planner card background should paint a border");
-            (fill, border)
-        };
-
-        let (idle_fill, idle_border) = paint_colors(&widget);
-        let idle_tokens = radiant::widgets::resolve_widget_visual_tokens(
-            &theme,
-            widget.common().style,
-            widget.common().state,
-        );
-        assert_eq!(idle_fill, super::planner_card_fill(true, &theme));
-        assert_eq!(idle_border, idle_tokens.border);
-
-        let non_favorite = super::PlannerCardBackgroundWidget::new(false);
-        assert_eq!(
-            paint_colors(&non_favorite).0,
-            super::planner_card_fill(false, &theme)
-        );
-
-        for (state_name, state) in [
-            (
-                "hover",
-                ui::WidgetState {
-                    hovered: true,
-                    ..ui::WidgetState::default()
-                },
-            ),
-            (
-                "pressed",
-                ui::WidgetState {
-                    pressed: true,
-                    ..ui::WidgetState::default()
-                },
-            ),
-        ] {
-            let mut stateful = super::PlannerCardBackgroundWidget::new(true);
-            stateful.common_mut().state = state;
-            let (fill, border) = paint_colors(&stateful);
-            let tokens = radiant::widgets::resolve_widget_visual_tokens(
-                &theme,
-                stateful.common().style,
-                state,
-            );
-            assert_eq!(
-                fill, tokens.fill,
-                "{state_name} fill should resolve from state"
-            );
-            assert_eq!(
-                border, tokens.border,
-                "{state_name} border should resolve from state"
-            );
-        }
+            })
+            .collect()
     }
 
     #[test]
-    fn favorite_card_fills_are_distinct_in_dark_and_light_themes() {
+    fn track_card_chrome_is_paint_only_and_uses_shared_style() {
+        let bounds = Rect::from_min_size(Point::new(10.0, 20.0), Vector2::new(200.0, 100.0));
+        let theme = ThemeTokens::default();
+        let widget = super::TrackCardChromeWidget::new(true, true);
+
+        assert!(!widget.accepts_pointer_move());
+        assert!(
+            !widget.accepts_pointer_input(&WidgetInput::primary_press(Point::new(20.0, 30.0,)))
+        );
+        assert!(!widget.common().paint.suppresses_container_hover);
+        assert!(!widget.common().paint.paints_focus);
+
+        let mut primitives = Vec::new();
+        widget.append_paint(
+            &mut primitives,
+            bounds,
+            &radiant::layout::LayoutOutput::default(),
+            &theme,
+        );
+        let snapshots = track_card_paint_snapshots(&primitives);
+        assert_eq!(snapshots.len(), 1);
+        let snapshot = &snapshots[0];
+        assert_eq!(snapshot.fill, super::track_card_fill(true, &theme));
+        assert_eq!(snapshot.outline, super::TRACK_CARD_SELECTED_CORAL);
+        assert_eq!(snapshot.outline_width, super::TRACK_CARD_OUTLINE_WIDTH);
+        assert_eq!(snapshot.rail, super::TRACK_CARD_SELECTED_CORAL);
+        assert_eq!(snapshot.rail_width, super::TRACK_CARD_RAIL_WIDTH);
+        assert_eq!(snapshot.points, super::track_card_points(bounds));
+    }
+
+    #[test]
+    fn favorite_track_card_fill_is_shared_in_dark_and_light_themes() {
         for (name, theme) in [
             ("dark", ThemeTokens::default()),
             ("light", ThemeTokens::light()),
         ] {
-            let library_favorite = super::track_card_fill(true, &theme);
-            let library_non_favorite = super::track_card_fill(false, &theme);
-            let planner_favorite = super::planner_card_fill(true, &theme);
-            let planner_non_favorite = super::planner_card_fill(false, &theme);
+            let favorite = super::track_card_fill(true, &theme);
+            let non_favorite = super::track_card_fill(false, &theme);
 
-            assert_eq!(library_non_favorite, theme.bg_primary);
-            if name == "light" {
-                assert_eq!(planner_favorite, theme.surface_raised);
-                assert_eq!(
-                    planner_non_favorite,
-                    theme.surface_raised.blend_toward(
-                        theme.bg_primary,
-                        super::PLANNER_CARD_NON_FAVORITE_LIGHT_BLEND,
-                    )
-                );
-            } else {
-                assert_eq!(planner_non_favorite, theme.surface_raised);
-            }
-            let distinct_surface_theme = ThemeTokens {
-                surface_overlay: theme.surface_overlay.blend_toward(theme.text_primary, 0.1),
-                ..theme
-            };
-            assert_eq!(
-                super::planner_card_fill(false, &distinct_surface_theme),
-                distinct_surface_theme.surface_raised,
-                "non-favorites should retain the raised baseline when a lighter overlay exists"
-            );
-            assert_ne!(
-                library_favorite, library_non_favorite,
-                "Library {name} fills should differ"
-            );
-            assert_ne!(
-                planner_favorite, planner_non_favorite,
-                "Planner {name} fills should differ"
-            );
-
+            assert_eq!(non_favorite, theme.bg_primary);
+            assert_ne!(favorite, non_favorite, "{name} card fills should differ");
             assert!(
-                library_favorite.r > library_non_favorite.r
-                    && library_favorite.g > library_non_favorite.g
-                    && library_favorite.b > library_non_favorite.b,
-                "favorite Library fill should be brighter in every RGB channel in {name} theme"
-            );
-            assert!(
-                planner_favorite.r > planner_non_favorite.r
-                    && planner_favorite.g > planner_non_favorite.g
-                    && planner_favorite.b > planner_non_favorite.b,
-                "favorite Planner fill should be brighter in every RGB channel in {name} theme"
+                favorite.r > non_favorite.r
+                    && favorite.g > non_favorite.g
+                    && favorite.b > non_favorite.b,
+                "favorite fill should be brighter in every RGB channel in {name} theme"
             );
             if name == "light" {
                 assert!(
-                    library_favorite.r >= 247
-                        && library_favorite.g >= 247
-                        && library_favorite.b >= 247,
-                    "light favorite Library fill should remain near-white"
+                    favorite.r >= 247 && favorite.g >= 247 && favorite.b >= 247,
+                    "light favorite fill should remain near-white"
                 );
             }
         }
@@ -15831,65 +16254,99 @@ mod tests {
     }
 
     #[test]
-    fn planner_track_cards_paint_lighter_favorite_fill() {
-        let mut favorite = audition_track("favorite-planner-card");
+    fn all_track_card_contexts_paint_shared_chrome_and_selection_states() {
+        let mut favorite = audition_track("favorite-track-card");
         favorite.favorite = true;
         favorite.stage = TrackStage::Production;
-        let mut non_favorite = audition_track("non-favorite-planner-card");
-        non_favorite.stage = TrackStage::Production;
+        let mut selected = audition_track("selected-track-card");
+        selected.stage = TrackStage::Production;
         let mut state = AppState {
             busy: false,
-            workspace_mode: WorkspaceMode::Planner,
             ..AppState::default()
         };
-        state.library.tracks = vec![favorite, non_favorite];
-
-        let frame = project_surface(&state)
-            .view_frame_at_size_with_default_theme(Vector2::new(1_400.0, 900.0));
+        state.library.selected_track_id = Some(selected.id.clone());
+        state.library.tracks = vec![favorite.clone(), selected.clone()];
+        state.audition_queue = vec![favorite.id.clone(), selected.id.clone()];
         let theme = ThemeTokens::default();
-        let planner_card_fills = frame
-            .paint_plan
-            .fill_rects()
-            .filter(|fill| {
-                fill.rect.width() > 120.0
-                    && fill.rect.height() > 100.0
-                    && fill.rect.height() < 300.0
-                    && frame.paint_plan.primitives.iter().any(|primitive| {
-                        matches!(
-                            primitive,
-                            PaintPrimitive::StrokeRect(stroke)
-                                if stroke.widget_id == fill.widget_id
-                                    && stroke.rect == fill.rect
-                                    && stroke.color == theme.border
-                                    && stroke.width == 1.0
-                        )
-                    })
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            planner_card_fills.len(),
-            2,
-            "Planner should paint one background fill for each track card"
-        );
+        let mut expected_styles = None;
 
-        let favorite_fill = planner_card_fills
-            .iter()
-            .find(|fill| fill.color == super::planner_card_fill(true, &theme))
-            .expect("favorite Planner card should use the lighter fill");
-        let non_favorite_fill = planner_card_fills
-            .iter()
-            .find(|fill| fill.color == super::planner_card_fill(false, &theme))
-            .expect("non-favorite Planner card should retain the baseline fill");
-        assert_ne!(
-            favorite_fill.color, non_favorite_fill.color,
-            "favorite and non-favorite Planner card fills should differ"
-        );
-        assert!(
-            favorite_fill.color.r > non_favorite_fill.color.r
-                && favorite_fill.color.g > non_favorite_fill.color.g
-                && favorite_fill.color.b > non_favorite_fill.color.b,
-            "favorite Planner card fill should be lighter in every RGB channel"
-        );
+        for mode in [
+            WorkspaceMode::Review,
+            WorkspaceMode::Audition,
+            WorkspaceMode::Planner,
+        ] {
+            state.workspace_mode = mode;
+            let frame = project_surface(&state)
+                .view_frame_at_size_with_default_theme(Vector2::new(1_400.0, 900.0));
+            let cards = track_card_paint_snapshots(&frame.paint_plan.primitives);
+            assert_eq!(
+                cards.len(),
+                2,
+                "{mode:?} should paint one shared card chrome for each track"
+            );
+
+            let selected_card = cards
+                .iter()
+                .find(|card| card.outline == super::TRACK_CARD_SELECTED_CORAL)
+                .expect("selected track should have the coral card outline");
+            assert_eq!(selected_card.fill, super::track_card_fill(false, &theme));
+            assert_eq!(selected_card.rail, super::TRACK_CARD_SELECTED_CORAL);
+
+            let favorite_card = cards
+                .iter()
+                .find(|card| card.fill == super::track_card_fill(true, &theme))
+                .expect("favorite track should have the lighter card fill");
+            assert_eq!(favorite_card.outline, theme.grid_strong);
+            assert_eq!(favorite_card.rail, theme.grid_strong);
+
+            for card in &cards {
+                assert_eq!(card.outline_width, super::TRACK_CARD_OUTLINE_WIDTH);
+                assert_eq!(card.rail_width, super::TRACK_CARD_RAIL_WIDTH);
+                assert_eq!(card.rail, card.outline);
+                assert_eq!(card.points.len(), 5);
+                assert!(
+                    ((card.points[1].x - card.points[3].x) - super::TRACK_CARD_CHAMFER).abs()
+                        < 0.01,
+                    "{mode:?} card should use the shared bottom-right chamfer"
+                );
+            }
+
+            let mut styles = cards
+                .iter()
+                .map(|card| {
+                    (
+                        card.fill,
+                        card.outline,
+                        card.outline_width.to_bits(),
+                        card.rail,
+                        card.rail_width.to_bits(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            styles.sort_by_key(|(fill, outline, outline_width, rail, rail_width)| {
+                (
+                    fill.r,
+                    fill.g,
+                    fill.b,
+                    outline.r,
+                    outline.g,
+                    outline.b,
+                    *outline_width,
+                    rail.r,
+                    rail.g,
+                    rail.b,
+                    *rail_width,
+                )
+            });
+            if let Some(expected_styles) = &expected_styles {
+                assert_eq!(
+                    &styles, expected_styles,
+                    "{mode:?} should reuse Review's card chrome colors and dimensions"
+                );
+            } else {
+                expected_styles = Some(styles);
+            }
+        }
     }
 
     #[test]
@@ -16110,7 +16567,7 @@ mod tests {
         );
         for pair in card_rects.windows(2) {
             assert!(
-                pair[1].min.y - pair[0].max.y >= super::LIBRARY_CARD_SPACING - 0.01,
+                pair[1].min.y - pair[0].max.y >= super::TRACK_CARD_LIST_SPACING - 0.01,
                 "library cards should retain a visible vertical gap: {:?} then {:?}",
                 pair[0],
                 pair[1]
