@@ -5,9 +5,7 @@ mod transport;
 mod waveform;
 
 use radiant::{
-    application::{
-        AnchoredPopoverParts, anchored_popover_from_parts, dismissible_anchored_popover_from_parts,
-    },
+    application::{AnchoredPopoverParts, IntoView, anchored_popover_from_parts},
     gui::{
         list::DenseRowMarkerParts,
         types::{Point, Rect, Vector2},
@@ -103,9 +101,6 @@ enum Message {
         position: Point,
     },
     ToggleSettings,
-    ToggleSettingsAt {
-        position: Point,
-    },
     CloseSettings,
     RemoveReferenceTrack(PathBuf),
     SetReferenceTrack {
@@ -787,7 +782,6 @@ struct AppState {
     reference_menu_track_id: Option<String>,
     reference_menu_anchor: Option<Point>,
     settings_open: bool,
-    settings_anchor: Option<Point>,
 }
 
 #[derive(Clone, Debug)]
@@ -888,7 +882,6 @@ impl Default for AppState {
             reference_menu_track_id: None,
             reference_menu_anchor: None,
             settings_open: false,
-            settings_anchor: None,
         }
     }
 }
@@ -934,6 +927,7 @@ fn main() -> radiant::Result {
         .size(1180, 720)
         .min_size(900, 560)
         .view(project_surface)
+        .auxiliary_windows(reference_settings_auxiliary_windows)
         .animation(|state| {
             state.transport_playing
                 || state.transport_polling
@@ -1564,10 +1558,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
         }
         Message::ToggleSettings => {
-            toggle_settings(state, context, keyboard_settings_anchor());
-        }
-        Message::ToggleSettingsAt { position } => {
-            toggle_settings(state, context, settings_anchor_from_pointer(position));
+            toggle_settings(state, context);
         }
         Message::CloseSettings => {
             close_settings(state);
@@ -4933,14 +4924,9 @@ fn close_reference_menu(state: &mut AppState) {
 
 fn close_settings(state: &mut AppState) {
     state.settings_open = false;
-    state.settings_anchor = None;
 }
 
-fn toggle_settings(
-    state: &mut AppState,
-    context: &mut ui::UiUpdateContext<Message>,
-    anchor: Point,
-) {
+fn toggle_settings(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
     if state.settings_open {
         close_settings(state);
     } else {
@@ -4949,7 +4935,6 @@ fn toggle_settings(
         close_reference_menu(state);
         state.review_filter_menu_open = false;
         state.settings_open = true;
-        state.settings_anchor = Some(anchor);
     }
     context.request_repaint();
 }
@@ -5516,9 +5501,7 @@ fn settings_trigger(state: &AppState) -> ui::View<Message> {
                 .pointer_drop(false)
                 .wheel(false)
                 .filter_map(|message| match message {
-                    ui::PointerShieldMessage::PointerPress { position, .. } => {
-                        Some(Message::ToggleSettingsAt { position })
-                    }
+                    ui::PointerShieldMessage::PointerPress { .. } => Some(Message::ToggleSettings),
                     _ => None,
                 }),
         )
@@ -5579,11 +5562,6 @@ fn project_surface(state: &AppState) -> ui::View<Message> {
                 .filter(|track| !reference_dropdown_paths(state, track).is_empty())
                 .map(|track| reference_menu_popover(state, track, anchor))
         });
-    let settings_menu = state
-        .settings_open
-        .then_some(state.settings_anchor)
-        .flatten()
-        .map(|anchor| reference_settings_popover(state, anchor));
     let workspace_tabs = [
         WorkspaceMode::Review,
         WorkspaceMode::Planner,
@@ -5708,7 +5686,6 @@ fn project_surface(state: &AppState) -> ui::View<Message> {
             ui::overlays()
                 .popover_opt(stage_menu)
                 .popover_opt(reference_menu)
-                .popover_opt(settings_menu)
                 .drag_preview_opt(drag_preview),
         ),
     )
@@ -6350,9 +6327,17 @@ fn planner_drop_is_valid(
 }
 
 const STAGE_MENU_WIDTH: f32 = 174.0;
-const SETTINGS_POPOVER_WIDTH: f32 = 360.0;
-const SETTINGS_REFERENCE_ROW_HEIGHT: f32 = 42.0;
-const SETTINGS_REFERENCE_LIST_MAX_HEIGHT: f32 = 252.0;
+const REFERENCE_SETTINGS_WINDOW_WIDTH: f32 = 680.0;
+const REFERENCE_SETTINGS_WINDOW_HEIGHT: f32 = 520.0;
+const REFERENCE_SETTINGS_WINDOW_PADDING: f32 = 22.0;
+const SETTINGS_REFERENCE_ROW_HEIGHT: f32 = 64.0;
+const SETTINGS_REFERENCE_ROW_TITLE_HEIGHT: f32 = 25.0;
+const SETTINGS_REFERENCE_ROW_METADATA_HEIGHT: f32 = 21.0;
+const SETTINGS_REFERENCE_ROW_TEXT_SPACING: f32 = 4.0;
+const SETTINGS_REFERENCE_ROW_TEXT_HEIGHT: f32 = SETTINGS_REFERENCE_ROW_TITLE_HEIGHT
+    + SETTINGS_REFERENCE_ROW_TEXT_SPACING
+    + SETTINGS_REFERENCE_ROW_METADATA_HEIGHT;
+const SETTINGS_REFERENCE_REMOVE_BUTTON_SIZE: f32 = 32.0;
 
 fn keyboard_stage_menu_anchor(state: &AppState) -> Point {
     match state.workspace_mode {
@@ -6468,17 +6453,6 @@ fn stage_menu_popover(track: &storage::Track, anchor: Point) -> ui::View<Message
     ))
 }
 
-fn settings_anchor_from_pointer(position: Point) -> Point {
-    Point::new(
-        position.x - SETTINGS_POPOVER_WIDTH + 30.0,
-        position.y + ui::dropdown_trigger_height() * 0.5,
-    )
-}
-
-fn keyboard_settings_anchor() -> Point {
-    Point::new(1180.0 - SETTINGS_POPOVER_WIDTH - 18.0, 42.0)
-}
-
 fn reference_assignment_count(library: &storage::Library, path: &Path) -> usize {
     library
         .tracks
@@ -6505,41 +6479,45 @@ fn settings_reference_row(
         index,
         [
             ui::column([
-                ui::text(name).truncate().height(20.0).fill_width(),
+                ui::text(name)
+                    .truncate()
+                    .height(SETTINGS_REFERENCE_ROW_TITLE_HEIGHT)
+                    .fill_width(),
                 ui::text(assignment_label)
                     .truncate()
-                    .height(17.0)
+                    .height(SETTINGS_REFERENCE_ROW_METADATA_HEIGHT)
                     .fill_width()
                     .subtle(),
             ])
-            .spacing(1.0)
+            .spacing(SETTINGS_REFERENCE_ROW_TEXT_SPACING)
             .fill_width()
-            .height(38.0),
+            .height(SETTINGS_REFERENCE_ROW_TEXT_HEIGHT),
             ui::close_button()
                 .subtle()
                 .message(Message::RemoveReferenceTrack(remove_path))
                 .key(format!("settings-remove-reference-{index}"))
                 .tooltip("Remove reference track")
-                .size(28.0, 24.0),
+                .size(
+                    SETTINGS_REFERENCE_REMOVE_BUTTON_SIZE,
+                    SETTINGS_REFERENCE_REMOVE_BUTTON_SIZE,
+                ),
         ],
     )
     .fill_width()
     .height(SETTINGS_REFERENCE_ROW_HEIGHT)
 }
 
-fn reference_settings_popover(state: &AppState, anchor: Point) -> ui::View<Message> {
+fn reference_settings_window_view(state: &AppState) -> ui::View<Message> {
     let reference_count = state.library.reference_tracks.len();
-    let list_height = (reference_count as f32 * SETTINGS_REFERENCE_ROW_HEIGHT)
-        .min(SETTINGS_REFERENCE_LIST_MAX_HEIGHT);
     let references = if reference_count == 0 {
         ui::column([ui::text("No reference tracks cataloged yet.")
             .wrap()
             .height(36.0)
             .fill_width()
             .subtle()])
-        .padding(8.0)
+        .without_chrome()
         .fill_width()
-        .height(44.0)
+        .fill_height()
     } else {
         let selected_reference_path =
             selected_track(state).and_then(|track| track.reference_path.clone());
@@ -6560,18 +6538,12 @@ fn reference_settings_popover(state: &AppState, anchor: Point) -> ui::View<Messa
         })
         .without_chrome()
         .fill_width()
-        .height(list_height)
+        .fill_height()
     };
-    let list_height = if reference_count == 0 {
-        44.0
-    } else {
-        list_height
-    };
-    let content_height = 12.0 + 24.0 + 8.0 + list_height + 8.0 + 30.0 + 12.0;
-    let content = ui::column([
+    ui::column([
         ui::text("REFERENCE TRACKS")
             .style(ui::WidgetStyle::strong(ui::WidgetTone::Neutral))
-            .height(24.0)
+            .height(28.0)
             .fill_width(),
         references,
         ui::button("Add reference tracks")
@@ -6579,20 +6551,32 @@ fn reference_settings_popover(state: &AppState, anchor: Point) -> ui::View<Messa
             .message(Message::AddReferenceTracksPressed)
             .key("settings-add-reference-tracks")
             .fill_width()
-            .height(30.0),
+            .height(34.0),
     ])
-    .padding(12.0)
-    .spacing(8.0)
-    .fill_width()
-    .height(content_height);
-    dismissible_anchored_popover_from_parts(
-        AnchoredPopoverParts::below(
-            content.key("reference-settings-popover"),
-            ui::AnchoredPopoverAnchor::pointer(anchor),
-            Vector2::new(SETTINGS_POPOVER_WIDTH, content_height),
-        ),
-        Message::CloseSettings,
-    )
+    .key("reference-settings-window")
+    .style(ui::WidgetStyle::strong(ui::WidgetTone::Neutral))
+    .padding(REFERENCE_SETTINGS_WINDOW_PADDING)
+    .spacing(12.0)
+    .fill()
+}
+
+#[allow(clippy::arc_with_non_send_sync)]
+fn reference_settings_auxiliary_windows(state: &mut AppState) -> Vec<ui::AuxiliaryWindow<Message>> {
+    if !state.settings_open {
+        return Vec::new();
+    }
+    let surface = reference_settings_window_view(state).into_surface();
+    vec![
+        ui::AuxiliaryWindow::utility(
+            "reference-settings",
+            "Reference Tracks",
+            REFERENCE_SETTINGS_WINDOW_WIDTH,
+            REFERENCE_SETTINGS_WINDOW_HEIGHT,
+            Arc::new(surface),
+        )
+        .on_close(Message::CloseSettings)
+        .cache_on_close(),
+    ]
 }
 
 const REFERENCE_MENU_WIDTH: f32 = 190.0;
@@ -8140,16 +8124,18 @@ mod tests {
     use super::{
         APP_VERSION_LABEL, AppState, AuditionSource, FavoriteMarkerWidget, ImportBatchProgress,
         LoopBounds, LoopSelection, LoopSelections, Message, NoteDraft, REFERENCE_MENU_WIDTH,
+        SETTINGS_REFERENCE_ROW_METADATA_HEIGHT, SETTINGS_REFERENCE_ROW_TEXT_HEIGHT,
+        SETTINGS_REFERENCE_ROW_TEXT_SPACING, SETTINGS_REFERENCE_ROW_TITLE_HEIGHT,
         STATUS_BAR_VERSION_WIDTH, StatusMenuHost, TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER,
         TRACK_CARD_SELECTED_CORAL, WAVEFORM_HEIGHT, WorkspaceMode, apply_transport_snapshot,
         audition_panel, audition_shuffle_seed, audition_statuses, current_loudness_match_gain_db,
         current_lufs_meter_value, current_reference_lufs_meter_value, decode_result_is_current,
-        deterministic_shuffle, enforce_loop, favorite_toggle, keyboard_settings_anchor,
-        library_track_title_id, loop_bounds, main_output_gain, native_launch_options, note_editor,
-        note_ratio_for_id, planner_drop_is_valid, playback_shortcut, project_surface,
-        rebuild_audition_queue, reconcile_audition_queue, reference_decode_result_is_current,
-        reference_output_gain, review_status_filter_message, selected_reference_notes,
-        selected_track, settings_anchor_from_pointer, stage_dropdown,
+        deterministic_shuffle, enforce_loop, favorite_toggle, library_track_title_id, loop_bounds,
+        main_output_gain, native_launch_options, note_editor, note_ratio_for_id,
+        planner_drop_is_valid, playback_shortcut, project_surface, rebuild_audition_queue,
+        reconcile_audition_queue, reference_decode_result_is_current, reference_output_gain,
+        reference_settings_auxiliary_windows, reference_settings_window_view,
+        review_status_filter_message, selected_reference_notes, selected_track, stage_dropdown,
         stage_menu_anchor_from_pointer, stage_menu_popover, status_dropdown_for_host,
         status_filter_dropdown, sync_audition_queue_after_status_change, tracks_in_stage,
         tracks_with_status, transport_command_is_confirmed, update,
@@ -8709,13 +8695,36 @@ mod tests {
     }
 
     #[test]
-    fn reference_catalog_settings_popover_preserves_catalog_order_and_projects_active_usage() {
+    fn reference_settings_auxiliary_projection_is_closed_or_one_cached_window() {
+        let mut state = AppState::default();
+        assert!(reference_settings_auxiliary_windows(&mut state).is_empty());
+
+        state.settings_open = true;
+        let windows = reference_settings_auxiliary_windows(&mut state);
+
+        assert_eq!(windows.len(), 1);
+        let window = &windows[0];
+        assert_eq!(window.key, "reference-settings");
+        assert_eq!(window.options.window.title, "Reference Tracks");
+        assert_eq!(
+            window.options.window.geometry.inner_size,
+            Some([680.0, 520.0])
+        );
+        assert_eq!(
+            window.options.window.geometry.min_inner_size,
+            Some([680.0, 520.0])
+        );
+        assert_eq!(window.close_message, Some(Message::CloseSettings));
+        assert!(window.caches_on_close());
+    }
+
+    #[test]
+    fn reference_settings_window_preserves_catalog_order_and_projects_active_usage() {
         let first_path = PathBuf::from("/external/first-reference.wav");
         let second_path = PathBuf::from("/external/second-reference.wav");
         let mut state = AppState {
             busy: false,
             settings_open: true,
-            settings_anchor: Some(Point::new(780.0, 42.0)),
             ..AppState::default()
         };
         state.library.selected_track_id = Some(String::from("selected"));
@@ -8754,8 +8763,8 @@ mod tests {
             },
         ];
 
-        let labels = project_surface(&state)
-            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 720.0))
+        let labels = reference_settings_window_view(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(680.0, 520.0))
             .paint_plan
             .text_label_strings();
         let first_index = labels
@@ -8770,34 +8779,126 @@ mod tests {
         assert!(labels.iter().any(|label| label == "1 assigned"));
         assert!(labels.iter().any(|label| label == "1 assigned · ACTIVE"));
         assert!(labels.iter().any(|label| label == "Add reference tracks"));
+
+        let project_labels = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 720.0))
+            .paint_plan
+            .text_label_strings();
+        for label in [
+            "REFERENCE TRACKS",
+            "1 assigned",
+            "1 assigned · ACTIVE",
+            "Add reference tracks",
+        ] {
+            assert!(
+                !project_labels.iter().any(|painted| painted == label),
+                "settings content should be limited to the auxiliary window: {label:?}"
+            );
+        }
     }
 
     #[test]
-    fn settings_toggle_supports_pointer_and_keyboard_anchors_and_outside_close() {
+    fn reference_settings_row_paints_metadata_inside_its_vertical_bounds() {
+        let path =
+            PathBuf::from("/external/reference-with-a-deliberately-long-name-for-truncation.wav");
+        let mut state = AppState::default();
+        state.library.reference_tracks.push(ReferenceTrack {
+            path,
+            notes: Vec::new(),
+        });
+
+        let frame = reference_settings_window_view(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(680.0, 520.0));
+        let title = frame
+            .paint_plan
+            .first_text_run("reference-with-a-deliberately-long-name-for-truncation.wav")
+            .expect("reference title should be painted");
+        let metadata = frame
+            .paint_plan
+            .first_text_run("0 assigned")
+            .expect("reference assignment metadata should be painted");
+
+        assert_eq!(title.rect.height(), SETTINGS_REFERENCE_ROW_TITLE_HEIGHT);
+        assert_eq!(
+            metadata.rect.height(),
+            SETTINGS_REFERENCE_ROW_METADATA_HEIGHT
+        );
+        assert!(
+            (metadata.rect.min.y - title.rect.max.y - SETTINGS_REFERENCE_ROW_TEXT_SPACING).abs()
+                < 0.01,
+            "metadata should follow the title with the intended gap: title={:?}, metadata={:?}",
+            title.rect,
+            metadata.rect
+        );
+        assert!(
+            metadata.rect.max.y <= title.rect.min.y + SETTINGS_REFERENCE_ROW_TEXT_HEIGHT + 0.01,
+            "metadata should stay inside the row text column: title={:?}, metadata={:?}",
+            title.rect,
+            metadata.rect
+        );
+    }
+
+    #[test]
+    fn empty_reference_settings_window_has_growing_empty_region_and_opaque_root() {
+        let frame = reference_settings_window_view(&AppState::default())
+            .view_frame_at_size_with_default_theme(Vector2::new(680.0, 520.0));
+        let labels = frame.paint_plan.text_label_strings();
+
+        assert!(labels.iter().any(|label| label == "REFERENCE TRACKS"));
+        assert!(
+            labels
+                .iter()
+                .any(|label| label == "No reference tracks cataloged yet.")
+        );
+        assert!(labels.iter().any(|label| label == "Add reference tracks"));
+        let root_fill = frame.paint_plan.primitives.iter().find_map(|primitive| {
+            let PaintPrimitive::FillRect(fill) = primitive else {
+                return None;
+            };
+            (fill.rect.width() == 680.0
+                && fill.rect.height() == 520.0
+                && fill.color == ThemeTokens::default().surface_overlay)
+                .then_some(fill)
+        });
+        assert!(
+            root_fill.is_some(),
+            "the utility client area should be opaque"
+        );
+    }
+
+    #[test]
+    fn settings_toggle_and_close_transitions_close_other_menus() {
         let mut state = AppState {
             busy: false,
+            stage_menu_track_id: Some(String::from("stage")),
+            stage_menu_anchor: Some(Point::new(10.0, 10.0)),
+            status_menu_track_id: Some(String::from("status")),
+            status_menu_host: Some(StatusMenuHost::Library),
+            reference_menu_track_id: Some(String::from("reference")),
+            reference_menu_anchor: Some(Point::new(20.0, 20.0)),
+            review_filter_menu_open: true,
             ..AppState::default()
         };
         let mut context = ui::UiUpdateContext::default();
-        let pointer = Point::new(1_108.0, 34.0);
-        update(
-            &mut state,
-            Message::ToggleSettingsAt { position: pointer },
-            &mut context,
-        );
-        assert!(state.settings_open);
-        assert_eq!(
-            state.settings_anchor,
-            Some(settings_anchor_from_pointer(pointer))
-        );
-
-        update(&mut state, Message::CloseSettings, &mut context);
-        assert!(!state.settings_open);
-        assert_eq!(state.settings_anchor, None);
 
         update(&mut state, Message::ToggleSettings, &mut context);
         assert!(state.settings_open);
-        assert_eq!(state.settings_anchor, Some(keyboard_settings_anchor()));
+        assert_eq!(state.stage_menu_track_id, None);
+        assert_eq!(state.stage_menu_anchor, None);
+        assert_eq!(state.status_menu_track_id, None);
+        assert_eq!(state.status_menu_host, None);
+        assert_eq!(state.reference_menu_track_id, None);
+        assert_eq!(state.reference_menu_anchor, None);
+        assert!(!state.review_filter_menu_open);
+
+        update(&mut state, Message::ToggleSettings, &mut context);
+        assert!(!state.settings_open);
+
+        update(&mut state, Message::ToggleSettings, &mut context);
+        assert!(state.settings_open);
+
+        update(&mut state, Message::CloseSettings, &mut context);
+        assert!(!state.settings_open);
     }
 
     #[test]
@@ -8825,7 +8926,6 @@ mod tests {
         let mut state = AppState {
             busy: true,
             settings_open: true,
-            settings_anchor: Some(Point::new(780.0, 42.0)),
             ..AppState::default()
         };
         let mut context = ui::UiUpdateContext::default();
@@ -8846,12 +8946,11 @@ mod tests {
     }
 
     #[test]
-    fn removing_selected_catalog_reference_clears_reference_runtime_state_and_keeps_popover_open() {
+    fn removing_selected_catalog_reference_clears_reference_runtime_state_and_keeps_window_open() {
         let reference_path = PathBuf::from("/external/selected-reference.wav");
         let mut state = AppState {
             busy: false,
             settings_open: true,
-            settings_anchor: Some(Point::new(780.0, 42.0)),
             reference_waveform: Some(audition_waveform()),
             reference_waveform_track_id: Some(String::from("selected")),
             reference_waveform_generation: 4,
