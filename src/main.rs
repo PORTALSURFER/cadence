@@ -8375,6 +8375,25 @@ mod tests {
         })
     }
 
+    fn last_fill_color_covering_point(
+        primitives: &[PaintPrimitive],
+        point: Point,
+    ) -> Option<ui::Rgba8> {
+        primitives
+            .iter()
+            .filter_map(|primitive| {
+                let PaintPrimitive::FillRect(fill) = primitive else {
+                    return None;
+                };
+                (point.x > fill.rect.min.x
+                    && point.x < fill.rect.max.x
+                    && point.y > fill.rect.min.y
+                    && point.y < fill.rect.max.y)
+                    .then_some(fill.color)
+            })
+            .next_back()
+    }
+
     fn source_icon_stop_states(primitives: &[PaintPrimitive]) -> Vec<bool> {
         let mut expected_documents = Vec::new();
         for (shows_stop, icon) in [
@@ -12117,6 +12136,37 @@ mod tests {
         let theme = ThemeTokens::default();
         let selected_row_id = ui::stable_widget_id(0xCAD3_0002, "open-note");
         let unselected_row_id = ui::stable_widget_id(0xCAD3_0002, "done-note");
+        let selected_accent_color = theme.accent_mint.with_alpha(150);
+        let selected_accent_rect = frame
+            .paint_plan
+            .fill_rects_for_widget(selected_row_id)
+            .find(|fill| fill.color == selected_accent_color)
+            .map(|fill| fill.rect)
+            .expect("selected main comment should expose its accent fill rect");
+        let selected_marker_rect = frame
+            .paint_plan
+            .fill_rects_for_widget(selected_row_id)
+            .find(|fill| {
+                fill.color == TRACK_CARD_SELECTED_CORAL && (fill.rect.width() - 3.0).abs() < 0.01
+            })
+            .map(|fill| fill.rect)
+            .expect("selected main comment should expose its coral marker rect");
+        assert_eq!(
+            last_fill_color_covering_point(
+                &frame.paint_plan.primitives,
+                selected_accent_rect.center()
+            ),
+            Some(selected_accent_color),
+            "selected main comment accent fill should be the final fill at the row center"
+        );
+        assert_eq!(
+            last_fill_color_covering_point(
+                &frame.paint_plan.primitives,
+                selected_marker_rect.center()
+            ),
+            Some(TRACK_CARD_SELECTED_CORAL),
+            "selected main comment coral marker should be the final fill at its center"
+        );
         assert!(
             frame
                 .paint_plan
@@ -12192,6 +12242,37 @@ mod tests {
             .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1000.0));
         let theme = ThemeTokens::default();
         let selected_row_id = ui::stable_widget_id(0xCAD3_0003, "selected-reference-note");
+        let selected_accent_color = theme.accent_mint.with_alpha(150);
+        let selected_accent_rect = frame
+            .paint_plan
+            .fill_rects_for_widget(selected_row_id)
+            .find(|fill| fill.color == selected_accent_color)
+            .map(|fill| fill.rect)
+            .expect("selected reference comment should expose its accent fill rect");
+        let selected_marker_rect = frame
+            .paint_plan
+            .fill_rects_for_widget(selected_row_id)
+            .find(|fill| {
+                fill.color == TRACK_CARD_SELECTED_CORAL && (fill.rect.width() - 3.0).abs() < 0.01
+            })
+            .map(|fill| fill.rect)
+            .expect("selected reference comment should expose its coral marker rect");
+        assert_eq!(
+            last_fill_color_covering_point(
+                &frame.paint_plan.primitives,
+                selected_accent_rect.center()
+            ),
+            Some(selected_accent_color),
+            "selected reference comment accent fill should be the final fill at the row center"
+        );
+        assert_eq!(
+            last_fill_color_covering_point(
+                &frame.paint_plan.primitives,
+                selected_marker_rect.center()
+            ),
+            Some(TRACK_CARD_SELECTED_CORAL),
+            "selected reference comment coral marker should be the final fill at its center"
+        );
         assert!(
             frame
                 .paint_plan
