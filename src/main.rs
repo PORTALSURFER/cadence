@@ -6891,14 +6891,18 @@ fn audition_source_choice(
     label: &'static str,
     source: AuditionSource,
     selected: bool,
-    transporting: bool,
+    shows_stop: bool,
 ) -> ui::View<Message> {
-    ui::icon_button(audition_source_icon(transporting))
+    ui::icon_button(audition_source_icon(shows_stop))
         .active(selected)
         .message(Message::ActivateAuditionSource(source))
         .key(format!("audition-source-{}", label.to_ascii_lowercase()))
         .tooltip(format!("Audition {label}"))
         .size(AUDITION_SOURCE_SELECTOR_WIDTH, 28.0)
+}
+
+fn source_button_shows_stop(state: &AppState, source: AuditionSource) -> bool {
+    state.audition_source == source && source_transport_is_active(state, source)
 }
 
 const REVIEW_TRANSPORT_ICON_TINTS: ui::SvgIconTintPalette = ui::SvgIconTintPalette::new(
@@ -7133,14 +7137,14 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
         "MAIN",
         AuditionSource::Main,
         state.audition_source == AuditionSource::Main,
-        source_transport_is_active(state, AuditionSource::Main),
+        source_button_shows_stop(state, AuditionSource::Main),
     );
     let audition_source_control = if track.reference_path.is_some() {
         let reference_choice = audition_source_choice(
             "REF",
             AuditionSource::Reference,
             state.audition_source == AuditionSource::Reference,
-            source_transport_is_active(state, AuditionSource::Reference),
+            source_button_shows_stop(state, AuditionSource::Reference),
         );
         ui::column([
             ui::column([ui::spacer().fill(), main_choice, ui::spacer().fill()])
@@ -8375,6 +8379,44 @@ mod tests {
                 PaintPrimitive::Svg(actual) if actual.document == expected.document
             )
         })
+    }
+
+    fn source_icon_stop_states(primitives: &[PaintPrimitive]) -> Vec<bool> {
+        let mut expected_documents = Vec::new();
+        for (shows_stop, icon) in [
+            (false, super::audition_source_icon(false)),
+            (true, super::audition_source_icon(true)),
+        ] {
+            let mut expected_primitives = Vec::new();
+            icon.append_paint(
+                &mut expected_primitives,
+                0,
+                Rect::from_min_size(Point::new(0.0, 0.0), Vector2::new(16.0, 16.0)),
+            );
+            let Some(PaintPrimitive::Svg(expected)) = expected_primitives.first() else {
+                continue;
+            };
+            expected_documents.push((shows_stop, expected.document.clone()));
+        }
+
+        let mut states = primitives
+            .iter()
+            .filter_map(|primitive| {
+                let PaintPrimitive::Svg(actual) = primitive else {
+                    return None;
+                };
+                expected_documents
+                    .iter()
+                    .find_map(|(shows_stop, document)| {
+                        (&actual.document == document).then_some((actual.rect.min.y, *shows_stop))
+                    })
+            })
+            .collect::<Vec<_>>();
+        states.sort_by(|left, right| left.0.total_cmp(&right.0));
+        states
+            .into_iter()
+            .map(|(_, shows_stop)| shows_stop)
+            .collect()
     }
 
     fn planner_drag_preview_rect(state: &AppState) -> Option<Rect> {
@@ -11553,37 +11595,140 @@ mod tests {
     }
 
     #[test]
-    fn source_icons_render_stop_for_playing_polling_or_waiting_sources() {
+    fn source_icons_follow_focused_source_in_review_frames() {
         let mut state = shared_reference_playback_state();
         state.transport_playing = true;
-        state.reference_transport_polling = true;
-        state.reference_transport_waiting_token = Some(7);
+        state.reference_transport_playing = true;
+        assert!(super::source_button_shows_stop(
+            &state,
+            AuditionSource::Main
+        ));
+        assert!(!super::source_button_shows_stop(
+            &state,
+            AuditionSource::Reference
+        ));
 
         let active_frame = project_surface(&state)
             .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1_000.0));
-        assert!(paint_plan_contains_icon(
-            &active_frame.paint_plan.primitives,
-            &super::audition_source_icon(true),
-        ));
-        assert!(!paint_plan_contains_icon(
-            &active_frame.paint_plan.primitives,
-            &super::audition_source_icon(false),
-        ));
+        assert_eq!(
+            source_icon_stop_states(&active_frame.paint_plan.primitives),
+            [true, false],
+            "only focused Main should show Stop when both transports are active"
+        );
 
-        state.transport_playing = false;
-        state.reference_transport_polling = false;
-        state.reference_transport_waiting_token = None;
-        state.transport_waiting_token = Some(8);
-        let waiting_frame = project_surface(&state)
+        state.audition_source = AuditionSource::Reference;
+        assert!(!super::source_button_shows_stop(
+            &state,
+            AuditionSource::Main
+        ));
+        assert!(super::source_button_shows_stop(
+            &state,
+            AuditionSource::Reference
+        ));
+        let swapped_focus_frame = project_surface(&state)
             .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1_000.0));
-        assert!(paint_plan_contains_icon(
-            &waiting_frame.paint_plan.primitives,
-            &super::audition_source_icon(true),
+        assert_eq!(
+            source_icon_stop_states(&swapped_focus_frame.paint_plan.primitives),
+            [false, true],
+            "focus swap should move Stop to Reference"
+        );
+
+        state.audition_source = AuditionSource::Main;
+        state.transport_playing = false;
+        assert!(!super::source_button_shows_stop(
+            &state,
+            AuditionSource::Main
         ));
-        assert!(paint_plan_contains_icon(
-            &waiting_frame.paint_plan.primitives,
-            &super::audition_source_icon(false),
+        assert!(!super::source_button_shows_stop(
+            &state,
+            AuditionSource::Reference
         ));
+        let inactive_focused_frame = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1_000.0));
+        assert_eq!(
+            source_icon_stop_states(&inactive_focused_frame.paint_plan.primitives),
+            [false, false],
+            "focused inactive Main should show Play beside active Reference"
+        );
+
+        state.audition_source = AuditionSource::Reference;
+        state.transport_playing = true;
+        state.reference_transport_playing = false;
+        assert!(!super::source_button_shows_stop(
+            &state,
+            AuditionSource::Main
+        ));
+        assert!(!super::source_button_shows_stop(
+            &state,
+            AuditionSource::Reference
+        ));
+        let reference_inactive_focused_frame = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1_000.0));
+        assert_eq!(
+            source_icon_stop_states(&reference_inactive_focused_frame.paint_plan.primitives),
+            [false, false],
+            "focused inactive Reference should show Play beside active Main"
+        );
+    }
+
+    #[test]
+    fn focused_source_icons_show_stop_while_polling_or_waiting() {
+        let mut state = shared_reference_playback_state();
+        state.transport_polling = true;
+        assert!(super::source_button_shows_stop(
+            &state,
+            AuditionSource::Main
+        ));
+        let polling_main_frame = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1_000.0));
+        assert_eq!(
+            source_icon_stop_states(&polling_main_frame.paint_plan.primitives),
+            [true, false],
+            "focused Main should show Stop while polling"
+        );
+
+        state.transport_polling = false;
+        state.transport_waiting_token = Some(8);
+        assert!(super::source_button_shows_stop(
+            &state,
+            AuditionSource::Main
+        ));
+        let waiting_main_frame = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1_000.0));
+        assert_eq!(
+            source_icon_stop_states(&waiting_main_frame.paint_plan.primitives),
+            [true, false],
+            "focused Main should show Stop while waiting for a transport token"
+        );
+
+        state.audition_source = AuditionSource::Reference;
+        state.transport_waiting_token = None;
+        state.reference_transport_polling = true;
+        assert!(super::source_button_shows_stop(
+            &state,
+            AuditionSource::Reference
+        ));
+        let polling_reference_frame = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1_000.0));
+        assert_eq!(
+            source_icon_stop_states(&polling_reference_frame.paint_plan.primitives),
+            [false, true],
+            "focused Reference should show Stop while polling"
+        );
+
+        state.reference_transport_polling = false;
+        state.reference_transport_waiting_token = Some(9);
+        assert!(super::source_button_shows_stop(
+            &state,
+            AuditionSource::Reference
+        ));
+        let waiting_reference_frame = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1_000.0));
+        assert_eq!(
+            source_icon_stop_states(&waiting_reference_frame.paint_plan.primitives),
+            [false, true],
+            "focused Reference should show Stop while waiting for a transport token"
+        );
     }
 
     #[test]
