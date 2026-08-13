@@ -7822,6 +7822,7 @@ fn note_row(
             trailing_control,
         ],
     )
+    .without_chrome()
     .fill_width();
     let row_key = note_id.clone();
     let hover_id = note_id.clone();
@@ -7941,6 +7942,7 @@ fn reference_note_row(
             trailing_control,
         ],
     )
+    .without_chrome()
     .fill_width();
     let row_key = note_id.clone();
     let double_edit_id = note_id.clone();
