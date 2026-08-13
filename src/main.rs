@@ -245,6 +245,7 @@ enum WorkspaceMode {
 enum StatusMenuHost {
     Library,
     Planner,
+    Audition,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1691,6 +1692,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 return;
             }
             state.audition_status_filter = status;
+            close_status_menu(state);
             state.audition_shuffle_round = 0;
             state.audition_auto_advance = false;
             state.audition_play_token = None;
@@ -5600,6 +5602,9 @@ fn project_surface(state: &AppState) -> ui::View<Message> {
 
 fn audition_panel(state: &AppState) -> ui::View<Message> {
     let selected_id = state.library.selected_track_id.as_deref();
+    let status_menu_track_id = state.status_menu_track_id.as_deref();
+    let status_menu_host = state.status_menu_host;
+    let remove_confirmation_track_id = state.remove_confirmation_track_id.as_deref();
     let queue_tracks = state
         .audition_queue
         .iter()
@@ -5644,7 +5649,14 @@ fn audition_panel(state: &AppState) -> ui::View<Message> {
         .fill_width()
     } else {
         ui::list(queue_tracks, move |(index, track)| {
-            audition_queue_row(index, track, selected_id)
+            audition_queue_row(
+                index,
+                track,
+                selected_id,
+                status_menu_track_id,
+                status_menu_host,
+                remove_confirmation_track_id,
+            )
         })
         .without_chrome()
         .spacing(TRACK_CARD_LIST_SPACING)
@@ -5735,12 +5747,51 @@ fn audition_queue_row(
     index: usize,
     track: storage::Track,
     selected_id: Option<&str>,
+    status_menu_track_id: Option<&str>,
+    status_menu_host: Option<StatusMenuHost>,
+    remove_confirmation_track_id: Option<&str>,
 ) -> ui::View<Message> {
     let selected = selected_id == Some(track.id.as_str());
     let track_id = track.id.clone();
+    let status_menu_open = status_menu_host == Some(StatusMenuHost::Audition)
+        && status_menu_track_id == Some(track.id.as_str());
+    let remove_confirmation_open = remove_confirmation_track_id == Some(track.id.as_str());
     let title = format!("{:02}  {}", index + 1, track.title);
     let favorite_control =
         favorite_toggle(&track, selected, format!("audition-favorite-{}", track.id));
+    let remove_id = track.id.clone();
+    let remove_control = ui::close_button()
+        .subtle()
+        .message(Message::RequestRemoveTrack(remove_id.clone()))
+        .key(format!("audition-remove-{}", track.id))
+        .tooltip("Remove track")
+        .size(28.0, 24.0);
+    let status_control =
+        status_dropdown_for_host(&track, status_menu_open, selected, StatusMenuHost::Audition);
+    let removal_controls = if remove_confirmation_open {
+        ui::row([
+            card_control(
+                selected,
+                "Confirm",
+                ui::button("Confirm")
+                    .message(Message::ConfirmRemoveTrack(remove_id.clone()))
+                    .height(20.0),
+            )
+            .height(20.0),
+            card_control(
+                selected,
+                "Cancel",
+                ui::button("Cancel")
+                    .message(Message::CancelRemoveTrack)
+                    .height(20.0),
+            )
+            .height(20.0),
+        ])
+        .spacing(4.0)
+        .fill_width()
+    } else {
+        ui::spacer().fill_width().height(0.0)
+    };
     let input = ui::button(title.clone())
         .selected(selected)
         .message(Message::SelectTrack(track_id.clone()))
@@ -5748,15 +5799,21 @@ fn audition_queue_row(
         .fill_width()
         .height(28.0);
     let row = ui::column([
-        ui::row([input.fill_width().height(28.0), favorite_control])
-            .fill_width()
-            .spacing(TRACK_CARD_CONTENT_SPACING)
-            .height(28.0),
+        ui::row([
+            input.fill_width().height(28.0),
+            favorite_control,
+            remove_control,
+        ])
+        .fill_width()
+        .spacing(TRACK_CARD_CONTENT_SPACING)
+        .height(28.0),
         ui::text(track.original_name)
             .truncate()
             .height(18.0)
             .fill_width()
             .subtle(),
+        removal_controls,
+        status_control,
     ])
     .padding(TRACK_CARD_CONTENT_INSET)
     .spacing(TRACK_CARD_CONTENT_SPACING)
@@ -5980,6 +6037,7 @@ fn planner_panel(state: &AppState) -> ui::View<Message> {
                 stage_menu_track_id: state.stage_menu_track_id.as_deref(),
                 status_menu_track_id: state.status_menu_track_id.as_deref(),
                 status_menu_host: state.status_menu_host,
+                remove_confirmation_track_id: state.remove_confirmation_track_id.as_deref(),
             },
             drag_active,
             drag_source_stage,
@@ -6029,6 +6087,7 @@ struct PlannerColumnContext<'a> {
     stage_menu_track_id: Option<&'a str>,
     status_menu_track_id: Option<&'a str>,
     status_menu_host: Option<StatusMenuHost>,
+    remove_confirmation_track_id: Option<&'a str>,
 }
 
 fn planner_column(
@@ -6045,6 +6104,7 @@ fn planner_column(
         stage_menu_track_id,
         status_menu_track_id,
         status_menu_host,
+        remove_confirmation_track_id,
     } = context;
     let count = tracks.len();
     let candidate = drag_active && planner_drop_is_valid(drag_source_stage, stage);
@@ -6054,7 +6114,7 @@ fn planner_column(
             ui::text(if current_target {
                 "DROP HERE"
             } else {
-                stage.label()
+                planner_column_heading(stage)
             })
             .height(24.0)
             .fill_width(),
@@ -6105,6 +6165,7 @@ fn planner_column(
                     stage_menu_track_id,
                     status_menu_track_id,
                     status_menu_host,
+                    remove_confirmation_track_id,
                 )
             })
             .without_chrome()
@@ -6136,22 +6197,62 @@ fn planner_column(
     }
 }
 
+fn planner_column_heading(stage: storage::TrackStage) -> &'static str {
+    match stage {
+        storage::TrackStage::SoundDesign => "Backlog",
+        _ => stage.label(),
+    }
+}
+
 fn planner_card(
     track: storage::Track,
     selected_id: Option<&str>,
     stage_menu_track_id: Option<&str>,
     status_menu_track_id: Option<&str>,
     status_menu_host: Option<StatusMenuHost>,
+    remove_confirmation_track_id: Option<&str>,
 ) -> ui::View<Message> {
     let selected = selected_id == Some(track.id.as_str());
     let stage_menu_open = stage_menu_track_id == Some(track.id.as_str());
     let status_menu_open = status_menu_host == Some(StatusMenuHost::Planner)
         && status_menu_track_id == Some(track.id.as_str());
+    let remove_confirmation_open = remove_confirmation_track_id == Some(track.id.as_str());
     let title_track_id = track.id.clone();
     let drag_track_id = track.id.clone();
+    let remove_id = track.id.clone();
     let favorite_control =
         favorite_toggle(&track, selected, format!("planner-favorite-{}", track.id));
+    let remove_control = ui::close_button()
+        .subtle()
+        .message(Message::RequestRemoveTrack(remove_id.clone()))
+        .key(format!("planner-remove-{}", track.id))
+        .tooltip("Remove track")
+        .size(28.0, 24.0);
     let open_comments = track.notes.iter().filter(|note| !note.done).count();
+    let removal_controls = if remove_confirmation_open {
+        ui::row([
+            card_control(
+                selected,
+                "Confirm",
+                ui::button("Confirm")
+                    .message(Message::ConfirmRemoveTrack(remove_id.clone()))
+                    .height(20.0),
+            )
+            .height(20.0),
+            card_control(
+                selected,
+                "Cancel",
+                ui::button("Cancel")
+                    .message(Message::CancelRemoveTrack)
+                    .height(20.0),
+            )
+            .height(20.0),
+        ])
+        .spacing(4.0)
+        .fill_width()
+    } else {
+        ui::spacer().fill_width().height(0.0)
+    };
     let card_content = ui::column([
         ui::row([
             card_control(
@@ -6183,6 +6284,7 @@ fn planner_card(
             .fill_width()
             .height(28.0),
             favorite_control,
+            remove_control,
         ])
         .fill_width()
         .spacing(TRACK_CARD_CONTENT_SPACING),
@@ -6191,6 +6293,7 @@ fn planner_card(
             .height(20.0)
             .fill_width()
             .subtle(),
+        removal_controls,
         card_muted_text(
             selected,
             format!("{} open comment{}", open_comments, plural(open_comments)),
@@ -6594,6 +6697,7 @@ const fn status_menu_host_key(host: StatusMenuHost) -> &'static str {
     match host {
         StatusMenuHost::Library => "library",
         StatusMenuHost::Planner => "planner",
+        StatusMenuHost::Audition => "audition",
     }
 }
 
@@ -15176,6 +15280,300 @@ mod tests {
             );
         }
         assert!(!labels.iter().any(|label| label == "refine-track"));
+    }
+
+    #[test]
+    fn audition_cards_paint_status_triggers_and_semantic_rails() {
+        let mut track = audition_track("audition-status-card");
+        track.status = TrackStatus::Refine;
+        let mut state = AppState {
+            busy: false,
+            workspace_mode: WorkspaceMode::Audition,
+            audition_status_filter: TrackStatus::Refine,
+            ..AppState::default()
+        };
+        state.library.tracks = vec![track];
+        rebuild_audition_queue(&mut state);
+
+        let frame = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(1_180.0, 900.0));
+        let title = frame
+            .paint_plan
+            .first_text_run("01  audition-status-card")
+            .expect("the Audition queue card should paint its title");
+        let status = frame
+            .paint_plan
+            .text_runs()
+            .find(|run| {
+                run.text.as_str() == TrackStatus::Refine.label()
+                    && run.rect.min.y > title.rect.max.y
+            })
+            .expect("the Audition queue card should paint its status trigger");
+        let rail = frame
+            .paint_plan
+            .fill_rects()
+            .find(|fill| {
+                fill.color == ThemeTokens::default().accent_warning
+                    && (fill.rect.width() - super::STATUS_RAIL_WIDTH).abs() < 0.01
+                    && fill.rect.min.y < status.rect.max.y
+                    && fill.rect.max.y > status.rect.min.y
+            })
+            .expect("the Audition status trigger should paint its semantic rail");
+
+        assert!(rail.rect.max.x <= status.rect.min.x);
+        assert_eq!(rail.rect.height(), ui::dropdown_trigger_height());
+    }
+
+    #[test]
+    fn audition_status_menu_is_interactive_and_uses_a_distinct_host() {
+        let mut track = audition_track("audition-status-menu");
+        track.status = TrackStatus::Refine;
+        let track_id = track.id.clone();
+        let mut state = AppState {
+            busy: false,
+            workspace_mode: WorkspaceMode::Audition,
+            audition_status_filter: TrackStatus::Refine,
+            ..AppState::default()
+        };
+        state.library.tracks = vec![track];
+        rebuild_audition_queue(&mut state);
+        let bridge = DeclarativeOwnedRuntimeBridge::new(
+            state,
+            |state| project_surface(state).into_surface(),
+            |state, message| {
+                let mut context = ui::UiUpdateContext::default();
+                update(state, message, &mut context);
+            },
+        );
+        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1_180.0, 900.0));
+        let frame = runtime.frame_with_default_theme();
+        let title = frame
+            .paint_plan
+            .first_text_run("01  audition-status-menu")
+            .expect("the Audition queue card should paint its title");
+        let (_trigger, trigger_rect) = frame
+            .paint_plan
+            .text_runs()
+            .find_map(|run| {
+                (run.text.as_str() == TrackStatus::Refine.label()
+                    && run.rect.min.y > title.rect.max.y)
+                    .then_some((run.widget_id, run.rect))
+            })
+            .expect("the Audition queue card should paint a focusable status trigger");
+        let trigger_point = Point::new(
+            trigger_rect.min.x + trigger_rect.width() * 0.5,
+            trigger_rect.min.y + trigger_rect.height() * 0.5,
+        );
+
+        assert!(runtime.widget_at(trigger_point).is_some());
+        runtime.dispatch_primary_click(trigger_point);
+        assert_eq!(
+            runtime.bridge().state().status_menu_track_id.as_deref(),
+            Some(track_id.as_str())
+        );
+        assert_eq!(
+            runtime.bridge().state().status_menu_host,
+            Some(StatusMenuHost::Audition)
+        );
+        assert_eq!(
+            super::status_menu_host_key(StatusMenuHost::Audition),
+            "audition"
+        );
+
+        let opened_frame = runtime.frame_with_default_theme();
+        let option_rect = opened_frame
+            .paint_plan
+            .text_runs()
+            .find_map(|run| {
+                (run.text.as_str() == TrackStatus::Release.label()
+                    && run.rect.min.y > trigger_rect.max.y)
+                    .then_some(run.rect)
+            })
+            .expect("the open Audition status menu should paint the Release option");
+        let option_point = Point::new(
+            option_rect.min.x + option_rect.width() * 0.5,
+            option_rect.min.y + option_rect.height() * 0.5,
+        );
+        assert!(runtime.widget_at(option_point).is_some());
+        runtime.dispatch_primary_click(option_point);
+
+        assert_eq!(
+            runtime.bridge().state().library.tracks[0].status,
+            TrackStatus::Release
+        );
+        assert!(runtime.bridge().state().status_menu_track_id.is_none());
+        assert!(runtime.bridge().state().status_menu_host.is_none());
+    }
+
+    fn rightmost_svg_rect_after(primitives: &[PaintPrimitive], min_y: f32) -> Rect {
+        primitives
+            .iter()
+            .filter_map(|primitive| match primitive {
+                PaintPrimitive::Svg(svg) if svg.rect.max.y > min_y => Some(svg.rect),
+                _ => None,
+            })
+            .max_by(|left, right| left.max.x.total_cmp(&right.max.x))
+            .expect("the track card should paint its close control")
+    }
+
+    #[test]
+    fn audition_card_removal_control_opens_and_cancels_confirmation() {
+        let track = audition_track("audition-remove-card");
+        let track_id = track.id.clone();
+        let mut state = AppState {
+            busy: false,
+            workspace_mode: WorkspaceMode::Audition,
+            ..AppState::default()
+        };
+        state.library.tracks = vec![track];
+        rebuild_audition_queue(&mut state);
+        let bridge = DeclarativeOwnedRuntimeBridge::new(
+            state,
+            |state| project_surface(state).into_surface(),
+            |state, message| {
+                let mut context = ui::UiUpdateContext::default();
+                update(state, message, &mut context);
+            },
+        );
+        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1_180.0, 900.0));
+        let frame = runtime.frame_with_default_theme();
+        let title = frame
+            .paint_plan
+            .first_text_run("01  audition-remove-card")
+            .expect("the Audition queue card should paint its title");
+        let remove_rect = rightmost_svg_rect_after(&frame.paint_plan.primitives, title.rect.min.y);
+        let remove_point = Point::new(
+            remove_rect.min.x + remove_rect.width() * 0.5,
+            remove_rect.min.y + remove_rect.height() * 0.5,
+        );
+
+        assert!(runtime.widget_at(remove_point).is_some());
+        runtime.dispatch_primary_click(remove_point);
+        assert_eq!(
+            runtime
+                .bridge()
+                .state()
+                .remove_confirmation_track_id
+                .as_deref(),
+            Some(track_id.as_str())
+        );
+
+        let opened_frame = runtime.frame_with_default_theme();
+        assert!(
+            opened_frame
+                .paint_plan
+                .text_label_strings()
+                .iter()
+                .any(|label| label == "Confirm")
+        );
+        let cancel_rect = opened_frame
+            .paint_plan
+            .text_runs()
+            .find(|run| run.text.as_str() == "Cancel")
+            .expect("the Audition card should paint a Cancel control")
+            .rect;
+        let cancel_point = Point::new(
+            cancel_rect.min.x + cancel_rect.width() * 0.5,
+            cancel_rect.min.y + cancel_rect.height() * 0.5,
+        );
+        assert!(runtime.widget_at(cancel_point).is_some());
+        runtime.dispatch_primary_click(cancel_point);
+
+        assert!(
+            runtime
+                .bridge()
+                .state()
+                .remove_confirmation_track_id
+                .is_none()
+        );
+        assert_eq!(runtime.bridge().state().library.tracks.len(), 1);
+    }
+
+    #[test]
+    fn planner_card_removal_control_opens_and_confirms_removal() {
+        let mut track = audition_track("planner-remove-card");
+        track.stage = TrackStage::SoundDesign;
+        let track_id = track.id.clone();
+        let mut state = AppState {
+            busy: false,
+            workspace_mode: WorkspaceMode::Planner,
+            ..AppState::default()
+        };
+        state.library.tracks = vec![track];
+        let bridge = DeclarativeOwnedRuntimeBridge::new(
+            state,
+            |state| project_surface(state).into_surface(),
+            |state, message| {
+                let mut context = ui::UiUpdateContext::default();
+                update(state, message, &mut context);
+            },
+        );
+        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1_180.0, 900.0));
+        let frame = runtime.frame_with_default_theme();
+        let title = frame
+            .paint_plan
+            .first_text_run("planner-remove-card")
+            .expect("the Planner card should paint its title");
+        let remove_rect = rightmost_svg_rect_after(&frame.paint_plan.primitives, title.rect.min.y);
+        let remove_point = Point::new(
+            remove_rect.min.x + remove_rect.width() * 0.5,
+            remove_rect.min.y + remove_rect.height() * 0.5,
+        );
+
+        assert!(runtime.widget_at(remove_point).is_some());
+        runtime.dispatch_primary_click(remove_point);
+        assert_eq!(
+            runtime
+                .bridge()
+                .state()
+                .remove_confirmation_track_id
+                .as_deref(),
+            Some(track_id.as_str())
+        );
+
+        let opened_frame = runtime.frame_with_default_theme();
+        let confirm_rect = opened_frame
+            .paint_plan
+            .text_runs()
+            .find(|run| run.text.as_str() == "Confirm")
+            .expect("the Planner card should paint a Confirm control")
+            .rect;
+        let confirm_point = Point::new(
+            confirm_rect.min.x + confirm_rect.width() * 0.5,
+            confirm_rect.min.y + confirm_rect.height() * 0.5,
+        );
+        assert!(runtime.widget_at(confirm_point).is_some());
+        runtime.dispatch_primary_click(confirm_point);
+
+        assert!(
+            runtime
+                .bridge()
+                .state()
+                .remove_confirmation_track_id
+                .is_none()
+        );
+        assert!(runtime.bridge().state().library.tracks.is_empty());
+    }
+
+    #[test]
+    fn planner_uses_backlog_for_the_sound_design_column_heading() {
+        let state = AppState {
+            busy: false,
+            workspace_mode: WorkspaceMode::Planner,
+            ..AppState::default()
+        };
+        let labels = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(1_180.0, 900.0))
+            .paint_plan
+            .text_label_strings();
+
+        assert!(labels.iter().any(|label| label == "Backlog"));
+        assert!(!labels.iter().any(|label| label == "Sound design"));
+        assert_eq!(TrackStage::SoundDesign.label(), "Sound design");
+        assert_eq!(
+            super::planner_column_heading(TrackStage::SoundDesign),
+            "Backlog"
+        );
     }
 
     #[test]
