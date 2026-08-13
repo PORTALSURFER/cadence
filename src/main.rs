@@ -7576,6 +7576,10 @@ fn comments_panel(state: &AppState, track: &storage::Track) -> ui::View<Message>
         );
     } else {
         let selected_note_id = selected_note_id.clone();
+        let hovered_note_id = match source {
+            CommentSource::Main => state.hovered_note_id.clone(),
+            CommentSource::Reference => state.hovered_reference_note_id.clone(),
+        };
         let source_for_rows = source;
         let editing_note = match source {
             CommentSource::Main => state
@@ -7593,6 +7597,7 @@ fn comments_panel(state: &AppState, track: &storage::Track) -> ui::View<Message>
                     index,
                     note,
                     selected_note_id.as_deref(),
+                    hovered_note_id.as_deref(),
                     editing_note.as_ref(),
                 )
             } else {
@@ -7600,6 +7605,7 @@ fn comments_panel(state: &AppState, track: &storage::Track) -> ui::View<Message>
                     index,
                     note,
                     selected_note_id.as_deref(),
+                    hovered_note_id.as_deref(),
                     editing_note.as_ref(),
                 )
             }
@@ -7721,13 +7727,33 @@ fn reference_note_editor(draft: &NoteDraft) -> ui::View<Message> {
     .fill_width()
 }
 
+fn comment_row_style(selected: bool, domain_hovered: bool) -> ui::WidgetStyle {
+    if selected && !domain_hovered {
+        ui::WidgetStyle::normal(ui::WidgetTone::Accent)
+    } else {
+        ui::WidgetStyle::subtle(ui::WidgetTone::Accent)
+    }
+}
+
+fn comment_row_palette(selected: bool, domain_hovered: bool) -> ui::DenseRowPalette {
+    let style = comment_row_style(selected, domain_hovered);
+    let mut palette =
+        radiant::gui::list::dense_row_palette_from_style(&ThemeTokens::default(), style);
+    if selected && domain_hovered {
+        palette.selected = palette.selected_hovered;
+    }
+    palette
+}
+
 fn note_row(
     index: usize,
     note: storage::Note,
     selected_note_id: Option<&str>,
+    hovered_note_id: Option<&str>,
     editing_note: Option<&NoteDraft>,
 ) -> ui::View<Message> {
     let selected = selected_note_id == Some(note.id.as_str());
+    let domain_hovered = hovered_note_id == Some(note.id.as_str());
     let editing =
         editing_note.is_some_and(|draft| draft.note_id.as_deref() == Some(note.id.as_str()));
     let note_id = note.id.clone();
@@ -7803,9 +7829,15 @@ fn note_row(
     let row_actions = ui::row_actions()
         .primary(move || Message::SelectNote(row_key.clone()))
         .double_activate(move || Message::EditNote(double_edit_id.clone()));
-    let row_surface = ui::interactive_row_underlay(row)
+    let row_style = comment_row_style(selected, domain_hovered);
+    let mut row_surface = ui::interactive_row_underlay(row)
         .selected(selected)
-        .style(ui::WidgetStyle::subtle(ui::WidgetTone::Accent))
+        .style(row_style);
+    if selected && domain_hovered {
+        row_surface =
+            row_surface.dense_chrome_palette(comment_row_palette(selected, domain_hovered));
+    }
+    let row_surface = row_surface
         .leading_marker_if(
             selected,
             ui::DenseRowMarkerStyle::new(
@@ -7836,9 +7868,11 @@ fn reference_note_row(
     index: usize,
     note: storage::Note,
     selected_note_id: Option<&str>,
+    hovered_note_id: Option<&str>,
     editing_note: Option<&NoteDraft>,
 ) -> ui::View<Message> {
     let selected = selected_note_id == Some(note.id.as_str());
+    let domain_hovered = hovered_note_id == Some(note.id.as_str());
     let editing =
         editing_note.is_some_and(|draft| draft.note_id.as_deref() == Some(note.id.as_str()));
     let note_id = note.id.clone();
@@ -7915,9 +7949,15 @@ fn reference_note_row(
     let row_actions = ui::row_actions()
         .primary(move || Message::SelectReferenceNote(row_key.clone()))
         .double_activate(move || Message::EditReferenceNote(double_edit_id.clone()));
-    let row_surface = ui::interactive_row_underlay(row)
+    let row_style = comment_row_style(selected, domain_hovered);
+    let mut row_surface = ui::interactive_row_underlay(row)
         .selected(selected)
-        .style(ui::WidgetStyle::subtle(ui::WidgetTone::Accent))
+        .style(row_style);
+    if selected && domain_hovered {
+        row_surface =
+            row_surface.dense_chrome_palette(comment_row_palette(selected, domain_hovered));
+    }
+    let row_surface = row_surface
         .leading_marker_if(
             selected,
             ui::DenseRowMarkerStyle::new(
@@ -12079,7 +12119,7 @@ mod tests {
             frame
                 .paint_plan
                 .fill_rects_for_widget(selected_row_id)
-                .any(|fill| { fill.color == theme.accent_mint.with_alpha(120) }),
+                .any(|fill| { fill.color == theme.accent_mint.with_alpha(150) }),
             "selected main comment should paint an accent selection fill"
         );
         assert!(
@@ -12098,6 +12138,17 @@ mod tests {
                 .fill_rects_for_widget(unselected_row_id)
                 .any(|fill| fill.color == TRACK_CARD_SELECTED_CORAL),
             "unselected main comment should not paint the orange selection marker"
+        );
+
+        state.hovered_note_id = Some(String::from("open-note"));
+        let hovered_frame = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1000.0));
+        assert!(
+            hovered_frame
+                .paint_plan
+                .fill_rects_for_widget(selected_row_id)
+                .any(|fill| { fill.color == theme.accent_mint.with_alpha(174) }),
+            "domain-hovered selected main comment should paint the subtle selected-hover fill"
         );
     }
 
@@ -12143,7 +12194,7 @@ mod tests {
             frame
                 .paint_plan
                 .fill_rects_for_widget(selected_row_id)
-                .any(|fill| { fill.color == theme.accent_mint.with_alpha(120) }),
+                .any(|fill| { fill.color == theme.accent_mint.with_alpha(150) }),
             "selected reference comment should paint an accent selection fill"
         );
         assert!(
@@ -12155,6 +12206,46 @@ mod tests {
                         && (fill.rect.width() - 3.0).abs() < 0.01
                 }),
             "selected reference comment should paint an orange leading marker"
+        );
+
+        state.hovered_reference_note_id = Some(String::from("selected-reference-note"));
+        let hovered_frame = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1000.0));
+        assert!(
+            hovered_frame
+                .paint_plan
+                .fill_rects_for_widget(selected_row_id)
+                .any(|fill| { fill.color == theme.accent_mint.with_alpha(174) }),
+            "domain-hovered selected reference comment should paint the subtle selected-hover fill"
+        );
+    }
+
+    #[test]
+    fn comment_row_style_distinguishes_idle_selection_from_domain_hover() {
+        assert_eq!(
+            super::comment_row_style(true, false),
+            ui::WidgetStyle::normal(ui::WidgetTone::Accent)
+        );
+        assert_eq!(
+            super::comment_row_style(true, true),
+            ui::WidgetStyle::subtle(ui::WidgetTone::Accent)
+        );
+        assert_eq!(
+            super::comment_row_style(false, false),
+            ui::WidgetStyle::subtle(ui::WidgetTone::Accent)
+        );
+        assert_eq!(
+            super::comment_row_style(false, true),
+            ui::WidgetStyle::subtle(ui::WidgetTone::Accent)
+        );
+        let theme = ThemeTokens::default();
+        assert_eq!(
+            super::comment_row_palette(true, false).selected,
+            Some(theme.accent_mint.with_alpha(150))
+        );
+        assert_eq!(
+            super::comment_row_palette(true, true).selected,
+            Some(theme.accent_mint.with_alpha(174))
         );
     }
 
