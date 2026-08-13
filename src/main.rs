@@ -6147,11 +6147,12 @@ fn tracks_with_status(
     tracks: &[storage::Track],
     status: Option<storage::TrackStatus>,
 ) -> Vec<storage::Track> {
-    tracks
+    let (favorites, non_favorites): (Vec<_>, Vec<_>) = tracks
         .iter()
         .filter(|track| status.is_none_or(|status| track.status == status))
         .cloned()
-        .collect()
+        .partition(|track| track.favorite);
+    favorites.into_iter().chain(non_favorites).collect()
 }
 
 fn tracks_in_stage(tracks: &[storage::Track], stage: storage::TrackStage) -> Vec<storage::Track> {
@@ -12324,6 +12325,60 @@ mod tests {
             !empty_planner_labels
                 .iter()
                 .any(|label| label == "No tracks here yet.")
+        );
+    }
+
+    #[test]
+    fn filtered_track_lists_put_favorites_first_without_reordering_groups() {
+        let track = |id: &str, status: TrackStatus, favorite: bool| Track {
+            id: String::from(id),
+            title: format!("{id} track"),
+            original_name: format!("{id}.wav"),
+            path: PathBuf::from(format!("/external/{id}.wav")),
+            reference_path: None,
+            size: 0,
+            favorite,
+            stage: TrackStage::Production,
+            status,
+            notes: Vec::new(),
+        };
+        let tracks = vec![
+            track("unstarred-inbox", TrackStatus::Inbox, false),
+            track("starred-refine-first", TrackStatus::Refine, true),
+            track("unstarred-refine-first", TrackStatus::Refine, false),
+            track("starred-inbox", TrackStatus::Inbox, true),
+            track("starred-refine-second", TrackStatus::Refine, true),
+            track("unstarred-refine-second", TrackStatus::Refine, false),
+        ];
+
+        let all_tracks = tracks_with_status(&tracks, None);
+        let refined_tracks = tracks_with_status(&tracks, Some(TrackStatus::Refine));
+
+        assert_eq!(
+            all_tracks
+                .iter()
+                .map(|track| track.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "starred-refine-first",
+                "starred-inbox",
+                "starred-refine-second",
+                "unstarred-inbox",
+                "unstarred-refine-first",
+                "unstarred-refine-second",
+            ]
+        );
+        assert_eq!(
+            refined_tracks
+                .iter()
+                .map(|track| track.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "starred-refine-first",
+                "starred-refine-second",
+                "unstarred-refine-first",
+                "unstarred-refine-second",
+            ]
         );
     }
 
