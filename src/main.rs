@@ -319,6 +319,8 @@ const LUFS_METER_WIDTH: f32 = 76.0;
 const REFERENCE_HEADER_HEIGHT: f32 = 26.0;
 const REFERENCE_SECTION_SPACING: f32 = 4.0;
 const WAVEFORM_SECTION_SPACING: f32 = 8.0;
+const WORKSPACE_PANEL_PADDING: f32 = 12.0;
+const WORKSPACE_PANEL_SPACING: f32 = 8.0;
 const AUDITION_SOURCE_SELECTOR_WIDTH: f32 = 28.0;
 const FAVORITE_CONTROL_WIDTH: f32 = 28.0;
 const MIN_LOOP_MILLIS: u64 = 120;
@@ -5502,6 +5504,12 @@ fn settings_trigger(state: &AppState) -> ui::View<Message> {
         )
 }
 
+fn workspace_surface(content: ui::View<Message>) -> ui::View<Message> {
+    content
+        .style(ui::WidgetStyle::strong(ui::WidgetTone::Neutral))
+        .fill()
+}
+
 fn project_surface(state: &AppState) -> ui::View<Message> {
     let workspace = match state.workspace_mode {
         WorkspaceMode::Review => ui::row([
@@ -5767,12 +5775,13 @@ fn audition_panel(state: &AppState) -> ui::View<Message> {
         ui::row([
             ui::column([
                 ui::text("AUDITION / PLAYLIST")
+                    .style(ui::WidgetStyle::strong(ui::WidgetTone::Neutral))
                     .height(18.0)
-                    .fill_width()
-                    .subtle(),
+                    .fill_width(),
                 ui::text("Fixed shuffle · one pass")
                     .height(26.0)
-                    .fill_width(),
+                    .fill_width()
+                    .muted_text(),
             ])
             .fill_width(),
             ui::button("Shuffle")
@@ -5800,10 +5809,10 @@ fn audition_panel(state: &AppState) -> ui::View<Message> {
         .height(22.0),
         queue,
     ])
-    .padding(14.0)
-    .spacing(8.0)
+    .padding(WORKSPACE_PANEL_PADDING)
+    .spacing(WORKSPACE_PANEL_SPACING)
     .fill_height();
-    ui::stack([ui::card().fill(), content]).fill_height()
+    workspace_surface(content)
 }
 
 fn audition_queue_row(
@@ -6062,16 +6071,17 @@ fn planner_panel(state: &AppState) -> ui::View<Message> {
         )
     });
     let track_count = filtered_tracks.len();
-    ui::column([
+    let content = ui::column([
         ui::row([
             ui::column([
                 ui::text("FINISHING BOARD")
+                    .style(ui::WidgetStyle::strong(ui::WidgetTone::Neutral))
                     .height(18.0)
-                    .fill_width()
-                    .subtle(),
+                    .fill_width(),
                 ui::text("Move every track toward release.")
                     .height(30.0)
-                    .fill_width(),
+                    .fill_width()
+                    .muted_text(),
             ])
             .fill_width(),
             status_filter_controls(
@@ -6092,9 +6102,10 @@ fn planner_panel(state: &AppState) -> ui::View<Message> {
         .spacing(12.0),
         ui::row(columns).spacing(10.0).fill(),
     ])
-    .padding(18.0)
-    .spacing(14.0)
-    .fill()
+    .padding(WORKSPACE_PANEL_PADDING)
+    .spacing(WORKSPACE_PANEL_SPACING)
+    .fill();
+    workspace_surface(content)
 }
 
 struct PlannerColumnContext<'a> {
@@ -6332,8 +6343,8 @@ fn keyboard_stage_menu_anchor(state: &AppState) -> Point {
 
 fn stage_menu_anchor_from_pointer(position: Point) -> Point {
     Point::new(
-        position.x - STAGE_MENU_WIDTH * 0.5,
-        position.y + ui::dropdown_trigger_height() * 0.5,
+        (position.x - STAGE_MENU_WIDTH * 0.5).floor(),
+        (position.y + ui::dropdown_trigger_height() * 0.5).floor(),
     )
 }
 
@@ -6566,8 +6577,8 @@ const REFERENCE_MENU_WIDTH: f32 = 190.0;
 
 fn reference_menu_anchor_from_pointer(position: Point) -> Point {
     Point::new(
-        position.x - REFERENCE_MENU_WIDTH * 0.5,
-        position.y + ui::dropdown_trigger_height() * 0.5,
+        (position.x - REFERENCE_MENU_WIDTH * 0.5).floor(),
+        (position.y + ui::dropdown_trigger_height() * 0.5).floor(),
     )
 }
 
@@ -6929,16 +6940,17 @@ fn review_transport_icon(icon: &'static ui::SvgIconTintCache, active: bool) -> u
 
 fn review_panel(state: &AppState) -> ui::View<Message> {
     let Some(track) = selected_track(state).cloned() else {
-        return ui::column([
+        let content = ui::column([
             ui::text("Your review desk").height(30.0).fill_width(),
             ui::text("Import a track to begin reviewing.")
                 .height(28.0)
                 .fill_width(),
             ui::spacer().fill(),
         ])
-        .padding(18.0)
-        .spacing(12.0)
+        .padding(WORKSPACE_PANEL_PADDING)
+        .spacing(WORKSPACE_PANEL_SPACING)
         .fill();
+        return workspace_surface(content);
     };
 
     let note_ratios = state
@@ -7163,16 +7175,10 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
         .height(waveform_pair_height);
 
     let content = ui::column([waveform_with_source, comments_panel(state, &track)])
-        .padding(8.0)
-        .spacing(8.0)
+        .padding(WORKSPACE_PANEL_PADDING)
+        .spacing(WORKSPACE_PANEL_SPACING)
         .fill();
-    ui::stack([
-        ui::card()
-            .style(ui::WidgetStyle::strong(ui::WidgetTone::Neutral))
-            .fill(),
-        content,
-    ])
-    .fill()
+    workspace_surface(content)
 }
 
 fn reference_dropdown_paths(state: &AppState, track: &storage::Track) -> Vec<PathBuf> {
@@ -15254,6 +15260,58 @@ mod tests {
             );
         }
         assert!(!labels.iter().any(|label| label == "refine-track"));
+    }
+
+    #[test]
+    fn workspace_modes_paint_shared_surfaces_and_text_hierarchy() {
+        let theme = ThemeTokens::default();
+        let mut state = AppState {
+            busy: false,
+            ..AppState::default()
+        };
+        for (mode, eyebrow, subtitle) in [
+            (WorkspaceMode::Review, "Your review desk", None),
+            (
+                WorkspaceMode::Planner,
+                "FINISHING BOARD",
+                Some("Move every track toward release."),
+            ),
+            (
+                WorkspaceMode::Audition,
+                "AUDITION / PLAYLIST",
+                Some("Fixed shuffle · one pass"),
+            ),
+        ] {
+            state.workspace_mode = mode;
+            let frame = project_surface(&state)
+                .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 720.0));
+            let heading = frame
+                .paint_plan
+                .first_text_run(eyebrow)
+                .unwrap_or_else(|| panic!("missing {eyebrow:?} in {mode:?}"));
+            let surface = frame.paint_plan.fill_rects().find(|fill| {
+                fill.color == theme.surface_overlay
+                    && heading.rect.min.x >= fill.rect.min.x
+                    && heading.rect.min.y >= fill.rect.min.y
+                    && heading.rect.max.x <= fill.rect.max.x
+                    && heading.rect.max.y <= fill.rect.max.y
+                    && (heading.rect.min.x - (fill.rect.min.x + super::WORKSPACE_PANEL_PADDING))
+                        .abs()
+                        < 0.01
+            });
+            assert!(
+                surface.is_some(),
+                "{mode:?} should paint a strong-neutral workspace surface with the shared inset"
+            );
+            assert_eq!(heading.color, theme.text_primary);
+            if let Some(subtitle) = subtitle {
+                assert_eq!(
+                    frame.paint_plan.first_text_color(subtitle),
+                    Some(theme.text_muted),
+                    "{mode:?} subtitle should remain subtle"
+                );
+            }
+        }
     }
 
     #[test]
