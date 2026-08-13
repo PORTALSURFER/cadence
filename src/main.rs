@@ -5427,6 +5427,12 @@ fn workspace_surface(content: ui::View<Message>) -> ui::View<Message> {
         .fill()
 }
 
+fn planner_board_surface(content: ui::View<Message>) -> ui::View<Message> {
+    content
+        .style(ui::WidgetStyle::normal(ui::WidgetTone::Neutral))
+        .fill()
+}
+
 fn project_surface(state: &AppState) -> ui::View<Message> {
     let workspace = match state.workspace_mode {
         WorkspaceMode::Review => ui::row([
@@ -6081,7 +6087,7 @@ fn planner_panel(state: &AppState) -> ui::View<Message> {
     .padding(WORKSPACE_PANEL_PADDING)
     .spacing(WORKSPACE_PANEL_SPACING)
     .fill();
-    workspace_surface(content)
+    planner_board_surface(content)
 }
 
 struct PlannerColumnContext<'a> {
@@ -6176,7 +6182,9 @@ fn planner_column(
         );
     }
     let content = ui::stack([
-        ui::card().fill(),
+        ui::card()
+            .style(ui::WidgetStyle::strong(ui::WidgetTone::Neutral))
+            .fill(),
         ui::column(children).padding(12.0).spacing(8.0).fill(),
     ])
     .fill();
@@ -15678,23 +15686,30 @@ mod tests {
     }
 
     #[test]
-    fn workspace_modes_paint_shared_surfaces_and_text_hierarchy() {
+    fn workspace_modes_paint_expected_surfaces_and_text_hierarchy() {
         let theme = ThemeTokens::default();
         let mut state = AppState {
             busy: false,
             ..AppState::default()
         };
-        for (mode, eyebrow, subtitle) in [
-            (WorkspaceMode::Review, "Your review desk", None),
+        for (mode, eyebrow, subtitle, expected_surface) in [
+            (
+                WorkspaceMode::Review,
+                "Your review desk",
+                None,
+                theme.surface_overlay,
+            ),
             (
                 WorkspaceMode::Planner,
                 "FINISHING BOARD",
                 Some("Move every track toward release."),
+                theme.surface_raised,
             ),
             (
                 WorkspaceMode::Audition,
                 "AUDITION / PLAYLIST",
                 Some("Fixed shuffle · one pass"),
+                theme.surface_overlay,
             ),
         ] {
             state.workspace_mode = mode;
@@ -15705,7 +15720,7 @@ mod tests {
                 .first_text_run(eyebrow)
                 .unwrap_or_else(|| panic!("missing {eyebrow:?} in {mode:?}"));
             let surface = frame.paint_plan.fill_rects().find(|fill| {
-                fill.color == theme.surface_overlay
+                fill.color == expected_surface
                     && heading.rect.min.x >= fill.rect.min.x
                     && heading.rect.min.y >= fill.rect.min.y
                     && heading.rect.max.x <= fill.rect.max.x
@@ -15716,7 +15731,7 @@ mod tests {
             });
             assert!(
                 surface.is_some(),
-                "{mode:?} should paint a strong-neutral workspace surface with the shared inset"
+                "{mode:?} should paint its expected neutral workspace surface with the shared inset"
             );
             assert_eq!(heading.color, theme.text_primary);
             if let Some(subtitle) = subtitle {
@@ -15727,6 +15742,82 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn planner_paints_a_raised_board_behind_strong_columns() {
+        let theme = ThemeTokens::default();
+        let state = AppState {
+            busy: false,
+            workspace_mode: WorkspaceMode::Planner,
+            ..AppState::default()
+        };
+        let frame = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(1_180.0, 900.0));
+        let contains = |outer: Rect, inner: Rect| {
+            inner.min.x >= outer.min.x
+                && inner.min.y >= outer.min.y
+                && inner.max.x <= outer.max.x
+                && inner.max.y <= outer.max.y
+        };
+        let board_heading = frame
+            .paint_plan
+            .first_text_run("FINISHING BOARD")
+            .expect("Planner should paint its board heading");
+        let board = frame
+            .paint_plan
+            .fill_rects()
+            .find(|fill| {
+                fill.color == theme.surface_raised
+                    && contains(fill.rect, board_heading.rect)
+                    && (board_heading.rect.min.x
+                        - (fill.rect.min.x + super::WORKSPACE_PANEL_PADDING))
+                        .abs()
+                        < 0.01
+            })
+            .expect("Planner should paint its outer board with the raised neutral surface");
+
+        for stage in [
+            TrackStage::SoundDesign,
+            TrackStage::Production,
+            TrackStage::Mixdown,
+            TrackStage::Mastering,
+        ] {
+            let heading_label = super::planner_column_heading(stage);
+            let heading = frame
+                .paint_plan
+                .first_text_run(heading_label)
+                .unwrap_or_else(|| panic!("Planner should paint the {heading_label:?} heading"));
+            let column = frame
+                .paint_plan
+                .fill_rects()
+                .find(|fill| {
+                    fill.color == theme.surface_overlay
+                        && contains(fill.rect, heading.rect)
+                        && (heading.rect.min.x
+                            - (fill.rect.min.x + super::WORKSPACE_PANEL_PADDING))
+                            .abs()
+                            < 0.01
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "Planner should paint the {heading_label:?} column with the overlay neutral surface"
+                    )
+                });
+            assert!(
+                column.rect.min.y > board.rect.min.y,
+                "Planner columns should be nested below the outer board heading"
+            );
+        }
+
+        assert!(
+            board.color.r < theme.surface_overlay.r
+                && board.color.g < theme.surface_overlay.g
+                && board.color.b < theme.surface_overlay.b,
+            "Planner board should be darker than its columns: board={:?}, columns={:?}",
+            board.color,
+            theme.surface_overlay
+        );
     }
 
     #[test]
