@@ -314,6 +314,7 @@ const TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER: f32 = 72.0;
 // the review panel while retaining enough height for the split waveform.
 const WAVEFORM_HEIGHT: f32 = 124.0;
 const REFERENCE_WAVEFORM_HEIGHT: f32 = WAVEFORM_HEIGHT;
+const MAIN_WAVEFORM_HEADER_HEIGHT: f32 = 22.0;
 const LUFS_METER_WIDTH: f32 = 76.0;
 const REFERENCE_HEADER_HEIGHT: f32 = 26.0;
 const REFERENCE_SECTION_SPACING: f32 = 4.0;
@@ -1593,13 +1594,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             match result {
                 Ok(waveform) => {
                     state.waveform_track_id = Some(track_id.clone());
-                    state.status = format!(
-                        "Waveform ready · {} Hz · {} channel{} · {}.",
-                        waveform.sample_rate,
-                        waveform.channels,
-                        if waveform.channels == 1 { "" } else { "s" },
-                        format_duration(waveform.duration_millis),
-                    );
+                    state.status = String::from("Waveform ready.");
                     state.waveform = Some(waveform);
                     if let Some(path) = selected_track(state)
                         .filter(|track| track.id == track_id)
@@ -7083,25 +7078,6 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
         .fill_width()
         .height(WAVEFORM_HEIGHT)
     };
-    let (metadata, duration_millis) = state
-        .waveform
-        .as_ref()
-        .filter(|_| state.waveform_track_id.as_deref() == Some(track.id.as_str()))
-        .map_or_else(
-            || (String::from("Audio analysis pending"), 0),
-            |waveform| {
-                (
-                    format!(
-                        "{} Hz · {} channel{} · {}",
-                        waveform.sample_rate,
-                        waveform.channels,
-                        if waveform.channels == 1 { "" } else { "s" },
-                        format_duration(waveform.duration_millis),
-                    ),
-                    waveform.duration_millis,
-                )
-            },
-        );
     let meter_lufs = current_lufs_meter_value(state, &track.id);
     let waveform_with_meter = ui::row([
         chrome::lufs_meter(meter_lufs, state.waveform_busy)
@@ -7112,10 +7088,36 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
     .spacing(8.0)
     .fill_width()
     .height(WAVEFORM_HEIGHT);
+    let main_waveform_header = ui::row([
+        ui::spacer().fill_width(),
+        ui::text("MAIN WAVEFORM")
+            .style(ui::WidgetStyle::strong(ui::WidgetTone::Neutral))
+            .height(MAIN_WAVEFORM_HEADER_HEIGHT)
+            .width(132.0)
+            .align_text(ui::TextAlign::Right),
+        ui::text(track.original_name.clone())
+            .truncate()
+            .height(MAIN_WAVEFORM_HEADER_HEIGHT)
+            .width(300.0)
+            .align_text(ui::TextAlign::Right)
+            .subtle(),
+    ])
+    .spacing(8.0)
+    .fill_width()
+    .height(MAIN_WAVEFORM_HEADER_HEIGHT);
+    let main_section_height =
+        WAVEFORM_HEIGHT + REFERENCE_SECTION_SPACING + MAIN_WAVEFORM_HEADER_HEIGHT;
+    let main_waveform_section = ui::column([waveform_with_meter, main_waveform_header])
+        .spacing(REFERENCE_SECTION_SPACING)
+        .fill_width()
+        .height(main_section_height);
     let reference_height = reference_section_height(state, &track);
-    let waveform_pair_height = WAVEFORM_HEIGHT + WAVEFORM_SECTION_SPACING + reference_height;
+    let waveform_pair_height = main_section_height + WAVEFORM_SECTION_SPACING + reference_height;
+    let reference_body_spacing =
+        REFERENCE_SECTION_SPACING + MAIN_WAVEFORM_HEADER_HEIGHT + WAVEFORM_SECTION_SPACING;
+    let reference_label_area_height = REFERENCE_SECTION_SPACING + REFERENCE_HEADER_HEIGHT;
     let waveform_pair = ui::column([
-        waveform_with_meter,
+        main_waveform_section,
         reference_waveform_section(state, &track),
     ])
     .spacing(WAVEFORM_SECTION_SPACING)
@@ -7137,11 +7139,12 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
         ui::column([
             ui::column([ui::spacer().fill(), main_choice, ui::spacer().fill()])
                 .height(WAVEFORM_HEIGHT),
-            ui::spacer()
-                .height(WAVEFORM_SECTION_SPACING + reference_height - REFERENCE_WAVEFORM_HEIGHT),
+            ui::spacer().height(reference_body_spacing),
             ui::column([ui::spacer().fill(), reference_choice, ui::spacer().fill()])
                 .height(REFERENCE_WAVEFORM_HEIGHT),
+            ui::spacer().height(reference_label_area_height),
         ])
+        .spacing(0.0)
         .width(AUDITION_SOURCE_SELECTOR_WIDTH)
         .height(waveform_pair_height)
     } else {
@@ -7150,6 +7153,7 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
                 .height(WAVEFORM_HEIGHT),
             ui::spacer().fill(),
         ])
+        .spacing(0.0)
         .width(AUDITION_SOURCE_SELECTOR_WIDTH)
         .height(waveform_pair_height)
     };
@@ -7158,42 +7162,7 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
         .fill_width()
         .height(waveform_pair_height);
 
-    let main_waveform_header = ui::row([
-        ui::spacer().width(AUDITION_SOURCE_SELECTOR_WIDTH),
-        ui::spacer().fill_width(),
-        ui::text("MAIN WAVEFORM")
-            .style(ui::WidgetStyle::strong(ui::WidgetTone::Neutral))
-            .height(22.0)
-            .width(132.0)
-            .align_text(ui::TextAlign::Right),
-        ui::text(track.original_name.clone())
-            .truncate()
-            .height(22.0)
-            .width(300.0)
-            .align_text(ui::TextAlign::Right)
-            .subtle(),
-    ])
-    .spacing(8.0)
-    .fill_width()
-    .height(22.0);
-
-    let waveform_status = ui::text(format!(
-        "{metadata} · {} / {}",
-        format_timestamp(state.transport_position_millis.min(duration_millis)),
-        format_duration(duration_millis),
-    ))
-    .key(format!("review-track-status-{}", track.id))
-    .truncate()
-    .height(18.0)
-    .fill_width()
-    .align_text(ui::TextAlign::Right)
-    .subtle();
-    let waveform_section =
-        ui::column([main_waveform_header, waveform_with_source, waveform_status])
-            .spacing(4.0)
-            .fill_width();
-
-    let content = ui::column([waveform_section, comments_panel(state, &track)])
+    let content = ui::column([waveform_with_source, comments_panel(state, &track)])
         .padding(8.0)
         .spacing(8.0)
         .fill();
@@ -7345,7 +7314,7 @@ fn reference_menu_is_open(state: &AppState, track: &storage::Track) -> bool {
 
 fn reference_section_height(state: &AppState, track: &storage::Track) -> f32 {
     let _ = (state, track);
-    REFERENCE_HEADER_HEIGHT + REFERENCE_SECTION_SPACING + REFERENCE_WAVEFORM_HEIGHT
+    REFERENCE_WAVEFORM_HEIGHT + REFERENCE_SECTION_SPACING + REFERENCE_HEADER_HEIGHT
 }
 
 fn reference_waveform_section(state: &AppState, track: &storage::Track) -> ui::View<Message> {
@@ -7523,7 +7492,7 @@ fn reference_waveform_section(state: &AppState, track: &storage::Track) -> ui::V
     .spacing(8.0)
     .fill_width()
     .height(REFERENCE_HEADER_HEIGHT);
-    ui::column([header, body])
+    ui::column([body, header])
         .spacing(REFERENCE_SECTION_SPACING)
         .fill_width()
         .height(reference_section_height(state, track))
@@ -8102,11 +8071,6 @@ fn format_timestamp(time_millis: u64) -> String {
     format!("{:02}:{:02}", total_seconds / 60, total_seconds % 60)
 }
 
-fn format_duration(duration_millis: u64) -> String {
-    let total_seconds = duration_millis / 1_000;
-    format!("{:02}:{:02}", total_seconds / 60, total_seconds % 60)
-}
-
 fn plural(count: usize) -> &'static str {
     if count == 1 { "" } else { "s" }
 }
@@ -8405,6 +8369,61 @@ mod tests {
             .into_iter()
             .map(|(_, shows_stop)| shows_stop)
             .collect()
+    }
+
+    fn audition_source_icon_rects(primitives: &[PaintPrimitive]) -> Vec<Rect> {
+        let mut expected_documents = Vec::new();
+        for icon in [
+            super::audition_source_icon(false),
+            super::audition_source_icon(true),
+        ] {
+            let mut expected_primitives = Vec::new();
+            icon.append_paint(
+                &mut expected_primitives,
+                0,
+                Rect::from_min_size(Point::new(0.0, 0.0), Vector2::new(16.0, 16.0)),
+            );
+            let Some(PaintPrimitive::Svg(expected)) = expected_primitives.first() else {
+                continue;
+            };
+            expected_documents.push(expected.document.clone());
+        }
+
+        let mut rects = primitives
+            .iter()
+            .filter_map(|primitive| {
+                let PaintPrimitive::Svg(actual) = primitive else {
+                    return None;
+                };
+                expected_documents
+                    .contains(&actual.document)
+                    .then_some(actual.rect)
+            })
+            .collect::<Vec<_>>();
+        rects.sort_by(|left, right| left.min.y.total_cmp(&right.min.y));
+        rects
+    }
+
+    fn waveform_lower_rail_rects(primitives: &[PaintPrimitive]) -> Vec<Rect> {
+        let mut rects = primitives
+            .iter()
+            .filter_map(|primitive| match primitive {
+                PaintPrimitive::FillRect(fill)
+                    if fill.color
+                        == ThemeTokens::default()
+                            .surface_overlay
+                            .blend_toward(ThemeTokens::default().bg_primary, 0.45)
+                        && fill.rect.width() > 300.0
+                        && fill.rect.height() > 20.0
+                        && fill.rect.height() <= WAVEFORM_HEIGHT =>
+                {
+                    Some(fill.rect)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        rects.sort_by(|left, right| left.min.y.total_cmp(&right.min.y));
+        rects
     }
 
     fn planner_drag_preview_rect(state: &AppState) -> Option<Rect> {
@@ -11461,20 +11480,10 @@ mod tests {
 
         let frame = project_surface(&state)
             .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1_000.0));
-        let reference_rect = frame
-            .paint_plan
-            .first_text_rect("reference.wav")
-            .expect("the global reference selector should be visible");
-        let title_rect = frame
+        let _title_rect = frame
             .paint_plan
             .first_text_rect("Review track")
             .expect("the primary track title should be visible");
-        let metadata_rect = frame
-            .paint_plan
-            .text_runs()
-            .find(|run| run.text.as_str().contains("48000 Hz"))
-            .map(|run| run.rect)
-            .expect("the transport metadata should be visible");
         let reference_header_rect = frame
             .paint_plan
             .text_runs()
@@ -11486,25 +11495,14 @@ mod tests {
             .text_runs()
             .find(|run| run.text.as_str() == "MAIN WAVEFORM")
             .expect("the main waveform header should be visible");
-        let main_waveform_rect = frame
-            .paint_plan
-            .primitives
-            .iter()
-            .find_map(|primitive| match primitive {
-                PaintPrimitive::FillRect(fill)
-                    if fill.color
-                        == ThemeTokens::default()
-                            .surface_overlay
-                            .blend_toward(ThemeTokens::default().bg_primary, 0.45)
-                        && fill.rect.width() > 300.0
-                        && fill.rect.height() > 20.0
-                        && fill.rect.height() <= WAVEFORM_HEIGHT =>
-                {
-                    Some(fill.rect)
-                }
-                _ => None,
-            })
-            .expect("the main waveform should paint its lower rail");
+        let waveform_lower_rails = waveform_lower_rail_rects(&frame.paint_plan.primitives);
+        assert!(
+            waveform_lower_rails.len() >= 2,
+            "the selected reference review should paint one lower rail per waveform"
+        );
+        let main_waveform_rect = &waveform_lower_rails[0];
+        let reference_waveform_rect = &waveform_lower_rails[1];
+        let source_icon_rects = audition_source_icon_rects(&frame.paint_plan.primitives);
         let svg_count = frame
             .paint_plan
             .primitives
@@ -11539,31 +11537,43 @@ mod tests {
                 .any(|label| label == "01  WAVEFORM / TOP TO PLAY"),
             "the redundant waveform heading should stay removed"
         );
-        assert!(
-            labels
-                .iter()
-                .any(|label| label.contains("48000 Hz") && label.contains("00:00 / 00:02")),
-            "metadata and transport time should share the compact waveform status line"
-        );
+        assert!(!labels.iter().any(|label| label.contains("48000 Hz")));
+        assert!(!labels.iter().any(|label| label.contains("channel")));
+        assert!(!labels.iter().any(|label| label.contains("00:00 / 00:02")));
         assert_eq!(main_header_run.align, PaintTextAlign::Right);
         assert_ne!(
             main_header_run.color,
             ThemeTokens::default().highlight_orange,
             "the static waveform heading should not use the playback accent"
         );
-        assert!(reference_rect.min.y < main_waveform_rect.min.y);
         assert!(
-            main_waveform_rect.min.y < metadata_rect.min.y,
-            "the transport metadata should sit below the compact waveform pair"
+            main_waveform_rect.max.y <= main_header_run.rect.min.y,
+            "the main waveform header should sit below the main waveform"
         );
         assert!(
-            title_rect.min.y < main_waveform_rect.min.y,
-            "the primary track title should sit above the main waveform"
+            main_header_run.rect.max.y <= reference_waveform_rect.min.y,
+            "the reference waveform should sit below the main waveform header"
         );
         assert!(
-            main_waveform_rect.min.y < reference_header_rect.min.y,
-            "the reference header should remain below the main waveform"
+            reference_waveform_rect.max.y <= reference_header_rect.min.y,
+            "the reference header should sit below the reference waveform"
         );
+        assert!(
+            source_icon_rects.len() >= 2,
+            "MAIN and REF source controls should both paint their icons"
+        );
+        for (index, (source_icon_rect, waveform_rect)) in source_icon_rects
+            .iter()
+            .zip(waveform_lower_rails.iter())
+            .enumerate()
+        {
+            let source_center = source_icon_rect.min.y + source_icon_rect.height() * 0.5;
+            let waveform_center = waveform_rect.max.y - WAVEFORM_HEIGHT * 0.5;
+            assert!(
+                (source_center - waveform_center).abs() <= 2.0,
+                "source icon {index} center {source_center} should align with waveform body center {waveform_center} (icon={source_icon_rect:?}, rail={waveform_rect:?})"
+            );
+        }
     }
 
     #[test]
@@ -11580,6 +11590,20 @@ mod tests {
             &frame.paint_plan.primitives,
             &super::audition_source_icon(true),
         ));
+        let waveform_lower_rails = waveform_lower_rail_rects(&frame.paint_plan.primitives);
+        let source_icon_rects = audition_source_icon_rects(&frame.paint_plan.primitives);
+        let Some(main_waveform_rect) = waveform_lower_rails.first() else {
+            panic!("the main-only review should paint a waveform lower rail");
+        };
+        let Some(main_source_icon_rect) = source_icon_rects.first() else {
+            panic!("the main-only review should paint a source icon");
+        };
+        let source_center = main_source_icon_rect.min.y + main_source_icon_rect.height() * 0.5;
+        let waveform_center = main_waveform_rect.max.y - WAVEFORM_HEIGHT * 0.5;
+        assert!(
+            (source_center - waveform_center).abs() <= 2.0,
+            "the MAIN source icon should remain centered beside the main waveform body"
+        );
     }
 
     #[test]
