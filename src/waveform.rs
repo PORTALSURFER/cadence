@@ -54,6 +54,7 @@ struct WaveformColors {
     upper_bar: Rgba8,
     lower_bar: Rgba8,
     bar_played: Rgba8,
+    lower_bar_played: Rgba8,
     reference_selection_fill: Rgba8,
     reference_selection_edge: Rgba8,
     rail: Rgba8,
@@ -71,6 +72,7 @@ impl WaveformColors {
             upper_bar: theme.text_primary,
             lower_bar: theme.text_muted.with_alpha(160),
             bar_played: theme.highlight_orange,
+            lower_bar_played: theme.highlight_orange.with_alpha(160),
             reference_selection_fill: theme.accent_mint.with_alpha(72),
             reference_selection_edge: theme.accent_mint,
             rail: theme.grid_strong,
@@ -1349,7 +1351,11 @@ fn paint_bars(
             continue;
         }
         let color = if played {
-            colors.bar_played
+            if style.lower {
+                colors.lower_bar_played
+            } else {
+                colors.bar_played
+            }
         } else if style.lower {
             colors.lower_bar
         } else {
@@ -1578,7 +1584,8 @@ mod tests {
                 PaintPrimitive::FillRect(fill)
                     if fill.color == colors.upper_bar
                         || fill.color == colors.lower_bar
-                        || fill.color == colors.bar_played =>
+                        || fill.color == colors.bar_played
+                        || fill.color == colors.lower_bar_played =>
                 {
                     Some((fill.rect, fill.color))
                 }
@@ -1598,6 +1605,10 @@ mod tests {
             theme.surface_overlay.blend_toward(theme.bg_primary, 0.45)
         );
         assert_eq!(colors.bar_played, theme.highlight_orange);
+        assert_eq!(
+            colors.lower_bar_played,
+            theme.highlight_orange.with_alpha(160)
+        );
         assert_eq!(colors.cursor, theme.highlight_orange_soft);
 
         let bounds = Rect::from_size(320.0, 120.0);
@@ -1648,6 +1659,16 @@ mod tests {
         );
         assert!(
             fills
+                .iter()
+                .any(|(rect, color)| { *color == colors.lower_bar_played && rect.min.y > rail_y })
+        );
+        assert!(
+            fills
+                .iter()
+                .any(|(rect, color)| { *color == colors.lower_bar && rect.min.y > rail_y })
+        );
+        assert!(
+            !fills
                 .iter()
                 .any(|(rect, color)| { *color == colors.bar_played && rect.min.y > rail_y })
         );
