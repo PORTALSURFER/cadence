@@ -316,6 +316,7 @@ const TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER: f32 = 72.0;
 // the review panel while retaining enough height for the split waveform.
 const WAVEFORM_HEIGHT: f32 = 124.0;
 const REFERENCE_WAVEFORM_HEIGHT: f32 = WAVEFORM_HEIGHT;
+const LUFS_METER_WIDTH: f32 = 76.0;
 const REFERENCE_HEADER_HEIGHT: f32 = 26.0;
 const REFERENCE_SECTION_SPACING: f32 = 4.0;
 const WAVEFORM_SECTION_SPACING: f32 = 8.0;
@@ -6527,6 +6528,22 @@ fn library_panel(state: &AppState) -> ui::View<Message> {
     let tracks = tracks_with_status(&state.library.tracks, state.review_status_filter);
     let total_track_count = state.library.tracks.len();
     let content = ui::column([
+        ui::row([
+            ui::text("LIBRARY")
+                .style(ui::WidgetStyle::strong(ui::WidgetTone::Neutral))
+                .height(22.0)
+                .fill_width(),
+            ui::text(format!(
+                "{} track{}",
+                total_track_count,
+                plural(total_track_count)
+            ))
+            .height(22.0)
+            .subtle(),
+        ])
+        .fill_width()
+        .height(22.0)
+        .spacing(8.0),
         ui::button("Import")
             .primary()
             .message(Message::ImportPressed)
@@ -6588,7 +6605,13 @@ fn library_panel(state: &AppState) -> ui::View<Message> {
     .padding(10.0)
     .spacing(8.0)
     .fill_height();
-    ui::stack([ui::card().fill(), content]).fill_height()
+    ui::stack([
+        ui::card()
+            .style(ui::WidgetStyle::strong(ui::WidgetTone::Neutral))
+            .fill(),
+        content,
+    ])
+    .fill_height()
 }
 
 fn track_row(
@@ -6683,6 +6706,11 @@ fn track_row(
             .spacing(3.0)
             .fill_width()
             .height(26.0),
+            ui::text(track.original_name.clone())
+                .truncate()
+                .height(18.0)
+                .fill_width()
+                .subtle(),
             removal_controls,
             stage_control,
             status_control,
@@ -6913,7 +6941,7 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
     let meter_lufs = current_lufs_meter_value(state, &track.id);
     let waveform_with_meter = ui::row([
         chrome::lufs_meter(meter_lufs, state.waveform_busy)
-            .width(68.0)
+            .width(LUFS_METER_WIDTH)
             .height(WAVEFORM_HEIGHT),
         waveform_view,
     ])
@@ -6960,6 +6988,25 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
         .fill_width()
         .height(waveform_pair_height);
 
+    let main_waveform_header = ui::row([
+        ui::spacer().width(AUDITION_SOURCE_SELECTOR_WIDTH),
+        ui::spacer().fill_width(),
+        ui::text("MAIN WAVEFORM")
+            .style(ui::WidgetStyle::strong(ui::WidgetTone::Neutral))
+            .height(22.0)
+            .width(132.0)
+            .align_text(ui::TextAlign::Right),
+        ui::text(track.original_name.clone())
+            .truncate()
+            .height(22.0)
+            .width(300.0)
+            .align_text(ui::TextAlign::Right)
+            .subtle(),
+    ])
+    .spacing(8.0)
+    .fill_width()
+    .height(22.0);
+
     let waveform_status = ui::text(format!(
         "{metadata} · {} / {}",
         format_timestamp(state.transport_position_millis.min(duration_millis)),
@@ -6969,16 +7016,24 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
     .truncate()
     .height(18.0)
     .fill_width()
+    .align_text(ui::TextAlign::Right)
     .subtle();
-    let waveform_section = ui::column([waveform_with_source, waveform_status])
-        .spacing(4.0)
-        .fill_width();
+    let waveform_section =
+        ui::column([main_waveform_header, waveform_with_source, waveform_status])
+            .spacing(4.0)
+            .fill_width();
 
     let content = ui::column([waveform_section, comments_panel(state, &track)])
         .padding(8.0)
         .spacing(8.0)
         .fill();
-    ui::stack([ui::card().fill(), content]).fill()
+    ui::stack([
+        ui::card()
+            .style(ui::WidgetStyle::strong(ui::WidgetTone::Neutral))
+            .fill(),
+        content,
+    ])
+    .fill()
 }
 
 fn reference_dropdown_paths(state: &AppState, track: &storage::Track) -> Vec<PathBuf> {
@@ -7034,7 +7089,7 @@ fn review_reference_controls(state: &AppState, track: &storage::Track) -> ui::Vi
     } else {
         "Import reference"
     })
-    .primary()
+    .subtle()
     .message(Message::ReferencePressed(track.id.clone()))
     .width(142.0)
     .height(26.0);
@@ -7298,21 +7353,26 @@ fn reference_waveform_section(state: &AppState, track: &storage::Track) -> ui::V
     };
     let reference_meter = if has_reference {
         chrome::lufs_meter(reference_meter_lufs, state.reference_waveform_busy)
-            .width(68.0)
+            .width(LUFS_METER_WIDTH)
             .height(REFERENCE_WAVEFORM_HEIGHT)
     } else {
-        ui::spacer().width(68.0).height(REFERENCE_WAVEFORM_HEIGHT)
+        ui::spacer()
+            .width(LUFS_METER_WIDTH)
+            .height(REFERENCE_WAVEFORM_HEIGHT)
     };
     let body = ui::row([reference_meter, reference_body])
         .spacing(0.0)
         .fill_width()
         .height(REFERENCE_WAVEFORM_HEIGHT);
     let header = ui::row([
-        ui::spacer().width(68.0).height(REFERENCE_HEADER_HEIGHT),
+        ui::spacer()
+            .width(LUFS_METER_WIDTH)
+            .height(REFERENCE_HEADER_HEIGHT),
         ui::text(reference_label)
             .truncate()
             .height(REFERENCE_HEADER_HEIGHT)
             .fill_width()
+            .align_text(ui::TextAlign::Right)
             .subtle(),
     ])
     .spacing(8.0)
@@ -7380,6 +7440,10 @@ fn comments_panel(state: &AppState, track: &storage::Track) -> ui::View<Message>
                 .width(104.0)
                 .height(28.0),
             tabs,
+            ui::text("Click to seek · double-click to edit")
+                .height(28.0)
+                .width(224.0)
+                .subtle(),
             ui::spacer().fill_width(),
             ui::text(format!("{} total · {} open", notes.len(), open_count))
                 .height(28.0)
@@ -7451,9 +7515,14 @@ fn comments_panel(state: &AppState, track: &storage::Track) -> ui::View<Message>
         .spacing(8.0)
         .fill_width()
         .fill_height();
-    ui::stack([ui::card().fill(), content])
-        .fill_width()
-        .fill_height()
+    ui::stack([
+        ui::card()
+            .style(ui::WidgetStyle::strong(ui::WidgetTone::Neutral))
+            .fill(),
+        content,
+    ])
+    .fill_width()
+    .fill_height()
 }
 
 fn note_editor(draft: &NoteDraft) -> ui::View<Message> {
@@ -7564,7 +7633,17 @@ fn note_row(
             .fill_width()
             .height(30.0)
     } else {
-        ui::text(note_body).wrap().height(30.0).fill_width()
+        ui::text(note_body)
+            .style(if selected {
+                ui::WidgetStyle::strong(ui::WidgetTone::Neutral)
+            } else if note.done {
+                ui::WidgetStyle::subtle(ui::WidgetTone::Neutral)
+            } else {
+                ui::WidgetStyle::normal(ui::WidgetTone::Neutral)
+            })
+            .wrap()
+            .height(30.0)
+            .fill_width()
     };
     let trailing_control = if editing {
         ui::row([
@@ -7591,6 +7670,11 @@ fn note_row(
         index,
         [
             ui::text(format_timestamp(note_time_millis))
+                .style(if selected {
+                    ui::WidgetStyle::subtle(ui::WidgetTone::Accent)
+                } else {
+                    ui::WidgetStyle::subtle(ui::WidgetTone::Neutral)
+                })
                 .height(30.0)
                 .width(68.0)
                 .subtle(),
@@ -7660,7 +7744,17 @@ fn reference_note_row(
             .fill_width()
             .height(30.0)
     } else {
-        ui::text(note_body).wrap().height(30.0).fill_width()
+        ui::text(note_body)
+            .style(if selected {
+                ui::WidgetStyle::strong(ui::WidgetTone::Neutral)
+            } else if note.done {
+                ui::WidgetStyle::subtle(ui::WidgetTone::Neutral)
+            } else {
+                ui::WidgetStyle::normal(ui::WidgetTone::Neutral)
+            })
+            .wrap()
+            .height(30.0)
+            .fill_width()
     };
     let trailing_control = if editing {
         ui::row([
@@ -7687,6 +7781,11 @@ fn reference_note_row(
         index,
         [
             ui::text(format_timestamp(note_time_millis))
+                .style(if selected {
+                    ui::WidgetStyle::subtle(ui::WidgetTone::Accent)
+                } else {
+                    ui::WidgetStyle::subtle(ui::WidgetTone::Neutral)
+                })
                 .height(30.0)
                 .width(68.0)
                 .subtle(),
@@ -10868,13 +10967,21 @@ mod tests {
             .find(|run| run.text.as_str().starts_with("REFERENCE · reference.wav"))
             .map(|run| run.rect)
             .expect("the reference waveform header should be visible");
+        let main_header_run = frame
+            .paint_plan
+            .text_runs()
+            .find(|run| run.text.as_str() == "MAIN WAVEFORM")
+            .expect("the main waveform header should be visible");
         let main_waveform_rect = frame
             .paint_plan
             .primitives
             .iter()
             .find_map(|primitive| match primitive {
                 PaintPrimitive::FillRect(fill)
-                    if fill.color == ThemeTokens::default().bg_secondary
+                    if fill.color
+                        == ThemeTokens::default()
+                            .surface_overlay
+                            .blend_toward(ThemeTokens::default().bg_primary, 0.45)
                         && fill.rect.width() > 300.0
                         && fill.rect.height() > 20.0
                         && fill.rect.height() <= WAVEFORM_HEIGHT =>
@@ -10917,6 +11024,12 @@ mod tests {
                 .iter()
                 .any(|label| label.contains("48000 Hz") && label.contains("00:00 / 00:02")),
             "metadata and transport time should share the compact waveform status line"
+        );
+        assert_eq!(main_header_run.align, PaintTextAlign::Right);
+        assert_ne!(
+            main_header_run.color,
+            ThemeTokens::default().highlight_orange,
+            "the static waveform heading should not use the playback accent"
         );
         assert!(reference_rect.min.y < main_waveform_rect.min.y);
         assert!(
@@ -11588,7 +11701,10 @@ mod tests {
             .iter()
             .filter_map(|primitive| match primitive {
                 PaintPrimitive::FillRect(fill)
-                    if fill.color == ThemeTokens::default().bg_secondary
+                    if fill.color
+                        == ThemeTokens::default()
+                            .surface_overlay
+                            .blend_toward(ThemeTokens::default().bg_primary, 0.45)
                         && fill.rect.width() > 300.0
                         && fill.rect.height() <= WAVEFORM_HEIGHT =>
                 {
@@ -11737,7 +11853,10 @@ mod tests {
             .iter()
             .find_map(|primitive| match primitive {
                 PaintPrimitive::FillRect(fill)
-                    if fill.color == ThemeTokens::default().bg_secondary
+                    if fill.color
+                        == ThemeTokens::default()
+                            .surface_overlay
+                            .blend_toward(ThemeTokens::default().bg_primary, 0.45)
                         && fill.rect.width() > 300.0
                         && fill.rect.height() > 20.0
                         && fill.rect.height() <= WAVEFORM_HEIGHT =>
@@ -14890,7 +15009,8 @@ mod tests {
         );
         let expected_height = 26.0
             + (ui::dropdown_trigger_height() * 2.0)
-            + (super::TRACK_CARD_CONTENT_SPACING * 3.0)
+            + (super::TRACK_CARD_CONTENT_SPACING * 4.0)
+            + 18.0
             + (super::TRACK_CARD_CONTENT_INSET * 2.0);
         assert!(
             (card_bounds.height() - expected_height).abs() < 0.01,
