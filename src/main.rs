@@ -227,6 +227,11 @@ enum Message {
     SaveDraftNote,
     CancelDraftNote,
     SelectNote(String),
+    PlayComment {
+        track_id: String,
+        source: CommentSource,
+        note_id: String,
+    },
     CommentHoverStarted(String),
     CommentHoverEnded(String),
     ReferenceCommentHoverStarted(String),
@@ -804,6 +809,7 @@ struct AppState {
     reference_match_enabled: bool,
     comment_source: CommentSource,
     comment_source_explicit: bool,
+    pending_comment_playback: Option<PendingCommentPlayback>,
     draft_note: Option<NoteDraft>,
     reference_draft_note: Option<NoteDraft>,
     persisted_note_drag: Option<PersistedNoteDrag>,
@@ -860,6 +866,13 @@ struct PersistedNoteDrag {
     moved: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingCommentPlayback {
+    track_id: String,
+    source: CommentSource,
+    note_id: String,
+}
+
 impl Default for AppState {
     fn default() -> Self {
         Self {
@@ -904,6 +917,7 @@ impl Default for AppState {
             reference_match_enabled: false,
             comment_source: CommentSource::Main,
             comment_source_explicit: false,
+            pending_comment_playback: None,
             draft_note: None,
             reference_draft_note: None,
             persisted_note_drag: None,
@@ -968,6 +982,7 @@ fn animation_requested(state: &AppState) -> bool {
         || state.reference_transport_playing
         || state.reference_transport_polling
         || state.audition_pending_play_track_id.is_some()
+        || state.pending_comment_playback.is_some()
         || state.playhead_drag_active
         || state.reference_playhead_drag_active
 }
@@ -1686,11 +1701,25 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 Err(error) if error == "cancelled" => {
                     state.waveform = None;
                     state.waveform_track_id = None;
+                    if state
+                        .pending_comment_playback
+                        .as_ref()
+                        .is_some_and(|pending| pending.track_id == track_id)
+                    {
+                        state.pending_comment_playback = None;
+                    }
                 }
                 Err(error) => {
                     state.waveform = None;
                     state.waveform_track_id = None;
                     state.status = format!("Waveform unavailable: {error}");
+                    if state
+                        .pending_comment_playback
+                        .as_ref()
+                        .is_some_and(|pending| pending.track_id == track_id)
+                    {
+                        state.pending_comment_playback = None;
+                    }
                     if pending_audition {
                         state.audition_auto_advance = false;
                         state.audition_play_token = None;
@@ -1733,11 +1762,25 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 Err(error) if error == "cancelled" => {
                     state.reference_waveform = None;
                     state.reference_waveform_track_id = None;
+                    if state
+                        .pending_comment_playback
+                        .as_ref()
+                        .is_some_and(|pending| pending.track_id == track_id)
+                    {
+                        state.pending_comment_playback = None;
+                    }
                 }
                 Err(error) => {
                     state.reference_waveform = None;
                     state.reference_waveform_track_id = None;
                     state.status = format!("Reference waveform unavailable: {error}");
+                    if state
+                        .pending_comment_playback
+                        .as_ref()
+                        .is_some_and(|pending| pending.track_id == track_id)
+                    {
+                        state.pending_comment_playback = None;
+                    }
                 }
             }
             context.request_repaint();
@@ -1799,6 +1842,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 maybe_start_pending_audition(state, context);
             }
             enforce_loop(state, was_main_playing, was_reference_playing);
+            maybe_start_pending_comment_playback(state, context);
             context.request_repaint();
         }
         Message::LibrarySaved(result) => {
@@ -1819,6 +1863,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
         }
         Message::SelectTrack(id) => {
             if !state.busy && state.library.tracks.iter().any(|track| track.id == id) {
+                state.pending_comment_playback = None;
                 if state.workspace_mode == WorkspaceMode::Audition {
                     state.audition_heard.retain(|heard_id| heard_id != &id);
                 }
@@ -2557,6 +2602,11 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 context.request_repaint();
             }
         }
+        Message::PlayComment {
+            track_id,
+            source,
+            note_id,
+        } => play_comment(state, context, track_id, source, note_id),
         Message::CommentHoverStarted(id) => {
             if state.busy {
                 return;
@@ -3522,6 +3572,7 @@ fn stop_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Message
     state.audition_auto_advance = false;
     state.audition_play_token = None;
     state.audition_pending_play_track_id = None;
+    state.pending_comment_playback = None;
     let main_active = state.transport_playing
         || state.transport_polling
         || state.transport_waiting_token.is_some();
@@ -4963,6 +5014,168 @@ fn seek_review_position(
         state.status = format!("Scrubbing at {}.", format_timestamp(time_millis));
     }
     context.request_repaint();
+}
+
+fn comment_time_for_track(
+    state: &AppState,
+    track_id: &str,
+    source: CommentSource,
+    note_id: &str,
+) -> Option<u64> {
+    let track = state
+        .library
+        .tracks
+        .iter()
+        .find(|track| track.id == track_id)?;
+    match source {
+        CommentSource::Main => track
+            .notes
+            .iter()
+            .find(|note| note.id == note_id)
+            .map(|note| note.time_millis),
+        CommentSource::Reference => reference_notes_for_track(&state.library, track)
+            .iter()
+            .find(|note| note.id == note_id)
+            .map(|note| note.time_millis),
+    }
+}
+
+fn play_comment(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    track_id: String,
+    source: CommentSource,
+    note_id: String,
+) {
+    if state.busy {
+        return;
+    }
+    if comment_time_for_track(state, &track_id, source, &note_id).is_none() {
+        state.status = String::from("That comment no longer exists.");
+        context.request_repaint();
+        return;
+    }
+
+    let pending = PendingCommentPlayback {
+        track_id: track_id.clone(),
+        source,
+        note_id,
+    };
+    if state.library.selected_track_id.as_deref() != Some(track_id.as_str()) {
+        let title = state
+            .library
+            .tracks
+            .iter()
+            .find(|track| track.id == track_id)
+            .map_or_else(|| String::from("track"), |track| track.title.clone());
+        select_track_internal(state, context, track_id, false);
+        state.pending_comment_playback = Some(pending);
+        state.status = format!("Loading comment on {title}…");
+        context.request_repaint();
+        return;
+    }
+
+    state.pending_comment_playback = Some(pending);
+    maybe_start_pending_comment_playback(state, context);
+}
+
+fn maybe_start_pending_comment_playback(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+) {
+    let Some(pending) = state.pending_comment_playback.clone() else {
+        return;
+    };
+    if state.busy || state.library.selected_track_id.as_deref() != Some(pending.track_id.as_str()) {
+        return;
+    }
+    let Some(time_millis) =
+        comment_time_for_track(state, &pending.track_id, pending.source, &pending.note_id)
+    else {
+        state.pending_comment_playback = None;
+        state.status = String::from("That comment no longer exists.");
+        context.request_repaint();
+        return;
+    };
+    if state.waveform_busy
+        || state.waveform_track_id.as_deref() != Some(pending.track_id.as_str())
+        || state.waveform.is_none()
+    {
+        return;
+    }
+    let has_reference = selected_track(state)
+        .and_then(|track| track.reference_path.as_ref())
+        .is_some();
+    if has_reference
+        && (state.reference_waveform_busy
+            || state.reference_waveform_track_id.as_deref() != Some(pending.track_id.as_str())
+            || state.reference_waveform.is_none())
+    {
+        return;
+    }
+    if state.transport_polling
+        || state.transport_waiting_token.is_some()
+        || state.transport.has_pending_load()
+        || state.reference_transport_polling
+        || state.reference_transport_waiting_token.is_some()
+        || state
+            .reference_transport
+            .as_ref()
+            .is_some_and(transport::AudioTransport::has_pending_load)
+    {
+        return;
+    }
+
+    match pending.source {
+        CommentSource::Main => {
+            state.comment_source = CommentSource::Main;
+            state.comment_source_explicit = true;
+            state.selected_note_id = Some(pending.note_id);
+            state.draft_note = None;
+            state.review_cursor_millis = time_millis;
+            state.transport_position_millis = time_millis;
+            set_audition_source(state, AuditionSource::Main);
+        }
+        CommentSource::Reference => {
+            state.comment_source = CommentSource::Reference;
+            state.comment_source_explicit = true;
+            state.selected_reference_note_id = Some(pending.note_id);
+            state.reference_draft_note = None;
+            state.reference_transport_position_millis = time_millis;
+            set_audition_source(state, AuditionSource::Reference);
+        }
+    }
+
+    let main_position_millis = state.transport_position_millis;
+    let reference_position_millis = state.reference_transport_position_millis;
+    match seek_synchronized_positions(state, main_position_millis, reference_position_millis, true)
+    {
+        Ok(()) => {
+            state.pending_comment_playback = None;
+            let source_label = match pending.source {
+                CommentSource::Main => "comment",
+                CommentSource::Reference => "reference comment",
+            };
+            state.status = format!(
+                "Playing {source_label} from {}.",
+                format_timestamp(time_millis)
+            );
+        }
+        Err(error) if comment_playback_should_wait(&error) => {
+            state.status = String::from("Preparing comment playback…");
+        }
+        Err(error) => {
+            state.pending_comment_playback = None;
+            state.status = error;
+        }
+    }
+    context.request_repaint();
+}
+
+fn comment_playback_should_wait(error: &str) -> bool {
+    error == transport::CONTROLS_BUSY_ERROR
+        || error == "Audio analysis is still building."
+        || error == "Audio analysis is still pending."
 }
 
 fn close_stage_menu(state: &mut AppState) {
@@ -8012,6 +8225,11 @@ fn comments_panel(state: &AppState, track: &storage::Track) -> ui::View<Message>
     let tabs = ui::row([
         ui::button("MAIN")
             .selected(source == CommentSource::Main)
+            .style(if source == CommentSource::Main {
+                ui::WidgetStyle::normal(ui::WidgetTone::Accent)
+            } else {
+                ui::WidgetStyle::default()
+            })
             .message(Message::SelectCommentSource(CommentSource::Main))
             .key("comments-tab-main")
             .width(76.0)
@@ -8019,6 +8237,11 @@ fn comments_panel(state: &AppState, track: &storage::Track) -> ui::View<Message>
         if reference_available {
             ui::button("REFERENCE")
                 .selected(source == CommentSource::Reference)
+                .style(if source == CommentSource::Reference {
+                    ui::WidgetStyle::normal(ui::WidgetTone::Accent)
+                } else {
+                    ui::WidgetStyle::default()
+                })
                 .message(Message::SelectCommentSource(CommentSource::Reference))
                 .key("comments-tab-reference")
                 .width(112.0)
@@ -8036,10 +8259,6 @@ fn comments_panel(state: &AppState, track: &storage::Track) -> ui::View<Message>
                 .width(104.0)
                 .height(28.0),
             tabs,
-            ui::text("Click to seek · double-click to edit")
-                .height(28.0)
-                .width(224.0)
-                .subtle(),
             ui::spacer().fill_width(),
             ui::text(format!("{} total · {} open", notes.len(), open_count))
                 .height(28.0)
@@ -8073,11 +8292,13 @@ fn comments_panel(state: &AppState, track: &storage::Track) -> ui::View<Message>
                 .clone()
                 .filter(|draft| draft.note_id.is_some()),
         };
+        let track_id = track.id.clone();
         let list = ui::list(notes.into_iter().enumerate(), move |(index, note)| {
             if source_for_rows == CommentSource::Main {
                 note_row(
                     index,
                     note,
+                    track_id.clone(),
                     selected_note_id.as_deref(),
                     hovered_note_id.as_deref(),
                     editing_note.as_ref(),
@@ -8086,6 +8307,7 @@ fn comments_panel(state: &AppState, track: &storage::Track) -> ui::View<Message>
                 reference_note_row(
                     index,
                     note,
+                    track_id.clone(),
                     selected_note_id.as_deref(),
                     hovered_note_id.as_deref(),
                     editing_note.as_ref(),
@@ -8230,6 +8452,7 @@ fn comment_row_palette(selected: bool, domain_hovered: bool) -> ui::DenseRowPale
 fn note_row(
     index: usize,
     note: storage::Note,
+    track_id: String,
     selected_note_id: Option<&str>,
     hovered_note_id: Option<&str>,
     editing_note: Option<&NoteDraft>,
@@ -8241,6 +8464,18 @@ fn note_row(
     let note_id = note.id.clone();
     let note_body = note.body.clone();
     let note_time_millis = note.time_millis;
+    let play_note_id = note.id.clone();
+    let play_track_id = track_id.clone();
+    let play_control = ui::icon_button(review_transport_icon(&REVIEW_SOURCE_PLAY_ICON, false))
+        .subtle()
+        .message(Message::PlayComment {
+            track_id: play_track_id,
+            source: CommentSource::Main,
+            note_id: play_note_id,
+        })
+        .key(format!("comment-play-{}", note.id))
+        .tooltip("Play from comment")
+        .size(28.0, 24.0);
     let body = if editing {
         let draft = editing_note.expect("an editing row should have a matching draft");
         ui::text_input(draft.body.clone())
@@ -8281,12 +8516,17 @@ fn note_row(
         .spacing(4.0)
         .height(28.0)
     } else {
-        ui::close_button()
-            .subtle()
-            .message(Message::DeleteNote(note_id.clone()))
-            .key(format!("comment-remove-{note_id}"))
-            .tooltip("Remove comment")
-            .size(28.0, 24.0)
+        ui::row([
+            play_control,
+            ui::close_button()
+                .subtle()
+                .message(Message::DeleteNote(note_id.clone()))
+                .key(format!("comment-remove-{note_id}"))
+                .tooltip("Remove comment")
+                .size(28.0, 24.0),
+        ])
+        .spacing(4.0)
+        .height(28.0)
     };
     let row = ui::list_row(
         index,
@@ -8350,6 +8590,7 @@ fn note_row(
 fn reference_note_row(
     index: usize,
     note: storage::Note,
+    track_id: String,
     selected_note_id: Option<&str>,
     hovered_note_id: Option<&str>,
     editing_note: Option<&NoteDraft>,
@@ -8361,6 +8602,17 @@ fn reference_note_row(
     let note_id = note.id.clone();
     let note_body = note.body.clone();
     let note_time_millis = note.time_millis;
+    let play_note_id = note.id.clone();
+    let play_control = ui::icon_button(review_transport_icon(&REVIEW_SOURCE_PLAY_ICON, false))
+        .subtle()
+        .message(Message::PlayComment {
+            track_id,
+            source: CommentSource::Reference,
+            note_id: play_note_id,
+        })
+        .key(format!("reference-comment-play-{}", note.id))
+        .tooltip("Play from reference comment")
+        .size(28.0, 24.0);
     let body = if editing {
         let draft = editing_note.expect("an editing reference row should have a matching draft");
         ui::text_input(draft.body.clone())
@@ -8401,12 +8653,17 @@ fn reference_note_row(
         .spacing(4.0)
         .height(28.0)
     } else {
-        ui::close_button()
-            .subtle()
-            .message(Message::DeleteReferenceNote(note_id.clone()))
-            .key(format!("reference-comment-remove-{note_id}"))
-            .tooltip("Remove comment")
-            .size(28.0, 24.0)
+        ui::row([
+            play_control,
+            ui::close_button()
+                .subtle()
+                .message(Message::DeleteReferenceNote(note_id.clone()))
+                .key(format!("reference-comment-remove-{note_id}"))
+                .tooltip("Remove comment")
+                .size(28.0, 24.0),
+        ])
+        .spacing(4.0)
+        .height(28.0)
     };
     let row = ui::list_row(
         index,
@@ -12692,17 +12949,41 @@ mod tests {
         let frame = project_surface(&state)
             .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1000.0));
         let labels = frame.paint_plan.text_label_strings();
+        let theme = ThemeTokens::default();
 
         assert!(labels.iter().any(|label| label == "COMMENTS"));
         assert!(labels.iter().any(|label| label == "first comment"));
         assert!(labels.iter().any(|label| label == "second comment"));
+        assert!(
+            !labels
+                .iter()
+                .any(|label| label == "Click to seek · double-click to edit"),
+            "the comments header should not render the old helper copy"
+        );
+        let main_tab = frame
+            .paint_plan
+            .first_text_run("MAIN")
+            .expect("the main comment tab should be painted");
+        assert!(
+            frame
+                .paint_plan
+                .fill_polygons_for_widget(main_tab.widget_id)
+                .any(|fill| fill.color == theme.accent_mint),
+            "the active main comment tab should use the accent fill"
+        );
+        assert!(
+            paint_plan_contains_icon(
+                &frame.paint_plan.primitives,
+                &super::review_transport_icon(&super::REVIEW_SOURCE_PLAY_ICON, false)
+            ),
+            "main comment rows should expose an icon-only play control"
+        );
         for obsolete_action in ["Open", "Done", "Edit", "Delete"] {
             assert!(
                 !labels.iter().any(|label| label == obsolete_action),
                 "comment rows should not render the {obsolete_action} action"
             );
         }
-        let theme = ThemeTokens::default();
         let selected_row_id = ui::stable_widget_id(0xCAD3_0002, "open-note");
         let unselected_row_id = ui::stable_widget_id(0xCAD3_0002, "done-note");
         let selected_accent_color = theme.accent_mint.with_alpha(150);
@@ -12810,6 +13091,24 @@ mod tests {
         let frame = project_surface(&state)
             .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1000.0));
         let theme = ThemeTokens::default();
+        let reference_tab = frame
+            .paint_plan
+            .first_text_run("REFERENCE")
+            .expect("the reference comment tab should be painted");
+        assert!(
+            frame
+                .paint_plan
+                .fill_polygons_for_widget(reference_tab.widget_id)
+                .any(|fill| fill.color == theme.accent_mint),
+            "the active reference comment tab should use the accent fill"
+        );
+        assert!(
+            paint_plan_contains_icon(
+                &frame.paint_plan.primitives,
+                &super::review_transport_icon(&super::REVIEW_SOURCE_PLAY_ICON, false)
+            ),
+            "reference comment rows should expose an icon-only play control"
+        );
         let selected_row_id = ui::stable_widget_id(0xCAD3_0003, "selected-reference-note");
         let selected_accent_color = theme.accent_mint.with_alpha(150);
         let selected_accent_rect = frame
@@ -13425,6 +13724,71 @@ mod tests {
     }
 
     #[test]
+    fn comment_row_play_control_starts_playback_from_the_comment_timestamp() {
+        let track_id = String::from("comment-row-play-track");
+        let note_id = String::from("comment-row-play-note");
+        let mut state = AppState {
+            busy: false,
+            waveform: Some(audition_waveform()),
+            waveform_track_id: Some(track_id.clone()),
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(track_id.clone());
+        state.library.tracks.push(Track {
+            id: track_id,
+            title: String::from("Comment row play track"),
+            original_name: String::from("comment-row-play-track.wav"),
+            path: PathBuf::from("/external/comment-row-play-track.wav"),
+            reference_path: None,
+            size: 0,
+            favorite: false,
+            stage: TrackStage::SoundDesign,
+            status: TrackStatus::Inbox,
+            notes: vec![Note {
+                id: note_id,
+                time_millis: 1_250,
+                body: String::from("play from this row"),
+                done: false,
+            }],
+        });
+
+        let bridge = DeclarativeOwnedRuntimeBridge::new(
+            state,
+            |state| project_surface(state).into_surface(),
+            |state, message| {
+                let mut context = ui::UiUpdateContext::default();
+                update(state, message, &mut context);
+            },
+        );
+        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1_180.0, 1_000.0));
+        let frame = runtime.frame_with_default_theme();
+        let note_rect = frame
+            .paint_plan
+            .first_text_rect("play from this row")
+            .expect("the comment row should paint its body");
+        let play_rect = svg_rect_for_icon_after(
+            &frame.paint_plan.primitives,
+            &super::review_transport_icon(&super::REVIEW_SOURCE_PLAY_ICON, false),
+            note_rect.min.y,
+        )
+        .expect("the comment row should paint its play control");
+        let play_point = Point::new(
+            play_rect.min.x + play_rect.width() * 0.5,
+            play_rect.min.y + play_rect.height() * 0.5,
+        );
+
+        assert!(runtime.widget_at(play_point).is_some());
+        runtime.dispatch_primary_click(play_point);
+
+        assert_eq!(
+            runtime.bridge().state().selected_note_id.as_deref(),
+            Some("comment-row-play-note")
+        );
+        assert_eq!(runtime.bridge().state().transport_position_millis, 1_250);
+        assert!(runtime.bridge().state().transport_polling);
+    }
+
+    #[test]
     fn comment_row_selection_tracks_the_linked_note_for_waveform_highlight() {
         let track_id = String::from("selected-track");
         let mut state = AppState {
@@ -13563,6 +13927,181 @@ mod tests {
 
         assert_eq!(state.reference_transport_position_millis, 2_500);
         assert!(state.reference_transport_polling);
+    }
+
+    #[test]
+    fn playing_a_main_comment_selects_the_track_and_starts_from_its_timestamp() {
+        let track_id = String::from("play-main-comment-track");
+        let note_id = String::from("play-main-comment");
+        let mut state = AppState {
+            busy: false,
+            waveform: Some(audition_waveform()),
+            waveform_track_id: Some(track_id.clone()),
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(track_id.clone());
+        state.library.tracks.push(Track {
+            id: track_id.clone(),
+            title: String::from("Play main comment track"),
+            original_name: String::from("play-main-comment.wav"),
+            path: PathBuf::from("/external/play-main-comment.wav"),
+            reference_path: None,
+            size: 0,
+            favorite: false,
+            stage: TrackStage::SoundDesign,
+            status: TrackStatus::Inbox,
+            notes: vec![Note {
+                id: note_id.clone(),
+                time_millis: 750,
+                body: String::from("play this"),
+                done: false,
+            }],
+        });
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::PlayComment {
+                track_id,
+                source: super::CommentSource::Main,
+                note_id,
+            },
+            &mut context,
+        );
+
+        assert_eq!(state.comment_source, super::CommentSource::Main);
+        assert_eq!(state.selected_note_id.as_deref(), Some("play-main-comment"));
+        assert_eq!(state.review_cursor_millis, 750);
+        assert_eq!(state.transport_position_millis, 750);
+        assert!(state.transport_polling);
+        assert!(state.pending_comment_playback.is_none());
+    }
+
+    #[test]
+    fn playing_a_comment_on_another_track_selects_it_and_defers_until_analysis_is_ready() {
+        let current_id = String::from("current-comment-track");
+        let target_id = String::from("target-comment-track");
+        let note_id = String::from("target-comment");
+        let mut target = audition_track(&target_id);
+        target.reference_path = None;
+        target.notes = vec![Note {
+            id: note_id.clone(),
+            time_millis: 600,
+            body: String::from("target comment"),
+            done: false,
+        }];
+        let mut state = AppState {
+            busy: false,
+            waveform: Some(audition_waveform()),
+            waveform_track_id: Some(current_id.clone()),
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(current_id.clone());
+        state.library.tracks = vec![audition_track(&current_id), target];
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::PlayComment {
+                track_id: target_id.clone(),
+                source: super::CommentSource::Main,
+                note_id: note_id.clone(),
+            },
+            &mut context,
+        );
+
+        assert_eq!(
+            state.library.selected_track_id.as_deref(),
+            Some(target_id.as_str())
+        );
+        assert!(state.waveform.is_none());
+        assert_eq!(
+            state.pending_comment_playback,
+            Some(super::PendingCommentPlayback {
+                track_id: target_id.clone(),
+                source: super::CommentSource::Main,
+                note_id,
+            })
+        );
+        assert!(state.status.contains("Loading comment"));
+
+        let waveform_generation = state.waveform_generation;
+        update(
+            &mut state,
+            Message::DecodeCompleted {
+                track_id: target_id.clone(),
+                generation: waveform_generation,
+                result: Ok(audition_waveform()),
+            },
+            &mut context,
+        );
+
+        assert_eq!(state.waveform_track_id.as_deref(), Some(target_id.as_str()));
+        assert!(!state.waveform_busy);
+        let load_token = state
+            .transport_waiting_token
+            .expect("target transport loading should be pending");
+        state.transport.set_snapshot_for_test(Snapshot {
+            generation: state.transport_generation,
+            acknowledged_token: load_token,
+            position_millis: 0,
+            playing: false,
+            ready: true,
+        });
+
+        update(&mut state, Message::Frame, &mut context);
+
+        assert!(state.pending_comment_playback.is_none());
+        assert_eq!(state.transport_position_millis, 600);
+        assert!(state.transport_polling);
+        assert!(state.transport_waiting_token.is_some());
+    }
+
+    #[test]
+    fn playing_a_reference_comment_selects_reference_and_restarts_active_transport() {
+        let mut state = shared_reference_playback_state();
+        let track_id = state
+            .library
+            .selected_track_id
+            .clone()
+            .expect("paired playback state should select a track");
+        let reference_path = state.library.tracks[0]
+            .reference_path
+            .clone()
+            .expect("paired playback state should have a reference path");
+        state.library.reference_tracks.push(ReferenceTrack {
+            path: reference_path,
+            notes: vec![Note {
+                id: String::from("play-reference-comment"),
+                time_millis: 2_500,
+                body: String::from("play the reference"),
+                done: false,
+            }],
+        });
+        state.transport_playing = true;
+        state.reference_transport_playing = true;
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::PlayComment {
+                track_id,
+                source: super::CommentSource::Reference,
+                note_id: String::from("play-reference-comment"),
+            },
+            &mut context,
+        );
+
+        assert_eq!(state.comment_source, super::CommentSource::Reference);
+        assert_eq!(
+            state.selected_reference_note_id.as_deref(),
+            Some("play-reference-comment")
+        );
+        assert_eq!(state.reference_transport_position_millis, 2_500);
+        assert!(state.transport_polling);
+        assert!(state.reference_transport_polling);
+        assert!(state.pending_comment_playback.is_none());
+        assert_ne!(state.status, "Pausing playback…");
     }
 
     #[test]
