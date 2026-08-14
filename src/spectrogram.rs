@@ -14,13 +14,14 @@ use radiant::{
     prelude as ui,
     runtime::{
         GpuShaderSurfaceDescriptor, GpuShaderSurfaceDescriptorParts, GpuSurfaceCapabilities,
-        GpuSurfaceContent, PaintFillRect, PaintGpuSurface, PaintPrimitive, PaintStrokePolyline,
-        PaintStrokeRect, PaintTextAlign, PaintTextMetrics, push_text_run_with_metrics,
+        GpuSurfaceContent, PaintFillPolygon, PaintFillRect, PaintFillRectBatch, PaintGpuSurface,
+        PaintPrimitive, PaintRectList, PaintStrokePolyline, PaintStrokeRect, PaintTextAlign,
+        PaintTextMetrics, push_text_run_with_metrics,
     },
     theme::ThemeTokens,
     widgets::{FocusBehavior, PaintBounds, Widget, WidgetCommon, WidgetInput, WidgetOutput},
 };
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 pub const HEIGHT: f32 = 78.0;
 pub const MIN_HEIGHT: f32 = 72.0;
@@ -55,7 +56,10 @@ const GRID_LINE_ALPHA: u8 = 82;
 const GRID_LABEL_ALPHA: u8 = 200;
 const GRID_LABEL_FONT_SIZE: f32 = 9.0;
 const WATERFALL_SURFACE_KEY: u64 = 0x4341_4445_4e43_4553;
+pub const LIVE_SPECTROGRAM_OVERLAY_WIDGET_ID: u64 = 0xCAD3_2201;
 const WATERFALL_SHADER_KEY: &str = "cadence/live-spectrogram-waterfall";
+const OVERLAY_HISTORY_ROWS: usize = 96;
+const OVERLAY_COLOR_LEVELS: usize = 24;
 
 const WATERFALL_SHADER_WGSL: &str = r#"
 struct SurfaceParams {
@@ -194,11 +198,14 @@ fn waterfall_uniform_bytes(frame: &LiveSpectrogramFrame) -> [u8; 16] {
 }
 
 fn waterfall_shader_descriptor(frame: &LiveSpectrogramFrame) -> Arc<GpuShaderSurfaceDescriptor> {
+    static SHADER_SOURCE: OnceLock<Arc<str>> = OnceLock::new();
     let uniform_bytes = waterfall_uniform_bytes(frame);
     Arc::new(GpuShaderSurfaceDescriptor::from_parts(
         GpuShaderSurfaceDescriptorParts {
             shader_key: String::from(WATERFALL_SHADER_KEY),
-            wgsl_source: Some(Arc::<str>::from(WATERFALL_SHADER_WGSL)),
+            wgsl_source: Some(Arc::clone(
+                SHADER_SOURCE.get_or_init(|| Arc::<str>::from(WATERFALL_SHADER_WGSL)),
+            )),
             entry_point: String::from("vertex_main"),
             fragment_entry_point: Some(String::from("fragment_main")),
             uniform_bytes: Arc::<[u8]>::from(uniform_bytes.as_slice()),
@@ -216,8 +223,17 @@ struct SpectrogramWidget {
 }
 
 impl SpectrogramWidget {
+    #[cfg(test)]
     fn new(frame: Arc<LiveSpectrogramFrame>, mode: crate::LiveSpectrogramMode) -> Self {
-        let mut common = WidgetCommon::fixed(0, 1.0, 1.0).without_default_chrome();
+        Self::new_with_id(0, frame, mode)
+    }
+
+    fn new_with_id(
+        id: u64,
+        frame: Arc<LiveSpectrogramFrame>,
+        mode: crate::LiveSpectrogramMode,
+    ) -> Self {
+        let mut common = WidgetCommon::fixed(id, 1.0, 1.0).without_default_chrome();
         common.focus = FocusBehavior::None;
         common.paint.bounds = PaintBounds::ClipToRect;
         common.paint.paints_focus = false;
@@ -372,6 +388,230 @@ impl SpectrogramWidget {
             }));
         }
     }
+
+    fn overlay_color(level: usize) -> Rgba8 {
+        let level = level.min(OVERLAY_COLOR_LEVELS - 1);
+        let normalized = level as f32 / (OVERLAY_COLOR_LEVELS - 1) as f32;
+        let scaled = normalized * (PALETTE.len() - 1) as f32;
+        let lower = scaled.floor() as usize;
+        let upper = (lower + 1).min(PALETTE.len() - 1);
+        PALETTE[lower].blend_toward(PALETTE[upper], scaled - lower as f32)
+    }
+
+    fn overlay_grid(&self, primitives: &mut Vec<PaintPrimitive>, plot: Rect, theme: &ThemeTokens) {
+        let grid_color = theme.border.with_alpha(GRID_LINE_ALPHA);
+        let label_color = theme.text_muted.with_alpha(GRID_LABEL_ALPHA);
+
+        for &(decibels, label) in &DECIBEL_GRID {
+            let y = Self::y_for_decibels(plot, decibels);
+            let line_bottom = (y + 1.0).min(plot.max.y);
+            if line_bottom > y {
+                primitives.push(PaintPrimitive::StrokeRect(PaintStrokeRect {
+                    widget_id: self.common.id,
+                    rect: Rect::from_min_max(
+                        Point::new(plot.min.x, y),
+                        Point::new(plot.max.x, line_bottom),
+                    ),
+                    color: grid_color,
+                    width: 1.0,
+                }));
+            }
+            let label_rect = Rect::from_min_max(
+                Point::new(plot.min.x + 4.0, (y - 8.0).max(plot.min.y)),
+                Point::new(plot.min.x + 42.0, (y + 8.0).min(plot.max.y)),
+            );
+            if label_rect.has_finite_positive_area() {
+                push_text_run_with_metrics(
+                    primitives,
+                    self.common.id,
+                    label,
+                    label_rect,
+                    label_color,
+                    PaintTextAlign::Left,
+                    PaintTextMetrics::new(GRID_LABEL_FONT_SIZE, Some(10.0)),
+                );
+            }
+        }
+
+        let mut previous_x: Option<f32> = None;
+        for (frequency, label) in self.frequency_grid() {
+            let x = self.x_for_frequency(plot, frequency);
+            if previous_x.is_some_and(|previous| (x - previous).abs() < 2.0) {
+                continue;
+            }
+            previous_x = Some(x);
+            let line_right = (x + 1.0).min(plot.max.x);
+            if line_right > x {
+                primitives.push(PaintPrimitive::StrokeRect(PaintStrokeRect {
+                    widget_id: self.common.id,
+                    rect: Rect::from_min_max(
+                        Point::new(x, plot.min.y),
+                        Point::new(line_right, plot.max.y),
+                    ),
+                    color: grid_color,
+                    width: 1.0,
+                }));
+            }
+            let label_rect = Rect::from_min_max(
+                Point::new(
+                    (x - 24.0).max(plot.min.x),
+                    (plot.max.y - 16.0).max(plot.min.y),
+                ),
+                Point::new((x + 24.0).min(plot.max.x), plot.max.y),
+            );
+            if label_rect.has_finite_positive_area() {
+                push_text_run_with_metrics(
+                    primitives,
+                    self.common.id,
+                    &label,
+                    label_rect,
+                    label_color,
+                    PaintTextAlign::Center,
+                    PaintTextMetrics::new(GRID_LABEL_FONT_SIZE, Some(10.0)),
+                );
+            }
+        }
+    }
+
+    fn append_overlay_waterfall(&self, primitives: &mut Vec<PaintPrimitive>, plot: Rect) {
+        let active_rows = self.frame.row_count.min(OVERLAY_HISTORY_ROWS);
+        if active_rows == 0 {
+            return;
+        }
+
+        let row_height = plot.height() / OVERLAY_HISTORY_ROWS as f32;
+        let active_top = plot.max.y - row_height * active_rows as f32;
+        let source_start = self.frame.row_count - active_rows;
+        let mut rects_by_level: Vec<Vec<Rect>> =
+            (0..OVERLAY_COLOR_LEVELS).map(|_| Vec::new()).collect();
+
+        for target_row in 0..active_rows {
+            let source_row = source_start + target_row;
+            let y0 = active_top + target_row as f32 * row_height;
+            let y1 = active_top + (target_row + 1) as f32 * row_height;
+            let row_offset = source_row * LIVE_SPECTROGRAM_BAND_COUNT;
+
+            let mut run_level = None;
+            let mut run_start = 0usize;
+            for band in 0..=LIVE_SPECTROGRAM_BAND_COUNT {
+                let level = (band < LIVE_SPECTROGRAM_BAND_COUNT).then(|| {
+                    usize::from(self.frame.values[row_offset + band]) * (OVERLAY_COLOR_LEVELS - 1)
+                        / usize::from(u8::MAX)
+                });
+                if level == run_level {
+                    continue;
+                }
+                if let Some(run_level) = run_level {
+                    let x0 = plot.min.x
+                        + plot.width() * run_start as f32 / LIVE_SPECTROGRAM_BAND_COUNT as f32;
+                    let x1 = plot.min.x
+                        + plot.width() * band as f32 / LIVE_SPECTROGRAM_BAND_COUNT as f32;
+                    if x1 > x0 && y1 > y0 {
+                        rects_by_level[run_level]
+                            .push(Rect::from_min_max(Point::new(x0, y0), Point::new(x1, y1)));
+                    }
+                }
+                run_level = level;
+                run_start = band;
+            }
+        }
+
+        for (level, rects) in rects_by_level.into_iter().enumerate() {
+            if rects.is_empty() {
+                continue;
+            }
+            primitives.push(PaintPrimitive::FillRectBatch(PaintFillRectBatch {
+                widget_id: self.common.id,
+                rects: PaintRectList::from(Arc::from(rects.into_boxed_slice())),
+                color: Self::overlay_color(level),
+            }));
+        }
+    }
+
+    fn append_overlay_spectrum(
+        &self,
+        primitives: &mut Vec<PaintPrimitive>,
+        plot: Rect,
+        theme: &ThemeTokens,
+    ) {
+        let points = (0..LIVE_SPECTROGRAM_BAND_COUNT)
+            .map(|band| {
+                let level = self.frame.spectrum_value(band) as f32 / u8::MAX as f32;
+                let x = plot.min.x
+                    + plot.width() * band as f32 / (LIVE_SPECTROGRAM_BAND_COUNT - 1) as f32;
+                let y = plot.max.y - plot.height() * level;
+                Point::new(x, y)
+            })
+            .collect::<Vec<_>>();
+        for pair in points.windows(2) {
+            let [start, end] = pair else {
+                continue;
+            };
+            let delta = Point::new(end.x - start.x, end.y - start.y);
+            let length = (delta.x * delta.x + delta.y * delta.y).sqrt();
+            if !length.is_finite() || length <= f32::EPSILON {
+                continue;
+            }
+            let half_width = 0.75;
+            let normal = Point::new(
+                -delta.y / length * half_width,
+                delta.x / length * half_width,
+            );
+            primitives.push(PaintPrimitive::FillPolygon(PaintFillPolygon {
+                widget_id: self.common.id,
+                points: Arc::from([
+                    Point::new(start.x + normal.x, start.y + normal.y),
+                    Point::new(end.x + normal.x, end.y + normal.y),
+                    Point::new(end.x - normal.x, end.y - normal.y),
+                    Point::new(start.x - normal.x, start.y - normal.y),
+                ]),
+                color: theme.highlight_orange,
+            }));
+        }
+    }
+
+    fn append_overlay_paint(
+        &self,
+        primitives: &mut Vec<PaintPrimitive>,
+        bounds: Rect,
+        theme: &ThemeTokens,
+    ) {
+        if !bounds.has_finite_positive_area() {
+            return;
+        }
+        let plot = Self::plot_rect(bounds);
+        primitives.push(PaintPrimitive::FillRect(PaintFillRect {
+            widget_id: self.common.id,
+            rect: bounds,
+            color: theme.bg_primary.blend_toward(theme.surface_overlay, 0.35),
+        }));
+        if !plot.has_finite_positive_area() {
+            return;
+        }
+        primitives.push(PaintPrimitive::FillRect(PaintFillRect {
+            widget_id: self.common.id,
+            rect: plot,
+            color: match self.mode {
+                crate::LiveSpectrogramMode::Waterfall => PALETTE[0],
+                crate::LiveSpectrogramMode::Spectrum => SPECTRUM_PLOT_BACKGROUND,
+            },
+        }));
+        match self.mode {
+            crate::LiveSpectrogramMode::Waterfall => {
+                self.append_overlay_waterfall(primitives, plot)
+            }
+            crate::LiveSpectrogramMode::Spectrum => {
+                self.append_overlay_spectrum(primitives, plot, theme)
+            }
+        }
+        self.overlay_grid(primitives, plot, theme);
+        primitives.push(PaintPrimitive::StrokeRect(PaintStrokeRect {
+            widget_id: self.common.id,
+            rect: plot,
+            color: theme.border_emphasis,
+            width: 1.0,
+        }));
+    }
 }
 
 fn format_frequency_label(frequency: f32) -> String {
@@ -467,9 +707,26 @@ pub fn view<Message: 'static>(
     height: f32,
 ) -> ui::View<Message> {
     let height = clamp_height(height);
-    ui::custom_widget(SpectrogramWidget::new(frame, mode), |_| None)
-        .height(height)
-        .fill_width()
+    ui::custom_widget(
+        SpectrogramWidget::new_with_id(LIVE_SPECTROGRAM_OVERLAY_WIDGET_ID, frame, mode),
+        |_| None,
+    )
+    .height(height)
+    .fill_width()
+}
+
+/// Paint the current live frame over the retained review surface using only
+/// primitives that the native transient compositor can replay after the base
+/// scene's GPU surfaces.
+pub fn paint_overlay(
+    frame: Arc<LiveSpectrogramFrame>,
+    mode: crate::LiveSpectrogramMode,
+    bounds: Rect,
+    primitives: &mut Vec<PaintPrimitive>,
+    theme: &ThemeTokens,
+) {
+    let widget = SpectrogramWidget::new_with_id(LIVE_SPECTROGRAM_OVERLAY_WIDGET_ID, frame, mode);
+    widget.append_overlay_paint(primitives, bounds, theme);
 }
 
 #[cfg(test)]
@@ -615,6 +872,47 @@ mod tests {
                 .any(|primitive| matches!(primitive, PaintPrimitive::FillRectBatch(_)))
         );
         assert!(primitives.len() <= 32);
+    }
+
+    #[test]
+    fn overlay_paint_uses_replayable_batches_for_full_history() {
+        let row_count = LIVE_SPECTROGRAM_MAX_HISTORY;
+        let mut values = vec![0_u8; row_count * LIVE_SPECTROGRAM_BAND_COUNT];
+        for row in 0..row_count {
+            for band in 0..LIVE_SPECTROGRAM_BAND_COUNT {
+                values[row * LIVE_SPECTROGRAM_BAND_COUNT + band] = ((row + band) % 256) as u8;
+            }
+        }
+        let frame = Arc::new(
+            LiveSpectrogramFrame::from_values(
+                1,
+                1,
+                1,
+                48_000,
+                row_count,
+                Arc::from(values.into_boxed_slice()),
+                Arc::from(vec![0_u8; LIVE_SPECTROGRAM_BAND_COUNT].into_boxed_slice()),
+            )
+            .expect("valid full-history frame"),
+        );
+        let widget = SpectrogramWidget::new(frame, LiveSpectrogramMode::Waterfall);
+        let bounds = Rect::from_min_size(Point::new(0.0, 0.0), Vector2::new(720.0, super::HEIGHT));
+        let mut primitives = Vec::new();
+        widget.append_overlay_paint(&mut primitives, bounds, &ThemeTokens::default());
+
+        assert!(
+            !primitives
+                .iter()
+                .any(|primitive| matches!(primitive, PaintPrimitive::GpuSurface(_)))
+        );
+        let batched_rects = primitives
+            .iter()
+            .filter_map(|primitive| match primitive {
+                PaintPrimitive::FillRectBatch(batch) => Some(batch.rects.len()),
+                _ => None,
+            })
+            .sum::<usize>();
+        assert!(batched_rects > 0);
     }
 
     #[test]

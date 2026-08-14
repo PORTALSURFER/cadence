@@ -41,6 +41,9 @@ const RMS_DISPLAY_BAND_INDEX: usize = 1;
 
 const NOTE_HOVER_OUTLINE_WIDTH: f32 = 3.0;
 
+pub const MAIN_WAVEFORM_WIDGET_ID: u64 = 0xCAD3_2101;
+pub const REFERENCE_WAVEFORM_WIDGET_ID: u64 = 0xCAD3_2102;
+
 #[derive(Clone, Copy)]
 struct BarPaintStyle {
     cursor_ratio: Option<f32>,
@@ -280,7 +283,7 @@ pub fn view_with_source_progress_and_loop<Message: 'static>(
     visible_ratio: Option<f32>,
     map: impl Fn(WaveformInteraction) -> Message + 'static,
 ) -> ui::View<Message> {
-    ui::custom_widget_mapped(
+    let view = ui::custom_widget_mapped(
         WaveformWidget::new_for_source(source, generation, waveform, cursor_ratio, note_ratios)
             .with_draft_ratio(draft_ratio)
             .with_external_hovered_note_ratio(hovered_note_ratio)
@@ -288,7 +291,11 @@ pub fn view_with_source_progress_and_loop<Message: 'static>(
             .with_loop_selection(loop_selection)
             .with_visible_ratio(visible_ratio),
         map,
-    )
+    );
+    match source {
+        WaveformSource::Main => view.id(MAIN_WAVEFORM_WIDGET_ID),
+        WaveformSource::Reference => view.id(REFERENCE_WAVEFORM_WIDGET_ID),
+    }
 }
 
 /// Build a reference waveform for a track's external reference.
@@ -1115,6 +1122,34 @@ impl Widget for WaveformWidget {
             );
         }
     }
+}
+
+/// Paint the moving playhead over the retained waveform surface without
+/// rebuilding the waveform bars and comment markers.
+pub fn paint_playhead_overlay(
+    primitives: &mut Vec<PaintPrimitive>,
+    bounds: Rect,
+    source: WaveformSource,
+    ratio: f32,
+    theme: &ThemeTokens,
+) {
+    if !bounds.has_finite_positive_area() {
+        return;
+    }
+    let colors = WaveformColors::from_theme(theme);
+    let timeline = TimelineSurface::new();
+    let plot_bounds = timeline.plot_bounds(bounds);
+    paint_cursor(
+        primitives,
+        match source {
+            WaveformSource::Main => MAIN_WAVEFORM_WIDGET_ID,
+            WaveformSource::Reference => REFERENCE_WAVEFORM_WIDGET_ID,
+        },
+        plot_bounds,
+        ratio,
+        comment_rail_y(bounds),
+        colors.cursor,
+    );
 }
 
 #[derive(Clone, Copy)]

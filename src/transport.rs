@@ -40,7 +40,11 @@ pub(crate) const LIVE_SPECTRUM_DISPLAY_TILT_DB_PER_OCTAVE: f32 = 4.5;
 pub(crate) const LIVE_SPECTRUM_DISPLAY_TILT_REFERENCE_FREQUENCY: f32 = 1_000.0;
 const LIVE_SPECTRUM_ATTACK_TIME: Duration = Duration::from_millis(60);
 const LIVE_SPECTRUM_RELEASE_TIME: Duration = Duration::from_millis(240);
-const LIVE_PUBLICATION_INTERVAL: Duration = Duration::from_millis(17);
+// The analyzer still consumes every captured frame and emits FFT rows at the
+// configured hop. The UI only needs a stable presentation cadence; keeping
+// publication at 30 Hz prevents a full retained-app rebuild and GPU storage
+// upload from competing with the rest of the review surface.
+const LIVE_PUBLICATION_INTERVAL: Duration = Duration::from_millis(33);
 const LIVE_ANALYZER_POLL_INTERVAL: Duration = Duration::from_millis(2);
 static NEXT_LIVE_GPU_REVISION: AtomicU64 = AtomicU64::new(1);
 
@@ -153,14 +157,10 @@ impl LiveSpectrogramFrame {
 }
 
 fn pack_u8_samples(values: &[u8]) -> Arc<[u8]> {
-    let mut words = vec![0_u32; values.len().div_ceil(4)];
-    for (index, &value) in values.iter().enumerate() {
-        words[index / 4] |= u32::from(value) << ((index % 4) * 8);
-    }
-    let mut packed = Vec::with_capacity(words.len() * std::mem::size_of::<u32>());
-    for word in words {
-        packed.extend_from_slice(&word.to_le_bytes());
-    }
+    // WGSL reads the storage words in little-endian byte order, so the
+    // quantized bytes are already the packed representation the shader needs.
+    let mut packed = vec![0_u8; values.len().div_ceil(4) * 4];
+    packed[..values.len()].copy_from_slice(values);
     Arc::from(packed.into_boxed_slice())
 }
 
@@ -451,7 +451,11 @@ impl SharedSnapshot {
         session: &LiveCaptureSession,
         frame: Arc<LiveSpectrogramFrame>,
     ) -> bool {
-        let Ok(mut latest) = self.live_frame.try_lock() else {
+        // This lock is held only while swapping one Arc and its revision. The
+        // audio callback never takes it; blocking the analyzer briefly gives
+        // the UI a coherent payload/revision pair instead of dropping a
+        // publication during a repaint race.
+        let Ok(mut latest) = self.live_frame.lock() else {
             return false;
         };
         let current = session.active.load(Ordering::Acquire)
@@ -462,13 +466,24 @@ impl SharedSnapshot {
         if !current || !frame.is_valid() {
             return false;
         }
-        self.live_revision.store(frame.revision, Ordering::Release);
+        let revision = frame.revision;
         *latest = Some(frame);
+        self.live_revision.store(revision, Ordering::Release);
         true
     }
 
+    #[cfg(test)]
     fn latest_live_frame(&self) -> Option<Arc<LiveSpectrogramFrame>> {
-        self.live_frame.try_lock().ok()?.as_ref().cloned()
+        self.live_frame.lock().ok()?.as_ref().cloned()
+    }
+
+    fn live_frame_snapshot(&self) -> (LiveFrameState, Option<Arc<LiveSpectrogramFrame>>) {
+        let Ok(latest) = self.live_frame.lock() else {
+            return (self.live_frame_state(), None);
+        };
+        let frame = latest.as_ref().cloned();
+        let state = self.live_frame_state();
+        (state, frame)
     }
 
     fn live_frame_state(&self) -> LiveFrameState {
@@ -488,7 +503,7 @@ impl SharedSnapshot {
         if session.id != self.live_session_id.load(Ordering::Acquire) {
             return;
         }
-        if let Ok(mut frame) = self.live_frame.try_lock() {
+        if let Ok(mut frame) = self.live_frame.lock() {
             *frame = None;
             self.live_revision.store(0, Ordering::Release);
         }
@@ -1275,8 +1290,10 @@ impl AudioTransport {
         self.shared.snapshot()
     }
 
-    pub fn latest_live_frame(&self) -> Option<Arc<LiveSpectrogramFrame>> {
-        self.shared.latest_live_frame()
+    pub(crate) fn live_frame_snapshot(
+        &self,
+    ) -> (LiveFrameState, Option<Arc<LiveSpectrogramFrame>>) {
+        self.shared.live_frame_snapshot()
     }
 
     pub fn live_frame_state(&self) -> LiveFrameState {
@@ -2066,9 +2083,9 @@ mod tests {
         LIVE_SPECTRUM_DISPLAY_MAX_FREQUENCY, LIVE_SPECTRUM_DISPLAY_MIN_FREQUENCY,
         LIVE_SPECTRUM_DISPLAY_TILT_DB_PER_OCTAVE, LIVE_SPECTRUM_DISPLAY_TILT_REFERENCE_FREQUENCY,
         LIVE_SPECTRUM_FFT_SIZE, LIVE_SPECTRUM_HOP_SIZE, LiveAnalysisSource, LiveAnalyzer,
-        LiveCaptureSession, MAX_OUTPUT_GAIN, PendingLoad, SharedSnapshot, clamp_position,
-        display_tilt_db, finish_analyzer_fallback, handle_command, is_current, live_band_ranges,
-        live_display_frequency_bounds, normalize_output_gain, normalize_volume,
+        LiveCaptureSession, LiveSpectrogramFrame, MAX_OUTPUT_GAIN, PendingLoad, SharedSnapshot,
+        clamp_position, display_tilt_db, finish_analyzer_fallback, handle_command, is_current,
+        live_band_ranges, live_display_frequency_bounds, normalize_output_gain, normalize_volume,
         publish_live_frame_if_due, run_live_analyzer_iteration,
     };
     use rodio::{Player, Source, buffer::SamplesBuffer, source::SeekError};
@@ -2296,6 +2313,24 @@ mod tests {
         );
         assert_eq!(frame.spectrum_values.len(), LIVE_SPECTROGRAM_BAND_COUNT);
         assert!(frame.is_valid());
+    }
+
+    #[test]
+    fn packed_history_bytes_preserve_quantized_band_order() {
+        let values = Arc::from(
+            (0..LIVE_SPECTROGRAM_BAND_COUNT)
+                .map(|value| value as u8)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
+        let spectrum = Arc::from(vec![0_u8; LIVE_SPECTROGRAM_BAND_COUNT].into_boxed_slice());
+        let frame = LiveSpectrogramFrame::from_values(1, 1, 1, 48_000, 1, values, spectrum)
+            .expect("valid packed history frame");
+
+        assert_eq!(
+            &frame.packed_values()[..LIVE_SPECTROGRAM_BAND_COUNT],
+            frame.values.as_ref()
+        );
     }
 
     #[test]

@@ -16,7 +16,7 @@ use radiant::{
     runtime::{
         FileDialogRequest, NativeRunOptions, PaintFillPolygon, PaintFillRect, PaintPrimitive,
         PaintStrokePolygon, PaintTextAlign, PaintTextMetrics, PlatformResponse, PlatformResult,
-        push_text_run_with_metrics,
+        SurfaceRevisions, push_text_run_with_metrics,
     },
     theme::ThemeTokens,
     widgets::{
@@ -354,6 +354,8 @@ const TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER: f32 = 72.0;
 const WAVEFORM_HEIGHT: f32 = 124.0;
 const REFERENCE_WAVEFORM_HEIGHT: f32 = WAVEFORM_HEIGHT;
 const LIVE_SPECTROGRAM_RESIZE_HANDLE_ID: u64 = 0xCAD3_2001;
+const LIVE_SPECTROGRAM_BODY_ID: u64 = 0xCAD3_2002;
+const LIVE_PLAYBACK_OVERLAY_KEY: u64 = 0xCAD3_2301;
 const LIVE_SPECTROGRAM_HEADER_HEIGHT: f32 = 22.0;
 const LIVE_SPECTROGRAM_SECTION_SPACING: f32 = 4.0;
 const MAIN_WAVEFORM_HEADER_HEIGHT: f32 = 22.0;
@@ -391,6 +393,7 @@ const PLANNER_DRAG_PREVIEW_CARD_HEIGHT: f32 = 154.0;
 const PLANNER_DROP_MARKER_ORANGE: ui::Rgba8 = ui::Rgba8::new(255, 160, 82, 255);
 const PLANNER_DROP_MARKER_HEIGHT: f32 = 4.0;
 const PLANNER_DROP_SENTINEL_HEIGHT: f32 = 20.0;
+const APP_FRAME_CLOCK_FPS: u32 = 30;
 
 #[derive(Clone, Debug)]
 struct TrackCardChromeWidget {
@@ -1038,6 +1041,183 @@ fn live_animation_requested(transport: &transport::AudioTransport, visible_revis
     state.pending || state.revision > visible_revision
 }
 
+fn frame_surface_revisions(state: &mut AppState) -> SurfaceRevisions {
+    let selected_track = state
+        .library
+        .selected_track_id
+        .as_deref()
+        .and_then(|track_id| {
+            state
+                .library
+                .tracks
+                .iter()
+                .find(|track| track.id == track_id)
+        });
+    let structure = frame_revision_mix(&[
+        workspace_mode_key(state.workspace_mode),
+        state.library.tracks.len() as u64,
+        frame_revision_text(state.library.selected_track_id.as_deref()),
+        frame_revision_text(state.waveform_track_id.as_deref()),
+        frame_revision_text(state.reference_waveform_track_id.as_deref()),
+        state.waveform.is_some() as u64,
+        state.reference_waveform.is_some() as u64,
+        state.waveform_busy as u64,
+        state.reference_waveform_busy as u64,
+        state.live_spectrogram.is_some() as u64,
+        state.reference_live_spectrogram.is_some() as u64,
+        selected_track.is_some_and(|track| track.reference_path.is_some()) as u64,
+        state.draft_note.is_some() as u64,
+        state.reference_draft_note.is_some() as u64,
+    ]);
+    let layout = frame_revision_mix(&[
+        state.live_spectrogram_height.to_bits() as u64,
+        state.library.tracks.len() as u64,
+    ]);
+    let projection = frame_revision_mix(&[
+        // Playback positions and the live graph are painted by the transient
+        // overlay while active. These booleans still invalidate once at
+        // start/stop so the retained base scene catches up at the boundary.
+        state.transport_playing as u64,
+        state.reference_transport_playing as u64,
+        state.transport_polling as u64,
+        state.reference_transport_polling as u64,
+        state.transport_waiting_token.is_some() as u64,
+        state.reference_transport_waiting_token.is_some() as u64,
+        state.waveform_progress.map_or(0, f32::to_bits) as u64,
+        state.reference_waveform_progress.map_or(0, f32::to_bits) as u64,
+        state.live_spectrogram_mode as u64,
+        state.audition_source as u64,
+        state.audition_queue_index as u64,
+        state.audition_auto_advance as u64,
+        state.audition_pending_play_track_id.is_some() as u64,
+        frame_revision_text(Some(&state.status)),
+    ]);
+    SurfaceRevisions::new(structure, layout, projection)
+}
+
+fn live_playback_overlay() -> ui::TransientOverlay<AppState> {
+    ui::TransientOverlay::new(LIVE_PLAYBACK_OVERLAY_KEY)
+        .paint_only()
+        .fps(APP_FRAME_CLOCK_FPS)
+        .when(|state: &mut AppState| state.transport_playing || state.reference_transport_playing)
+        .paint(paint_live_playback_overlay)
+}
+
+fn waveform_overlay_bounds(
+    context: &radiant::runtime::TransientOverlayContext<'_>,
+    widget_id: u64,
+    height: f32,
+) -> Option<Rect> {
+    let painted = context.plan.first_widget_rect(widget_id)?;
+    let bounds = Rect::from_min_max(
+        Point::new(painted.min.x, painted.max.y - height),
+        Point::new(painted.max.x, painted.max.y),
+    );
+    bounds.has_finite_positive_area().then_some(bounds)
+}
+
+fn playback_ratio_for_source(state: &AppState, source: AuditionSource) -> Option<f32> {
+    let selected_track_id = state.library.selected_track_id.as_deref()?;
+    match source {
+        AuditionSource::Main => {
+            if !state.transport_playing
+                || state.waveform_track_id.as_deref() != Some(selected_track_id)
+            {
+                return None;
+            }
+            let waveform = state.waveform.as_ref()?;
+            waveform::ratio_for_millis(state.transport_position_millis, waveform.duration_millis)
+        }
+        AuditionSource::Reference => {
+            if !state.reference_transport_playing
+                || state.reference_waveform_track_id.as_deref() != Some(selected_track_id)
+            {
+                return None;
+            }
+            let waveform = state.reference_waveform.as_ref()?;
+            waveform::ratio_for_millis(
+                state.reference_transport_position_millis,
+                waveform.duration_millis,
+            )
+        }
+    }
+}
+
+fn paint_live_playback_overlay(
+    state: &mut AppState,
+    context: radiant::runtime::TransientOverlayContext<'_>,
+    primitives: &mut Vec<PaintPrimitive>,
+) {
+    let theme = ThemeTokens::default();
+    if let Some(ratio) = playback_ratio_for_source(state, AuditionSource::Main)
+        && let Some(bounds) =
+            waveform_overlay_bounds(&context, waveform::MAIN_WAVEFORM_WIDGET_ID, WAVEFORM_HEIGHT)
+    {
+        waveform::paint_playhead_overlay(
+            primitives,
+            bounds,
+            waveform::WaveformSource::Main,
+            ratio,
+            &theme,
+        );
+    }
+    if let Some(ratio) = playback_ratio_for_source(state, AuditionSource::Reference)
+        && let Some(bounds) = waveform_overlay_bounds(
+            &context,
+            waveform::REFERENCE_WAVEFORM_WIDGET_ID,
+            REFERENCE_WAVEFORM_HEIGHT,
+        )
+    {
+        waveform::paint_playhead_overlay(
+            primitives,
+            bounds,
+            waveform::WaveformSource::Reference,
+            ratio,
+            &theme,
+        );
+    }
+
+    let Some(track) = selected_track(state) else {
+        return;
+    };
+    let Some((_, frame)) = review_spectrogram_source(state, track) else {
+        return;
+    };
+    let Some(bounds) = context.plan.first_widget_rect(LIVE_SPECTROGRAM_BODY_ID) else {
+        return;
+    };
+    spectrogram::paint_overlay(
+        frame,
+        state.live_spectrogram_mode,
+        bounds,
+        primitives,
+        &theme,
+    );
+}
+
+fn workspace_mode_key(mode: WorkspaceMode) -> u64 {
+    match mode {
+        WorkspaceMode::Review => 0,
+        WorkspaceMode::Planner => 1,
+        WorkspaceMode::Audition => 2,
+    }
+}
+
+fn frame_revision_text(value: Option<&str>) -> u64 {
+    value.map_or(0, |text| {
+        text.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+            hash.wrapping_mul(0x0000_0100_0000_01b3) ^ u64::from(byte)
+        })
+    })
+}
+
+fn frame_revision_mix(values: &[u64]) -> u64 {
+    values.iter().fold(0x9e37_79b9_7f4a_7c15, |hash, value| {
+        hash.rotate_left(7).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            ^ value.wrapping_add(0x517c_c1b7_2722_0a95)
+    })
+}
+
 fn native_launch_options() -> NativeRunOptions {
     let mut options = NativeRunOptions::default();
     options.window.behavior.maximized = true;
@@ -1065,8 +1245,16 @@ fn main() -> radiant::Result {
         .min_size(900, 560)
         .view(project_surface)
         .auxiliary_windows(reference_settings_auxiliary_windows)
-        .animation(|state| animation_requested(state))
-        .on_frame(|| Message::Frame)
+        .presentation(
+            ui::presentation()
+                .frame_clock(
+                    ui::FrameClock::message(Message::Frame)
+                        .when(|state| animation_requested(state))
+                        .fps(APP_FRAME_CLOCK_FPS)
+                        .surface_revisions(frame_surface_revisions),
+                )
+                .transient_overlay(live_playback_overlay()),
+        )
         .on_startup(|_state, context| schedule_library_load(context))
         .shortcuts(|state, _pending, press, _focus| playback_shortcut(state, press))
         .handle_message(update)
@@ -1902,7 +2090,6 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             enforce_loop(state, was_main_playing, was_reference_playing);
             maybe_start_pending_comment_playback(state, context);
             refresh_live_spectrograms(state);
-            context.request_repaint();
         }
         Message::ToggleLiveSpectrogramMode => {
             state.live_spectrogram_mode = state.live_spectrogram_mode.toggled();
@@ -5082,8 +5269,7 @@ fn reset_live_spectrogram_segment(state: &mut AppState, source: AuditionSource) 
 }
 
 fn refresh_live_spectrograms(state: &mut AppState) {
-    let main_state = state.transport.live_frame_state();
-    let main_frame = state.transport.latest_live_frame();
+    let (main_state, main_frame) = state.transport.live_frame_snapshot();
     refresh_live_spectrogram(
         &mut state.live_spectrogram,
         &mut state.live_spectrogram_revision,
@@ -5097,8 +5283,7 @@ fn refresh_live_spectrograms(state: &mut AppState) {
         state.reference_live_spectrogram_revision = 0;
         return;
     };
-    let reference_state = reference_transport.live_frame_state();
-    let reference_frame = reference_transport.latest_live_frame();
+    let (reference_state, reference_frame) = reference_transport.live_frame_snapshot();
     refresh_live_spectrogram(
         &mut state.reference_live_spectrogram,
         &mut state.reference_live_spectrogram_revision,
@@ -5129,9 +5314,8 @@ fn refresh_live_spectrogram(
     live_state: transport::LiveFrameState,
     latest: Option<Arc<transport::LiveSpectrogramFrame>>,
 ) {
-    // Publication stores the revision before swapping the Arc under a
-    // try-lock. If the UI observes that small window, keep the last valid
-    // frame from this exact session rather than clearing the widget.
+    // The UI reads the state and payload from one coherent shared snapshot, so
+    // a transient publication boundary cannot clear a still-valid frame.
     let visible_is_current = visible.as_ref().is_some_and(|frame| {
         live_frame_matches_current_session(frame, generation, live_state)
             && frame.revision == *visible_revision
@@ -7966,6 +8150,7 @@ fn live_spectrogram_section(state: &AppState, track: &storage::Track) -> ui::Vie
         },
         |(_, frame)| spectrogram::view::<Message>(frame, state.live_spectrogram_mode, body_height),
     );
+    let body = body.id(LIVE_SPECTROGRAM_BODY_ID);
     let resize_handle = ui::panel_section_resize_header(
         "live-spectrogram-resize",
         spectrogram::RESIZE_HANDLE_HEIGHT,
@@ -8024,7 +8209,9 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
         .waveform
         .as_ref()
         .filter(|_| {
-            !state.waveform_busy && state.waveform_track_id.as_deref() == Some(track.id.as_str())
+            !state.waveform_busy
+                && !state.transport_playing
+                && state.waveform_track_id.as_deref() == Some(track.id.as_str())
         })
         .map(|waveform| {
             track
@@ -8401,7 +8588,7 @@ fn reference_waveform_section(state: &AppState, track: &storage::Track) -> ui::V
         .as_ref()
         .filter(|_| state.reference_waveform_track_id.as_deref() == Some(track.id.as_str()));
     let reference_cursor_ratio = reference_waveform
-        .filter(|_| !state.reference_waveform_busy)
+        .filter(|_| !state.reference_waveform_busy && !state.reference_transport_playing)
         .and_then(|waveform| {
             waveform::ratio_for_millis(
                 state.reference_transport_position_millis,
@@ -9525,8 +9712,8 @@ mod tests {
                 pending: false,
             });
 
-        // No latest frame simulates latest_live_frame() losing its try-lock
-        // race with the analyzer publisher.
+        // No latest frame simulates the analyzer publisher not having a
+        // payload available yet.
         refresh_live_spectrograms(&mut state);
 
         assert_eq!(state.live_spectrogram.as_ref(), Some(&frame));
