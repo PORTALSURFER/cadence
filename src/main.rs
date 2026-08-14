@@ -6512,6 +6512,10 @@ fn planner_drop_hit_target(
 }
 
 fn planner_insertion_clear_target(active: bool, key: impl ToString) -> ui::View<Message> {
+    if !active {
+        return ui::spacer().fill();
+    }
+
     ui::interactive_row()
         .tracked_drop_candidate(active, false, false, active)
         .actions(ui::InteractiveRowActions::new().clear_drop(|_| Message::PlannerInsertionCleared))
@@ -13760,6 +13764,148 @@ mod tests {
             !empty_planner_labels
                 .iter()
                 .any(|label| label == "No tracks here yet.")
+        );
+    }
+
+    #[test]
+    fn planner_status_filter_chips_click_to_filter_and_restore_all_tracks() {
+        let track = |id: &str, status: TrackStatus, stage: TrackStage| Track {
+            id: String::from(id),
+            title: format!("{id} planner card"),
+            original_name: format!("{id}.wav"),
+            path: PathBuf::from(format!("/external/{id}.wav")),
+            reference_path: None,
+            size: 0,
+            favorite: false,
+            stage,
+            status,
+            notes: Vec::new(),
+        };
+        let mut state = AppState {
+            busy: false,
+            workspace_mode: WorkspaceMode::Planner,
+            ..AppState::default()
+        };
+        state.library.tracks = vec![
+            track("inbox", TrackStatus::Inbox, TrackStage::SoundDesign),
+            track("refine", TrackStatus::Refine, TrackStage::Production),
+            track("release", TrackStatus::Release, TrackStage::Mixdown),
+        ];
+        state.library.planner_order = vec![
+            String::from("inbox"),
+            String::from("refine"),
+            String::from("release"),
+        ];
+
+        let bridge = DeclarativeOwnedRuntimeBridge::new(
+            state,
+            |state| project_surface(state).into_surface(),
+            |state, message| {
+                let mut context = ui::UiUpdateContext::default();
+                update(state, message, &mut context);
+            },
+        );
+        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1180.0, 720.0));
+        let all_frame = runtime.frame_with_default_theme();
+        let (refine_widget_id, refine_rect) = all_frame
+            .paint_plan
+            .text_runs()
+            .find_map(|run| {
+                (run.text.as_str() == TrackStatus::Refine.label() && run.rect.min.y < 130.0)
+                    .then_some((run.widget_id, run.rect))
+            })
+            .expect("the Planner header should paint the Refine status chip");
+        let refine_point = refine_rect.center();
+        assert_eq!(
+            runtime.widget_at(refine_point),
+            Some(refine_widget_id),
+            "the idle Planner header chip should remain the topmost interactive widget"
+        );
+
+        let click = runtime.dispatch_primary_click(refine_point);
+        assert_eq!(click.press_target, Some(refine_widget_id));
+        assert_eq!(
+            runtime.bridge().state().planner_status_filter,
+            Some(TrackStatus::Refine)
+        );
+
+        let refined_frame = runtime.frame_with_default_theme();
+        let refined_labels = refined_frame.paint_plan.text_label_strings();
+        assert!(
+            refined_labels
+                .iter()
+                .any(|label| label == "refine planner card")
+        );
+        assert!(
+            !refined_labels
+                .iter()
+                .any(|label| label == "inbox planner card")
+        );
+        assert!(
+            !refined_labels
+                .iter()
+                .any(|label| label == "release planner card")
+        );
+        assert!(
+            refined_labels
+                .iter()
+                .any(|label| label == "1 track · derived from the library")
+        );
+        let selected_refine_widget_id = refined_frame
+            .paint_plan
+            .text_runs()
+            .find_map(|run| {
+                (run.text.as_str() == TrackStatus::Refine.label() && run.rect.min.y < 130.0)
+                    .then_some(run.widget_id)
+            })
+            .expect("the selected Refine chip should remain visible");
+        assert!(
+            refined_frame.paint_plan.primitives.iter().any(|primitive| {
+                matches!(
+                    primitive,
+                    PaintPrimitive::StrokePolyline(marker)
+                        if marker.widget_id == selected_refine_widget_id
+                            && marker.points.len() == 2
+                            && (marker.points[0].x - marker.points[1].x).abs()
+                                < f32::EPSILON
+                            && (marker.width - 2.0).abs() < f32::EPSILON
+                )
+            }),
+            "the selected Refine chip should retain the button selected marker"
+        );
+
+        let (all_widget_id, all_rect) = refined_frame
+            .paint_plan
+            .text_runs()
+            .find_map(|run| {
+                (run.text.as_str() == "All" && run.rect.min.y < 130.0)
+                    .then_some((run.widget_id, run.rect))
+            })
+            .expect("the Planner header should paint the All status chip");
+        let all_point = all_rect.center();
+        assert_eq!(runtime.widget_at(all_point), Some(all_widget_id));
+        let click = runtime.dispatch_primary_click(all_point);
+        assert_eq!(click.press_target, Some(all_widget_id));
+        assert_eq!(runtime.bridge().state().planner_status_filter, None);
+
+        let unfiltered_labels = runtime
+            .frame_with_default_theme()
+            .paint_plan
+            .text_label_strings();
+        for title in [
+            "inbox planner card",
+            "refine planner card",
+            "release planner card",
+        ] {
+            assert!(
+                unfiltered_labels.iter().any(|label| label == title),
+                "the All filter should restore {title}"
+            );
+        }
+        assert!(
+            unfiltered_labels
+                .iter()
+                .any(|label| label == "3 tracks · derived from the library")
         );
     }
 
