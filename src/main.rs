@@ -14018,12 +14018,43 @@ mod tests {
         assert_eq!(
             state.pending_comment_playback,
             Some(super::PendingCommentPlayback {
-                track_id: target_id,
+                track_id: target_id.clone(),
                 source: super::CommentSource::Main,
                 note_id,
             })
         );
         assert!(state.status.contains("Loading comment"));
+
+        let waveform_generation = state.waveform_generation;
+        update(
+            &mut state,
+            Message::DecodeCompleted {
+                track_id: target_id.clone(),
+                generation: waveform_generation,
+                result: Ok(audition_waveform()),
+            },
+            &mut context,
+        );
+
+        assert_eq!(state.waveform_track_id.as_deref(), Some(target_id.as_str()));
+        assert!(!state.waveform_busy);
+        let load_token = state
+            .transport_waiting_token
+            .expect("target transport loading should be pending");
+        state.transport.set_snapshot_for_test(Snapshot {
+            generation: state.transport_generation,
+            acknowledged_token: load_token,
+            position_millis: 0,
+            playing: false,
+            ready: true,
+        });
+
+        update(&mut state, Message::Frame, &mut context);
+
+        assert!(state.pending_comment_playback.is_none());
+        assert_eq!(state.transport_position_millis, 600);
+        assert!(state.transport_polling);
+        assert!(state.transport_waiting_token.is_some());
     }
 
     #[test]
