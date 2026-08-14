@@ -771,6 +771,7 @@ fn run_live_analyzer(
                     &analyzer,
                     &session,
                     &shared,
+                    observed_epoch,
                     &mut published_revision,
                     &mut last_publication,
                     false,
@@ -782,6 +783,7 @@ fn run_live_analyzer(
                 &analyzer,
                 &session,
                 &shared,
+                observed_epoch,
                 &mut published_revision,
                 &mut last_publication,
                 false,
@@ -807,6 +809,7 @@ fn run_live_analyzer(
                     &analyzer,
                     &session,
                     &shared,
+                    observed_epoch,
                     &mut published_revision,
                     &mut last_publication,
                     true,
@@ -828,6 +831,7 @@ fn publish_live_frame_if_due(
     analyzer: &LiveAnalyzer,
     session: &LiveCaptureSession,
     shared: &SharedSnapshot,
+    observed_epoch: u64,
     published_revision: &mut u64,
     last_publication: &mut Instant,
     force: bool,
@@ -838,9 +842,15 @@ fn publish_live_frame_if_due(
     if !force && last_publication.elapsed() < LIVE_PUBLICATION_INTERVAL {
         return;
     }
-    let Some(frame) = analyzer.frame(session.generation, session.current_epoch()) else {
+    if session.current_epoch() != observed_epoch {
+        return;
+    }
+    let Some(frame) = analyzer.frame(session.generation, observed_epoch) else {
         return;
     };
+    if session.current_epoch() != observed_epoch {
+        return;
+    }
     if shared.publish_live_frame(session, frame) {
         *published_revision = analyzer.revision;
         *last_publication = Instant::now();
@@ -1664,9 +1674,10 @@ pub fn normalize_output_gain(gain: f32) -> f32 {
 mod tests {
     use super::{
         AudioTransport, CONTROLS_BUSY_ERROR, CaptureFrame, Command, DEFAULT_VOLUME,
-        LIVE_SPECTROGRAM_BAND_COUNT, LIVE_SPECTROGRAM_MAX_HISTORY, LiveAnalysisSource,
-        LiveAnalyzer, LiveCaptureSession, MAX_OUTPUT_GAIN, PendingLoad, SharedSnapshot,
-        clamp_position, is_current, normalize_output_gain, normalize_volume,
+        LIVE_SPECTROGRAM_BAND_COUNT, LIVE_SPECTROGRAM_MAX_HISTORY, LIVE_SPECTRUM_FFT_SIZE,
+        LiveAnalysisSource, LiveAnalyzer, LiveCaptureSession, MAX_OUTPUT_GAIN, PendingLoad,
+        SharedSnapshot, clamp_position, is_current, normalize_output_gain, normalize_volume,
+        publish_live_frame_if_due,
     };
     use rodio::{Source, buffer::SamplesBuffer, source::SeekError};
     use std::path::PathBuf;
@@ -1675,7 +1686,7 @@ mod tests {
         atomic::{AtomicU64, AtomicUsize, Ordering},
         mpsc,
     };
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn seek_position_is_saturated_to_track_duration() {
@@ -1897,6 +1908,33 @@ mod tests {
         assert_eq!(analyzer.fft_count, 101);
         assert_eq!(analyzer.revision, 101);
         assert_eq!(analyzer.row_count, LIVE_SPECTROGRAM_MAX_HISTORY);
+    }
+
+    #[test]
+    fn analyzer_does_not_publish_history_after_epoch_changes_before_publication() {
+        let (shared, session) = active_test_session(7);
+        let observed_epoch = session.current_epoch();
+        let mut analyzer = LiveAnalyzer::new(48_000);
+        for _ in 0..LIVE_SPECTRUM_FFT_SIZE {
+            analyzer.push(0.25);
+        }
+        assert!(analyzer.revision > 0);
+
+        session.mark_discontinuity(&shared);
+        let mut published_revision = 0;
+        let mut last_publication = Instant::now();
+        publish_live_frame_if_due(
+            &analyzer,
+            &session,
+            &shared,
+            observed_epoch,
+            &mut published_revision,
+            &mut last_publication,
+            true,
+        );
+
+        assert!(shared.latest_live_frame().is_none());
+        assert_eq!(published_revision, 0);
     }
 
     fn strongest_band_for_tone(frequency: f32) -> usize {

@@ -3454,6 +3454,9 @@ fn set_audition_source(state: &mut AppState, source: AuditionSource) {
     }
     state.audition_source = source;
     sync_audition_output_gains(state);
+    if state.transport_playing || state.reference_transport_playing {
+        reset_live_spectrogram_segment(state, source);
+    }
 }
 
 fn play_audition(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
@@ -11227,6 +11230,52 @@ mod tests {
             &mut context,
         );
         assert_eq!(state.audition_source, AuditionSource::Reference);
+    }
+
+    #[test]
+    fn active_source_switch_resets_the_newly_audible_live_segment() {
+        let mut state = shared_reference_playback_state();
+        state.transport_playing = true;
+        state.reference_transport_playing = true;
+        state.audition_source = AuditionSource::Main;
+
+        let reference_transport = state
+            .reference_transport
+            .as_ref()
+            .expect("the paired state should have a reference transport")
+            .clone();
+        let reference_epoch = reference_transport.live_frame_state().epoch;
+        let frame = live_frame(state.reference_transport_generation, reference_epoch, 1);
+        state.reference_live_spectrogram = Some(Arc::clone(&frame));
+        state.reference_live_spectrogram_revision = frame.revision;
+        reference_transport.set_live_state_for_test(transport::LiveFrameState {
+            generation: state.reference_transport_generation,
+            epoch: reference_epoch,
+            revision: frame.revision,
+            pending: false,
+        });
+        let track_id = selected_track(&state)
+            .expect("the paired state should have a track")
+            .id
+            .clone();
+
+        assert_eq!(
+            super::current_live_frame_for_source(&state, &track_id, AuditionSource::Reference),
+            Some(Arc::clone(&frame))
+        );
+
+        super::set_audition_source(&mut state, AuditionSource::Reference);
+
+        let reset_epoch = reference_transport.live_frame_state().epoch;
+        assert!(reset_epoch > reference_epoch);
+        assert!(state.reference_live_spectrogram.is_none());
+        assert_eq!(state.reference_live_spectrogram_revision, 0);
+        assert!(
+            super::current_live_frame_for_source(&state, &track_id, AuditionSource::Reference)
+                .is_none()
+        );
+        let track = selected_track(&state).expect("the paired state should have a track");
+        assert!(review_spectrogram_source(&state, track).is_none());
     }
 
     #[test]
