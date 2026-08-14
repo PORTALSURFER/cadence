@@ -35,6 +35,8 @@ const LIVE_SPECTRUM_HOP_SIZE: usize = LIVE_SPECTRUM_FFT_SIZE / 2;
 const LIVE_SPECTRUM_MIN_FREQUENCY: f32 = 40.0;
 const LIVE_SPECTRUM_MAX_FREQUENCY: f32 = 18_000.0;
 const LIVE_SPECTRUM_FLOOR_DB: f32 = -80.0;
+const LIVE_SPECTRUM_ATTACK_TIME: Duration = Duration::from_millis(60);
+const LIVE_SPECTRUM_RELEASE_TIME: Duration = Duration::from_millis(240);
 const LIVE_PUBLICATION_INTERVAL: Duration = Duration::from_millis(17);
 const LIVE_ANALYZER_POLL_INTERVAL: Duration = Duration::from_millis(2);
 
@@ -417,9 +419,9 @@ where
         if !self.session.active.load(Ordering::Acquire) {
             return;
         }
-        let gain = self.shared.requested_volume();
-        let scaled = mono * gain;
-        let sample = if scaled.is_finite() { scaled } else { 0.0 };
+        // Analysis is intentionally pre-fader: the display follows decoder
+        // audio even when the audition output volume changes.
+        let sample = if mono.is_finite() { mono } else { 0.0 };
         let frame = CaptureFrame {
             sample,
             epoch: self.session.current_epoch(),
@@ -507,6 +509,10 @@ where
 struct LiveAnalyzer {
     sample_rate: u32,
     band_ranges: [LiveBandRange; LIVE_SPECTROGRAM_BAND_COUNT],
+    attack_coefficient: f32,
+    release_coefficient: f32,
+    smoothed_levels: [f32; LIVE_SPECTROGRAM_BAND_COUNT],
+    has_smoothed_levels: bool,
     window: [f32; LIVE_SPECTRUM_FFT_SIZE],
     window_len: usize,
     fft: [LiveComplexSample; LIVE_SPECTRUM_FFT_SIZE],
@@ -518,9 +524,17 @@ struct LiveAnalyzer {
 
 impl LiveAnalyzer {
     fn new(sample_rate: u32) -> Self {
+        let sample_rate = sample_rate.max(1);
         Self {
-            sample_rate: sample_rate.max(1),
+            sample_rate,
             band_ranges: live_band_ranges(sample_rate),
+            attack_coefficient: live_ballistic_coefficient(LIVE_SPECTRUM_ATTACK_TIME, sample_rate),
+            release_coefficient: live_ballistic_coefficient(
+                LIVE_SPECTRUM_RELEASE_TIME,
+                sample_rate,
+            ),
+            smoothed_levels: [0.0; LIVE_SPECTROGRAM_BAND_COUNT],
+            has_smoothed_levels: false,
             window: [0.0; LIVE_SPECTRUM_FFT_SIZE],
             window_len: 0,
             fft: [LiveComplexSample::default(); LIVE_SPECTRUM_FFT_SIZE],
@@ -532,6 +546,8 @@ impl LiveAnalyzer {
     }
 
     fn reset(&mut self) {
+        self.smoothed_levels = [0.0; LIVE_SPECTROGRAM_BAND_COUNT];
+        self.has_smoothed_levels = false;
         self.window_len = 0;
         self.row_count = 0;
         self.revision = 0;
@@ -564,7 +580,7 @@ impl LiveAnalyzer {
         }
         live_fft_in_place(&mut self.fft);
 
-        let mut row = [0_u8; LIVE_SPECTROGRAM_BAND_COUNT];
+        let mut target_row = [0_u8; LIVE_SPECTROGRAM_BAND_COUNT];
         for (band, range) in self.band_ranges.iter().enumerate() {
             let magnitude = (range.start..range.end)
                 .map(|bin| {
@@ -576,8 +592,9 @@ impl LiveAnalyzer {
             let decibels = 20.0 * magnitude.max(1.0e-8).log10();
             let normalized =
                 ((decibels - LIVE_SPECTRUM_FLOOR_DB) / -LIVE_SPECTRUM_FLOOR_DB).clamp(0.0, 1.0);
-            row[band] = (normalized * u8::MAX as f32).round() as u8;
+            target_row[band] = (normalized * u8::MAX as f32).round() as u8;
         }
+        let row = self.smooth_row(target_row);
 
         if self.row_count < LIVE_SPECTROGRAM_MAX_HISTORY {
             self.rows[self.row_count] = row;
@@ -588,6 +605,34 @@ impl LiveAnalyzer {
         }
         self.revision = self.revision.wrapping_add(1);
         self.fft_count = self.fft_count.saturating_add(1);
+    }
+
+    /// Apply display-only exponential attack/release ballistics. This keeps
+    /// the line readable without changing the decoder samples or audio path.
+    fn smooth_row(
+        &mut self,
+        target_row: [u8; LIVE_SPECTROGRAM_BAND_COUNT],
+    ) -> [u8; LIVE_SPECTROGRAM_BAND_COUNT] {
+        let mut row = [0_u8; LIVE_SPECTROGRAM_BAND_COUNT];
+        for (band, &target) in target_row.iter().enumerate() {
+            let target = target as f32 / u8::MAX as f32;
+            let previous = self.smoothed_levels[band];
+            let level = if self.has_smoothed_levels {
+                let coefficient = if target > previous {
+                    self.attack_coefficient
+                } else {
+                    self.release_coefficient
+                };
+                previous + coefficient * (target - previous)
+            } else {
+                target
+            };
+            let level = level.clamp(0.0, 1.0);
+            self.smoothed_levels[band] = level;
+            row[band] = (level * u8::MAX as f32).round() as u8;
+        }
+        self.has_smoothed_levels = true;
+        row
     }
 
     fn frame(&self, generation: u64, epoch: u64) -> Option<Arc<LiveSpectrogramFrame>> {
@@ -601,6 +646,12 @@ impl LiveAnalyzer {
         )
         .map(Arc::new)
     }
+}
+
+fn live_ballistic_coefficient(time_constant: Duration, sample_rate: u32) -> f32 {
+    let hop_seconds = LIVE_SPECTRUM_HOP_SIZE as f32 / sample_rate.max(1) as f32;
+    let time_constant_seconds = time_constant.as_secs_f32().max(f32::EPSILON);
+    (1.0 - (-hop_seconds / time_constant_seconds).exp()).clamp(0.0, 1.0)
 }
 
 fn live_band_ranges(sample_rate: u32) -> [LiveBandRange; LIVE_SPECTROGRAM_BAND_COUNT] {
@@ -1755,11 +1806,11 @@ mod tests {
     }
 
     #[test]
-    fn analysis_source_downmixes_complete_frames_without_changing_output() {
+    fn analysis_source_downmixes_complete_frames_without_output_gain() {
         let (shared, session) = active_test_session(3);
         shared
             .requested_volume
-            .store(1.0_f32.to_bits(), Ordering::Release);
+            .store(0.25_f32.to_bits(), Ordering::Release);
         let (producer, mut consumer) = super::RingBuffer::new(8);
         let source = SamplesBuffer::new(
             std::num::NonZeroU16::new(2).expect("non-zero channel count"),
@@ -1772,6 +1823,26 @@ mod tests {
         assert_eq!(consumer.pop().expect("first mono frame").sample, 0.0);
         assert_eq!(consumer.pop().expect("second mono frame").sample, 0.5);
         assert!(consumer.pop().is_err());
+    }
+
+    #[test]
+    fn analyzer_display_uses_exponential_attack_and_slower_release() {
+        let mut attack = LiveAnalyzer::new(48_000);
+        attack.smooth_row([0_u8; LIVE_SPECTROGRAM_BAND_COUNT]);
+        let rising = attack.smooth_row([u8::MAX; LIVE_SPECTROGRAM_BAND_COUNT]);
+
+        let mut release = LiveAnalyzer::new(48_000);
+        release.smooth_row([u8::MAX; LIVE_SPECTROGRAM_BAND_COUNT]);
+        let falling = release.smooth_row([0_u8; LIVE_SPECTROGRAM_BAND_COUNT]);
+
+        assert!(rising[0] > 0 && rising[0] < u8::MAX);
+        assert!(falling[0] > 0 && falling[0] < u8::MAX);
+        let attack_delta = rising[0] as u16;
+        let release_delta = u8::MAX as u16 - falling[0] as u16;
+        assert!(
+            attack_delta > release_delta,
+            "attack_delta={attack_delta}, release_delta={release_delta}"
+        );
     }
 
     #[test]

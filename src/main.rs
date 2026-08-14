@@ -5062,24 +5062,13 @@ fn reset_live_spectrogram_segment(state: &mut AppState, source: AuditionSource) 
 fn refresh_live_spectrograms(state: &mut AppState) {
     let main_state = state.transport.live_frame_state();
     let main_frame = state.transport.latest_live_frame();
-    if state.live_spectrogram.as_ref().is_some_and(|frame| {
-        frame.generation != state.transport_generation
-            || frame.epoch != main_state.epoch
-            || frame.revision != main_state.revision
-            || !frame.is_valid()
-    }) {
-        state.live_spectrogram = None;
-        state.live_spectrogram_revision = 0;
-    }
-    if let Some(frame) = main_frame.filter(|frame| {
-        frame.generation == state.transport_generation
-            && frame.epoch == main_state.epoch
-            && frame.revision == main_state.revision
-            && frame.is_valid()
-    }) {
-        state.live_spectrogram_revision = frame.revision;
-        state.live_spectrogram = Some(frame);
-    }
+    refresh_live_spectrogram(
+        &mut state.live_spectrogram,
+        &mut state.live_spectrogram_revision,
+        state.transport_generation,
+        main_state,
+        main_frame,
+    );
 
     let Some(reference_transport) = state.reference_transport.as_ref() else {
         state.reference_live_spectrogram = None;
@@ -5088,27 +5077,58 @@ fn refresh_live_spectrograms(state: &mut AppState) {
     };
     let reference_state = reference_transport.live_frame_state();
     let reference_frame = reference_transport.latest_live_frame();
-    if state
-        .reference_live_spectrogram
-        .as_ref()
-        .is_some_and(|frame| {
-            frame.generation != state.reference_transport_generation
-                || frame.epoch != reference_state.epoch
-                || frame.revision != reference_state.revision
-                || !frame.is_valid()
-        })
-    {
-        state.reference_live_spectrogram = None;
-        state.reference_live_spectrogram_revision = 0;
+    refresh_live_spectrogram(
+        &mut state.reference_live_spectrogram,
+        &mut state.reference_live_spectrogram_revision,
+        state.reference_transport_generation,
+        reference_state,
+        reference_frame,
+    );
+}
+
+fn live_frame_matches_current_session(
+    frame: &transport::LiveSpectrogramFrame,
+    generation: u64,
+    live_state: transport::LiveFrameState,
+) -> bool {
+    live_state.generation == generation
+        && live_state.revision > 0
+        && frame.generation == generation
+        && frame.epoch == live_state.epoch
+        && frame.revision > 0
+        && frame.revision <= live_state.revision
+        && frame.is_valid()
+}
+
+fn refresh_live_spectrogram(
+    visible: &mut Option<Arc<transport::LiveSpectrogramFrame>>,
+    visible_revision: &mut u64,
+    generation: u64,
+    live_state: transport::LiveFrameState,
+    latest: Option<Arc<transport::LiveSpectrogramFrame>>,
+) {
+    // Publication stores the revision before swapping the Arc under a
+    // try-lock. If the UI observes that small window, keep the last valid
+    // frame from this exact session rather than clearing the widget.
+    let visible_is_current = visible.as_ref().is_some_and(|frame| {
+        live_frame_matches_current_session(frame, generation, live_state)
+            && frame.revision == *visible_revision
+    });
+    if !visible_is_current {
+        *visible = None;
+        *visible_revision = 0;
     }
-    if let Some(frame) = reference_frame.filter(|frame| {
-        frame.generation == state.reference_transport_generation
-            && frame.epoch == reference_state.epoch
-            && frame.revision == reference_state.revision
-            && frame.is_valid()
-    }) {
-        state.reference_live_spectrogram_revision = frame.revision;
-        state.reference_live_spectrogram = Some(frame);
+
+    if let Some(frame) =
+        latest.filter(|frame| live_frame_matches_current_session(frame, generation, live_state))
+    {
+        let is_newer = visible
+            .as_ref()
+            .is_none_or(|current| frame.revision >= current.revision);
+        if is_newer {
+            *visible_revision = frame.revision;
+            *visible = Some(frame);
+        }
     }
 }
 
@@ -7806,12 +7826,9 @@ fn current_live_frame_for_source(
             }
             let live_state = state.transport.live_frame_state();
             let frame = state.live_spectrogram.as_ref()?;
-            (frame.generation == state.transport_generation
-                && frame.epoch == live_state.epoch
-                && frame.revision == state.live_spectrogram_revision
-                && frame.revision == live_state.revision
-                && frame.is_valid())
-            .then(|| Arc::clone(frame))
+            (live_frame_matches_current_session(frame, state.transport_generation, live_state)
+                && frame.revision == state.live_spectrogram_revision)
+                .then(|| Arc::clone(frame))
         }
         AuditionSource::Reference => {
             if state.reference_waveform_track_id.as_deref() != Some(track_id) {
@@ -7820,12 +7837,12 @@ fn current_live_frame_for_source(
             let reference_transport = state.reference_transport.as_ref()?;
             let live_state = reference_transport.live_frame_state();
             let frame = state.reference_live_spectrogram.as_ref()?;
-            (frame.generation == state.reference_transport_generation
-                && frame.epoch == live_state.epoch
-                && frame.revision == state.reference_live_spectrogram_revision
-                && frame.revision == live_state.revision
-                && frame.is_valid())
-            .then(|| Arc::clone(frame))
+            (live_frame_matches_current_session(
+                frame,
+                state.reference_transport_generation,
+                live_state,
+            ) && frame.revision == state.reference_live_spectrogram_revision)
+                .then(|| Arc::clone(frame))
         }
     }
 }
@@ -9171,12 +9188,13 @@ mod tests {
         WorkspaceMode, animation_requested, apply_transport_snapshot, audition_panel,
         audition_shuffle_seed, audition_statuses, current_loudness_match_gain_db,
         current_lufs_meter_value, current_reference_lufs_meter_value, decode_result_is_current,
-        deterministic_shuffle, enforce_loop, favorite_toggle, library_track_title_id, loop_bounds,
-        main_output_gain, native_launch_options, note_editor, note_ratio_for_id,
-        planner_insertion_target_is_valid, playback_shortcut, project_surface,
-        rebuild_audition_queue, reconcile_audition_queue, reference_decode_result_is_current,
-        reference_output_gain, reference_settings_auxiliary_windows,
-        reference_settings_window_view, review_spectrogram_source, review_status_filter_message,
+        deterministic_shuffle, enforce_loop, favorite_toggle, library_track_title_id,
+        live_frame_matches_current_session, loop_bounds, main_output_gain, native_launch_options,
+        note_editor, note_ratio_for_id, planner_insertion_target_is_valid, playback_shortcut,
+        project_surface, rebuild_audition_queue, reconcile_audition_queue,
+        reference_decode_result_is_current, reference_output_gain,
+        reference_settings_auxiliary_windows, reference_settings_window_view,
+        refresh_live_spectrograms, review_spectrogram_source, review_status_filter_message,
         selected_reference_notes, selected_track, stage_dropdown, stage_menu_anchor_from_pointer,
         stage_menu_popover, status_dropdown_for_host, status_filter_dropdown,
         sync_audition_queue_after_status_change, tracks_in_stage, tracks_with_status,
@@ -9426,6 +9444,70 @@ mod tests {
         assert!(animation_requested(&state));
         state.live_spectrogram_revision = 3;
         assert!(!animation_requested(&state));
+    }
+
+    #[test]
+    fn live_spectrogram_refresh_retains_same_session_frame_during_publication_race() {
+        let mut state = audition_state(&["main"]);
+        let frame = live_frame(0, 0, 1);
+        state.live_spectrogram = Some(Arc::clone(&frame));
+        state.live_spectrogram_revision = frame.revision;
+        state
+            .transport
+            .set_live_state_for_test(transport::LiveFrameState {
+                generation: 0,
+                epoch: 0,
+                revision: 2,
+                pending: false,
+            });
+
+        // No latest frame simulates latest_live_frame() losing its try-lock
+        // race with the analyzer publisher.
+        refresh_live_spectrograms(&mut state);
+
+        assert_eq!(state.live_spectrogram.as_ref(), Some(&frame));
+        assert_eq!(state.live_spectrogram_revision, 1);
+        assert!(live_frame_matches_current_session(
+            state.live_spectrogram.as_ref().expect("retained frame"),
+            state.transport_generation,
+            state.transport.live_frame_state(),
+        ));
+        state.transport_playing = true;
+        let track = selected_track(&state).expect("selected test track").clone();
+        assert!(review_spectrogram_source(&state, &track).is_some());
+    }
+
+    #[test]
+    fn live_spectrogram_refresh_drops_frames_from_old_generation_or_epoch() {
+        let mut state = audition_state(&["main"]);
+        state.live_spectrogram = Some(live_frame(0, 0, 1));
+        state.live_spectrogram_revision = 1;
+        state
+            .transport
+            .set_live_state_for_test(transport::LiveFrameState {
+                generation: 0,
+                epoch: 1,
+                revision: 1,
+                pending: false,
+            });
+        refresh_live_spectrograms(&mut state);
+        assert!(state.live_spectrogram.is_none());
+        assert_eq!(state.live_spectrogram_revision, 0);
+
+        state.live_spectrogram = Some(live_frame(0, 0, 1));
+        state.live_spectrogram_revision = 1;
+        state.transport_generation = 1;
+        state
+            .transport
+            .set_live_state_for_test(transport::LiveFrameState {
+                generation: 1,
+                epoch: 0,
+                revision: 1,
+                pending: false,
+            });
+        refresh_live_spectrograms(&mut state);
+        assert!(state.live_spectrogram.is_none());
+        assert_eq!(state.live_spectrogram_revision, 0);
     }
 
     #[test]
