@@ -1041,6 +1041,17 @@ fn live_animation_requested(transport: &transport::AudioTransport, visible_revis
     state.pending || state.revision > visible_revision
 }
 
+fn retained_live_spectrogram_revision(state: &AppState) -> u64 {
+    if state.transport_playing || state.reference_transport_playing {
+        0
+    } else {
+        frame_revision_mix(&[
+            state.live_spectrogram_revision,
+            state.reference_live_spectrogram_revision,
+        ])
+    }
+}
+
 fn frame_surface_revisions(state: &mut AppState) -> SurfaceRevisions {
     let selected_track = state
         .library
@@ -1085,6 +1096,10 @@ fn frame_surface_revisions(state: &mut AppState) -> SurfaceRevisions {
         state.reference_transport_waiting_token.is_some() as u64,
         state.waveform_progress.map_or(0, f32::to_bits) as u64,
         state.reference_waveform_progress.map_or(0, f32::to_bits) as u64,
+        // Active playback keeps live frames in the paint-only overlay. Once
+        // playback is stopped, accepted frame revisions must reproject the
+        // retained scene so the final analyzer rows are included.
+        retained_live_spectrogram_revision(state),
         state.live_spectrogram_mode as u64,
         state.audition_source as u64,
         state.audition_queue_index as u64,
@@ -9437,19 +9452,19 @@ mod tests {
         WorkspaceMode, animation_requested, apply_transport_snapshot, audition_panel,
         audition_shuffle_seed, audition_statuses, current_loudness_match_gain_db,
         current_lufs_meter_value, current_reference_lufs_meter_value, decode_result_is_current,
-        deterministic_shuffle, enforce_loop, favorite_toggle, library_track_title_id,
-        live_frame_matches_current_session, loop_bounds, main_output_gain, native_launch_options,
-        note_editor, note_ratio_for_id, planner_insertion_target_is_valid, playback_shortcut,
-        project_surface, rebuild_audition_queue, reconcile_audition_queue,
+        deterministic_shuffle, enforce_loop, favorite_toggle, frame_surface_revisions,
+        library_track_title_id, live_frame_matches_current_session, loop_bounds, main_output_gain,
+        native_launch_options, note_editor, note_ratio_for_id, planner_insertion_target_is_valid,
+        playback_shortcut, project_surface, rebuild_audition_queue, reconcile_audition_queue,
         reference_decode_result_is_current, reference_output_gain,
         reference_settings_auxiliary_windows, reference_settings_window_view,
-        refresh_live_spectrograms, review_spectrogram_source, review_status_filter_message,
-        selected_reference_notes, selected_track, stage_dropdown, stage_menu_anchor_from_pointer,
-        stage_menu_popover, status_dropdown_for_host, status_filter_dropdown,
-        sync_audition_queue_after_status_change, tracks_in_stage, tracks_with_status,
-        transport_command_is_confirmed, update,
+        refresh_live_spectrogram, refresh_live_spectrograms, review_spectrogram_source,
+        review_status_filter_message, selected_reference_notes, selected_track, stage_dropdown,
+        stage_menu_anchor_from_pointer, stage_menu_popover, status_dropdown_for_host,
+        status_filter_dropdown, sync_audition_queue_after_status_change, tracks_in_stage,
+        tracks_with_status, transport_command_is_confirmed, update,
     };
-    use crate::transport::Snapshot;
+    use crate::transport::{LiveFrameState, Snapshot};
     use crate::{
         audio::{LoudnessPoint, WaveformData},
         storage::{Library, Note, ReferenceTrack, Track, TrackStage, TrackStatus},
@@ -9462,7 +9477,7 @@ mod tests {
         runtime::{
             Command, DeclarativeOwnedCommandRuntimeBridge, DeclarativeOwnedRuntimeBridge, Event,
             FocusTraversal, PaintPrimitive, PaintTextAlign, PlatformRequest, PlatformResponse,
-            SurfaceRuntime,
+            RepaintScope, SurfaceRuntime,
         },
         theme::ThemeTokens,
         widgets::{PointerModifiers, Widget, WidgetInput},
@@ -9695,6 +9710,83 @@ mod tests {
         assert!(animation_requested(&state));
         state.live_spectrogram_revision = 3;
         assert!(!animation_requested(&state));
+    }
+
+    #[test]
+    fn final_live_frame_after_natural_stop_advances_retained_projection() {
+        let mut state = audition_state(&["main"]);
+        let initial_frame = live_frame(0, 0, 1);
+        state.live_spectrogram = Some(Arc::clone(&initial_frame));
+        state.live_spectrogram_revision = initial_frame.revision;
+        state.transport.set_live_state_for_test(LiveFrameState {
+            generation: 0,
+            epoch: 0,
+            revision: 1,
+            pending: false,
+        });
+        state.transport_playing = true;
+
+        let active_before = frame_surface_revisions(&mut state);
+        let active_frame = live_frame(0, 0, 2);
+        state.transport.set_live_state_for_test(LiveFrameState {
+            generation: 0,
+            epoch: 0,
+            revision: 2,
+            pending: false,
+        });
+        let active_live_state = state.transport.live_frame_state();
+        refresh_live_spectrogram(
+            &mut state.live_spectrogram,
+            &mut state.live_spectrogram_revision,
+            state.transport_generation,
+            active_live_state,
+            Some(active_frame),
+        );
+        assert_eq!(state.live_spectrogram_revision, 2);
+        let active_after = frame_surface_revisions(&mut state);
+        assert_eq!(
+            active_after.repaint_scope_since(active_before),
+            RepaintScope::PaintOnly
+        );
+
+        apply_transport_snapshot(
+            &mut state,
+            Snapshot {
+                generation: 0,
+                acknowledged_token: 0,
+                position_millis: 1_000,
+                playing: false,
+                ready: true,
+            },
+        );
+        assert!(!state.transport_playing);
+        let stopped_before_final = frame_surface_revisions(&mut state);
+        assert_eq!(
+            stopped_before_final.repaint_scope_since(active_after),
+            RepaintScope::Projection
+        );
+
+        let final_frame = live_frame(0, 0, 3);
+        state.transport.set_live_state_for_test(LiveFrameState {
+            generation: 0,
+            epoch: 0,
+            revision: 3,
+            pending: false,
+        });
+        let final_live_state = state.transport.live_frame_state();
+        refresh_live_spectrogram(
+            &mut state.live_spectrogram,
+            &mut state.live_spectrogram_revision,
+            state.transport_generation,
+            final_live_state,
+            Some(final_frame),
+        );
+        assert_eq!(state.live_spectrogram_revision, 3);
+        let stopped_after_final = frame_surface_revisions(&mut state);
+        assert_eq!(
+            stopped_after_final.repaint_scope_since(stopped_before_final),
+            RepaintScope::Projection
+        );
     }
 
     #[test]
