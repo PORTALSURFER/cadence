@@ -31,6 +31,7 @@ pub const LIVE_SPECTROGRAM_MAX_HISTORY: usize = 192;
 
 const LIVE_CAPTURE_RING_CAPACITY: usize = 16_384;
 const LIVE_SPECTRUM_FFT_SIZE: usize = 2_048;
+const LIVE_SPECTRUM_POSITIVE_BIN_COUNT: usize = LIVE_SPECTRUM_FFT_SIZE / 2 + 1;
 const LIVE_SPECTRUM_HOP_SIZE: usize = 512;
 pub(crate) const LIVE_SPECTRUM_DISPLAY_MIN_FREQUENCY: f32 = 20.0;
 pub(crate) const LIVE_SPECTRUM_DISPLAY_MAX_FREQUENCY: f32 = 20_000.0;
@@ -237,6 +238,7 @@ struct LiveBandRange {
     end: usize,
     start_frequency: f32,
     end_frequency: f32,
+    display_tilt_db: f32,
 }
 
 impl LiveBandRange {
@@ -653,6 +655,8 @@ where
 struct LiveAnalyzer {
     sample_rate: u32,
     band_ranges: [LiveBandRange; LIVE_SPECTROGRAM_BAND_COUNT],
+    window_coefficients: [f32; LIVE_SPECTRUM_FFT_SIZE],
+    one_sided_bin_calibration: [f32; LIVE_SPECTRUM_POSITIVE_BIN_COUNT],
     attack_coefficient: f32,
     release_coefficient: f32,
     smoothed_levels: [f32; LIVE_SPECTROGRAM_BAND_COUNT],
@@ -660,6 +664,7 @@ struct LiveAnalyzer {
     window: [f32; LIVE_SPECTRUM_FFT_SIZE],
     window_len: usize,
     fft: [LiveComplexSample; LIVE_SPECTRUM_FFT_SIZE],
+    positive_magnitudes: [f32; LIVE_SPECTRUM_POSITIVE_BIN_COUNT],
     rows: [[u8; LIVE_SPECTROGRAM_BAND_COUNT]; LIVE_SPECTROGRAM_MAX_HISTORY],
     spectrum_values: [u8; LIVE_SPECTROGRAM_BAND_COUNT],
     row_count: usize,
@@ -670,9 +675,25 @@ struct LiveAnalyzer {
 impl LiveAnalyzer {
     fn new(sample_rate: u32) -> Self {
         let sample_rate = sample_rate.max(1);
+        let window_coefficients = live_periodic_hann_window();
+        let window_sum = window_coefficients.iter().copied().sum::<f32>();
+        assert!(
+            window_sum.is_finite() && window_sum > 0.0,
+            "periodic Hann window must have a finite positive sum"
+        );
+        let one_sided_bin_calibration = std::array::from_fn(|bin| {
+            let one_sided_factor = if bin == 0 || bin == LIVE_SPECTRUM_POSITIVE_BIN_COUNT - 1 {
+                1.0
+            } else {
+                2.0
+            };
+            one_sided_factor / window_sum
+        });
         Self {
             sample_rate,
             band_ranges: live_band_ranges(sample_rate),
+            window_coefficients,
+            one_sided_bin_calibration,
             attack_coefficient: live_ballistic_coefficient(LIVE_SPECTRUM_ATTACK_TIME, sample_rate),
             release_coefficient: live_ballistic_coefficient(
                 LIVE_SPECTRUM_RELEASE_TIME,
@@ -683,6 +704,7 @@ impl LiveAnalyzer {
             window: [0.0; LIVE_SPECTRUM_FFT_SIZE],
             window_len: 0,
             fft: [LiveComplexSample::default(); LIVE_SPECTRUM_FFT_SIZE],
+            positive_magnitudes: [0.0; LIVE_SPECTRUM_POSITIVE_BIN_COUNT],
             rows: [[0; LIVE_SPECTROGRAM_BAND_COUNT]; LIVE_SPECTROGRAM_MAX_HISTORY],
             spectrum_values: [0; LIVE_SPECTROGRAM_BAND_COUNT],
             row_count: 0,
@@ -725,27 +747,27 @@ impl LiveAnalyzer {
 
     fn analyze_window(&mut self) {
         for (index, (&sample, fft)) in self.window.iter().zip(self.fft.iter_mut()).enumerate() {
-            let hann = 0.5
-                - 0.5
-                    * (std::f32::consts::TAU * index as f32 / LIVE_SPECTRUM_FFT_SIZE as f32).cos();
             *fft = LiveComplexSample {
-                real: sample * hann,
+                real: sample * self.window_coefficients[index],
                 imaginary: 0.0,
             };
         }
         live_fft_in_place(&mut self.fft);
 
+        for (bin, magnitude) in self.positive_magnitudes.iter_mut().enumerate() {
+            let sample = self.fft[bin];
+            *magnitude = (sample.real * sample.real + sample.imaginary * sample.imaginary).sqrt()
+                * self.one_sided_bin_calibration[bin];
+        }
+
         let mut target_row = [0_u8; LIVE_SPECTROGRAM_BAND_COUNT];
         for (band, range) in self.band_ranges.iter().enumerate() {
-            let magnitude = (range.start..range.end)
-                .map(|bin| {
-                    let sample = self.fft[bin];
-                    (sample.real * sample.real + sample.imaginary * sample.imaginary).sqrt()
-                        / LIVE_SPECTRUM_FFT_SIZE as f32
-                })
+            let magnitude = self.positive_magnitudes[range.start..range.end]
+                .iter()
+                .copied()
                 .fold(0.0_f32, f32::max);
             let decibels = 20.0 * magnitude.max(1.0e-8).log10();
-            let display_decibels = (decibels + display_tilt_db(range.center_frequency())).clamp(
+            let display_decibels = (decibels + range.display_tilt_db).clamp(
                 LIVE_SPECTRUM_DISPLAY_FLOOR_DB,
                 LIVE_SPECTRUM_DISPLAY_CEILING_DB,
             );
@@ -831,6 +853,12 @@ pub(crate) fn live_display_frequency_bounds(sample_rate: u32) -> (f32, f32) {
     (minimum, maximum)
 }
 
+fn live_periodic_hann_window() -> [f32; LIVE_SPECTRUM_FFT_SIZE] {
+    std::array::from_fn(|index| {
+        0.5 - 0.5 * (std::f32::consts::TAU * index as f32 / LIVE_SPECTRUM_FFT_SIZE as f32).cos()
+    })
+}
+
 /// Apply the display-only analyzer tilt around 1 kHz.
 ///
 /// The positive 4.5 dB/octave sign boosts frequencies above 1 kHz and cuts
@@ -858,12 +886,15 @@ fn live_band_ranges(sample_rate: u32) -> [LiveBandRange; LIVE_SPECTROGRAM_BAND_C
             ((end_frequency / sample_rate) * LIVE_SPECTRUM_FFT_SIZE as f32).ceil() as usize;
         let start = start_bin.clamp(1, maximum_bin.saturating_sub(1));
         let end = end_bin.clamp(start.saturating_add(1), maximum_bin);
-        LiveBandRange {
+        let mut band = LiveBandRange {
             start,
             end,
             start_frequency,
             end_frequency,
-        }
+            display_tilt_db: 0.0,
+        };
+        band.display_tilt_db = display_tilt_db(band.center_frequency());
+        band
     })
 }
 
@@ -2344,6 +2375,90 @@ mod tests {
         assert!(
             (display_tilt_db(reference / 2.0) + LIVE_SPECTRUM_DISPLAY_TILT_DB_PER_OCTAVE).abs()
                 < 0.001
+        );
+    }
+
+    #[test]
+    fn analyzer_precomputes_periodic_hann_and_one_sided_calibration() {
+        let analyzer = LiveAnalyzer::new(48_000);
+        let window_sum = analyzer.window_coefficients.iter().copied().sum::<f32>();
+        let expected_unique_bin_calibration = 1.0 / window_sum;
+        let expected_interior_bin_calibration = 2.0 / window_sum;
+
+        assert!(window_sum.is_finite() && window_sum > 0.0);
+        assert!(analyzer.window_coefficients[0].abs() < f32::EPSILON);
+        assert!(
+            analyzer
+                .window_coefficients
+                .iter()
+                .all(|coefficient| coefficient.is_finite())
+        );
+        assert!(analyzer.window_coefficients[LIVE_SPECTRUM_FFT_SIZE - 1] > 0.0);
+        assert!(
+            (analyzer.one_sided_bin_calibration[0] - expected_unique_bin_calibration).abs()
+                < 1.0e-9
+        );
+        assert!(
+            (analyzer.one_sided_bin_calibration[1] - expected_interior_bin_calibration).abs()
+                < 1.0e-9
+        );
+        assert!(
+            (analyzer.one_sided_bin_calibration[analyzer.one_sided_bin_calibration.len() - 1]
+                - expected_unique_bin_calibration)
+                .abs()
+                < 1.0e-9
+        );
+    }
+
+    #[test]
+    fn analyzer_calibrates_bin_centered_interior_sine_to_peak_dbfs() {
+        let sample_rate = 48_000.0_f32;
+        let bin = 64_usize;
+        let expected_decibels = -18.0_f32;
+        let amplitude = 10.0_f32.powf(expected_decibels / 20.0);
+        let mut analyzer = LiveAnalyzer::new(sample_rate as u32);
+
+        for index in 0..LIVE_SPECTRUM_FFT_SIZE {
+            let phase =
+                std::f32::consts::TAU * bin as f32 * index as f32 / LIVE_SPECTRUM_FFT_SIZE as f32;
+            assert_eq!(
+                analyzer.push(amplitude * phase.sin()),
+                index + 1 == LIVE_SPECTRUM_FFT_SIZE
+            );
+        }
+
+        let calibrated_magnitude = analyzer.positive_magnitudes[bin];
+        let calibrated_decibels = 20.0 * calibrated_magnitude.log10();
+        assert!(
+            (calibrated_decibels - expected_decibels).abs() <= 0.75,
+            "calibrated_decibels={calibrated_decibels}, expected_decibels={expected_decibels}"
+        );
+    }
+
+    #[test]
+    fn analyzer_calibration_preserves_bin_centered_amplitude_spacing() {
+        let bin = 64_usize;
+        let decode_bin_decibels = |expected_decibels: f32| {
+            let amplitude = 10.0_f32.powf(expected_decibels / 20.0);
+            let mut analyzer = LiveAnalyzer::new(48_000);
+            for index in 0..LIVE_SPECTRUM_FFT_SIZE {
+                let phase = std::f32::consts::TAU * bin as f32 * index as f32
+                    / LIVE_SPECTRUM_FFT_SIZE as f32;
+                assert_eq!(
+                    analyzer.push(amplitude * phase.sin()),
+                    index + 1 == LIVE_SPECTRUM_FFT_SIZE
+                );
+            }
+            20.0 * analyzer.positive_magnitudes[bin].log10()
+        };
+
+        let quiet_decibels = decode_bin_decibels(-30.0);
+        let loud_decibels = decode_bin_decibels(-12.0);
+        let expected_spacing = 18.0;
+        let decoded_spacing = loud_decibels - quiet_decibels;
+        assert!(
+            (decoded_spacing - expected_spacing).abs() <= 0.75,
+            "decoded_spacing={decoded_spacing}, expected_spacing={expected_spacing}"
         );
     }
 
