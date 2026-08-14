@@ -3840,6 +3840,9 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
 
         let main_starts_new_segment =
             main_loop_bounds.is_some() || main_position_millis != state.transport_position_millis;
+        let reference_starts_new_segment = !state.reference_transport_loaded
+            || reference_loop_bounds.is_some()
+            || reference_position_millis != state.reference_transport_position_millis;
         let main_result = if main_starts_new_segment {
             state.transport.seek(
                 state.transport_generation,
@@ -3898,19 +3901,21 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
                 }
                 state.reference_transport_loaded = true;
             }
-            let seek_result = reference_transport.seek(
-                state.reference_transport_generation,
-                reference_position_millis,
-                reference_duration_millis,
-                false,
-            );
-            if let Err(error) = seek_result {
-                state.status = error;
-                context.request_repaint();
-                return;
+            if reference_starts_new_segment {
+                let seek_result = reference_transport.seek(
+                    state.reference_transport_generation,
+                    reference_position_millis,
+                    reference_duration_millis,
+                    false,
+                );
+                if let Err(error) = seek_result {
+                    state.status = error;
+                    context.request_repaint();
+                    return;
+                }
+                let _ = reference_transport;
+                reset_live_spectrogram_segment(state, AuditionSource::Reference);
             }
-            let _ = reference_transport;
-            reset_live_spectrogram_segment(state, AuditionSource::Reference);
             let reference_token = match state
                 .reference_transport
                 .as_ref()
@@ -12228,6 +12233,82 @@ mod tests {
         assert!(state.transport_waiting_token.is_none());
         assert!(state.transport_playing);
         assert!(state.reference_transport_playing);
+    }
+
+    #[test]
+    fn paired_resume_preserves_frozen_reference_live_frame_without_repositioning() {
+        let mut state = shared_reference_playback_state();
+        state.transport_position_millis = 600;
+        state.review_cursor_millis = 600;
+        state.reference_transport_position_millis = 1_200;
+        state.transport_playing = true;
+        state.reference_transport_playing = true;
+
+        let reference_transport = state
+            .reference_transport
+            .as_ref()
+            .expect("the paired state should have a reference transport")
+            .clone();
+        let main_epoch = state.transport.live_frame_state().epoch;
+        let reference_epoch = reference_transport.live_frame_state().epoch;
+        let main_frame = live_frame(state.transport_generation, main_epoch, 1);
+        let reference_frame = live_frame(state.reference_transport_generation, reference_epoch, 1);
+        state.live_spectrogram = Some(Arc::clone(&main_frame));
+        state.live_spectrogram_revision = main_frame.revision;
+        state.reference_live_spectrogram = Some(Arc::clone(&reference_frame));
+        state.reference_live_spectrogram_revision = reference_frame.revision;
+        state
+            .transport
+            .set_live_state_for_test(transport::LiveFrameState {
+                generation: state.transport_generation,
+                epoch: main_epoch,
+                revision: main_frame.revision,
+                pending: false,
+            });
+        reference_transport.set_live_state_for_test(transport::LiveFrameState {
+            generation: state.reference_transport_generation,
+            epoch: reference_epoch,
+            revision: reference_frame.revision,
+            pending: false,
+        });
+
+        let mut context = ui::UiUpdateContext::default();
+        update(&mut state, Message::StopPlayback, &mut context);
+        assert!(state.transport_polling);
+        assert!(state.reference_transport_polling);
+        assert_eq!(
+            state.reference_live_spectrogram.as_ref(),
+            Some(&reference_frame)
+        );
+        assert_eq!(
+            reference_transport.live_frame_state().epoch,
+            reference_epoch
+        );
+
+        // Acknowledge the stop without waiting for the background transports.
+        state.transport_playing = false;
+        state.transport_polling = false;
+        state.transport_waiting_token = None;
+        state.reference_transport_playing = false;
+        state.reference_transport_polling = false;
+        state.reference_transport_waiting_token = None;
+
+        update(&mut state, Message::TogglePlayback, &mut context);
+
+        assert!(state.transport_polling);
+        assert!(state.reference_transport_polling);
+        assert_eq!(
+            state.reference_live_spectrogram.as_ref(),
+            Some(&reference_frame)
+        );
+        assert_eq!(
+            state.reference_live_spectrogram_revision,
+            reference_frame.revision
+        );
+        assert_eq!(
+            reference_transport.live_frame_state().epoch,
+            reference_epoch
+        );
     }
 
     #[test]
