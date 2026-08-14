@@ -6604,10 +6604,17 @@ fn planner_card_with_key(
     let remove_confirmation_open = remove_confirmation_track_id == Some(track.id.as_str());
     let title_track_id = track.id.clone();
     let drag_track_id = track.id.clone();
+    let review_track_id = track.id.clone();
     let remove_id = track.id.clone();
     let favorite_control =
         favorite_toggle(&track, selected, format!("planner-favorite-{}", track.id));
     let replace_control = replace_toggle(&track, format!("planner-replace-{}", track.id));
+    let review_control = ui::icon_button(planner_review_icon())
+        .subtle()
+        .message(Message::SelectTrack(review_track_id))
+        .key(format!("planner-review-{}", track.id))
+        .tooltip("Review track")
+        .size(28.0, 24.0);
     let remove_control = ui::close_button()
         .subtle()
         .message(Message::RequestRemoveTrack(remove_id.clone()))
@@ -6669,6 +6676,7 @@ fn planner_card_with_key(
             )
             .fill_width()
             .height(28.0),
+            review_control,
             favorite_control,
             replace_control,
             remove_control,
@@ -7357,6 +7365,17 @@ const REVIEW_TRANSPORT_ICON_TINTS: ui::SvgIconTintPalette = ui::SvgIconTintPalet
     ui::Rgba8::new(233, 88, 67, 255),
     ui::Rgba8::new(153, 155, 154, 255),
 );
+
+static REVIEW_TRACK_ICON: ui::SvgIconTintCache = ui::SvgIconTintCache::new(
+    r#"<svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg" fill="none">
+  <path d="M1.2 8s2.4-4 6.8-4 6.8 4 6.8 4-2.4 4-6.8 4-6.8-4-6.8-4Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
+  <circle cx="8" cy="8" r="1.8" fill="currentColor"/>
+</svg>"#,
+);
+
+fn planner_review_icon() -> ui::SvgIcon {
+    REVIEW_TRACK_ICON.icon_for_state(REVIEW_TRANSPORT_ICON_TINTS, true, false)
+}
 
 static REVIEW_SOURCE_PLAY_ICON: ui::SvgIconTintCache = ui::SvgIconTintCache::new(
     r#"<svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg" fill="currentColor">
@@ -16547,6 +16566,30 @@ mod tests {
             .expect("the track card should paint its close control")
     }
 
+    fn svg_rect_for_icon_after(
+        primitives: &[PaintPrimitive],
+        icon: &ui::SvgIcon,
+        min_y: f32,
+    ) -> Option<Rect> {
+        let mut expected_primitives = Vec::new();
+        icon.append_paint(
+            &mut expected_primitives,
+            0,
+            Rect::from_min_size(Point::new(0.0, 0.0), Vector2::new(16.0, 16.0)),
+        );
+        let Some(PaintPrimitive::Svg(expected)) = expected_primitives.first() else {
+            return None;
+        };
+        primitives.iter().find_map(|primitive| match primitive {
+            PaintPrimitive::Svg(actual)
+                if actual.document == expected.document && actual.rect.max.y > min_y =>
+            {
+                Some(actual.rect)
+            }
+            _ => None,
+        })
+    }
+
     #[test]
     fn audition_card_removal_control_opens_and_cancels_confirmation() {
         let track = audition_track("audition-remove-card");
@@ -16618,6 +16661,64 @@ mod tests {
                 .is_none()
         );
         assert_eq!(runtime.bridge().state().library.tracks.len(), 1);
+    }
+
+    #[test]
+    fn planner_card_review_control_switches_to_review() {
+        let mut track = audition_track("planner-review-card");
+        track.stage = TrackStage::SoundDesign;
+        let track_id = track.id.clone();
+        let mut state = AppState {
+            busy: false,
+            workspace_mode: WorkspaceMode::Planner,
+            ..AppState::default()
+        };
+        state.library.tracks = vec![track];
+        let bridge = DeclarativeOwnedRuntimeBridge::new(
+            state,
+            |state| project_surface(state).into_surface(),
+            |state, message| {
+                let mut context = ui::UiUpdateContext::default();
+                update(state, message, &mut context);
+            },
+        );
+        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1_180.0, 900.0));
+        let frame = runtime.frame_with_default_theme();
+        let title = frame
+            .paint_plan
+            .first_text_run("planner-review-card")
+            .expect("the Planner card should paint its title");
+        assert!(paint_plan_contains_icon(
+            &frame.paint_plan.primitives,
+            &super::planner_review_icon()
+        ));
+        let review_rect = svg_rect_for_icon_after(
+            &frame.paint_plan.primitives,
+            &super::planner_review_icon(),
+            title.rect.min.y,
+        )
+        .expect("the Planner card should paint its review icon");
+        let review_point = Point::new(
+            review_rect.min.x + review_rect.width() * 0.5,
+            review_rect.min.y + review_rect.height() * 0.5,
+        );
+
+        assert!(runtime.widget_at(review_point).is_some());
+        runtime.dispatch_primary_click(review_point);
+
+        assert_eq!(
+            runtime.bridge().state().workspace_mode,
+            WorkspaceMode::Review
+        );
+        assert_eq!(
+            runtime
+                .bridge()
+                .state()
+                .library
+                .selected_track_id
+                .as_deref(),
+            Some(track_id.as_str())
+        );
     }
 
     #[test]
