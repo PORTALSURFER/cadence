@@ -140,7 +140,10 @@ fn fragment_main(input: VertexOut) -> @location(0) vec4<f32> {
     }
 
     let max_history = max(params.max_history, 1u);
-    let active_height = min(f32(params.row_count) / f32(max_history), 1.0);
+    let requested_active_height = min(f32(params.row_count) / f32(max_history), 1.0);
+    let plot_height = max(surface.dest.w, 1.0);
+    let active_pixels = max(1.0, requested_active_height * plot_height);
+    let active_height = min(active_pixels / plot_height, 1.0);
     let active_top = 1.0 - active_height;
     if input.local.y < active_top {
         return vec4<f32>(palette_color(0.0), 1.0);
@@ -558,6 +561,8 @@ mod tests {
         assert!(descriptor.wgsl_source.as_deref().is_some_and(
             |source| source.contains("row_index")
                 && source.contains("active_top")
+                && source.contains("surface.dest.w")
+                && source.contains("active_pixels")
                 && source.contains("band_position")
                 && source.contains("oldest-to-newest")
                 && source.contains("newest row is anchored at the")
