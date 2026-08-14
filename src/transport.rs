@@ -114,6 +114,7 @@ struct LiveCaptureSession {
     id: u64,
     epoch: AtomicU64,
     active: AtomicBool,
+    analysis_frozen: AtomicBool,
     discontinuity_marked: AtomicBool,
 }
 
@@ -124,6 +125,7 @@ impl LiveCaptureSession {
             id,
             epoch: AtomicU64::new(epoch),
             active: AtomicBool::new(true),
+            analysis_frozen: AtomicBool::new(true),
             discontinuity_marked: AtomicBool::new(false),
         }
     }
@@ -147,6 +149,7 @@ impl LiveCaptureSession {
     }
 
     fn retire(&self) {
+        self.analysis_frozen.store(true, Ordering::Release);
         self.active.store(false, Ordering::Release);
         self.discontinuity_marked.store(false, Ordering::Release);
     }
@@ -290,6 +293,20 @@ impl SharedSnapshot {
         self.clear_live_frame();
     }
 
+    fn set_live_analysis_frozen(&self, session: &LiveCaptureSession, frozen: bool) -> bool {
+        let Ok(_latest) = self.live_frame.lock() else {
+            return false;
+        };
+        let current = session.active.load(Ordering::Acquire)
+            && session.generation == self.requested_generation.load(Ordering::Acquire)
+            && session.id == self.live_session_id.load(Ordering::Acquire);
+        if !current {
+            return false;
+        }
+        session.analysis_frozen.store(frozen, Ordering::Release);
+        true
+    }
+
     fn retire_live_session(&self, session: Option<&Arc<LiveCaptureSession>>) {
         if let Some(session) = session {
             session.retire();
@@ -329,6 +346,7 @@ impl SharedSnapshot {
             return false;
         };
         let current = session.active.load(Ordering::Acquire)
+            && !session.analysis_frozen.load(Ordering::Acquire)
             && session.generation == self.requested_generation.load(Ordering::Acquire)
             && session.id == self.live_session_id.load(Ordering::Acquire)
             && session.current_epoch() == frame.epoch;
@@ -416,7 +434,9 @@ where
     }
 
     fn push_analysis_frame(&mut self, mono: f32) {
-        if !self.session.active.load(Ordering::Acquire) {
+        if !self.session.active.load(Ordering::Acquire)
+            || self.session.analysis_frozen.load(Ordering::Acquire)
+        {
             return;
         }
         // Analysis is intentionally pre-fader: the display follows decoder
@@ -753,48 +773,25 @@ fn run_live_analyzer(
             shared.clear_live_frame_for_session(&session);
         }
 
-        let mut consumed = false;
-        while let Ok(capture) = consumer.pop() {
-            consumed = true;
-            let current_epoch = session.current_epoch();
-            if current_epoch != observed_epoch {
-                observed_epoch = current_epoch;
-                analyzer.reset();
-                published_revision = 0;
-                shared.clear_live_frame_for_session(&session);
-            }
-            if capture.epoch != observed_epoch {
-                continue;
-            }
-            if analyzer.push(capture.sample) {
-                publish_live_frame_if_due(
-                    &analyzer,
-                    &session,
-                    &shared,
-                    observed_epoch,
-                    &mut published_revision,
-                    &mut last_publication,
-                    false,
-                );
-            }
-        }
-        if analyzer.revision > published_revision {
-            publish_live_frame_if_due(
-                &analyzer,
-                &session,
-                &shared,
-                observed_epoch,
-                &mut published_revision,
-                &mut last_publication,
-                false,
-            );
-        }
+        let (consumed, frozen) = run_live_analyzer_iteration(
+            &mut consumer,
+            &session,
+            &shared,
+            &mut analyzer,
+            &mut observed_epoch,
+            &mut published_revision,
+            &mut last_publication,
+        );
 
-        if consumer.is_empty()
-            && analyzer.revision <= published_revision
-            && session.id == shared.live_session_id.load(Ordering::Acquire)
-        {
-            shared.live_pending.store(false, Ordering::Release);
+        if frozen {
+            let producer_gone = consumer.is_abandoned() && consumer.is_empty();
+            if producer_gone {
+                break;
+            }
+            if !consumed {
+                thread::sleep(LIVE_ANALYZER_POLL_INTERVAL);
+            }
+            continue;
         }
 
         let producer_gone = consumer.is_abandoned() && consumer.is_empty();
@@ -822,9 +819,116 @@ fn run_live_analyzer(
             thread::sleep(LIVE_ANALYZER_POLL_INTERVAL);
         }
     }
+    session.retire();
     if session.id == shared.live_session_id.load(Ordering::Acquire) {
         shared.live_pending.store(false, Ordering::Release);
     }
+}
+
+fn discard_live_capture(
+    consumer: &mut Consumer<CaptureFrame>,
+    session: &LiveCaptureSession,
+    shared: &SharedSnapshot,
+) -> bool {
+    let mut discarded = false;
+    while consumer.pop().is_ok() {
+        discarded = true;
+    }
+    if session.id == shared.live_session_id.load(Ordering::Acquire) && consumer.is_empty() {
+        shared.live_pending.store(false, Ordering::Release);
+    }
+    discarded
+}
+
+fn run_live_analyzer_iteration(
+    consumer: &mut Consumer<CaptureFrame>,
+    session: &LiveCaptureSession,
+    shared: &SharedSnapshot,
+    analyzer: &mut LiveAnalyzer,
+    observed_epoch: &mut u64,
+    published_revision: &mut u64,
+    last_publication: &mut Instant,
+) -> (bool, bool) {
+    let current_epoch = session.current_epoch();
+    if current_epoch != *observed_epoch {
+        *observed_epoch = current_epoch;
+        analyzer.reset();
+        *published_revision = 0;
+        shared.clear_live_frame_for_session(session);
+    }
+
+    if session.analysis_frozen.load(Ordering::Acquire) {
+        let consumed = discard_live_capture(consumer, session, shared);
+        // Work computed before the pause is intentionally not published after
+        // it. The last displayed frame remains the pause boundary, while the
+        // analyzer's rolling window and epoch stay intact for resume.
+        *published_revision = analyzer.revision;
+        return (consumed, true);
+    }
+
+    let mut consumed = false;
+    while let Ok(capture) = consumer.pop() {
+        consumed = true;
+        if session.analysis_frozen.load(Ordering::Acquire) {
+            let discarded = discard_live_capture(consumer, session, shared);
+            *published_revision = analyzer.revision;
+            return (consumed || discarded, true);
+        }
+
+        let current_epoch = session.current_epoch();
+        if current_epoch != *observed_epoch {
+            *observed_epoch = current_epoch;
+            analyzer.reset();
+            *published_revision = 0;
+            shared.clear_live_frame_for_session(session);
+        }
+        if capture.epoch != *observed_epoch {
+            continue;
+        }
+        if analyzer.push(capture.sample) {
+            publish_live_frame_if_due(
+                analyzer,
+                session,
+                shared,
+                *observed_epoch,
+                published_revision,
+                last_publication,
+                false,
+            );
+        }
+
+        if session.analysis_frozen.load(Ordering::Acquire) {
+            let discarded = discard_live_capture(consumer, session, shared);
+            *published_revision = analyzer.revision;
+            return (consumed || discarded, true);
+        }
+    }
+
+    if session.analysis_frozen.load(Ordering::Acquire) {
+        let discarded = discard_live_capture(consumer, session, shared);
+        *published_revision = analyzer.revision;
+        return (consumed || discarded, true);
+    }
+
+    if analyzer.revision > *published_revision {
+        publish_live_frame_if_due(
+            analyzer,
+            session,
+            shared,
+            *observed_epoch,
+            published_revision,
+            last_publication,
+            false,
+        );
+    }
+
+    if consumer.is_empty()
+        && analyzer.revision <= *published_revision
+        && session.id == shared.live_session_id.load(Ordering::Acquire)
+    {
+        shared.live_pending.store(false, Ordering::Release);
+    }
+    (consumed, false)
 }
 
 fn publish_live_frame_if_due(
@@ -1415,6 +1519,9 @@ fn handle_command(
                             .as_ref()
                             .is_some_and(|track| track.generation == generation)
                     {
+                        if let Some(session) = live_session.as_deref() {
+                            shared.set_live_analysis_frozen(session, false);
+                        }
                         player.play();
                         shared.playing.store(true, Ordering::Release);
                     }
@@ -1426,6 +1533,12 @@ fn handle_command(
             if !is_current(shared, generation) {
                 (token, false)
             } else {
+                if let Some(session) = live_session.as_deref() {
+                    // Freeze publication before pausing the player so any
+                    // decoder frames already queued at this command boundary
+                    // are drained without advancing the visible display.
+                    shared.set_live_analysis_frozen(session, true);
+                }
                 if let Some(player) = player.as_ref() {
                     player.pause();
                 }
@@ -1463,9 +1576,18 @@ fn handle_command(
                         if !reloaded {
                             (token, false)
                         } else if let Some(player) = player.as_ref() {
+                            let was_frozen = live_session.as_deref().is_none_or(|session| {
+                                session.analysis_frozen.load(Ordering::Acquire)
+                            });
+                            if let Some(session) = live_session.as_deref() {
+                                shared.set_live_analysis_frozen(session, true);
+                            }
                             if let Err(error) =
                                 player.try_seek(Duration::from_millis(position_millis))
                             {
+                                if let Some(session) = live_session.as_deref() {
+                                    shared.set_live_analysis_frozen(session, was_frozen);
+                                }
                                 shared.set_error(
                                     generation,
                                     format!("Could not seek this audio file: {error}"),
@@ -1473,8 +1595,14 @@ fn handle_command(
                                 (token, true)
                             } else {
                                 if resume {
+                                    if let Some(session) = live_session.as_deref() {
+                                        shared.set_live_analysis_frozen(session, false);
+                                    }
                                     player.play();
                                 } else {
+                                    if let Some(session) = live_session.as_deref() {
+                                        shared.set_live_analysis_frozen(session, true);
+                                    }
                                     player.pause();
                                 }
                                 shared
@@ -1692,8 +1820,9 @@ mod tests {
         AudioTransport, CONTROLS_BUSY_ERROR, CaptureFrame, Command, DEFAULT_VOLUME,
         LIVE_SPECTROGRAM_BAND_COUNT, LIVE_SPECTROGRAM_MAX_HISTORY, LIVE_SPECTRUM_FFT_SIZE,
         LiveAnalysisSource, LiveAnalyzer, LiveCaptureSession, MAX_OUTPUT_GAIN, PendingLoad,
-        SharedSnapshot, clamp_position, handle_live_analyzer_spawn_error, is_current,
-        normalize_output_gain, normalize_volume, publish_live_frame_if_due,
+        SharedSnapshot, clamp_position, handle_command, handle_live_analyzer_spawn_error,
+        is_current, normalize_output_gain, normalize_volume, publish_live_frame_if_due,
+        run_live_analyzer_iteration,
     };
     use rodio::{Source, buffer::SamplesBuffer, source::SeekError};
     use std::path::PathBuf;
@@ -1829,6 +1958,7 @@ mod tests {
             .store(generation, Ordering::Release);
         let session = Arc::new(LiveCaptureSession::new(generation, 1, 1));
         shared.begin_live_session(&session);
+        assert!(shared.set_live_analysis_frozen(&session, false));
         (shared, session)
     }
 
@@ -1951,6 +2081,115 @@ mod tests {
 
         assert!(shared.latest_live_frame().is_none());
         assert_eq!(published_revision, 0);
+    }
+
+    #[test]
+    fn paused_analyzer_drains_queued_capture_and_resumes_same_epoch() {
+        let (shared, session) = active_test_session(8);
+        let (mut producer, mut consumer) = super::RingBuffer::new(4_096);
+        let mut analyzer = LiveAnalyzer::new(48_000);
+        let mut observed_epoch = session.current_epoch();
+        for index in 0..LIVE_SPECTRUM_FFT_SIZE {
+            let emitted = analyzer.push((index as f32 * 0.01).sin());
+            assert_eq!(emitted, index + 1 == LIVE_SPECTRUM_FFT_SIZE);
+        }
+
+        let mut published_revision = 0;
+        let mut last_publication = Instant::now();
+        publish_live_frame_if_due(
+            &analyzer,
+            &session,
+            &shared,
+            observed_epoch,
+            &mut published_revision,
+            &mut last_publication,
+            true,
+        );
+        let displayed_frame = shared
+            .latest_live_frame()
+            .expect("the pre-pause frame should be visible");
+        let displayed_state = shared.live_frame_state();
+
+        for index in 0..LIVE_SPECTRUM_FFT_SIZE {
+            producer
+                .push(CaptureFrame {
+                    sample: (index as f32 * 0.02).cos(),
+                    epoch: observed_epoch,
+                })
+                .expect("the test capture ring should have room");
+        }
+        shared.mark_capture_pending();
+        let mut player = None;
+        let mut loaded = None;
+        let mut live_session = Some(Arc::clone(&session));
+        handle_command(
+            Command::Pause {
+                token: 1,
+                generation: 8,
+            },
+            &shared,
+            None,
+            &mut player,
+            &mut loaded,
+            &mut live_session,
+        );
+        assert_eq!(shared.snapshot().acknowledged_token, 1);
+        assert!(session.analysis_frozen.load(Ordering::Acquire));
+
+        let (consumed, frozen) = run_live_analyzer_iteration(
+            &mut consumer,
+            &session,
+            &shared,
+            &mut analyzer,
+            &mut observed_epoch,
+            &mut published_revision,
+            &mut last_publication,
+        );
+        assert!(consumed);
+        assert!(frozen);
+        assert_eq!(analyzer.revision, displayed_state.revision);
+        assert_eq!(published_revision, displayed_state.revision);
+        assert!(!shared.live_frame_state().pending);
+        let paused_frame = shared
+            .latest_live_frame()
+            .expect("pause should preserve the displayed frame");
+        assert!(Arc::ptr_eq(&paused_frame, &displayed_frame));
+        assert_eq!(shared.live_frame_state().epoch, displayed_state.epoch);
+        assert_eq!(shared.live_frame_state().revision, displayed_state.revision);
+
+        assert!(shared.set_live_analysis_frozen(&session, false));
+        last_publication = Instant::now()
+            .checked_sub(super::LIVE_PUBLICATION_INTERVAL)
+            .expect("the publication interval should be representable");
+        for index in 0..super::LIVE_SPECTRUM_HOP_SIZE {
+            producer
+                .push(CaptureFrame {
+                    sample: (index as f32 * 0.03).sin(),
+                    epoch: observed_epoch,
+                })
+                .expect("the resumed capture ring should have room");
+        }
+        shared.mark_capture_pending();
+        let (consumed, frozen) = run_live_analyzer_iteration(
+            &mut consumer,
+            &session,
+            &shared,
+            &mut analyzer,
+            &mut observed_epoch,
+            &mut published_revision,
+            &mut last_publication,
+        );
+        assert!(consumed);
+        assert!(!frozen);
+        assert!(published_revision > displayed_state.revision);
+        let resumed_frame = shared
+            .latest_live_frame()
+            .expect("resume should publish newly analyzed audio");
+        assert_eq!(resumed_frame.epoch, displayed_frame.epoch);
+        assert_eq!(resumed_frame.revision, published_revision);
+        assert!(!Arc::ptr_eq(&resumed_frame, &displayed_frame));
+        assert!(!shared.live_frame_state().pending);
+        session.retire();
     }
 
     fn strongest_band_for_tone(frequency: f32) -> usize {
@@ -2089,6 +2328,7 @@ mod tests {
         shared.requested_generation.store(7, Ordering::Release);
         let old_session = Arc::new(LiveCaptureSession::new(7, 1, 1));
         shared.begin_live_session(&old_session);
+        assert!(shared.set_live_analysis_frozen(&old_session, false));
         let old_frame = Arc::new(super::LiveSpectrogramFrame {
             generation: 7,
             epoch: 1,
