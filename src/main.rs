@@ -1843,6 +1843,12 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 && state.audition_pending_play_track_id.is_some();
             let mut main_snapshot_applied = false;
             if snapshot.generation == state.transport_generation {
+                if let Some(warning) = state
+                    .transport
+                    .take_analysis_warning(state.transport_generation)
+                {
+                    state.status = format!("Live spectrogram unavailable: {warning}");
+                }
                 if let Some(error) = state.transport.take_error(state.transport_generation) {
                     state.playhead_drag_active = false;
                     state.transport_playing = false;
@@ -2969,7 +2975,6 @@ fn seek_synchronized_positions(
         main_duration_millis,
         resume,
     )?;
-    reset_live_spectrogram_segment(state, AuditionSource::Main);
     begin_transport_polling(state, main_token);
     if let Some((reference_path, reference_duration_millis)) = reference_details {
         let reference_gain = reference_output_gain(state);
@@ -2994,7 +2999,6 @@ fn seek_synchronized_positions(
             reference_duration_millis,
             resume,
         )?;
-        reset_live_spectrogram_segment(state, AuditionSource::Reference);
         state.reference_transport_waiting_token = Some(reference_token);
         state.reference_transport_polling = true;
     }
@@ -3089,7 +3093,6 @@ fn seek_reference_waveform_position(
         true,
     ) {
         Ok(token) => {
-            reset_live_spectrogram_segment(state, AuditionSource::Reference);
             state.reference_transport_position_millis = reference_position_millis;
             state.reference_transport_waiting_token = Some(token);
             state.reference_transport_polling = true;
@@ -3154,7 +3157,6 @@ fn seek_loop_owner(
                 duration_millis,
                 true,
             )?;
-            reset_live_spectrogram_segment(state, AuditionSource::Main);
             set_source_position(state, source, position_millis);
             begin_transport_polling(state, token);
         }
@@ -3176,7 +3178,6 @@ fn seek_loop_owner(
                 duration_millis,
                 true,
             )?;
-            reset_live_spectrogram_segment(state, AuditionSource::Reference);
             set_source_position(state, source, position_millis);
             state.reference_transport_waiting_token = Some(token);
             state.reference_transport_polling = true;
@@ -3358,9 +3359,6 @@ fn start_source_alongside_active(
             };
             match result {
                 Ok(token) => {
-                    if starts_new_segment {
-                        reset_live_spectrogram_segment(state, AuditionSource::Main);
-                    }
                     set_source_position(state, AuditionSource::Main, position_millis);
                     begin_transport_polling(state, token);
                     Ok(())
@@ -3433,7 +3431,6 @@ fn start_source_alongside_active(
             }
             match result {
                 Ok(token) => {
-                    reset_live_spectrogram_segment(state, AuditionSource::Reference);
                     set_source_position(state, AuditionSource::Reference, position_millis);
                     state.reference_transport_waiting_token = Some(token);
                     state.reference_transport_polling = true;
@@ -3865,9 +3862,6 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
                 return;
             }
         };
-        if main_starts_new_segment {
-            reset_live_spectrogram_segment(state, AuditionSource::Main);
-        }
         set_source_position(state, AuditionSource::Main, main_position_millis);
         if state.workspace_mode == WorkspaceMode::Audition {
             state.audition_auto_advance = true;
@@ -3913,8 +3907,6 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
                     context.request_repaint();
                     return;
                 }
-                let _ = reference_transport;
-                reset_live_spectrogram_segment(state, AuditionSource::Reference);
             }
             let reference_token = match state
                 .reference_transport
@@ -4993,6 +4985,15 @@ fn update_reference_transport(state: &mut AppState) {
     };
     if snapshot.generation != state.reference_transport_generation {
         return;
+    }
+    if let Some(warning) = state
+        .reference_transport
+        .as_ref()
+        .and_then(|reference_transport| {
+            reference_transport.take_analysis_warning(state.reference_transport_generation)
+        })
+    {
+        state.status = format!("Live spectrogram unavailable: {warning}");
     }
     if let Some(error) = state
         .reference_transport
@@ -17360,6 +17361,67 @@ mod tests {
                 String::from("Could not open test-audio.wav for playback: test failure"),
             );
         })
+    }
+
+    #[test]
+    fn frame_analysis_warning_preserves_main_and_reference_transport_controls() {
+        let mut state = AppState {
+            busy: false,
+            transport_playing: true,
+            transport_polling: true,
+            transport_waiting_token: Some(7),
+            ..AppState::default()
+        };
+        let generation = state.transport_generation;
+        state.transport.set_snapshot_for_test(Snapshot {
+            generation,
+            acknowledged_token: 0,
+            position_millis: 250,
+            playing: true,
+            ready: true,
+        });
+        state
+            .transport
+            .set_analysis_warning_for_test(generation, String::from("analysis worker failed"));
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut state, Message::Frame, &mut context);
+
+        assert_eq!(
+            state.status,
+            "Live spectrogram unavailable: analysis worker failed"
+        );
+        assert!(state.transport_playing);
+        assert!(state.transport_polling);
+        assert_eq!(state.transport_waiting_token, Some(7));
+
+        let reference_transport = transport::AudioTransport::spawn();
+        let reference_generation = state.reference_transport_generation;
+        reference_transport.set_snapshot_for_test(Snapshot {
+            generation: reference_generation,
+            acknowledged_token: 0,
+            position_millis: 500,
+            playing: true,
+            ready: true,
+        });
+        reference_transport.set_analysis_warning_for_test(
+            reference_generation,
+            String::from("reference analyzer failed"),
+        );
+        state.reference_transport = Some(reference_transport);
+        state.reference_transport_playing = true;
+        state.reference_transport_polling = true;
+        state.reference_transport_waiting_token = Some(11);
+
+        update(&mut state, Message::Frame, &mut context);
+
+        assert_eq!(
+            state.status,
+            "Live spectrogram unavailable: reference analyzer failed"
+        );
+        assert!(state.reference_transport_playing);
+        assert!(state.reference_transport_polling);
+        assert_eq!(state.reference_transport_waiting_token, Some(11));
     }
 
     fn wait_for_frame_state(

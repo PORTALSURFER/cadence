@@ -187,6 +187,8 @@ struct SharedSnapshot {
     requested_volume: AtomicU32,
     error_available: AtomicBool,
     error: Mutex<Option<(u64, String)>>,
+    analysis_warning_available: AtomicBool,
+    analysis_warning: Mutex<Option<(u64, String)>>,
     live_session_id: AtomicU64,
     next_live_session_id: AtomicU64,
     live_epoch: AtomicU64,
@@ -208,6 +210,8 @@ impl SharedSnapshot {
             requested_volume: AtomicU32::new(DEFAULT_VOLUME.to_bits()),
             error_available: AtomicBool::new(false),
             error: Mutex::new(None),
+            analysis_warning_available: AtomicBool::new(false),
+            analysis_warning: Mutex::new(None),
             live_session_id: AtomicU64::new(0),
             next_live_session_id: AtomicU64::new(1),
             live_epoch: AtomicU64::new(0),
@@ -262,6 +266,33 @@ impl SharedSnapshot {
             }
             Some(_) | None => {
                 self.error_available.store(false, Ordering::Release);
+                None
+            }
+        }
+    }
+
+    fn set_analysis_warning(&self, generation: u64, warning: String) {
+        if let Ok(mut slot) = self.analysis_warning.lock() {
+            *slot = Some((generation, warning));
+            self.analysis_warning_available
+                .store(true, Ordering::Release);
+        }
+    }
+
+    fn take_analysis_warning(&self, generation: u64) -> Option<String> {
+        if !self.analysis_warning_available.load(Ordering::Acquire) {
+            return None;
+        }
+        let mut slot = self.analysis_warning.try_lock().ok()?;
+        match slot.take() {
+            Some((warning_generation, warning)) if warning_generation == generation => {
+                self.analysis_warning_available
+                    .store(false, Ordering::Release);
+                Some(warning)
+            }
+            Some(_) | None => {
+                self.analysis_warning_available
+                    .store(false, Ordering::Release);
                 None
             }
         }
@@ -1131,9 +1162,18 @@ impl AudioTransport {
         self.shared.take_error(generation)
     }
 
+    pub fn take_analysis_warning(&self, generation: u64) -> Option<String> {
+        self.shared.take_analysis_warning(generation)
+    }
+
     #[cfg(test)]
     pub(crate) fn set_error_for_test(&self, generation: u64, error: String) {
         self.shared.set_error(generation, error);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_analysis_warning_for_test(&self, generation: u64, warning: String) {
+        self.shared.set_analysis_warning(generation, warning);
     }
 
     #[cfg(test)]
@@ -1332,6 +1372,34 @@ struct LoadedTrack {
     generation: u64,
     path: PathBuf,
     duration_millis: u64,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_loaded_track<S>(
+    shared: &SharedSnapshot,
+    generation: u64,
+    path: PathBuf,
+    duration_millis: u64,
+    player_handle: Player,
+    source: S,
+    analysis_session: Option<Arc<LiveCaptureSession>>,
+    player: &mut Option<Player>,
+    loaded: &mut Option<LoadedTrack>,
+    live_session: &mut Option<Arc<LiveCaptureSession>>,
+) where
+    S: Source<Item = f32> + Send + 'static,
+{
+    player_handle.append(source);
+    player_handle.set_volume(shared.requested_volume());
+    player_handle.pause();
+    *player = Some(player_handle);
+    *loaded = Some(LoadedTrack {
+        generation,
+        path,
+        duration_millis,
+    });
+    *live_session = analysis_session;
+    shared.ready.store(true, Ordering::Release);
 }
 
 fn run_transport(
@@ -1698,32 +1766,71 @@ fn load_track(
 
     let analyzer_session = Arc::clone(&session);
     let analyzer_shared = Arc::clone(shared);
-    if let Err(error) = thread::Builder::new()
+    let analyzer_spawn = thread::Builder::new()
         .name(String::from("cadence-live-spectrogram"))
-        .spawn(move || run_live_analyzer(consumer, analyzer_session, analyzer_shared, sample_rate))
-    {
-        handle_live_analyzer_spawn_error(shared, generation, &session, error);
-        return true;
-    }
-
+        .spawn(move || run_live_analyzer(consumer, analyzer_session, analyzer_shared, sample_rate));
     let player_handle = Player::connect_new(output.mixer());
-    player_handle.append(LiveAnalysisSource::new(
-        decoder,
-        producer,
-        Arc::clone(&session),
-        Arc::clone(shared),
-    ));
-    player_handle.set_volume(shared.requested_volume());
-    player_handle.pause();
-    *player = Some(player_handle);
-    *loaded = Some(LoadedTrack {
+    match analyzer_spawn {
+        Ok(_) => finish_loaded_track(
+            shared,
+            generation,
+            path,
+            duration_millis,
+            player_handle,
+            LiveAnalysisSource::new(decoder, producer, Arc::clone(&session), Arc::clone(shared)),
+            Some(session),
+            player,
+            loaded,
+            live_session,
+        ),
+        Err(error) => {
+            finish_analyzer_fallback(
+                shared,
+                generation,
+                path,
+                duration_millis,
+                player_handle,
+                decoder,
+                &session,
+                error,
+                player,
+                loaded,
+                live_session,
+            );
+        }
+    }
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_analyzer_fallback<S>(
+    shared: &SharedSnapshot,
+    generation: u64,
+    path: PathBuf,
+    duration_millis: u64,
+    player_handle: Player,
+    source: S,
+    session: &Arc<LiveCaptureSession>,
+    error: std::io::Error,
+    player: &mut Option<Player>,
+    loaded: &mut Option<LoadedTrack>,
+    live_session: &mut Option<Arc<LiveCaptureSession>>,
+) where
+    S: Source<Item = f32> + Send + 'static,
+{
+    handle_live_analyzer_spawn_error(shared, generation, session, error);
+    finish_loaded_track(
+        shared,
         generation,
         path,
         duration_millis,
-    });
-    *live_session = Some(session);
-    shared.ready.store(true, Ordering::Release);
-    true
+        player_handle,
+        source,
+        None,
+        player,
+        loaded,
+        live_session,
+    );
 }
 
 fn handle_live_analyzer_spawn_error(
@@ -1733,7 +1840,7 @@ fn handle_live_analyzer_spawn_error(
     error: std::io::Error,
 ) {
     shared.retire_live_session(Some(session));
-    shared.set_error(
+    shared.set_analysis_warning(
         generation,
         format!("Could not start live spectrogram analysis: {error}"),
     );
@@ -1820,11 +1927,11 @@ mod tests {
         AudioTransport, CONTROLS_BUSY_ERROR, CaptureFrame, Command, DEFAULT_VOLUME,
         LIVE_SPECTROGRAM_BAND_COUNT, LIVE_SPECTROGRAM_MAX_HISTORY, LIVE_SPECTRUM_FFT_SIZE,
         LiveAnalysisSource, LiveAnalyzer, LiveCaptureSession, MAX_OUTPUT_GAIN, PendingLoad,
-        SharedSnapshot, clamp_position, handle_command, handle_live_analyzer_spawn_error,
-        is_current, normalize_output_gain, normalize_volume, publish_live_frame_if_due,
+        SharedSnapshot, clamp_position, finish_analyzer_fallback, handle_command, is_current,
+        normalize_output_gain, normalize_volume, publish_live_frame_if_due,
         run_live_analyzer_iteration,
     };
-    use rodio::{Source, buffer::SamplesBuffer, source::SeekError};
+    use rodio::{Player, Source, buffer::SamplesBuffer, source::SeekError};
     use std::path::PathBuf;
     use std::sync::{
         Arc,
@@ -2220,6 +2327,7 @@ mod tests {
         samples: Vec<f32>,
         position: usize,
         sought_to_millis: Arc<AtomicUsize>,
+        reject_seek: bool,
     }
 
     impl Iterator for SeekableSource {
@@ -2250,6 +2358,11 @@ mod tests {
         }
 
         fn try_seek(&mut self, position: Duration) -> Result<(), SeekError> {
+            if self.reject_seek {
+                return Err(SeekError::NotSupported {
+                    underlying_source: "test-seekable-source",
+                });
+            }
             self.position = position.as_millis() as usize;
             self.sought_to_millis
                 .store(position.as_millis() as usize, Ordering::Release);
@@ -2265,6 +2378,7 @@ mod tests {
             samples: vec![0.0; 128],
             position: 0,
             sought_to_millis: Arc::clone(&sought_to_millis),
+            reject_seek: false,
         };
         let (producer, _consumer) = super::RingBuffer::new(8);
         let mut adapter = LiveAnalysisSource::new(source, producer, Arc::clone(&session), shared);
@@ -2275,6 +2389,38 @@ mod tests {
         assert_eq!(sought_to_millis.load(Ordering::Acquire), 37);
         assert!(session.current_epoch() > old_epoch);
         assert_eq!(adapter.current_span_len(), Some(91));
+    }
+
+    #[test]
+    fn analysis_source_failed_seek_preserves_epoch_and_visible_frame() {
+        let (shared, session) = active_test_session(5);
+        let frame = Arc::new(super::LiveSpectrogramFrame {
+            generation: 5,
+            epoch: session.current_epoch(),
+            revision: 1,
+            sample_rate: 48_000,
+            row_count: 1,
+            values: Arc::from(vec![1_u8; LIVE_SPECTROGRAM_BAND_COUNT].into_boxed_slice()),
+        });
+        assert!(shared.publish_live_frame(&session, Arc::clone(&frame)));
+        let (producer, _consumer) = super::RingBuffer::new(8);
+        let source = SeekableSource {
+            samples: vec![0.0; 128],
+            position: 0,
+            sought_to_millis: Arc::new(AtomicUsize::new(0)),
+            reject_seek: true,
+        };
+        let mut adapter = LiveAnalysisSource::new(source, producer, session, Arc::clone(&shared));
+        let old_epoch = adapter.session.current_epoch();
+
+        assert!(adapter.try_seek(Duration::from_millis(37)).is_err());
+        assert_eq!(adapter.session.current_epoch(), old_epoch);
+        assert_eq!(shared.live_frame_state().epoch, old_epoch);
+        assert!(
+            shared
+                .latest_live_frame()
+                .is_some_and(|latest| Arc::ptr_eq(&latest, &frame))
+        );
     }
 
     #[test]
@@ -2292,8 +2438,9 @@ mod tests {
     }
 
     #[test]
-    fn analyzer_spawn_error_retires_session_and_publishes_generation_error() {
+    fn analyzer_spawn_failure_keeps_raw_player_ready_and_publishes_warning() {
         let (shared, session) = active_test_session(9);
+        shared.generation.store(9, Ordering::Release);
         let frame = Arc::new(super::LiveSpectrogramFrame {
             generation: 9,
             epoch: 1,
@@ -2304,22 +2451,41 @@ mod tests {
         });
         assert!(shared.publish_live_frame(&session, frame));
 
-        handle_live_analyzer_spawn_error(
+        let (player_handle, _queue) = Player::new();
+        let mut player = None;
+        let mut loaded = None;
+        let mut live_session = Some(Arc::clone(&session));
+        finish_analyzer_fallback(
             &shared,
             9,
+            PathBuf::from("fallback.wav"),
+            1_000,
+            player_handle,
+            SamplesBuffer::new(
+                std::num::NonZeroU16::new(1).expect("non-zero channel count"),
+                std::num::NonZeroU32::new(48_000).expect("non-zero sample rate"),
+                vec![0.0; 4],
+            ),
             &session,
             std::io::Error::other("thread limit reached"),
+            &mut player,
+            &mut loaded,
+            &mut live_session,
         );
-
         assert!(!session.active.load(Ordering::Acquire));
         assert_eq!(shared.live_session_id.load(Ordering::Acquire), 0);
         assert!(shared.latest_live_frame().is_none());
+        assert!(player.as_ref().is_some_and(|player| !player.empty()));
+        assert_eq!(loaded.as_ref().map(|track| track.generation), Some(9));
+        assert!(shared.snapshot().ready);
+        assert!(live_session.is_none());
         assert_eq!(
-            shared.take_error(9),
+            shared.take_analysis_warning(9),
             Some(String::from(
                 "Could not start live spectrogram analysis: thread limit reached"
             ))
         );
+        assert!(shared.take_error(9).is_none());
     }
 
     #[test]
