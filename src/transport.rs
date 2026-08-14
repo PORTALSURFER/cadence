@@ -686,6 +686,14 @@ impl LiveAnalyzer {
         self.fft_count = 0;
     }
 
+    fn reset_after_pause(&mut self) {
+        self.smoothed_levels = [0.0; LIVE_SPECTROGRAM_BAND_COUNT];
+        self.has_smoothed_levels = false;
+        self.window_len = 0;
+        self.spectrum_values = [0; LIVE_SPECTROGRAM_BAND_COUNT];
+        self.row_count = 0;
+    }
+
     fn push(&mut self, sample: f32) -> bool {
         self.window[self.window_len] = sample;
         self.window_len += 1;
@@ -1005,12 +1013,16 @@ fn run_live_analyzer_iteration(
     }
 
     if session.analysis_frozen.load(Ordering::Acquire) {
-        let consumed = discard_live_capture(consumer, session, shared);
+        let discarded = discard_live_capture(consumer, session, shared);
         // Work computed before the pause is intentionally not published after
-        // it. The last displayed frame remains the pause boundary, while the
-        // analyzer's rolling window and epoch stay intact for resume.
+        // it. Keep the last displayed frame at the pause boundary, but reset
+        // any partial rolling window so resumed audio cannot bridge the pause
+        // gap with discarded capture.
+        if discarded || analyzer.window_len > 0 {
+            analyzer.reset_after_pause();
+        }
         *published_revision = analyzer.revision;
-        return (consumed, true);
+        return (discarded, true);
     }
 
     let mut consumed = false;
@@ -1018,6 +1030,9 @@ fn run_live_analyzer_iteration(
         consumed = true;
         if session.analysis_frozen.load(Ordering::Acquire) {
             let discarded = discard_live_capture(consumer, session, shared);
+            if discarded || analyzer.window_len > 0 {
+                analyzer.reset_after_pause();
+            }
             *published_revision = analyzer.revision;
             return (consumed || discarded, true);
         }
@@ -1046,6 +1061,9 @@ fn run_live_analyzer_iteration(
 
         if session.analysis_frozen.load(Ordering::Acquire) {
             let discarded = discard_live_capture(consumer, session, shared);
+            if discarded || analyzer.window_len > 0 {
+                analyzer.reset_after_pause();
+            }
             *published_revision = analyzer.revision;
             return (consumed || discarded, true);
         }
@@ -1053,6 +1071,9 @@ fn run_live_analyzer_iteration(
 
     if session.analysis_frozen.load(Ordering::Acquire) {
         let discarded = discard_live_capture(consumer, session, shared);
+        if discarded || analyzer.window_len > 0 {
+            analyzer.reset_after_pause();
+        }
         *published_revision = analyzer.revision;
         return (consumed || discarded, true);
     }
@@ -2402,7 +2423,7 @@ mod tests {
     }
 
     #[test]
-    fn paused_analyzer_drains_queued_capture_and_resumes_same_epoch() {
+    fn paused_analyzer_discards_partial_window_and_resumes_same_epoch() {
         let (shared, session) = active_test_session(8);
         let (mut producer, mut consumer) = super::RingBuffer::new(4_096);
         let mut analyzer = LiveAnalyzer::new(48_000);
@@ -2466,6 +2487,7 @@ mod tests {
         assert!(consumed);
         assert!(frozen);
         assert_eq!(analyzer.revision, displayed_state.revision);
+        assert_eq!(analyzer.window_len, 0);
         assert_eq!(published_revision, displayed_state.revision);
         assert!(!shared.live_frame_state().pending);
         let paused_frame = shared
@@ -2483,6 +2505,33 @@ mod tests {
             producer
                 .push(CaptureFrame {
                     sample: (index as f32 * 0.03).sin(),
+                    epoch: observed_epoch,
+                })
+                .expect("the resumed capture ring should have room");
+        }
+        shared.mark_capture_pending();
+        let (consumed, frozen) = run_live_analyzer_iteration(
+            &mut consumer,
+            &session,
+            &shared,
+            &mut analyzer,
+            &mut observed_epoch,
+            &mut published_revision,
+            &mut last_publication,
+        );
+        assert!(consumed);
+        assert!(!frozen);
+        assert_eq!(analyzer.revision, displayed_state.revision);
+        assert_eq!(published_revision, displayed_state.revision);
+        let still_displayed_frame = shared
+            .latest_live_frame()
+            .expect("one resumed hop should keep the frozen frame");
+        assert!(Arc::ptr_eq(&still_displayed_frame, &displayed_frame));
+
+        for index in 0..(super::LIVE_SPECTRUM_FFT_SIZE - super::LIVE_SPECTRUM_HOP_SIZE) {
+            producer
+                .push(CaptureFrame {
+                    sample: (index as f32 * 0.04).cos(),
                     epoch: observed_epoch,
                 })
                 .expect("the resumed capture ring should have room");
