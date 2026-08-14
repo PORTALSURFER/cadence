@@ -6186,23 +6186,23 @@ fn planner_column(
         ui::column(children).padding(12.0).spacing(8.0).fill(),
     ])
     .fill();
-    let actions = ui::InteractiveRowActions::new().tracked_drop_candidate_key(
-        stage,
-        Message::PlannerStageDropped,
-        |stage, _position| Message::PlannerStageHovered(stage),
-        |stage, _position| Message::PlannerStageHoverCleared(stage),
-    );
-    let drop_target = ui::interactive_row()
-        .tracked_drop_candidate(drag_active, current_target, candidate, current_target)
-        .actions(actions)
-        .key(format!("planner-column-drop-{}", stage.label()))
-        .fill()
-        .input_only();
-    if drag_active {
-        ui::stack([content, drop_target]).fill()
+    let drop_target = if drag_active {
+        let actions = ui::InteractiveRowActions::new().tracked_drop_candidate_key(
+            stage,
+            Message::PlannerStageDropped,
+            |stage, _position| Message::PlannerStageHovered(stage),
+            |stage, _position| Message::PlannerStageHoverCleared(stage),
+        );
+        ui::interactive_row()
+            .tracked_drop_candidate(drag_active, current_target, candidate, current_target)
+            .actions(actions)
+            .key(format!("planner-column-drop-{}", stage.label()))
+            .fill()
+            .input_only()
     } else {
-        content
-    }
+        ui::spacer().fill()
+    };
+    ui::stack([content, drop_target]).fill()
 }
 
 fn planner_column_heading(stage: storage::TrackStage) -> &'static str {
@@ -8189,8 +8189,9 @@ mod tests {
         gui::types::{Point, Rect, Vector2},
         prelude as ui,
         runtime::{
-            Command, DeclarativeOwnedRuntimeBridge, Event, FocusTraversal, PaintPrimitive,
-            PaintTextAlign, PlatformRequest, PlatformResponse, SurfaceRuntime,
+            Command, DeclarativeOwnedCommandRuntimeBridge, DeclarativeOwnedRuntimeBridge, Event,
+            FocusTraversal, PaintPrimitive, PaintTextAlign, PlatformRequest, PlatformResponse,
+            SurfaceRuntime,
         },
         theme::ThemeTokens,
         widgets::{PointerModifiers, Widget, WidgetInput},
@@ -13423,6 +13424,65 @@ mod tests {
         let second_moved_preview = planner_drag_preview_rect(&state)
             .expect("the second planner drag move should keep its preview visible");
         assert_ne!(first_moved_preview.min, second_moved_preview.min);
+    }
+
+    #[test]
+    fn planner_drag_runtime_routes_captured_moves_to_preview() {
+        let mut state = planner_drag_state(Point::new(120.0, 90.0));
+        state.planner_drag_source_track_id = None;
+        state.planner_drag_pointer = None;
+        let bridge = DeclarativeOwnedCommandRuntimeBridge::new(
+            state,
+            |state| project_surface(state).into_surface(),
+            |state, message| {
+                let mut context = ui::UiUpdateContext::default();
+                update(state, message, &mut context);
+                context.into_command()
+            },
+        );
+        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1180.0, 720.0));
+        let handle_point = runtime
+            .frame_with_default_theme()
+            .paint_plan
+            .first_text_rect("↕")
+            .expect("the planner drag handle should paint")
+            .center();
+
+        runtime.dispatch_event(Event::primary_press(handle_point));
+        let started_pointer = Point::new(handle_point.x + 80.0, handle_point.y + 80.0);
+        let outcome = runtime.dispatch_pointer_move_deferred_refresh_with_outcome(started_pointer);
+
+        assert!(outcome.pointer_captured);
+        assert_eq!(
+            runtime.bridge().state().planner_drag_pointer,
+            Some(started_pointer)
+        );
+        let captured_handle = runtime
+            .pointer_capture()
+            .expect("the drag handle should retain pointer capture after starting");
+        runtime.refresh();
+        assert_eq!(
+            runtime.pointer_capture(),
+            Some(captured_handle),
+            "refreshing the active drag preview must retain the source handle capture"
+        );
+        let moved_pointer = Point::new(handle_point.x + 180.0, handle_point.y + 180.0);
+        let outcome = runtime.dispatch_pointer_move_deferred_refresh_with_outcome(moved_pointer);
+
+        assert!(outcome.pointer_captured);
+        assert_eq!(
+            runtime.bridge().state().planner_drag_pointer,
+            Some(moved_pointer)
+        );
+        runtime.refresh();
+        assert!(
+            runtime
+                .frame_with_default_theme()
+                .paint_plan
+                .first_text_rect("↕ Preview me")
+                .is_some(),
+            "a captured drag move must refresh the declarative preview"
+        );
     }
 
     #[test]
