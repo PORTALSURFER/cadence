@@ -6,17 +6,18 @@
 //! data and service internal control state from the output callback, so this is
 //! intentionally not a lock-free realtime or sample-accurate audio engine.
 
-use rodio::{Decoder, DeviceSinkBuilder, Player};
+use rodio::{Decoder, DeviceSinkBuilder, Player, Source, source::SeekError};
+use rtrb::{Consumer, Producer, RingBuffer};
 use std::{
     fs::File,
     path::PathBuf,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, Weak,
         atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const COMMAND_CAPACITY: usize = 32;
@@ -24,6 +25,142 @@ const CONTROL_INTERVAL: Duration = Duration::from_millis(8);
 pub const CONTROLS_BUSY_ERROR: &str = "Audio controls are busy — try again shortly.";
 pub const DEFAULT_VOLUME: f32 = 0.8;
 pub const MAX_OUTPUT_GAIN: f32 = 16.0;
+
+pub const LIVE_SPECTROGRAM_BAND_COUNT: usize = 48;
+pub const LIVE_SPECTROGRAM_MAX_HISTORY: usize = 96;
+
+const LIVE_CAPTURE_RING_CAPACITY: usize = 16_384;
+const LIVE_SPECTRUM_FFT_SIZE: usize = 1_024;
+const LIVE_SPECTRUM_HOP_SIZE: usize = LIVE_SPECTRUM_FFT_SIZE / 2;
+const LIVE_SPECTRUM_MIN_FREQUENCY: f32 = 40.0;
+const LIVE_SPECTRUM_MAX_FREQUENCY: f32 = 18_000.0;
+const LIVE_SPECTRUM_FLOOR_DB: f32 = -80.0;
+const LIVE_PUBLICATION_INTERVAL: Duration = Duration::from_millis(17);
+const LIVE_ANALYZER_POLL_INTERVAL: Duration = Duration::from_millis(2);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveSpectrogramFrame {
+    pub generation: u64,
+    pub epoch: u64,
+    pub revision: u64,
+    pub sample_rate: u32,
+    pub row_count: usize,
+    pub values: Arc<[u8]>,
+}
+
+impl LiveSpectrogramFrame {
+    fn new(
+        generation: u64,
+        epoch: u64,
+        revision: u64,
+        sample_rate: u32,
+        rows: &[[u8; LIVE_SPECTROGRAM_BAND_COUNT]; LIVE_SPECTROGRAM_MAX_HISTORY],
+        row_count: usize,
+    ) -> Option<Self> {
+        if sample_rate == 0 || row_count == 0 || row_count > LIVE_SPECTROGRAM_MAX_HISTORY {
+            return None;
+        }
+        let mut values = Vec::with_capacity(row_count * LIVE_SPECTROGRAM_BAND_COUNT);
+        for row in rows.iter().take(row_count) {
+            values.extend_from_slice(row);
+        }
+        Some(Self {
+            generation,
+            epoch,
+            revision,
+            sample_rate,
+            row_count,
+            values: Arc::from(values.into_boxed_slice()),
+        })
+    }
+
+    pub fn value(&self, row: usize, band: usize) -> u8 {
+        if row >= self.row_count || band >= LIVE_SPECTROGRAM_BAND_COUNT {
+            return 0;
+        }
+        self.values
+            .get(row * LIVE_SPECTROGRAM_BAND_COUNT + band)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.sample_rate > 0
+            && self.row_count > 0
+            && self.row_count <= LIVE_SPECTROGRAM_MAX_HISTORY
+            && self.values.len() == self.row_count * LIVE_SPECTROGRAM_BAND_COUNT
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LiveFrameState {
+    pub generation: u64,
+    pub epoch: u64,
+    pub revision: u64,
+    pub pending: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CaptureFrame {
+    sample: f32,
+    epoch: u64,
+}
+
+#[derive(Debug)]
+struct LiveCaptureSession {
+    generation: u64,
+    id: u64,
+    epoch: AtomicU64,
+    active: AtomicBool,
+    discontinuity_marked: AtomicBool,
+}
+
+impl LiveCaptureSession {
+    fn new(generation: u64, id: u64, epoch: u64) -> Self {
+        Self {
+            generation,
+            id,
+            epoch: AtomicU64::new(epoch),
+            active: AtomicBool::new(true),
+            discontinuity_marked: AtomicBool::new(false),
+        }
+    }
+
+    fn current_epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
+    fn mark_discontinuity(&self, shared: &SharedSnapshot) -> u64 {
+        self.discontinuity_marked.store(false, Ordering::Release);
+        let epoch = self.epoch.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+        shared.live_epoch.store(epoch, Ordering::Release);
+        epoch
+    }
+
+    fn mark_capture_drop(&self, shared: &SharedSnapshot) {
+        if !self.discontinuity_marked.swap(true, Ordering::AcqRel) {
+            self.mark_discontinuity(shared);
+            self.discontinuity_marked.store(true, Ordering::Release);
+        }
+    }
+
+    fn retire(&self) {
+        self.active.store(false, Ordering::Release);
+        self.discontinuity_marked.store(false, Ordering::Release);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct LiveComplexSample {
+    real: f32,
+    imaginary: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct LiveBandRange {
+    start: usize,
+    end: usize,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Snapshot {
@@ -45,6 +182,13 @@ struct SharedSnapshot {
     requested_volume: AtomicU32,
     error_available: AtomicBool,
     error: Mutex<Option<(u64, String)>>,
+    live_session_id: AtomicU64,
+    next_live_session_id: AtomicU64,
+    live_epoch: AtomicU64,
+    live_revision: AtomicU64,
+    live_pending: AtomicBool,
+    live_frame: Mutex<Option<Arc<LiveSpectrogramFrame>>>,
+    live_session: Mutex<Option<Weak<LiveCaptureSession>>>,
 }
 
 impl SharedSnapshot {
@@ -59,6 +203,13 @@ impl SharedSnapshot {
             requested_volume: AtomicU32::new(DEFAULT_VOLUME.to_bits()),
             error_available: AtomicBool::new(false),
             error: Mutex::new(None),
+            live_session_id: AtomicU64::new(0),
+            next_live_session_id: AtomicU64::new(1),
+            live_epoch: AtomicU64::new(0),
+            live_revision: AtomicU64::new(0),
+            live_pending: AtomicBool::new(false),
+            live_frame: Mutex::new(None),
+            live_session: Mutex::new(None),
         }
     }
 
@@ -115,6 +266,533 @@ impl SharedSnapshot {
         normalize_output_gain(f32::from_bits(
             self.requested_volume.load(Ordering::Acquire),
         ))
+    }
+
+    fn clear_live_frame(&self) {
+        if let Ok(mut frame) = self.live_frame.lock() {
+            *frame = None;
+        }
+        self.live_revision.store(0, Ordering::Release);
+        self.live_pending.store(false, Ordering::Release);
+    }
+
+    fn begin_live_session(&self, session: &Arc<LiveCaptureSession>) {
+        self.live_session_id.store(session.id, Ordering::Release);
+        self.live_epoch
+            .store(session.current_epoch(), Ordering::Release);
+        self.live_revision.store(0, Ordering::Release);
+        self.live_pending.store(false, Ordering::Release);
+        if let Ok(mut current) = self.live_session.lock() {
+            *current = Some(Arc::downgrade(session));
+        }
+        self.clear_live_frame();
+    }
+
+    fn retire_live_session(&self, session: Option<&Arc<LiveCaptureSession>>) {
+        if let Some(session) = session {
+            session.retire();
+            if self.live_session_id.load(Ordering::Acquire) == session.id {
+                self.live_session_id.store(0, Ordering::Release);
+                if let Ok(mut current) = self.live_session.lock() {
+                    *current = None;
+                }
+            }
+        }
+        self.live_epoch.fetch_add(1, Ordering::AcqRel);
+        self.clear_live_frame();
+    }
+
+    fn reset_live_segment(&self) {
+        let session = self
+            .live_session
+            .lock()
+            .ok()
+            .and_then(|current| current.as_ref().and_then(Weak::upgrade));
+        if let Some(session) = session {
+            if session.active.load(Ordering::Acquire) {
+                session.mark_discontinuity(self);
+            }
+        } else {
+            self.live_epoch.fetch_add(1, Ordering::AcqRel);
+        }
+        self.clear_live_frame();
+    }
+
+    fn publish_live_frame(
+        &self,
+        session: &LiveCaptureSession,
+        frame: Arc<LiveSpectrogramFrame>,
+    ) -> bool {
+        let Ok(mut latest) = self.live_frame.try_lock() else {
+            return false;
+        };
+        let current = session.active.load(Ordering::Acquire)
+            && session.generation == self.requested_generation.load(Ordering::Acquire)
+            && session.id == self.live_session_id.load(Ordering::Acquire)
+            && session.current_epoch() == frame.epoch;
+        if !current || !frame.is_valid() {
+            return false;
+        }
+        self.live_revision.store(frame.revision, Ordering::Release);
+        *latest = Some(frame);
+        true
+    }
+
+    fn latest_live_frame(&self) -> Option<Arc<LiveSpectrogramFrame>> {
+        self.live_frame.try_lock().ok()?.as_ref().cloned()
+    }
+
+    fn live_frame_state(&self) -> LiveFrameState {
+        LiveFrameState {
+            generation: self.requested_generation.load(Ordering::Acquire),
+            epoch: self.live_epoch.load(Ordering::Acquire),
+            revision: self.live_revision.load(Ordering::Acquire),
+            pending: self.live_pending.load(Ordering::Acquire),
+        }
+    }
+
+    fn mark_capture_pending(&self) {
+        self.live_pending.store(true, Ordering::Release);
+    }
+
+    fn clear_live_frame_for_session(&self, session: &LiveCaptureSession) {
+        if session.id != self.live_session_id.load(Ordering::Acquire) {
+            return;
+        }
+        if let Ok(mut frame) = self.live_frame.try_lock() {
+            *frame = None;
+            self.live_revision.store(0, Ordering::Release);
+        }
+    }
+}
+
+/// A rodio source adapter that leaves output samples untouched while copying
+/// one mono value per complete interleaved frame into the live-analysis ring.
+///
+/// The adapter is deliberately limited to fixed arithmetic, atomics, and the
+/// SPSC producer in `next()`. In particular, it never performs FFT work,
+/// allocation, locking, logging, or blocking I/O. The literal per-sample
+/// request is represented by every accepted mono frame; FFT rows are emitted
+/// at the bounded 512-frame hop below.
+struct LiveAnalysisSource<S> {
+    inner: S,
+    producer: Producer<CaptureFrame>,
+    session: Arc<LiveCaptureSession>,
+    shared: Arc<SharedSnapshot>,
+    frame_channels: usize,
+    frame_channel: usize,
+    frame_sum: f32,
+}
+
+impl<S> LiveAnalysisSource<S>
+where
+    S: Source<Item = f32>,
+{
+    fn new(
+        inner: S,
+        producer: Producer<CaptureFrame>,
+        session: Arc<LiveCaptureSession>,
+        shared: Arc<SharedSnapshot>,
+    ) -> Self {
+        let frame_channels = inner.channels().get() as usize;
+        Self {
+            inner,
+            producer,
+            session,
+            shared,
+            frame_channels: frame_channels.max(1),
+            frame_channel: 0,
+            frame_sum: 0.0,
+        }
+    }
+
+    fn reset_frame_accumulator(&mut self) {
+        self.frame_channel = 0;
+        self.frame_sum = 0.0;
+        self.frame_channels = self.inner.channels().get() as usize;
+        self.frame_channels = self.frame_channels.max(1);
+    }
+
+    fn push_analysis_frame(&mut self, mono: f32) {
+        if !self.session.active.load(Ordering::Acquire) {
+            return;
+        }
+        let gain = self.shared.requested_volume();
+        let scaled = mono * gain;
+        let sample = if scaled.is_finite() { scaled } else { 0.0 };
+        let frame = CaptureFrame {
+            sample,
+            epoch: self.session.current_epoch(),
+        };
+        if self.producer.push(frame).is_ok() {
+            self.session
+                .discontinuity_marked
+                .store(false, Ordering::Release);
+            self.shared.mark_capture_pending();
+        } else {
+            // A full ring drops the analysis copy immediately. The next
+            // accepted frame receives a new epoch, so no FFT window can span
+            // the omitted audio.
+            self.session.mark_capture_drop(&self.shared);
+        }
+    }
+}
+
+impl<S> Iterator for LiveAnalysisSource<S>
+where
+    S: Source<Item = f32>,
+{
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let sample = self.inner.next()?;
+        let channels = self.inner.channels().get() as usize;
+        if channels != self.frame_channels {
+            self.frame_channels = channels.max(1);
+            self.frame_channel = 0;
+            self.frame_sum = 0.0;
+        }
+
+        if self.frame_channel == 0 {
+            self.frame_sum = sample;
+        } else {
+            self.frame_sum += sample;
+        }
+        self.frame_channel += 1;
+        if self.frame_channel >= self.frame_channels {
+            let mono = if self.frame_sum.is_finite() {
+                self.frame_sum / self.frame_channels as f32
+            } else {
+                0.0
+            };
+            self.frame_channel = 0;
+            self.frame_sum = 0.0;
+            self.push_analysis_frame(mono);
+        }
+
+        Some(sample)
+    }
+}
+
+impl<S> Source for LiveAnalysisSource<S>
+where
+    S: Source<Item = f32>,
+{
+    fn current_span_len(&self) -> Option<usize> {
+        self.inner.current_span_len()
+    }
+
+    fn channels(&self) -> rodio::ChannelCount {
+        self.inner.channels()
+    }
+
+    fn sample_rate(&self) -> rodio::SampleRate {
+        self.inner.sample_rate()
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        self.inner.total_duration()
+    }
+
+    fn try_seek(&mut self, position: Duration) -> Result<(), SeekError> {
+        let result = self.inner.try_seek(position);
+        if result.is_ok() {
+            self.reset_frame_accumulator();
+            self.session.mark_discontinuity(&self.shared);
+        }
+        result
+    }
+}
+
+struct LiveAnalyzer {
+    sample_rate: u32,
+    band_ranges: [LiveBandRange; LIVE_SPECTROGRAM_BAND_COUNT],
+    window: [f32; LIVE_SPECTRUM_FFT_SIZE],
+    window_len: usize,
+    fft: [LiveComplexSample; LIVE_SPECTRUM_FFT_SIZE],
+    rows: [[u8; LIVE_SPECTROGRAM_BAND_COUNT]; LIVE_SPECTROGRAM_MAX_HISTORY],
+    row_count: usize,
+    revision: u64,
+    fft_count: usize,
+}
+
+impl LiveAnalyzer {
+    fn new(sample_rate: u32) -> Self {
+        Self {
+            sample_rate: sample_rate.max(1),
+            band_ranges: live_band_ranges(sample_rate),
+            window: [0.0; LIVE_SPECTRUM_FFT_SIZE],
+            window_len: 0,
+            fft: [LiveComplexSample::default(); LIVE_SPECTRUM_FFT_SIZE],
+            rows: [[0; LIVE_SPECTROGRAM_BAND_COUNT]; LIVE_SPECTROGRAM_MAX_HISTORY],
+            row_count: 0,
+            revision: 0,
+            fft_count: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.window_len = 0;
+        self.row_count = 0;
+        self.revision = 0;
+        self.fft_count = 0;
+    }
+
+    fn push(&mut self, sample: f32) -> bool {
+        self.window[self.window_len] = sample;
+        self.window_len += 1;
+        if self.window_len < LIVE_SPECTRUM_FFT_SIZE {
+            return false;
+        }
+
+        self.analyze_window();
+        self.window
+            .copy_within(LIVE_SPECTRUM_HOP_SIZE..LIVE_SPECTRUM_FFT_SIZE, 0);
+        self.window_len = LIVE_SPECTRUM_HOP_SIZE;
+        true
+    }
+
+    fn analyze_window(&mut self) {
+        for (index, (&sample, fft)) in self.window.iter().zip(self.fft.iter_mut()).enumerate() {
+            let hann = 0.5
+                - 0.5
+                    * (std::f32::consts::TAU * index as f32 / LIVE_SPECTRUM_FFT_SIZE as f32).cos();
+            *fft = LiveComplexSample {
+                real: sample * hann,
+                imaginary: 0.0,
+            };
+        }
+        live_fft_in_place(&mut self.fft);
+
+        let mut row = [0_u8; LIVE_SPECTROGRAM_BAND_COUNT];
+        for (band, range) in self.band_ranges.iter().enumerate() {
+            let magnitude = (range.start..range.end)
+                .map(|bin| {
+                    let sample = self.fft[bin];
+                    (sample.real * sample.real + sample.imaginary * sample.imaginary).sqrt()
+                        / LIVE_SPECTRUM_FFT_SIZE as f32
+                })
+                .fold(0.0_f32, f32::max);
+            let decibels = 20.0 * magnitude.max(1.0e-8).log10();
+            let normalized =
+                ((decibels - LIVE_SPECTRUM_FLOOR_DB) / -LIVE_SPECTRUM_FLOOR_DB).clamp(0.0, 1.0);
+            row[band] = (normalized * u8::MAX as f32).round() as u8;
+        }
+
+        if self.row_count < LIVE_SPECTROGRAM_MAX_HISTORY {
+            self.rows[self.row_count] = row;
+            self.row_count += 1;
+        } else {
+            self.rows.copy_within(1..LIVE_SPECTROGRAM_MAX_HISTORY, 0);
+            self.rows[LIVE_SPECTROGRAM_MAX_HISTORY - 1] = row;
+        }
+        self.revision = self.revision.wrapping_add(1);
+        self.fft_count = self.fft_count.saturating_add(1);
+    }
+
+    fn frame(&self, generation: u64, epoch: u64) -> Option<Arc<LiveSpectrogramFrame>> {
+        LiveSpectrogramFrame::new(
+            generation,
+            epoch,
+            self.revision,
+            self.sample_rate,
+            &self.rows,
+            self.row_count,
+        )
+        .map(Arc::new)
+    }
+}
+
+fn live_band_ranges(sample_rate: u32) -> [LiveBandRange; LIVE_SPECTROGRAM_BAND_COUNT] {
+    let sample_rate = sample_rate.max(1) as f32;
+    let nyquist = sample_rate * 0.5;
+    let minimum = LIVE_SPECTRUM_MIN_FREQUENCY.min(nyquist.max(1.0));
+    let maximum = LIVE_SPECTRUM_MAX_FREQUENCY.min(nyquist.max(minimum));
+    let ratio = (maximum / minimum.max(1.0)).max(1.0);
+    let maximum_bin = LIVE_SPECTRUM_FFT_SIZE / 2 + 1;
+
+    std::array::from_fn(|band| {
+        let start_frequency =
+            minimum * ratio.powf(band as f32 / LIVE_SPECTROGRAM_BAND_COUNT as f32);
+        let end_frequency =
+            minimum * ratio.powf((band + 1) as f32 / LIVE_SPECTROGRAM_BAND_COUNT as f32);
+        let start_bin =
+            ((start_frequency / sample_rate) * LIVE_SPECTRUM_FFT_SIZE as f32).floor() as usize;
+        let end_bin =
+            ((end_frequency / sample_rate) * LIVE_SPECTRUM_FFT_SIZE as f32).ceil() as usize;
+        let start = start_bin.clamp(1, maximum_bin.saturating_sub(1));
+        let end = end_bin.clamp(start.saturating_add(1), maximum_bin);
+        LiveBandRange { start, end }
+    })
+}
+
+fn live_fft_in_place(buffer: &mut [LiveComplexSample; LIVE_SPECTRUM_FFT_SIZE]) {
+    let mut reversed = 0usize;
+    for index in 1..buffer.len() {
+        let mut bit = buffer.len() >> 1;
+        while reversed & bit != 0 {
+            reversed ^= bit;
+            bit >>= 1;
+        }
+        reversed ^= bit;
+        if index < reversed {
+            buffer.swap(index, reversed);
+        }
+    }
+
+    let mut block_length = 2;
+    while block_length <= buffer.len() {
+        let angle = -std::f32::consts::TAU / block_length as f32;
+        let block_rotation = LiveComplexSample {
+            real: angle.cos(),
+            imaginary: angle.sin(),
+        };
+        for block_start in (0..buffer.len()).step_by(block_length) {
+            let mut rotation = LiveComplexSample {
+                real: 1.0,
+                imaginary: 0.0,
+            };
+            for offset in 0..block_length / 2 {
+                let even_index = block_start + offset;
+                let odd_index = even_index + block_length / 2;
+                let odd = buffer[odd_index];
+                let rotated = LiveComplexSample {
+                    real: odd.real * rotation.real - odd.imaginary * rotation.imaginary,
+                    imaginary: odd.real * rotation.imaginary + odd.imaginary * rotation.real,
+                };
+                let even = buffer[even_index];
+                buffer[even_index] = LiveComplexSample {
+                    real: even.real + rotated.real,
+                    imaginary: even.imaginary + rotated.imaginary,
+                };
+                buffer[odd_index] = LiveComplexSample {
+                    real: even.real - rotated.real,
+                    imaginary: even.imaginary - rotated.imaginary,
+                };
+                rotation = LiveComplexSample {
+                    real: rotation.real * block_rotation.real
+                        - rotation.imaginary * block_rotation.imaginary,
+                    imaginary: rotation.real * block_rotation.imaginary
+                        + rotation.imaginary * block_rotation.real,
+                };
+            }
+        }
+        block_length <<= 1;
+    }
+}
+
+fn run_live_analyzer(
+    mut consumer: Consumer<CaptureFrame>,
+    session: Arc<LiveCaptureSession>,
+    shared: Arc<SharedSnapshot>,
+    sample_rate: u32,
+) {
+    let mut analyzer = LiveAnalyzer::new(sample_rate);
+    let mut observed_epoch = session.current_epoch();
+    let mut published_revision = 0_u64;
+    let mut last_publication = Instant::now()
+        .checked_sub(LIVE_PUBLICATION_INTERVAL)
+        .unwrap_or_else(Instant::now);
+
+    loop {
+        if session.current_epoch() != observed_epoch {
+            observed_epoch = session.current_epoch();
+            analyzer.reset();
+            published_revision = 0;
+            shared.clear_live_frame_for_session(&session);
+        }
+
+        let mut consumed = false;
+        while let Ok(capture) = consumer.pop() {
+            consumed = true;
+            let current_epoch = session.current_epoch();
+            if current_epoch != observed_epoch {
+                observed_epoch = current_epoch;
+                analyzer.reset();
+                published_revision = 0;
+                shared.clear_live_frame_for_session(&session);
+            }
+            if capture.epoch != observed_epoch {
+                continue;
+            }
+            if analyzer.push(capture.sample) {
+                publish_live_frame_if_due(
+                    &analyzer,
+                    &session,
+                    &shared,
+                    &mut published_revision,
+                    &mut last_publication,
+                    false,
+                );
+            }
+        }
+        if analyzer.revision > published_revision {
+            publish_live_frame_if_due(
+                &analyzer,
+                &session,
+                &shared,
+                &mut published_revision,
+                &mut last_publication,
+                false,
+            );
+        }
+
+        if consumer.is_empty()
+            && analyzer.revision <= published_revision
+            && session.id == shared.live_session_id.load(Ordering::Acquire)
+        {
+            shared.live_pending.store(false, Ordering::Release);
+        }
+
+        let producer_gone = consumer.is_abandoned() && consumer.is_empty();
+        let retired = !session.active.load(Ordering::Acquire);
+        if producer_gone && consumer.is_empty() {
+            if !retired && analyzer.revision > published_revision {
+                let elapsed = last_publication.elapsed();
+                if elapsed < LIVE_PUBLICATION_INTERVAL {
+                    thread::sleep(LIVE_PUBLICATION_INTERVAL - elapsed);
+                }
+                publish_live_frame_if_due(
+                    &analyzer,
+                    &session,
+                    &shared,
+                    &mut published_revision,
+                    &mut last_publication,
+                    true,
+                );
+            }
+            break;
+        }
+
+        if !consumed {
+            thread::sleep(LIVE_ANALYZER_POLL_INTERVAL);
+        }
+    }
+    if session.id == shared.live_session_id.load(Ordering::Acquire) {
+        shared.live_pending.store(false, Ordering::Release);
+    }
+}
+
+fn publish_live_frame_if_due(
+    analyzer: &LiveAnalyzer,
+    session: &LiveCaptureSession,
+    shared: &SharedSnapshot,
+    published_revision: &mut u64,
+    last_publication: &mut Instant,
+    force: bool,
+) {
+    if analyzer.revision <= *published_revision {
+        return;
+    }
+    if !force && last_publication.elapsed() < LIVE_PUBLICATION_INTERVAL {
+        return;
+    }
+    let Some(frame) = analyzer.frame(session.generation, session.current_epoch()) else {
+        return;
+    };
+    if shared.publish_live_frame(session, frame) {
+        *published_revision = analyzer.revision;
+        *last_publication = Instant::now();
     }
 }
 
@@ -264,6 +942,26 @@ impl AudioTransport {
         self.shared.snapshot()
     }
 
+    pub fn latest_live_frame(&self) -> Option<Arc<LiveSpectrogramFrame>> {
+        self.shared.latest_live_frame()
+    }
+
+    pub fn live_frame_state(&self) -> LiveFrameState {
+        self.shared.live_frame_state()
+    }
+
+    pub fn live_analysis_pending(&self) -> bool {
+        self.shared.live_frame_state().pending
+    }
+
+    pub fn clear_live_frame(&self) {
+        self.shared.clear_live_frame();
+    }
+
+    pub fn reset_live_segment(&self) {
+        self.shared.reset_live_segment();
+    }
+
     pub fn take_error(&self, generation: u64) -> Option<String> {
         self.shared.take_error(generation)
     }
@@ -288,6 +986,17 @@ impl AudioTransport {
             .playing
             .store(snapshot.playing, Ordering::Release);
         self.shared.ready.store(snapshot.ready, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_live_state_for_test(&self, state: LiveFrameState) {
+        self.shared.live_epoch.store(state.epoch, Ordering::Release);
+        self.shared
+            .live_revision
+            .store(state.revision, Ordering::Release);
+        self.shared
+            .live_pending
+            .store(state.pending, Ordering::Release);
     }
 
     /// Set an output gain for a comparison source such as the reference
@@ -482,16 +1191,31 @@ fn run_transport(
     };
     let mut player: Option<Player> = None;
     let mut loaded: Option<LoadedTrack> = None;
+    let mut live_session: Option<Arc<LiveCaptureSession>> = None;
     let mut applied_volume = None;
 
     loop {
         if let Some(command) = take_pending_load(&pending_load) {
-            handle_command(command, &shared, output.as_ref(), &mut player, &mut loaded);
+            handle_command(
+                command,
+                &shared,
+                output.as_ref(),
+                &mut player,
+                &mut loaded,
+                &mut live_session,
+            );
         }
         match receiver.recv_timeout(CONTROL_INTERVAL) {
             Ok(command) => {
                 release_command_slot(&queued_commands);
-                handle_command(command, &shared, output.as_ref(), &mut player, &mut loaded)
+                handle_command(
+                    command,
+                    &shared,
+                    output.as_ref(),
+                    &mut player,
+                    &mut loaded,
+                    &mut live_session,
+                )
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -501,18 +1225,29 @@ fn run_transport(
             match receiver.try_recv() {
                 Ok(command) => {
                     release_command_slot(&queued_commands);
-                    handle_command(command, &shared, output.as_ref(), &mut player, &mut loaded)
+                    handle_command(
+                        command,
+                        &shared,
+                        output.as_ref(),
+                        &mut player,
+                        &mut loaded,
+                        &mut live_session,
+                    )
                 }
                 Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return,
+                Err(TryRecvError::Disconnected) => {
+                    retire_live_session(&shared, &mut live_session);
+                    return;
+                }
             }
         }
 
-        reconcile_stale_track(&shared, &mut player, &mut loaded);
+        reconcile_stale_track(&shared, &mut player, &mut loaded, &mut live_session);
         apply_requested_volume(&shared, player.as_ref(), &mut applied_volume);
         publish_snapshot(&shared, player.as_ref(), loaded.as_ref());
     }
 
+    retire_live_session(&shared, &mut live_session);
     drop(player);
     drop(loaded);
     drop(output);
@@ -531,12 +1266,14 @@ fn reconcile_stale_track(
     shared: &SharedSnapshot,
     player: &mut Option<Player>,
     loaded: &mut Option<LoadedTrack>,
+    live_session: &mut Option<Arc<LiveCaptureSession>>,
 ) {
     let requested_generation = shared.requested_generation.load(Ordering::Acquire);
     if loaded
         .as_ref()
         .is_some_and(|track| track.generation != requested_generation)
     {
+        retire_live_session(shared, live_session);
         *player = None;
         *loaded = None;
         shared
@@ -550,10 +1287,11 @@ fn reconcile_stale_track(
 
 fn handle_command(
     command: Command,
-    shared: &SharedSnapshot,
+    shared: &Arc<SharedSnapshot>,
     output: Option<&rodio::MixerDeviceSink>,
     player: &mut Option<Player>,
     loaded: &mut Option<LoadedTrack>,
+    live_session: &mut Option<Arc<LiveCaptureSession>>,
 ) {
     let (token, acknowledged) = match command {
         Command::Load {
@@ -571,12 +1309,14 @@ fn handle_command(
                 output,
                 player,
                 loaded,
+                live_session,
             ),
         ),
         Command::Unload { token, generation } => {
             if !is_current(shared, generation) {
                 (token, false)
             } else {
+                retire_live_session(shared, live_session);
                 *player = None;
                 *loaded = None;
                 shared.generation.store(generation, Ordering::Release);
@@ -601,6 +1341,7 @@ fn handle_command(
                         output,
                         player,
                         loaded,
+                        live_session,
                     )
                 } else {
                     true
@@ -653,6 +1394,7 @@ fn handle_command(
                                 output,
                                 player,
                                 loaded,
+                                live_session,
                             )
                         } else {
                             true
@@ -693,19 +1435,22 @@ fn handle_command(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_track(
     generation: u64,
     path: PathBuf,
     duration_millis: u64,
-    shared: &SharedSnapshot,
+    shared: &Arc<SharedSnapshot>,
     output: Option<&rodio::MixerDeviceSink>,
     player: &mut Option<Player>,
     loaded: &mut Option<LoadedTrack>,
+    live_session: &mut Option<Arc<LiveCaptureSession>>,
 ) -> bool {
     if !is_current(shared, generation) {
         return false;
     }
 
+    retire_live_session(shared, live_session);
     *player = None;
     *loaded = None;
     shared.generation.store(generation, Ordering::Release);
@@ -752,8 +1497,30 @@ fn load_track(
         return false;
     }
 
+    let sample_rate = decoder.sample_rate().get();
+    let (producer, consumer) = RingBuffer::new(LIVE_CAPTURE_RING_CAPACITY);
+    let session_id = shared.next_live_session_id.fetch_add(1, Ordering::Relaxed);
+    let epoch = shared
+        .live_epoch
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1);
+    let session = Arc::new(LiveCaptureSession::new(generation, session_id, epoch));
+    shared.begin_live_session(&session);
+
+    let analyzer_session = Arc::clone(&session);
+    let analyzer_shared = Arc::clone(shared);
+    thread::Builder::new()
+        .name(String::from("cadence-live-spectrogram"))
+        .spawn(move || run_live_analyzer(consumer, analyzer_session, analyzer_shared, sample_rate))
+        .expect("Cadence live spectrogram analyzer should spawn");
+
     let player_handle = Player::connect_new(output.mixer());
-    player_handle.append(decoder);
+    player_handle.append(LiveAnalysisSource::new(
+        decoder,
+        producer,
+        Arc::clone(&session),
+        Arc::clone(shared),
+    ));
     player_handle.set_volume(shared.requested_volume());
     player_handle.pause();
     *player = Some(player_handle);
@@ -762,8 +1529,17 @@ fn load_track(
         path,
         duration_millis,
     });
+    *live_session = Some(session);
     shared.ready.store(true, Ordering::Release);
     true
+}
+
+fn retire_live_session(
+    shared: &SharedSnapshot,
+    live_session: &mut Option<Arc<LiveCaptureSession>>,
+) {
+    let session = live_session.take();
+    shared.retire_live_session(session.as_ref());
 }
 
 fn apply_requested_volume(
@@ -836,15 +1612,19 @@ pub fn normalize_output_gain(gain: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        AudioTransport, CONTROLS_BUSY_ERROR, Command, DEFAULT_VOLUME, MAX_OUTPUT_GAIN, PendingLoad,
-        SharedSnapshot, clamp_position, is_current, normalize_output_gain, normalize_volume,
+        AudioTransport, CONTROLS_BUSY_ERROR, CaptureFrame, Command, DEFAULT_VOLUME,
+        LIVE_SPECTROGRAM_BAND_COUNT, LIVE_SPECTROGRAM_MAX_HISTORY, LiveAnalysisSource,
+        LiveAnalyzer, LiveCaptureSession, MAX_OUTPUT_GAIN, PendingLoad, SharedSnapshot,
+        clamp_position, is_current, normalize_output_gain, normalize_volume,
     };
+    use rodio::{Source, buffer::SamplesBuffer, source::SeekError};
     use std::path::PathBuf;
     use std::sync::{
         Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
         mpsc,
     };
+    use std::time::Duration;
 
     #[test]
     fn seek_position_is_saturated_to_track_duration() {
@@ -962,5 +1742,212 @@ mod tests {
             pending.take().and_then(|command| command.load_generation()),
             Some(2)
         );
+    }
+
+    fn active_test_session(generation: u64) -> (Arc<SharedSnapshot>, Arc<LiveCaptureSession>) {
+        let shared = Arc::new(SharedSnapshot::new());
+        shared
+            .requested_generation
+            .store(generation, Ordering::Release);
+        let session = Arc::new(LiveCaptureSession::new(generation, 1, 1));
+        shared.begin_live_session(&session);
+        (shared, session)
+    }
+
+    #[test]
+    fn analysis_source_downmixes_complete_frames_without_changing_output() {
+        let (shared, session) = active_test_session(3);
+        shared
+            .requested_volume
+            .store(1.0_f32.to_bits(), Ordering::Release);
+        let (producer, mut consumer) = super::RingBuffer::new(8);
+        let source = SamplesBuffer::new(
+            std::num::NonZeroU16::new(2).expect("non-zero channel count"),
+            std::num::NonZeroU32::new(48_000).expect("non-zero sample rate"),
+            vec![1.0, -1.0, 0.25, 0.75],
+        );
+        let mut adapter = LiveAnalysisSource::new(source, producer, session, shared);
+        let output = adapter.by_ref().collect::<Vec<_>>();
+        assert_eq!(output, vec![1.0, -1.0, 0.25, 0.75]);
+        assert_eq!(consumer.pop().expect("first mono frame").sample, 0.0);
+        assert_eq!(consumer.pop().expect("second mono frame").sample, 0.5);
+        assert!(consumer.pop().is_err());
+    }
+
+    #[test]
+    fn full_capture_ring_marks_a_discontinuity_before_accepting_again() {
+        let (shared, session) = active_test_session(4);
+        let (mut producer, mut consumer) = super::RingBuffer::new(1);
+        let old_epoch = session.current_epoch();
+        assert!(
+            producer
+                .push(CaptureFrame {
+                    sample: 0.1,
+                    epoch: old_epoch,
+                })
+                .is_ok()
+        );
+        session.mark_capture_drop(&shared);
+        let dropped_epoch = session.current_epoch();
+        assert!(dropped_epoch > old_epoch);
+        assert!(
+            producer
+                .push(CaptureFrame {
+                    sample: 0.2,
+                    epoch: dropped_epoch,
+                })
+                .is_err()
+        );
+        assert_eq!(
+            consumer.pop().expect("old frame remains bounded").epoch,
+            old_epoch
+        );
+        assert!(
+            producer
+                .push(CaptureFrame {
+                    sample: 0.2,
+                    epoch: session.current_epoch(),
+                })
+                .is_ok()
+        );
+        assert_eq!(consumer.pop().expect("new frame").epoch, dropped_epoch);
+    }
+
+    #[test]
+    fn analyzer_emits_at_one_row_per_512_frame_hop_and_caps_history() {
+        let mut analyzer = LiveAnalyzer::new(48_000);
+        let mut emitted = 0;
+        for index in 0..(1_024 + 512 * 100) {
+            if analyzer.push((index as f32 * 0.01).sin()) {
+                emitted += 1;
+            }
+        }
+        assert_eq!(emitted, 101);
+        assert_eq!(analyzer.fft_count, 101);
+        assert_eq!(analyzer.revision, 101);
+        assert_eq!(analyzer.row_count, LIVE_SPECTROGRAM_MAX_HISTORY);
+    }
+
+    fn strongest_band_for_tone(frequency: f32) -> usize {
+        let mut analyzer = LiveAnalyzer::new(48_000);
+        for index in 0..1_024 {
+            assert!(
+                !analyzer.push((std::f32::consts::TAU * frequency * index as f32 / 48_000.0).sin())
+                    || index == 1_023
+            );
+        }
+        let frame = analyzer.frame(1, 1).expect("one FFT row");
+        (0..LIVE_SPECTROGRAM_BAND_COUNT)
+            .max_by_key(|&band| frame.value(0, band))
+            .expect("spectrogram has bands")
+    }
+
+    #[test]
+    fn tones_localize_from_low_to_mid_to_high_log_bands() {
+        let low = strongest_band_for_tone(80.0);
+        let middle = strongest_band_for_tone(1_000.0);
+        let high = strongest_band_for_tone(10_000.0);
+        assert!(low < middle, "low={low}, middle={middle}");
+        assert!(middle < high, "middle={middle}, high={high}");
+    }
+
+    #[derive(Clone)]
+    struct SeekableSource {
+        samples: Vec<f32>,
+        position: usize,
+        sought_to_millis: Arc<AtomicUsize>,
+    }
+
+    impl Iterator for SeekableSource {
+        type Item = f32;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            let sample = self.samples.get(self.position).copied()?;
+            self.position += 1;
+            Some(sample)
+        }
+    }
+
+    impl Source for SeekableSource {
+        fn current_span_len(&self) -> Option<usize> {
+            Some(self.samples.len().saturating_sub(self.position))
+        }
+
+        fn channels(&self) -> rodio::ChannelCount {
+            std::num::NonZeroU16::new(1).expect("non-zero channel count")
+        }
+
+        fn sample_rate(&self) -> rodio::SampleRate {
+            std::num::NonZeroU32::new(48_000).expect("non-zero sample rate")
+        }
+
+        fn total_duration(&self) -> Option<Duration> {
+            Some(Duration::from_millis(100))
+        }
+
+        fn try_seek(&mut self, position: Duration) -> Result<(), SeekError> {
+            self.position = position.as_millis() as usize;
+            self.sought_to_millis
+                .store(position.as_millis() as usize, Ordering::Release);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn analysis_source_delegates_seek_and_starts_a_new_epoch() {
+        let (shared, session) = active_test_session(5);
+        let sought_to_millis = Arc::new(AtomicUsize::new(0));
+        let source = SeekableSource {
+            samples: vec![0.0; 128],
+            position: 0,
+            sought_to_millis: Arc::clone(&sought_to_millis),
+        };
+        let (producer, _consumer) = super::RingBuffer::new(8);
+        let mut adapter = LiveAnalysisSource::new(source, producer, Arc::clone(&session), shared);
+        let old_epoch = session.current_epoch();
+        adapter
+            .try_seek(Duration::from_millis(37))
+            .expect("test source accepts seek");
+        assert_eq!(sought_to_millis.load(Ordering::Acquire), 37);
+        assert!(session.current_epoch() > old_epoch);
+        assert_eq!(adapter.current_span_len(), Some(91));
+    }
+
+    #[test]
+    fn live_frame_state_tracks_pending_work_and_clears_on_reset() {
+        let (shared, session) = active_test_session(6);
+        shared.mark_capture_pending();
+        let pending = shared.live_frame_state();
+        assert!(pending.pending);
+        assert_eq!(pending.generation, 6);
+        shared.reset_live_segment();
+        let reset = shared.live_frame_state();
+        assert!(!reset.pending);
+        assert!(reset.epoch > pending.epoch);
+        session.retire();
+    }
+
+    #[test]
+    fn retired_generation_cannot_publish_into_a_new_live_session() {
+        let shared = Arc::new(SharedSnapshot::new());
+        shared.requested_generation.store(7, Ordering::Release);
+        let old_session = Arc::new(LiveCaptureSession::new(7, 1, 1));
+        shared.begin_live_session(&old_session);
+        let old_frame = Arc::new(super::LiveSpectrogramFrame {
+            generation: 7,
+            epoch: 1,
+            revision: 1,
+            sample_rate: 48_000,
+            row_count: 1,
+            values: Arc::from(vec![1_u8; LIVE_SPECTROGRAM_BAND_COUNT].into_boxed_slice()),
+        });
+        assert!(shared.publish_live_frame(&old_session, old_frame.clone()));
+
+        old_session.retire();
+        shared.requested_generation.store(8, Ordering::Release);
+        let new_session = Arc::new(LiveCaptureSession::new(8, 2, 2));
+        shared.begin_live_session(&new_session);
+        assert!(!shared.publish_live_frame(&old_session, old_frame));
+        assert!(shared.latest_live_frame().is_none());
     }
 }

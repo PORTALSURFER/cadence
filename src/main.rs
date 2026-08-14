@@ -137,6 +137,7 @@ enum Message {
     CancelRemoveTrack,
     TogglePlayback,
     StopPlayback,
+    ToggleLiveSpectrogramMode,
     NewNoteAtCurrentTime,
     AuditionPlay,
     AuditionPrevious,
@@ -270,6 +271,22 @@ enum AuditionSource {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum LiveSpectrogramMode {
+    #[default]
+    Waterfall,
+    Spectrum,
+}
+
+impl LiveSpectrogramMode {
+    fn toggled(self) -> Self {
+        match self {
+            Self::Waterfall => Self::Spectrum,
+            Self::Spectrum => Self::Waterfall,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum CommentSource {
     #[default]
     Main,
@@ -329,8 +346,9 @@ const TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER: f32 = 72.0;
 // the review panel while retaining enough height for the split waveform.
 const WAVEFORM_HEIGHT: f32 = 124.0;
 const REFERENCE_WAVEFORM_HEIGHT: f32 = WAVEFORM_HEIGHT;
-const SPECTROGRAM_HEADER_HEIGHT: f32 = 22.0;
-const SPECTROGRAM_SECTION_SPACING: f32 = 4.0;
+const LIVE_SPECTROGRAM_HEIGHT: f32 = spectrogram::HEIGHT;
+const LIVE_SPECTROGRAM_HEADER_HEIGHT: f32 = 22.0;
+const LIVE_SPECTROGRAM_SECTION_SPACING: f32 = 4.0;
 const MAIN_WAVEFORM_HEADER_HEIGHT: f32 = 22.0;
 const LUFS_METER_WIDTH: f32 = 76.0;
 const REFERENCE_HEADER_HEIGHT: f32 = 26.0;
@@ -783,12 +801,17 @@ struct AppState {
     waveform_generation: u64,
     waveform_cancellation: Option<ui::CancellationToken>,
     waveform_progress: Option<f32>,
+    live_spectrogram: Option<Arc<transport::LiveSpectrogramFrame>>,
+    live_spectrogram_revision: u64,
+    live_spectrogram_mode: LiveSpectrogramMode,
     reference_waveform: Option<audio::WaveformData>,
     reference_waveform_track_id: Option<String>,
     reference_waveform_busy: bool,
     reference_waveform_generation: u64,
     reference_waveform_cancellation: Option<ui::CancellationToken>,
     reference_waveform_progress: Option<f32>,
+    reference_live_spectrogram: Option<Arc<transport::LiveSpectrogramFrame>>,
+    reference_live_spectrogram_revision: u64,
     loop_selections: LoopSelections,
     review_cursor_millis: u64,
     playhead_drag_active: bool,
@@ -891,12 +914,17 @@ impl Default for AppState {
             waveform_generation: 0,
             waveform_cancellation: None,
             waveform_progress: None,
+            live_spectrogram: None,
+            live_spectrogram_revision: 0,
+            live_spectrogram_mode: LiveSpectrogramMode::Waterfall,
             reference_waveform: None,
             reference_waveform_track_id: None,
             reference_waveform_busy: false,
             reference_waveform_generation: 0,
             reference_waveform_cancellation: None,
             reference_waveform_progress: None,
+            reference_live_spectrogram: None,
+            reference_live_spectrogram_revision: 0,
             loop_selections: LoopSelections::default(),
             review_cursor_millis: 0,
             playhead_drag_active: false,
@@ -984,10 +1012,19 @@ fn animation_requested(state: &AppState) -> bool {
         || state.transport_polling
         || state.reference_transport_playing
         || state.reference_transport_polling
+        || live_animation_requested(&state.transport, state.live_spectrogram_revision)
+        || state.reference_transport.as_ref().is_some_and(|transport| {
+            live_animation_requested(transport, state.reference_live_spectrogram_revision)
+        })
         || state.audition_pending_play_track_id.is_some()
         || state.pending_comment_playback.is_some()
         || state.playhead_drag_active
         || state.reference_playhead_drag_active
+}
+
+fn live_animation_requested(transport: &transport::AudioTransport, visible_revision: u64) -> bool {
+    let state = transport.live_frame_state();
+    state.pending || state.revision > visible_revision
 }
 
 fn native_launch_options() -> NativeRunOptions {
@@ -1680,6 +1717,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                         .filter(|track| track.id == track_id)
                         .map(|track| track.path.clone())
                     {
+                        clear_live_spectrogram(state, AuditionSource::Main);
                         match state.transport.load(
                             state.transport_generation,
                             path,
@@ -1846,6 +1884,11 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
             enforce_loop(state, was_main_playing, was_reference_playing);
             maybe_start_pending_comment_playback(state, context);
+            refresh_live_spectrograms(state);
+            context.request_repaint();
+        }
+        Message::ToggleLiveSpectrogramMode => {
+            state.live_spectrogram_mode = state.live_spectrogram_mode.toggled();
             context.request_repaint();
         }
         Message::LibrarySaved(result) => {
@@ -2906,6 +2949,9 @@ fn seek_synchronized_positions(
     }
     let reference_was_loaded = state.reference_transport_loaded;
     if reference_details.is_some() {
+        if !reference_was_loaded {
+            clear_live_spectrogram(state, AuditionSource::Reference);
+        }
         let reference_transport = state
             .reference_transport
             .get_or_insert_with(transport::AudioTransport::spawn);
@@ -2923,6 +2969,7 @@ fn seek_synchronized_positions(
         main_duration_millis,
         resume,
     )?;
+    reset_live_spectrogram_segment(state, AuditionSource::Main);
     begin_transport_polling(state, main_token);
     if let Some((reference_path, reference_duration_millis)) = reference_details {
         let reference_gain = reference_output_gain(state);
@@ -2947,6 +2994,7 @@ fn seek_synchronized_positions(
             reference_duration_millis,
             resume,
         )?;
+        reset_live_spectrogram_segment(state, AuditionSource::Reference);
         state.reference_transport_waiting_token = Some(reference_token);
         state.reference_transport_polling = true;
     }
@@ -3010,6 +3058,9 @@ fn seek_reference_waveform_position(
         return;
     }
     let reference_gain = reference_output_gain(state);
+    if !state.reference_transport_loaded {
+        clear_live_spectrogram(state, AuditionSource::Reference);
+    }
     let reference_transport = state
         .reference_transport
         .get_or_insert_with(transport::AudioTransport::spawn);
@@ -3038,6 +3089,7 @@ fn seek_reference_waveform_position(
         true,
     ) {
         Ok(token) => {
+            reset_live_spectrogram_segment(state, AuditionSource::Reference);
             state.reference_transport_position_millis = reference_position_millis;
             state.reference_transport_waiting_token = Some(token);
             state.reference_transport_polling = true;
@@ -3102,6 +3154,7 @@ fn seek_loop_owner(
                 duration_millis,
                 true,
             )?;
+            reset_live_spectrogram_segment(state, AuditionSource::Main);
             set_source_position(state, source, position_millis);
             begin_transport_polling(state, token);
         }
@@ -3123,6 +3176,7 @@ fn seek_loop_owner(
                 duration_millis,
                 true,
             )?;
+            reset_live_spectrogram_segment(state, AuditionSource::Reference);
             set_source_position(state, source, position_millis);
             state.reference_transport_waiting_token = Some(token);
             state.reference_transport_polling = true;
@@ -3289,20 +3343,24 @@ fn start_source_alongside_active(
             let loop_bounds = loop_bounds_for_source(state, AuditionSource::Main);
             let position_millis =
                 playback_start_position(state, AuditionSource::Main, duration_millis, loop_bounds);
+            let starts_new_segment =
+                loop_bounds.is_some() || position_millis != state.transport_position_millis;
             state.transport.set_output_gain(state.audition_volume);
-            let result =
-                if loop_bounds.is_some() || position_millis != state.transport_position_millis {
-                    state.transport.seek(
-                        state.transport_generation,
-                        position_millis,
-                        duration_millis,
-                        true,
-                    )
-                } else {
-                    state.transport.play(state.transport_generation)
-                };
+            let result = if starts_new_segment {
+                state.transport.seek(
+                    state.transport_generation,
+                    position_millis,
+                    duration_millis,
+                    true,
+                )
+            } else {
+                state.transport.play(state.transport_generation)
+            };
             match result {
                 Ok(token) => {
+                    if starts_new_segment {
+                        reset_live_spectrogram_segment(state, AuditionSource::Main);
+                    }
                     set_source_position(state, AuditionSource::Main, position_millis);
                     begin_transport_polling(state, token);
                     Ok(())
@@ -3326,6 +3384,9 @@ fn start_source_alongside_active(
                 loop_bounds,
             );
             let reference_gain = reference_output_gain_for_source(state, AuditionSource::Reference);
+            if !reference_was_loaded {
+                clear_live_spectrogram(state, AuditionSource::Reference);
+            }
             let reference_transport = state
                 .reference_transport
                 .get_or_insert_with(transport::AudioTransport::spawn);
@@ -3372,6 +3433,7 @@ fn start_source_alongside_active(
             }
             match result {
                 Ok(token) => {
+                    reset_live_spectrogram_segment(state, AuditionSource::Reference);
                     set_source_position(state, AuditionSource::Reference, position_millis);
                     state.reference_transport_waiting_token = Some(token);
                     state.reference_transport_polling = true;
@@ -3775,9 +3837,9 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
         }
         state.reference_only_playback = false;
 
-        let main_result = if main_loop_bounds.is_some()
-            || main_position_millis != state.transport_position_millis
-        {
+        let main_starts_new_segment =
+            main_loop_bounds.is_some() || main_position_millis != state.transport_position_millis;
+        let main_result = if main_starts_new_segment {
             state.transport.seek(
                 state.transport_generation,
                 main_position_millis,
@@ -3799,6 +3861,9 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
                 return;
             }
         };
+        if main_starts_new_segment {
+            reset_live_spectrogram_segment(state, AuditionSource::Main);
+        }
         set_source_position(state, AuditionSource::Main, main_position_millis);
         if state.workspace_mode == WorkspaceMode::Audition {
             state.audition_auto_advance = true;
@@ -3808,6 +3873,9 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
 
         if let Some((path, reference_duration_millis)) = reference_details {
             let reference_gain = reference_output_gain(state);
+            if !state.reference_transport_loaded {
+                clear_live_spectrogram(state, AuditionSource::Reference);
+            }
             let reference_transport = state
                 .reference_transport
                 .get_or_insert_with(transport::AudioTransport::spawn);
@@ -3829,25 +3897,32 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
                 }
                 state.reference_transport_loaded = true;
             }
-            if let Err(error) = reference_transport.seek(
+            let seek_result = reference_transport.seek(
                 state.reference_transport_generation,
                 reference_position_millis,
                 reference_duration_millis,
                 false,
-            ) {
+            );
+            if let Err(error) = seek_result {
                 state.status = error;
                 context.request_repaint();
                 return;
             }
-            let reference_token =
-                match reference_transport.play(state.reference_transport_generation) {
-                    Ok(token) => token,
-                    Err(error) => {
-                        state.status = error;
-                        context.request_repaint();
-                        return;
-                    }
-                };
+            let _ = reference_transport;
+            reset_live_spectrogram_segment(state, AuditionSource::Reference);
+            let reference_token = match state
+                .reference_transport
+                .as_ref()
+                .expect("reference transport remains loaded")
+                .play(state.reference_transport_generation)
+            {
+                Ok(token) => token,
+                Err(error) => {
+                    state.status = error;
+                    context.request_repaint();
+                    return;
+                }
+            };
             set_source_position(state, AuditionSource::Reference, reference_position_millis);
             state.reference_transport_waiting_token = Some(reference_token);
             state.reference_transport_polling = true;
@@ -4851,6 +4926,7 @@ fn schedule_library_save(state: &mut AppState, context: &mut ui::UiUpdateContext
 }
 
 fn reset_transport(state: &mut AppState) {
+    clear_live_spectrogram(state, AuditionSource::Main);
     state.transport_generation = state.transport_generation.wrapping_add(1);
     state.audition_play_token = None;
     state.transport_position_millis = 0;
@@ -4864,6 +4940,7 @@ fn reset_transport(state: &mut AppState) {
 }
 
 fn reset_reference_transport(state: &mut AppState) {
+    clear_live_spectrogram(state, AuditionSource::Reference);
     state.reference_transport_generation = state.reference_transport_generation.wrapping_add(1);
     state.reference_playhead_drag_active = false;
     rollback_reference_persisted_note_drag(state);
@@ -4945,6 +5022,93 @@ fn apply_reference_transport_snapshot(state: &mut AppState, snapshot: transport:
     } else {
         state.reference_transport_playing = false;
         state.reference_transport_polling = false;
+    }
+}
+
+fn clear_live_spectrogram(state: &mut AppState, source: AuditionSource) {
+    match source {
+        AuditionSource::Main => {
+            state.live_spectrogram = None;
+            state.live_spectrogram_revision = 0;
+            state.transport.clear_live_frame();
+        }
+        AuditionSource::Reference => {
+            state.reference_live_spectrogram = None;
+            state.reference_live_spectrogram_revision = 0;
+            if let Some(reference_transport) = state.reference_transport.as_ref() {
+                reference_transport.clear_live_frame();
+            }
+        }
+    }
+}
+
+fn reset_live_spectrogram_segment(state: &mut AppState, source: AuditionSource) {
+    match source {
+        AuditionSource::Main => {
+            state.live_spectrogram = None;
+            state.live_spectrogram_revision = 0;
+            state.transport.reset_live_segment();
+        }
+        AuditionSource::Reference => {
+            state.reference_live_spectrogram = None;
+            state.reference_live_spectrogram_revision = 0;
+            if let Some(reference_transport) = state.reference_transport.as_ref() {
+                reference_transport.reset_live_segment();
+            }
+        }
+    }
+}
+
+fn refresh_live_spectrograms(state: &mut AppState) {
+    let main_state = state.transport.live_frame_state();
+    let main_frame = state.transport.latest_live_frame();
+    if state.live_spectrogram.as_ref().is_some_and(|frame| {
+        frame.generation != state.transport_generation
+            || frame.epoch != main_state.epoch
+            || frame.revision != main_state.revision
+            || !frame.is_valid()
+    }) {
+        state.live_spectrogram = None;
+        state.live_spectrogram_revision = 0;
+    }
+    if let Some(frame) = main_frame.filter(|frame| {
+        frame.generation == state.transport_generation
+            && frame.epoch == main_state.epoch
+            && frame.revision == main_state.revision
+            && frame.is_valid()
+    }) {
+        state.live_spectrogram_revision = frame.revision;
+        state.live_spectrogram = Some(frame);
+    }
+
+    let Some(reference_transport) = state.reference_transport.as_ref() else {
+        state.reference_live_spectrogram = None;
+        state.reference_live_spectrogram_revision = 0;
+        return;
+    };
+    let reference_state = reference_transport.live_frame_state();
+    let reference_frame = reference_transport.latest_live_frame();
+    if state
+        .reference_live_spectrogram
+        .as_ref()
+        .is_some_and(|frame| {
+            frame.generation != state.reference_transport_generation
+                || frame.epoch != reference_state.epoch
+                || frame.revision != reference_state.revision
+                || !frame.is_valid()
+        })
+    {
+        state.reference_live_spectrogram = None;
+        state.reference_live_spectrogram_revision = 0;
+    }
+    if let Some(frame) = reference_frame.filter(|frame| {
+        frame.generation == state.reference_transport_generation
+            && frame.epoch == reference_state.epoch
+            && frame.revision == reference_state.revision
+            && frame.is_valid()
+    }) {
+        state.reference_live_spectrogram_revision = frame.revision;
+        state.reference_live_spectrogram = Some(frame);
     }
 }
 
@@ -7630,93 +7794,136 @@ fn review_transport_icon(icon: &'static ui::SvgIconTintCache, active: bool) -> u
     icon.icon_for_state(REVIEW_TRANSPORT_ICON_TINTS, true, active)
 }
 
-fn review_spectrogram_source<'a>(
-    state: &'a AppState,
-    track: &storage::Track,
-) -> Option<(AuditionSource, &'a audio::WaveformData)> {
-    let main = state
-        .waveform
-        .as_ref()
-        .filter(|_| state.waveform_track_id.as_deref() == Some(track.id.as_str()));
-    let reference = state
-        .reference_waveform
-        .as_ref()
-        .filter(|_| state.reference_waveform_track_id.as_deref() == Some(track.id.as_str()));
-    let requested = if state.reference_only_playback {
-        AuditionSource::Reference
-    } else if state.transport_playing && !state.reference_transport_playing {
-        AuditionSource::Main
-    } else if state.reference_transport_playing && !state.transport_playing {
-        AuditionSource::Reference
-    } else {
-        state.audition_source
-    };
-    match requested {
-        AuditionSource::Main => main
-            .map(|waveform| (AuditionSource::Main, waveform))
-            .or_else(|| reference.map(|waveform| (AuditionSource::Reference, waveform))),
-        AuditionSource::Reference => reference
-            .map(|waveform| (AuditionSource::Reference, waveform))
-            .or_else(|| main.map(|waveform| (AuditionSource::Main, waveform))),
+fn current_live_frame_for_source(
+    state: &AppState,
+    track_id: &str,
+    source: AuditionSource,
+) -> Option<Arc<transport::LiveSpectrogramFrame>> {
+    match source {
+        AuditionSource::Main => {
+            if state.waveform_track_id.as_deref() != Some(track_id) {
+                return None;
+            }
+            let live_state = state.transport.live_frame_state();
+            let frame = state.live_spectrogram.as_ref()?;
+            (frame.generation == state.transport_generation
+                && frame.epoch == live_state.epoch
+                && frame.revision == state.live_spectrogram_revision
+                && frame.revision == live_state.revision
+                && frame.is_valid())
+            .then(|| Arc::clone(frame))
+        }
+        AuditionSource::Reference => {
+            if state.reference_waveform_track_id.as_deref() != Some(track_id) {
+                return None;
+            }
+            let reference_transport = state.reference_transport.as_ref()?;
+            let live_state = reference_transport.live_frame_state();
+            let frame = state.reference_live_spectrogram.as_ref()?;
+            (frame.generation == state.reference_transport_generation
+                && frame.epoch == live_state.epoch
+                && frame.revision == state.reference_live_spectrogram_revision
+                && frame.revision == live_state.revision
+                && frame.is_valid())
+            .then(|| Arc::clone(frame))
+        }
     }
 }
 
-fn review_spectrogram_section(state: &AppState, track: &storage::Track) -> ui::View<Message> {
+fn review_spectrogram_source(
+    state: &AppState,
+    track: &storage::Track,
+) -> Option<(AuditionSource, Arc<transport::LiveSpectrogramFrame>)> {
+    let source = if state.reference_only_playback {
+        AuditionSource::Reference
+    } else {
+        match (state.transport_playing, state.reference_transport_playing) {
+            (true, false) => AuditionSource::Main,
+            (false, true) => AuditionSource::Reference,
+            (true, true) | (false, false) => state.audition_source,
+        }
+    };
+    current_live_frame_for_source(state, &track.id, source).map(|frame| (source, frame))
+}
+
+fn live_spectrogram_section(state: &AppState, track: &storage::Track) -> ui::View<Message> {
     let selected = review_spectrogram_source(state, track);
-    let source_label = selected.map_or_else(
-        || String::from("SPECTROGRAM · WAITING FOR AUDIO ANALYSIS"),
-        |(source, waveform)| {
-            let label = match source {
-                AuditionSource::Main => "MAIN",
-                AuditionSource::Reference => "REFERENCE",
-            };
-            let name = if source == AuditionSource::Main {
-                track.original_name.clone()
+    let label = selected.as_ref().map_or_else(
+        || {
+            if state.transport_playing
+                || state.reference_transport_playing
+                || state.transport.live_analysis_pending()
+                || state
+                    .reference_transport
+                    .as_ref()
+                    .is_some_and(transport::AudioTransport::live_analysis_pending)
+            {
+                String::from("LIVE SPECTROGRAM · BUILDING")
             } else {
-                track.reference_path.as_ref().map_or_else(
-                    || String::from("reference"),
-                    |path| reference_track_name(path),
-                )
-            };
-            let status = if waveform.spectrogram.column_count == 0 {
-                " · BUILDING"
-            } else {
-                ""
-            };
-            format!("SPECTROGRAM · {label} · {name}{status}")
+                String::from("LIVE SPECTROGRAM · WAITING FOR PLAYBACK")
+            }
+        },
+        |(source, frame)| {
+            format!(
+                "LIVE SPECTROGRAM · {} · {} BANDS",
+                match source {
+                    AuditionSource::Main => "MAIN",
+                    AuditionSource::Reference => "REFERENCE",
+                },
+                frame.values.len() / frame.row_count.max(1),
+            )
         },
     );
-    let header = ui::row([
-        ui::spacer().fill_width(),
-        ui::text(source_label)
-            .truncate()
-            .height(SPECTROGRAM_HEADER_HEIGHT)
-            .align_text(ui::TextAlign::Right)
-            .subtle(),
-    ])
-    .fill_width()
-    .height(SPECTROGRAM_HEADER_HEIGHT);
-    let body = if let Some((source, waveform)) = selected {
-        let cursor_millis = source_position(state, source);
-        let cursor_ratio = waveform::ratio_for_millis(cursor_millis, waveform.duration_millis);
-        spectrogram::view::<Message>(Arc::clone(&waveform.spectrogram), cursor_ratio)
-            .fill_width()
-            .height(spectrogram::HEIGHT)
-    } else {
-        ui::column([
-            ui::text("The spectrogram will appear when the selected track is analyzed.")
-                .height(28.0)
+    let body = selected.map_or_else(
+        || {
+            ui::column([
+                ui::text("Play a track to build the live frequency history.")
+                    .height(24.0)
+                    .fill_width(),
+                ui::text(
+                    "Low frequencies enter from the left; newest scanlines settle at the bottom.",
+                )
+                .wrap()
+                .height(30.0)
                 .fill_width()
                 .subtle(),
-        ])
-        .padding(12.0)
+            ])
+            .padding(10.0)
+            .spacing(4.0)
+            .fill_width()
+            .height(LIVE_SPECTROGRAM_HEIGHT)
+        },
+        |(_, frame)| spectrogram::view::<Message>(frame, state.live_spectrogram_mode),
+    );
+    let spectrum_selected = state.live_spectrogram_mode == LiveSpectrogramMode::Spectrum;
+    let mode_toggle = ui::button("SPECTRUM")
+        .subtle()
+        .active(spectrum_selected)
+        .selected(spectrum_selected)
+        .message(Message::ToggleLiveSpectrogramMode)
+        .key("live-spectrogram-mode-toggle")
+        .tooltip("Toggle live waterfall / spectrum view")
+        .width(82.0)
+        .height(LIVE_SPECTROGRAM_HEADER_HEIGHT);
+    let header = ui::row([
+        ui::spacer().fill_width(),
+        ui::text(label)
+            .style(ui::WidgetStyle::strong(ui::WidgetTone::Neutral))
+            .height(LIVE_SPECTROGRAM_HEADER_HEIGHT)
+            .align_text(ui::TextAlign::Right),
+        mode_toggle,
+    ])
+    .spacing(8.0)
+    .fill_width()
+    .height(LIVE_SPECTROGRAM_HEADER_HEIGHT);
+    ui::column([body, header])
+        .spacing(LIVE_SPECTROGRAM_SECTION_SPACING)
         .fill_width()
-        .height(spectrogram::HEIGHT)
-    };
-    ui::column([header, body])
-        .spacing(SPECTROGRAM_SECTION_SPACING)
-        .fill_width()
-        .height(SPECTROGRAM_HEADER_HEIGHT + SPECTROGRAM_SECTION_SPACING + spectrogram::HEIGHT)
+        .height(
+            LIVE_SPECTROGRAM_HEIGHT
+                + LIVE_SPECTROGRAM_SECTION_SPACING
+                + LIVE_SPECTROGRAM_HEADER_HEIGHT,
+        )
 }
 
 fn review_panel(state: &AppState) -> ui::View<Message> {
@@ -7955,9 +8162,8 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
         .fill_width()
         .height(waveform_pair_height);
 
-    let spectrogram_section = review_spectrogram_section(state, &track);
     let content = ui::column([
-        spectrogram_section,
+        live_spectrogram_section(state, &track),
         waveform_with_source,
         comments_panel(state, &track),
     ])
@@ -8957,8 +9163,8 @@ fn plural(count: usize) -> &'static str {
 mod tests {
     use super::{
         APP_VERSION_LABEL, AppState, AuditionSource, FavoriteMarkerWidget, ImportBatchProgress,
-        LoopBounds, LoopSelection, LoopSelections, Message, NoteDraft, PlannerInsertionTarget,
-        REFERENCE_MENU_WIDTH, SETTINGS_REFERENCE_ROW_METADATA_HEIGHT,
+        LiveSpectrogramMode, LoopBounds, LoopSelection, LoopSelections, Message, NoteDraft,
+        PlannerInsertionTarget, REFERENCE_MENU_WIDTH, SETTINGS_REFERENCE_ROW_METADATA_HEIGHT,
         SETTINGS_REFERENCE_ROW_TEXT_HEIGHT, SETTINGS_REFERENCE_ROW_TEXT_SPACING,
         SETTINGS_REFERENCE_ROW_TITLE_HEIGHT, STATUS_BAR_VERSION_WIDTH, StatusMenuHost,
         TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER, TRACK_CARD_SELECTED_CORAL, WAVEFORM_HEIGHT,
@@ -8970,10 +9176,11 @@ mod tests {
         planner_insertion_target_is_valid, playback_shortcut, project_surface,
         rebuild_audition_queue, reconcile_audition_queue, reference_decode_result_is_current,
         reference_output_gain, reference_settings_auxiliary_windows,
-        reference_settings_window_view, review_status_filter_message, selected_reference_notes,
-        selected_track, stage_dropdown, stage_menu_anchor_from_pointer, stage_menu_popover,
-        status_dropdown_for_host, status_filter_dropdown, sync_audition_queue_after_status_change,
-        tracks_in_stage, tracks_with_status, transport_command_is_confirmed, update,
+        reference_settings_window_view, review_spectrogram_source, review_status_filter_message,
+        selected_reference_notes, selected_track, stage_dropdown, stage_menu_anchor_from_pointer,
+        stage_menu_popover, status_dropdown_for_host, status_filter_dropdown,
+        sync_audition_queue_after_status_change, tracks_in_stage, tracks_with_status,
+        transport_command_is_confirmed, update,
     };
     use crate::transport::Snapshot;
     use crate::{
@@ -9094,7 +9301,6 @@ mod tests {
             render_frames: 48_000,
             integrated_lufs: Some(-7.0),
             loudness_profile: Arc::from([]),
-            spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
             summary: Arc::new(
                 radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                     &[0.0, 0.5, 0.0, 0.5],
@@ -9120,6 +9326,128 @@ mod tests {
         state.library.selected_track_id = selected_id;
         state.library.tracks = ids.iter().map(|id| audition_track(id)).collect();
         state
+    }
+
+    fn live_frame(
+        generation: u64,
+        epoch: u64,
+        revision: u64,
+    ) -> Arc<transport::LiveSpectrogramFrame> {
+        Arc::new(transport::LiveSpectrogramFrame {
+            generation,
+            epoch,
+            revision,
+            sample_rate: 48_000,
+            row_count: 1,
+            values: Arc::from(
+                vec![64_u8; transport::LIVE_SPECTROGRAM_BAND_COUNT].into_boxed_slice(),
+            ),
+        })
+    }
+
+    #[test]
+    fn live_spectrogram_source_selection_never_falls_back_to_the_other_transport() {
+        let mut state = audition_state(&["main"]);
+        state.reference_transport = Some(transport::AudioTransport::spawn());
+        state.reference_waveform_track_id = Some(String::from("main"));
+        state.waveform_track_id = Some(String::from("main"));
+        state.live_spectrogram = Some(live_frame(0, 0, 1));
+        state.live_spectrogram_revision = 1;
+        state.reference_live_spectrogram = Some(live_frame(0, 0, 1));
+        state.reference_live_spectrogram_revision = 1;
+        state
+            .transport
+            .set_live_state_for_test(transport::LiveFrameState {
+                generation: 0,
+                epoch: 0,
+                revision: 1,
+                pending: false,
+            });
+        state
+            .reference_transport
+            .as_ref()
+            .expect("reference transport")
+            .set_live_state_for_test(transport::LiveFrameState {
+                generation: 0,
+                epoch: 0,
+                revision: 1,
+                pending: false,
+            });
+        let track = selected_track(&state).expect("selected test track").clone();
+
+        state.transport_playing = true;
+        state.reference_transport_playing = false;
+        state.audition_source = AuditionSource::Main;
+        assert_eq!(
+            review_spectrogram_source(&state, &track).map(|(source, _)| source),
+            Some(AuditionSource::Main)
+        );
+
+        state.live_spectrogram = None;
+        state.live_spectrogram_revision = 0;
+        assert!(review_spectrogram_source(&state, &track).is_none());
+
+        state.transport_playing = false;
+        state.reference_transport_playing = true;
+        state.audition_source = AuditionSource::Reference;
+        assert_eq!(
+            review_spectrogram_source(&state, &track).map(|(source, _)| source),
+            Some(AuditionSource::Reference)
+        );
+
+        state.transport_playing = true;
+        state.reference_transport_playing = true;
+        state.audition_source = AuditionSource::Main;
+        assert!(review_spectrogram_source(&state, &track).is_none());
+    }
+
+    #[test]
+    fn live_spectrogram_animation_continues_for_pending_capture_and_revision() {
+        let mut state = audition_state(&["main"]);
+        assert!(!animation_requested(&state));
+        state
+            .transport
+            .set_live_state_for_test(transport::LiveFrameState {
+                generation: 0,
+                epoch: 1,
+                revision: 0,
+                pending: true,
+            });
+        assert!(animation_requested(&state));
+
+        state
+            .transport
+            .set_live_state_for_test(transport::LiveFrameState {
+                generation: 0,
+                epoch: 1,
+                revision: 3,
+                pending: false,
+            });
+        assert!(animation_requested(&state));
+        state.live_spectrogram_revision = 3;
+        assert!(!animation_requested(&state));
+    }
+
+    #[test]
+    fn live_spectrogram_mode_defaults_to_waterfall_and_toggles() {
+        let mut state = AppState::default();
+        let mut context = ui::UiUpdateContext::default();
+
+        assert_eq!(state.live_spectrogram_mode, LiveSpectrogramMode::Waterfall);
+        update(&mut state, Message::ToggleLiveSpectrogramMode, &mut context);
+        assert_eq!(state.live_spectrogram_mode, LiveSpectrogramMode::Spectrum);
+        update(&mut state, Message::ToggleLiveSpectrogramMode, &mut context);
+        assert_eq!(state.live_spectrogram_mode, LiveSpectrogramMode::Waterfall);
+    }
+
+    #[test]
+    fn live_spectrogram_mode_toggle_is_visible_before_live_frame_exists() {
+        let state = audition_state(&["main"]);
+        let frame = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1100.0));
+        let labels = frame.paint_plan.text_label_strings();
+
+        assert!(labels.iter().any(|label| label == "SPECTRUM"));
     }
 
     fn focus_request_id(command: &radiant::runtime::Command<Message>) -> Option<u64> {
@@ -10057,7 +10385,6 @@ mod tests {
                 render_frames: 48_000,
                 integrated_lufs: Some(-7.0),
                 loudness_profile: std::sync::Arc::from([]),
-                spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
                 summary: Arc::new(
                     radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                         &[0.1, 0.8, 0.2, 0.4],
@@ -10117,7 +10444,6 @@ mod tests {
                 render_frames: 48_000,
                 integrated_lufs: Some(-7.0),
                 loudness_profile: std::sync::Arc::from([]),
-                spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
                 summary: Arc::new(
                     radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                         &[0.1, 0.8, 0.2, 0.4],
@@ -10187,7 +10513,6 @@ mod tests {
             render_frames: 96_000,
             integrated_lufs: Some(-7.0),
             loudness_profile: Arc::from([]),
-            spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
             summary: Arc::new(
                 radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                     &[0.1, 0.8, 0.2, 0.4],
@@ -10480,7 +10805,6 @@ mod tests {
                 render_frames: 48_000,
                 integrated_lufs: Some(-7.0),
                 loudness_profile: std::sync::Arc::from([]),
-                spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
                 summary: Arc::new(
                     radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                         &[0.1, 0.8, 0.2, 0.4],
@@ -10529,7 +10853,6 @@ mod tests {
                         lufs: -12.0,
                     },
                 ]),
-                spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
                 summary: Arc::new(
                     radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                         &[0.1, 0.8, 0.2, 0.4],
@@ -10569,7 +10892,6 @@ mod tests {
                 render_frames: 80,
                 integrated_lufs: Some(-8.0),
                 loudness_profile: std::sync::Arc::from([]),
-                spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
                 summary: Arc::new(
                     radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                         &[0.1, 0.8, 0.2, 0.4],
@@ -10595,7 +10917,6 @@ mod tests {
                         lufs: -12.0,
                     },
                 ]),
-                spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
                 summary: Arc::new(
                     radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                         &[0.1, 0.8, 0.2, 0.4],
@@ -10633,7 +10954,6 @@ mod tests {
             render_frames: 48_000,
             integrated_lufs: Some(-8.0),
             loudness_profile: std::sync::Arc::from([]),
-            spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
             summary: Arc::new(
                 radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                     &[0.1, 0.8, 0.2, 0.4],
@@ -10701,7 +11021,6 @@ mod tests {
             render_frames: 48_000,
             integrated_lufs: Some(-8.0),
             loudness_profile: std::sync::Arc::from([]),
-            spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
             summary: Arc::new(
                 radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                     &[0.1, 0.8, 0.2, 0.4],
@@ -10765,7 +11084,6 @@ mod tests {
             render_frames: 48_000,
             integrated_lufs: Some(-8.0),
             loudness_profile: std::sync::Arc::from([]),
-            spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
             summary: Arc::new(
                 radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                     &[0.1, 0.8, 0.2, 0.4],
@@ -10918,7 +11236,6 @@ mod tests {
             render_frames: 96_000,
             integrated_lufs: Some(-8.0),
             loudness_profile: std::sync::Arc::from([]),
-            spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
             summary: Arc::new(
                 radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                     &[0.1, 0.8, 0.2, 0.4],
@@ -11033,7 +11350,6 @@ mod tests {
             render_frames: 96_000,
             integrated_lufs: Some(-8.0),
             loudness_profile: std::sync::Arc::from([]),
-            spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
             summary: Arc::new(
                 radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                     &[0.1, 0.8, 0.2, 0.4],
@@ -11116,7 +11432,6 @@ mod tests {
             render_frames: 96_000,
             integrated_lufs: Some(-8.0),
             loudness_profile: std::sync::Arc::from([]),
-            spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
             summary: Arc::new(
                 radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                     &[0.1, 0.8, 0.2, 0.4],
@@ -11201,7 +11516,6 @@ mod tests {
             render_frames: 96_000,
             integrated_lufs: Some(-8.0),
             loudness_profile: std::sync::Arc::from([]),
-            spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
             summary: Arc::new(
                 radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                     &[0.1, 0.8, 0.2, 0.4],
@@ -11726,7 +12040,6 @@ mod tests {
             render_frames: 96_000,
             integrated_lufs: Some(-8.0),
             loudness_profile: std::sync::Arc::from([]),
-            spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
             summary: Arc::new(
                 radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                     &[0.1, 0.8, 0.2, 0.4],
@@ -11800,7 +12113,6 @@ mod tests {
             render_frames: 96_000,
             integrated_lufs: Some(-8.0),
             loudness_profile: std::sync::Arc::from([]),
-            spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
             summary: Arc::new(
                 radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                     &[0.1, 0.8, 0.2, 0.4],
@@ -12293,7 +12605,6 @@ mod tests {
                 render_frames: 96_000,
                 integrated_lufs: Some(-7.0),
                 loudness_profile: std::sync::Arc::from([]),
-                spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
                 summary: Arc::new(
                     radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                         &[0.1, 0.8, 0.2, 0.4],
@@ -12441,65 +12752,6 @@ mod tests {
     }
 
     #[test]
-    fn review_spectrogram_source_follows_audible_source_and_rejects_stale_data() {
-        let track_id = String::from("spectrogram-source-track");
-        let mut state = audition_state(&[track_id.as_str()]);
-        let waveform_with_value = |value: u8| {
-            let mut waveform = audition_waveform();
-            waveform.spectrogram = Arc::new(crate::audio::SpectrogramData {
-                column_count: 1,
-                values: Arc::from(
-                    vec![value; crate::audio::SPECTROGRAM_BAND_COUNT].into_boxed_slice(),
-                ),
-            });
-            waveform
-        };
-        state.waveform = Some(waveform_with_value(32));
-        state.waveform_track_id = Some(track_id.clone());
-        state.reference_waveform = Some(waveform_with_value(224));
-        state.reference_waveform_track_id = Some(track_id.clone());
-        let track = state
-            .library
-            .tracks
-            .first()
-            .cloned()
-            .expect("the audition fixture should contain a track");
-
-        let selected = super::review_spectrogram_source(&state, &track)
-            .map(|(source, waveform)| (source, waveform.spectrogram.value(0, 0)));
-        assert_eq!(selected, Some((AuditionSource::Main, 32)));
-
-        state.audition_source = AuditionSource::Reference;
-        let selected = super::review_spectrogram_source(&state, &track)
-            .map(|(source, waveform)| (source, waveform.spectrogram.value(0, 0)));
-        assert_eq!(selected, Some((AuditionSource::Reference, 224)));
-
-        state.audition_source = AuditionSource::Reference;
-        state.transport_playing = true;
-        state.reference_transport_playing = false;
-        assert_eq!(
-            super::review_spectrogram_source(&state, &track).map(|(source, _)| source),
-            Some(AuditionSource::Main)
-        );
-
-        state.transport_playing = false;
-        state.reference_transport_playing = true;
-        assert_eq!(
-            super::review_spectrogram_source(&state, &track).map(|(source, _)| source),
-            Some(AuditionSource::Reference)
-        );
-
-        state.reference_waveform_track_id = None;
-        assert_eq!(
-            super::review_spectrogram_source(&state, &track).map(|(source, _)| source),
-            Some(AuditionSource::Main)
-        );
-
-        state.waveform_track_id = Some(String::from("different-track"));
-        assert!(super::review_spectrogram_source(&state, &track).is_none());
-    }
-
-    #[test]
     fn selected_reference_track_projects_a_matching_waveform_below_the_main_review() {
         let track_id = String::from("reference-track");
         let waveform = WaveformData {
@@ -12509,12 +12761,6 @@ mod tests {
             render_frames: 96_000,
             integrated_lufs: Some(-8.0),
             loudness_profile: std::sync::Arc::from([]),
-            spectrogram: Arc::new(crate::audio::SpectrogramData {
-                column_count: 2,
-                values: Arc::from(
-                    vec![64_u8; 2 * crate::audio::SPECTROGRAM_BAND_COUNT].into_boxed_slice(),
-                ),
-            }),
             summary: Arc::new(
                 radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                     &[0.1, 0.8, 0.2, 0.4],
@@ -12527,17 +12773,8 @@ mod tests {
             busy: false,
             waveform: Some(waveform.clone()),
             waveform_track_id: Some(track_id.clone()),
-            reference_waveform: Some(WaveformData {
-                spectrogram: Arc::new(crate::audio::SpectrogramData {
-                    column_count: 2,
-                    values: Arc::from(
-                        vec![220_u8; 2 * crate::audio::SPECTROGRAM_BAND_COUNT].into_boxed_slice(),
-                    ),
-                }),
-                ..waveform
-            }),
+            reference_waveform: Some(waveform),
             reference_waveform_track_id: Some(track_id.clone()),
-            audition_source: AuditionSource::Reference,
             ..AppState::default()
         };
         state.library.selected_track_id = Some(track_id.clone());
@@ -12586,22 +12823,6 @@ mod tests {
             .filter(|primitive| matches!(primitive, PaintPrimitive::Svg(_)))
             .count();
         let labels = frame.paint_plan.text_label_strings();
-
-        assert!(
-            labels
-                .iter()
-                .any(|label| { label.starts_with("SPECTROGRAM · REFERENCE · reference.wav") }),
-            "the spectrogram should identify the audible reference source"
-        );
-        assert!(
-            frame.paint_plan.primitives.iter().any(|primitive| {
-                matches!(
-                    primitive,
-                    PaintPrimitive::FillRectBatch(batch) if batch.rects.len() >= 2
-                )
-            }),
-            "the spectrogram should paint batched heatmap cells"
-        );
 
         assert!(labels.iter().any(|label| label == "Replace reference"));
         assert!(paint_plan_contains_icon(
@@ -13417,7 +13638,6 @@ mod tests {
                 render_frames: 96_000,
                 integrated_lufs: Some(-7.0),
                 loudness_profile: Arc::from([]),
-                spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
                 summary: Arc::new(
                     radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                         &[0.1, 0.8, 0.2, 0.4],
@@ -13741,7 +13961,6 @@ mod tests {
             render_frames: 96_000,
             integrated_lufs: Some(-7.0),
             loudness_profile: Arc::from([]),
-            spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
             summary: Arc::new(
                 radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                     &[0.1, 0.8, 0.2, 0.4],
@@ -14007,7 +14226,6 @@ mod tests {
                 render_frames: 96_000,
                 integrated_lufs: Some(-7.0),
                 loudness_profile: Arc::from([]),
-                spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
                 summary: Arc::new(
                     radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                         &[0.1, 0.8, 0.2, 0.4],
@@ -14341,7 +14559,6 @@ mod tests {
             render_frames: 2,
             integrated_lufs: None,
             loudness_profile: Arc::from([]),
-            spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
             summary: Arc::new(
                 radiant::runtime::GpuSignalSummary::from_interleaved_samples(&[0.2, 0.4], 2, 1),
             ),
@@ -16800,7 +17017,6 @@ mod tests {
                 render_frames: 48_000,
                 integrated_lufs: Some(-7.0),
                 loudness_profile: Arc::from([]),
-                spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
                 summary: Arc::new(
                     radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                         &[0.0, 0.0, 0.0, 0.0],
@@ -16975,7 +17191,6 @@ mod tests {
                 render_frames: 48,
                 integrated_lufs: Some(-7.0),
                 loudness_profile: Arc::from([]),
-                spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
                 summary: Arc::new(
                     radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                         &[0.0, 0.0, 0.0, 0.0],
@@ -16992,7 +17207,6 @@ mod tests {
                 render_frames: 48_000,
                 integrated_lufs: Some(-7.0),
                 loudness_profile: Arc::from([]),
-                spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
                 summary: Arc::new(
                     radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                         &[0.0, 0.0, 0.0, 0.0],

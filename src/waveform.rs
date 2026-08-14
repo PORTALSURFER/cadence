@@ -1501,7 +1501,6 @@ mod tests {
             render_frames: 48_000,
             integrated_lufs: Some(-7.0),
             loudness_profile: Arc::from([]),
-            spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
             summary: Arc::new(GpuSignalSummary::from_interleaved_samples(
                 &[0.1, 0.8, 0.2, 0.4],
                 4,
