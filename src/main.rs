@@ -612,6 +612,65 @@ fn status_rail(status: Option<storage::TrackStatus>, height: f32) -> ui::View<Me
         .height(height)
 }
 
+#[derive(Clone, Debug)]
+struct PlannerStageRailWidget {
+    common: WidgetCommon,
+    stage: storage::TrackStage,
+}
+
+impl PlannerStageRailWidget {
+    fn new(stage: storage::TrackStage) -> Self {
+        Self {
+            common: WidgetCommon::fixed(0, STATUS_RAIL_WIDTH, 1.0).without_default_chrome(),
+            stage,
+        }
+    }
+}
+
+impl Widget for PlannerStageRailWidget {
+    fn common(&self) -> &WidgetCommon {
+        &self.common
+    }
+
+    fn common_mut(&mut self) -> &mut WidgetCommon {
+        &mut self.common
+    }
+
+    fn accepts_pointer_move(&self) -> bool {
+        false
+    }
+
+    fn accepts_pointer_input(&self, _input: &WidgetInput) -> bool {
+        false
+    }
+
+    fn handle_input(&mut self, _bounds: Rect, _input: WidgetInput) -> Option<WidgetOutput> {
+        None
+    }
+
+    fn append_paint(
+        &self,
+        primitives: &mut Vec<PaintPrimitive>,
+        bounds: Rect,
+        _layout: &LayoutOutput,
+        theme: &ThemeTokens,
+    ) {
+        if bounds.has_finite_positive_area() {
+            primitives.push(PaintPrimitive::FillRect(PaintFillRect {
+                widget_id: self.common.id,
+                rect: bounds,
+                color: planner_stage_visual_color(self.stage, theme),
+            }));
+        }
+    }
+}
+
+fn planner_stage_rail(stage: storage::TrackStage, height: f32) -> ui::View<Message> {
+    ui::custom_widget(PlannerStageRailWidget::new(stage), |_| None)
+        .width(STATUS_RAIL_WIDTH)
+        .height(height)
+}
+
 fn status_bar_version_label(height: f32) -> ui::View<Message> {
     ui::text(APP_VERSION_LABEL)
         .height(height)
@@ -5820,7 +5879,7 @@ fn audition_panel(state: &AppState) -> ui::View<Message> {
     let content = ui::column([
         ui::row([
             ui::column([
-                ui::text("AUDITION / PLAYLIST")
+                ui::text("AUDITION")
                     .style(ui::WidgetStyle::strong(ui::WidgetTone::Neutral))
                     .height(18.0)
                     .fill_width(),
@@ -6162,10 +6221,7 @@ fn planner_panel(state: &AppState) -> ui::View<Message> {
                 .style(ui::WidgetStyle::strong(ui::WidgetTone::Neutral))
                 .height(18.0)
                 .fill_width(),
-            ui::text("Move every track toward release.")
-                .height(30.0)
-                .fill_width()
-                .muted_text(),
+            ui::spacer().height(30.0).fill_width(),
         ])
         .fill_width(),
         status_filter_controls(
@@ -6223,12 +6279,14 @@ fn planner_column(
         remove_confirmation_track_id,
     } = context;
     let count = tracks.len();
+    let tone = planner_column_tone(stage);
     let current_target = drag_target.is_some_and(|target| target.stage == stage);
     let active_slot = drag_target
         .filter(|target| target.stage == stage)
         .map(|target| target.slot);
     let mut children = vec![
         ui::row([
+            planner_stage_rail(stage, 24.0),
             ui::text(if current_target {
                 "DROP HERE"
             } else {
@@ -6237,8 +6295,9 @@ fn planner_column(
             .height(24.0)
             .fill_width(),
             ui::badge(count.to_string())
+                .style(ui::WidgetStyle::subtle(tone))
+                .outline()
                 .passive()
-                .subtle()
                 .width(32.0)
                 .height(24.0),
         ])
@@ -6487,6 +6546,25 @@ fn planner_column_heading(stage: storage::TrackStage) -> &'static str {
     match stage {
         storage::TrackStage::SoundDesign => "Backlog",
         _ => stage.label(),
+    }
+}
+
+const fn planner_column_tone(stage: storage::TrackStage) -> ui::WidgetTone {
+    match stage {
+        storage::TrackStage::SoundDesign => ui::WidgetTone::Warning,
+        storage::TrackStage::Production => ui::WidgetTone::Accent,
+        storage::TrackStage::Mixdown => ui::WidgetTone::Success,
+        storage::TrackStage::Mastering => ui::WidgetTone::Danger,
+    }
+}
+
+fn planner_stage_visual_color(stage: storage::TrackStage, theme: &ThemeTokens) -> ui::Rgba8 {
+    match planner_column_tone(stage) {
+        ui::WidgetTone::Accent => theme.accent_mint,
+        ui::WidgetTone::Success => theme.highlight_cyan,
+        ui::WidgetTone::Warning => theme.accent_warning,
+        ui::WidgetTone::Danger => theme.accent_danger,
+        ui::WidgetTone::Neutral => theme.text_primary,
     }
 }
 
@@ -16219,7 +16297,7 @@ mod tests {
             .text_label_strings();
 
         for label in [
-            "AUDITION / PLAYLIST",
+            "AUDITION",
             "Fixed shuffle · one pass",
             "PLAY STATUS",
             "Inbox",
@@ -16646,12 +16724,12 @@ mod tests {
             (
                 WorkspaceMode::Planner,
                 "FINISHING BOARD",
-                Some("Move every track toward release."),
+                None,
                 theme.surface_raised,
             ),
             (
                 WorkspaceMode::Audition,
-                "AUDITION / PLAYLIST",
+                "AUDITION",
                 Some("Fixed shuffle · one pass"),
                 theme.surface_overlay,
             ),
@@ -16683,6 +16761,14 @@ mod tests {
                     frame.paint_plan.first_text_color(subtitle),
                     Some(theme.text_muted),
                     "{mode:?} subtitle should remain subtle"
+                );
+            } else {
+                assert_eq!(
+                    frame
+                        .paint_plan
+                        .first_text_color("Move every track toward release."),
+                    None,
+                    "{mode:?} should not paint the removed Planner subtitle"
                 );
             }
         }
@@ -16736,12 +16822,7 @@ mod tests {
                 .paint_plan
                 .fill_rects()
                 .find(|fill| {
-                    fill.color == theme.surface_overlay
-                        && contains(fill.rect, heading.rect)
-                        && (heading.rect.min.x
-                            - (fill.rect.min.x + super::WORKSPACE_PANEL_PADDING))
-                            .abs()
-                            < 0.01
+                    fill.color == theme.surface_overlay && contains(fill.rect, heading.rect)
                 })
                 .unwrap_or_else(|| {
                     panic!(
@@ -16762,6 +16843,83 @@ mod tests {
             board.color,
             theme.surface_overlay
         );
+    }
+
+    #[test]
+    fn planner_color_codes_stage_headers_and_count_badges() {
+        let theme = ThemeTokens::default();
+        let state = AppState {
+            busy: false,
+            workspace_mode: WorkspaceMode::Planner,
+            ..AppState::default()
+        };
+        let frame = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(1_180.0, 900.0));
+        let contains = |outer: Rect, inner: Rect| {
+            inner.min.x >= outer.min.x
+                && inner.min.y >= outer.min.y
+                && inner.max.x <= outer.max.x
+                && inner.max.y <= outer.max.y
+        };
+
+        for stage in [
+            TrackStage::SoundDesign,
+            TrackStage::Production,
+            TrackStage::Mixdown,
+            TrackStage::Mastering,
+        ] {
+            let heading = frame
+                .paint_plan
+                .first_text_run(super::planner_column_heading(stage))
+                .expect("Planner should paint every stage heading");
+            let expected_color = match stage {
+                TrackStage::SoundDesign => theme.accent_warning,
+                TrackStage::Production => theme.accent_mint,
+                TrackStage::Mixdown => theme.highlight_cyan,
+                TrackStage::Mastering => theme.accent_danger,
+            };
+            assert_eq!(
+                super::planner_stage_visual_color(stage, &theme),
+                expected_color,
+                "Planner should map {:?} to its expected stage color",
+                stage
+            );
+            let column = frame
+                .paint_plan
+                .fill_rects()
+                .find(|fill| {
+                    fill.color == theme.surface_overlay && contains(fill.rect, heading.rect)
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "Planner should paint the {:?} column with the overlay neutral surface",
+                        stage
+                    )
+                });
+            assert!(
+                frame.paint_plan.fill_rects().any(|fill| {
+                    fill.color == expected_color
+                        && fill.rect.min.x >= column.rect.min.x
+                        && fill.rect.max.x <= column.rect.max.x
+                        && fill.rect.max.x <= heading.rect.min.x
+                        && fill.rect.min.y < heading.rect.max.y
+                        && fill.rect.max.y > heading.rect.min.y
+                }),
+                "Planner should paint a stage-colored rail for {:?}",
+                stage
+            );
+            assert!(
+                frame.paint_plan.stroke_rects().any(|stroke| {
+                    stroke.color == expected_color
+                        && stroke.rect.min.x >= column.rect.min.x
+                        && stroke.rect.max.x <= column.rect.max.x
+                        && stroke.rect.min.y < heading.rect.max.y
+                        && stroke.rect.max.y > heading.rect.min.y
+                }),
+                "Planner should outline the {:?} count badge with its stage color",
+                stage
+            );
+        }
     }
 
     #[test]
