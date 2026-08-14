@@ -3454,9 +3454,7 @@ fn set_audition_source(state: &mut AppState, source: AuditionSource) {
     }
     state.audition_source = source;
     sync_audition_output_gains(state);
-    if state.transport_playing || state.reference_transport_playing {
-        reset_live_spectrogram_segment(state, source);
-    }
+    reset_live_spectrogram_segment(state, source);
 }
 
 fn play_audition(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
@@ -11273,6 +11271,77 @@ mod tests {
         assert!(
             super::current_live_frame_for_source(&state, &track_id, AuditionSource::Reference)
                 .is_none()
+        );
+        let track = selected_track(&state).expect("the paired state should have a track");
+        assert!(review_spectrogram_source(&state, track).is_none());
+    }
+
+    #[test]
+    fn stopped_source_switch_resets_only_the_newly_selected_live_segment() {
+        let mut state = shared_reference_playback_state();
+        let reference_transport = state
+            .reference_transport
+            .as_ref()
+            .expect("the paired state should have a reference transport")
+            .clone();
+        let main_epoch = state.transport.live_frame_state().epoch;
+        let reference_epoch = reference_transport.live_frame_state().epoch;
+        let main_frame = live_frame(state.transport_generation, main_epoch, 1);
+        let reference_frame = live_frame(state.reference_transport_generation, reference_epoch, 1);
+        state.live_spectrogram = Some(Arc::clone(&main_frame));
+        state.live_spectrogram_revision = main_frame.revision;
+        state.reference_live_spectrogram = Some(Arc::clone(&reference_frame));
+        state.reference_live_spectrogram_revision = reference_frame.revision;
+        state
+            .transport
+            .set_live_state_for_test(transport::LiveFrameState {
+                generation: state.transport_generation,
+                epoch: main_epoch,
+                revision: main_frame.revision,
+                pending: false,
+            });
+        reference_transport.set_live_state_for_test(transport::LiveFrameState {
+            generation: state.reference_transport_generation,
+            epoch: reference_epoch,
+            revision: reference_frame.revision,
+            pending: false,
+        });
+        state.audition_source = AuditionSource::Reference;
+        let track_id = selected_track(&state)
+            .expect("the paired state should have a track")
+            .id
+            .clone();
+
+        assert_eq!(
+            super::current_live_frame_for_source(&state, &track_id, AuditionSource::Main),
+            Some(Arc::clone(&main_frame))
+        );
+        assert_eq!(
+            super::current_live_frame_for_source(&state, &track_id, AuditionSource::Reference),
+            Some(Arc::clone(&reference_frame))
+        );
+
+        super::set_audition_source(&mut state, AuditionSource::Main);
+
+        let reset_main_epoch = state.transport.live_frame_state().epoch;
+        assert!(reset_main_epoch > main_epoch);
+        assert_eq!(
+            reference_transport.live_frame_state().epoch,
+            reference_epoch
+        );
+        assert!(state.live_spectrogram.is_none());
+        assert_eq!(state.live_spectrogram_revision, 0);
+        assert_eq!(
+            state.reference_live_spectrogram.as_ref(),
+            Some(&reference_frame)
+        );
+        assert_eq!(state.reference_live_spectrogram_revision, 1);
+        assert!(
+            super::current_live_frame_for_source(&state, &track_id, AuditionSource::Main).is_none()
+        );
+        assert_eq!(
+            super::current_live_frame_for_source(&state, &track_id, AuditionSource::Reference),
+            Some(Arc::clone(&reference_frame))
         );
         let track = selected_track(&state).expect("the paired state should have a track");
         assert!(review_spectrogram_source(&state, track).is_none());
