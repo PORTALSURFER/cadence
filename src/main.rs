@@ -18,7 +18,9 @@ use radiant::{
         push_text_run_with_metrics,
     },
     theme::ThemeTokens,
-    widgets::{Widget, WidgetCommon, WidgetInput, WidgetOutput},
+    widgets::{
+        DragHandleWidget, InteractiveRowWidget, Widget, WidgetCommon, WidgetInput, WidgetOutput,
+    },
 };
 use std::{
     path::{Path, PathBuf},
@@ -362,6 +364,74 @@ struct TrackCardChromeWidget {
     common: WidgetCommon,
     selected: bool,
     favorite: bool,
+}
+
+const PLANNER_DRAG_HANDLE_SIZE: f32 = 22.0;
+
+/// Cadence's Planner drag handle uses Radiant's standard grip chrome while
+/// retaining pass-through capture so insertion targets can follow the pointer.
+#[derive(Clone, Debug)]
+struct PlannerDragHandleWidget {
+    inner: InteractiveRowWidget,
+}
+
+impl PlannerDragHandleWidget {
+    fn new() -> Self {
+        Self {
+            inner: InteractiveRowWidget::new(
+                0,
+                ui::WidgetSizing::fixed(Vector2::new(
+                    PLANNER_DRAG_HANDLE_SIZE,
+                    PLANNER_DRAG_HANDLE_SIZE,
+                )),
+            )
+            .with_drag(),
+        }
+    }
+}
+
+impl Widget for PlannerDragHandleWidget {
+    fn common(&self) -> &WidgetCommon {
+        &self.inner.common
+    }
+
+    fn common_mut(&mut self) -> &mut WidgetCommon {
+        &mut self.inner.common
+    }
+
+    fn handle_input(&mut self, bounds: Rect, input: WidgetInput) -> Option<WidgetOutput> {
+        match self.inner.handle_input(bounds, input) {
+            Some(ui::InteractiveRowMessage::Drag(message)) => Some(WidgetOutput::typed(message)),
+            _ => None,
+        }
+    }
+
+    fn synchronize_from_previous(&mut self, previous: &dyn Widget) {
+        let Some(previous) = previous.as_any().downcast_ref::<Self>() else {
+            return;
+        };
+        Widget::synchronize_from_previous(&mut self.inner, &previous.inner);
+    }
+
+    fn accepts_pointer_move(&self) -> bool {
+        true
+    }
+
+    fn allows_captured_pointer_pass_through(&self) -> bool {
+        true
+    }
+
+    fn append_paint(
+        &self,
+        primitives: &mut Vec<PaintPrimitive>,
+        bounds: Rect,
+        layout: &LayoutOutput,
+        theme: &ThemeTokens,
+    ) {
+        let mut handle = DragHandleWidget::new(0, self.inner.common.sizing);
+        handle.common = self.inner.common.clone();
+        Widget::append_paint(&handle, primitives, bounds, layout, theme);
+    }
 }
 
 impl TrackCardChromeWidget {
@@ -6495,26 +6565,20 @@ fn planner_card_with_key(
         ui::row([
             card_control(
                 selected,
-                "↕",
-                ui::input_overlay(
-                    ui::text("↕").width(22.0).height(22.0).input_only(),
-                    ui::interactive_row()
-                        .draggable()
-                        .actions(ui::InteractiveRowActions::new().drag(move |message| {
-                            Message::PlannerCardDrag {
-                                track_id: drag_track_id.clone(),
-                                message,
-                            }
-                        }))
-                        .key(format!("planner-card-drag-{}", track.id))
-                        .size(22.0, 22.0)
-                        .input_only(),
+                "Drag to reorder",
+                ui::custom_widget_mapped(
+                    PlannerDragHandleWidget::new(),
+                    move |message: ui::DragHandleMessage| Message::PlannerCardDrag {
+                        track_id: drag_track_id.clone(),
+                        message,
+                    },
                 )
                 .key(format!("planner-card-drag-surface-{}", track.id))
-                .size(22.0, 22.0),
+                .size(PLANNER_DRAG_HANDLE_SIZE, PLANNER_DRAG_HANDLE_SIZE)
+                .tooltip("Drag to reorder"),
             )
-            .width(22.0)
-            .height(22.0),
+            .width(PLANNER_DRAG_HANDLE_SIZE)
+            .height(PLANNER_DRAG_HANDLE_SIZE),
             card_control(
                 selected,
                 track.title.clone(),
@@ -8497,6 +8561,59 @@ mod tests {
             notes: Vec::new(),
         });
         state
+    }
+
+    fn planner_drag_handle_widget_id(frame: &radiant::runtime::SurfaceFrame) -> u64 {
+        let grip_lines = frame
+            .paint_plan
+            .primitives
+            .iter()
+            .filter_map(|primitive| match primitive {
+                PaintPrimitive::StrokePolyline(line) if line.points.len() == 2 => Some(line),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        grip_lines
+            .iter()
+            .find_map(|line| {
+                (grip_lines
+                    .iter()
+                    .filter(|candidate| candidate.widget_id == line.widget_id)
+                    .count()
+                    >= 3)
+                    .then_some(line.widget_id)
+            })
+            .expect("the Planner drag handle should paint its three grip lines")
+    }
+
+    fn planner_drag_handle_point(frame: &radiant::runtime::SurfaceFrame) -> Point {
+        let widget_id = planner_drag_handle_widget_id(frame);
+        let grip_lines = frame
+            .paint_plan
+            .primitives
+            .iter()
+            .filter_map(|primitive| match primitive {
+                PaintPrimitive::StrokePolyline(line)
+                    if line.widget_id == widget_id && line.points.len() == 2 =>
+                {
+                    Some(line)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let first_line = grip_lines
+            .first()
+            .expect("the Planner drag handle should have a first grip line");
+        let start = first_line.points[0];
+        let end = first_line.points[1];
+        Point::new(
+            (start.x + end.x) * 0.5,
+            grip_lines
+                .iter()
+                .map(|line| (line.points[0].y + line.points[1].y) * 0.5)
+                .sum::<f32>()
+                / grip_lines.len() as f32,
+        )
     }
 
     fn audition_track(id: &str) -> Track {
@@ -13829,12 +13946,7 @@ mod tests {
             },
         );
         let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1180.0, 900.0));
-        let handle_point = runtime
-            .frame_with_default_theme()
-            .paint_plan
-            .first_text_rect("↕")
-            .expect("the planner drag handle should paint")
-            .center();
+        let handle_point = planner_drag_handle_point(&runtime.frame_with_default_theme());
         runtime.dispatch_event(Event::primary_press(handle_point));
         runtime.dispatch_pointer_move_deferred_refresh_with_outcome(Point::new(
             handle_point.x + 80.0,
@@ -13887,6 +13999,99 @@ mod tests {
     }
 
     #[test]
+    fn planner_drag_handle_uses_grip_chrome_and_highlights_on_hover() {
+        let mut state = planner_drag_state(Point::new(120.0, 90.0));
+        state.planner_drag_source_track_id = None;
+        state.planner_drag_pointer = None;
+        let bridge = DeclarativeOwnedCommandRuntimeBridge::new(
+            state,
+            |state| project_surface(state).into_surface(),
+            |state, message| {
+                let mut context = ui::UiUpdateContext::default();
+                update(state, message, &mut context);
+                context.into_command()
+            },
+        );
+        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1180.0, 720.0));
+        let idle_frame = runtime.frame_with_default_theme();
+        let handle_id = planner_drag_handle_widget_id(&idle_frame);
+        let handle_point = planner_drag_handle_point(&idle_frame);
+        assert_eq!(
+            idle_frame
+                .paint_plan
+                .primitives
+                .iter()
+                .filter(|primitive| {
+                    matches!(
+                        primitive,
+                        PaintPrimitive::StrokePolyline(line)
+                            if line.widget_id == handle_id && line.points.len() == 2
+                    )
+                })
+                .count(),
+            3,
+            "the Planner handle should use the standard three-line grip"
+        );
+        assert!(!idle_frame.paint_plan.primitives.iter().any(|primitive| {
+            matches!(
+                primitive,
+                PaintPrimitive::StrokeRect(rect) if rect.widget_id == handle_id
+            )
+        }));
+        assert!(
+            !idle_frame
+                .paint_plan
+                .text_label_strings()
+                .iter()
+                .any(|label| label == "↕")
+        );
+
+        runtime.dispatch_pointer_move_deferred_refresh_with_outcome(handle_point);
+        runtime.refresh();
+        let hovered_frame = runtime.frame_with_default_theme();
+        assert!(hovered_frame.paint_plan.primitives.iter().any(|primitive| {
+            matches!(
+                primitive,
+                PaintPrimitive::StrokeRect(rect) if rect.widget_id == handle_id
+            )
+        }));
+    }
+
+    #[test]
+    fn planner_drag_handle_preserves_the_drag_start_threshold() {
+        let bounds = Rect::from_size(
+            super::PLANNER_DRAG_HANDLE_SIZE,
+            super::PLANNER_DRAG_HANDLE_SIZE,
+        );
+        let origin = Point::new(8.0, 6.0);
+        let tiny_move = Point::new(11.0, 10.0);
+        let mut handle = super::PlannerDragHandleWidget::new();
+
+        assert!(
+            Widget::handle_input(&mut handle, bounds, WidgetInput::primary_press(origin)).is_none()
+        );
+        assert!(
+            Widget::handle_input(&mut handle, bounds, WidgetInput::pointer_move(tiny_move))
+                .is_none()
+        );
+        assert!(
+            Widget::handle_input(&mut handle, bounds, WidgetInput::primary_release(tiny_move))
+                .is_none()
+        );
+
+        let threshold = Point::new(16.0, 12.0);
+        let mut handle = super::PlannerDragHandleWidget::new();
+        let _ = Widget::handle_input(&mut handle, bounds, WidgetInput::primary_press(origin));
+        let started =
+            Widget::handle_input(&mut handle, bounds, WidgetInput::pointer_move(threshold))
+                .and_then(|output| output.typed_copied::<ui::DragHandleMessage>())
+                .expect("crossing the threshold should start the Planner drag");
+        assert!(started.is_started());
+        assert_eq!(started.started_origin(), Some(origin));
+        assert_eq!(started.started_position(), Some(threshold));
+    }
+
+    #[test]
     fn planner_drag_drops_into_empty_column_from_bottom() {
         let track = |id: &str| Track {
             id: String::from(id),
@@ -13917,12 +14122,7 @@ mod tests {
             },
         );
         let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1180.0, 900.0));
-        let handle_point = runtime
-            .frame_with_default_theme()
-            .paint_plan
-            .first_text_rect("↕")
-            .expect("the Planner drag handle should paint")
-            .center();
+        let handle_point = planner_drag_handle_point(&runtime.frame_with_default_theme());
         runtime.dispatch_event(Event::primary_press(handle_point));
         runtime.dispatch_pointer_move_deferred_refresh_with_outcome(Point::new(
             handle_point.x + 80.0,
@@ -14085,12 +14285,7 @@ mod tests {
             },
         );
         let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1180.0, 720.0));
-        let handle_point = runtime
-            .frame_with_default_theme()
-            .paint_plan
-            .first_text_rect("↕")
-            .expect("the planner drag handle should paint")
-            .center();
+        let handle_point = planner_drag_handle_point(&runtime.frame_with_default_theme());
 
         runtime.dispatch_event(Event::primary_press(handle_point));
         let started_pointer = Point::new(handle_point.x + 80.0, handle_point.y + 80.0);
