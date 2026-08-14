@@ -138,6 +138,7 @@ enum Message {
     TogglePlayback,
     StopPlayback,
     ToggleLiveSpectrogramMode,
+    ResizeLiveSpectrogram(ui::DragHandleMessage),
     NewNoteAtCurrentTime,
     AuditionPlay,
     AuditionPrevious,
@@ -336,6 +337,12 @@ struct LoopBounds {
     end_millis: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LiveSpectrogramResize {
+    start_height: f32,
+    start_pointer_y: f32,
+}
+
 const LIBRARY_WIDTH: f32 = 252.0;
 const APP_VERSION_LABEL: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 const STATUS_BAR_VERSION_WIDTH: f32 = 64.0;
@@ -346,7 +353,7 @@ const TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER: f32 = 72.0;
 // the review panel while retaining enough height for the split waveform.
 const WAVEFORM_HEIGHT: f32 = 124.0;
 const REFERENCE_WAVEFORM_HEIGHT: f32 = WAVEFORM_HEIGHT;
-const LIVE_SPECTROGRAM_HEIGHT: f32 = spectrogram::HEIGHT;
+const LIVE_SPECTROGRAM_RESIZE_HANDLE_ID: u64 = 0xCAD3_2001;
 const LIVE_SPECTROGRAM_HEADER_HEIGHT: f32 = 22.0;
 const LIVE_SPECTROGRAM_SECTION_SPACING: f32 = 4.0;
 const MAIN_WAVEFORM_HEADER_HEIGHT: f32 = 22.0;
@@ -804,6 +811,8 @@ struct AppState {
     live_spectrogram: Option<Arc<transport::LiveSpectrogramFrame>>,
     live_spectrogram_revision: u64,
     live_spectrogram_mode: LiveSpectrogramMode,
+    live_spectrogram_height: f32,
+    live_spectrogram_resize: Option<LiveSpectrogramResize>,
     reference_waveform: Option<audio::WaveformData>,
     reference_waveform_track_id: Option<String>,
     reference_waveform_busy: bool,
@@ -917,6 +926,8 @@ impl Default for AppState {
             live_spectrogram: None,
             live_spectrogram_revision: 0,
             live_spectrogram_mode: LiveSpectrogramMode::Waterfall,
+            live_spectrogram_height: spectrogram::HEIGHT,
+            live_spectrogram_resize: None,
             reference_waveform: None,
             reference_waveform_track_id: None,
             reference_waveform_busy: false,
@@ -1895,6 +1906,10 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
         }
         Message::ToggleLiveSpectrogramMode => {
             state.live_spectrogram_mode = state.live_spectrogram_mode.toggled();
+            context.request_repaint();
+        }
+        Message::ResizeLiveSpectrogram(message) => {
+            update_live_spectrogram_resize(state, message);
             context.request_repaint();
         }
         Message::LibrarySaved(result) => {
@@ -5924,6 +5939,37 @@ fn drag_message_position(message: ui::DragHandleMessage) -> Option<Point> {
     })
 }
 
+fn update_live_spectrogram_resize(state: &mut AppState, message: ui::DragHandleMessage) {
+    match message {
+        ui::DragHandleMessage::Started { origin, .. } => {
+            state.live_spectrogram_resize = Some(LiveSpectrogramResize {
+                start_height: spectrogram::clamp_height(state.live_spectrogram_height),
+                start_pointer_y: origin.y,
+            });
+        }
+        ui::DragHandleMessage::Moved { position, .. } => {
+            if let Some(resize) = state.live_spectrogram_resize {
+                state.live_spectrogram_height = spectrogram::clamp_height(
+                    resize.start_height + position.y - resize.start_pointer_y,
+                );
+            }
+        }
+        ui::DragHandleMessage::Ended { .. } => {
+            state.live_spectrogram_height =
+                spectrogram::clamp_height(state.live_spectrogram_height);
+            state.live_spectrogram_resize = None;
+        }
+        ui::DragHandleMessage::Cancelled { .. } => {
+            if let Some(resize) = state.live_spectrogram_resize.take() {
+                state.live_spectrogram_height = resize.start_height;
+            }
+        }
+        ui::DragHandleMessage::DoubleActivate { .. } => {
+            state.live_spectrogram_resize = None;
+        }
+    }
+}
+
 fn main_inline_comment_editor_id(note_id: &str) -> u64 {
     ui::stable_widget_id(MAIN_INLINE_COMMENT_EDITOR_SCOPE, note_id)
 }
@@ -7898,6 +7944,7 @@ fn live_spectrogram_section(state: &AppState, track: &storage::Track) -> ui::Vie
             )
         },
     );
+    let body_height = spectrogram::clamp_height(state.live_spectrogram_height);
     let body = selected.map_or_else(
         || {
             ui::column([
@@ -7915,10 +7962,17 @@ fn live_spectrogram_section(state: &AppState, track: &storage::Track) -> ui::Vie
             .padding(10.0)
             .spacing(4.0)
             .fill_width()
-            .height(LIVE_SPECTROGRAM_HEIGHT)
+            .height(body_height)
         },
-        |(_, frame)| spectrogram::view::<Message>(frame, state.live_spectrogram_mode),
+        |(_, frame)| spectrogram::view::<Message>(frame, state.live_spectrogram_mode, body_height),
     );
+    let resize_handle = ui::panel_section_resize_header(
+        "live-spectrogram-resize",
+        spectrogram::RESIZE_HANDLE_HEIGHT,
+        Message::ResizeLiveSpectrogram,
+    )
+    .id(LIVE_SPECTROGRAM_RESIZE_HANDLE_ID)
+    .tooltip("Drag to resize the live spectrogram panel");
     let spectrum_selected = state.live_spectrogram_mode == LiveSpectrogramMode::Spectrum;
     let mode_toggle = ui::button("SPECTRUM")
         .subtle()
@@ -7940,12 +7994,13 @@ fn live_spectrogram_section(state: &AppState, track: &storage::Track) -> ui::Vie
     .spacing(8.0)
     .fill_width()
     .height(LIVE_SPECTROGRAM_HEADER_HEIGHT);
-    ui::column([body, header])
+    ui::column([body, resize_handle, header])
         .spacing(LIVE_SPECTROGRAM_SECTION_SPACING)
         .fill_width()
         .height(
-            LIVE_SPECTROGRAM_HEIGHT
-                + LIVE_SPECTROGRAM_SECTION_SPACING
+            body_height
+                + spectrogram::RESIZE_HANDLE_HEIGHT
+                + LIVE_SPECTROGRAM_SECTION_SPACING * 2.0
                 + LIVE_SPECTROGRAM_HEADER_HEIGHT,
         )
 }
@@ -9358,16 +9413,18 @@ mod tests {
         epoch: u64,
         revision: u64,
     ) -> Arc<transport::LiveSpectrogramFrame> {
-        Arc::new(transport::LiveSpectrogramFrame {
-            generation,
-            epoch,
-            revision,
-            sample_rate: 48_000,
-            row_count: 1,
-            values: Arc::from(
-                vec![64_u8; transport::LIVE_SPECTROGRAM_BAND_COUNT].into_boxed_slice(),
-            ),
-        })
+        Arc::new(
+            transport::LiveSpectrogramFrame::from_values(
+                generation,
+                epoch,
+                revision,
+                48_000,
+                1,
+                Arc::from(vec![64_u8; transport::LIVE_SPECTROGRAM_BAND_COUNT].into_boxed_slice()),
+                Arc::from(vec![64_u8; transport::LIVE_SPECTROGRAM_BAND_COUNT].into_boxed_slice()),
+            )
+            .expect("valid live spectrogram test frame"),
+        )
     }
 
     #[test]
@@ -9527,6 +9584,76 @@ mod tests {
         assert_eq!(state.live_spectrogram_mode, LiveSpectrogramMode::Spectrum);
         update(&mut state, Message::ToggleLiveSpectrogramMode, &mut context);
         assert_eq!(state.live_spectrogram_mode, LiveSpectrogramMode::Waterfall);
+    }
+
+    #[test]
+    fn live_spectrogram_resize_clamps_and_clears_drag_lifecycle() {
+        let mut state = AppState::default();
+        let mut context = ui::UiUpdateContext::default();
+        let origin = Point::new(20.0, 100.0);
+
+        update(
+            &mut state,
+            Message::ResizeLiveSpectrogram(ui::DragHandleMessage::started(origin)),
+            &mut context,
+        );
+        assert_eq!(
+            state.live_spectrogram_resize,
+            Some(super::LiveSpectrogramResize {
+                start_height: super::spectrogram::HEIGHT,
+                start_pointer_y: origin.y,
+            })
+        );
+
+        update(
+            &mut state,
+            Message::ResizeLiveSpectrogram(ui::DragHandleMessage::moved(Point::new(
+                origin.x,
+                origin.y + 500.0,
+            ))),
+            &mut context,
+        );
+        assert_eq!(
+            state.live_spectrogram_height,
+            super::spectrogram::MAX_HEIGHT
+        );
+
+        update(
+            &mut state,
+            Message::ResizeLiveSpectrogram(ui::DragHandleMessage::ended(origin)),
+            &mut context,
+        );
+        assert!(state.live_spectrogram_resize.is_none());
+
+        let second_origin = Point::new(20.0, 300.0);
+        update(
+            &mut state,
+            Message::ResizeLiveSpectrogram(ui::DragHandleMessage::started(second_origin)),
+            &mut context,
+        );
+        update(
+            &mut state,
+            Message::ResizeLiveSpectrogram(ui::DragHandleMessage::moved(Point::new(
+                second_origin.x,
+                second_origin.y - 500.0,
+            ))),
+            &mut context,
+        );
+        assert_eq!(
+            state.live_spectrogram_height,
+            super::spectrogram::MIN_HEIGHT
+        );
+
+        update(
+            &mut state,
+            Message::ResizeLiveSpectrogram(ui::DragHandleMessage::cancelled(second_origin)),
+            &mut context,
+        );
+        assert!(state.live_spectrogram_resize.is_none());
+        assert_eq!(
+            state.live_spectrogram_height,
+            super::spectrogram::MAX_HEIGHT
+        );
     }
 
     #[test]

@@ -26,19 +26,23 @@ pub const CONTROLS_BUSY_ERROR: &str = "Audio controls are busy — try again sho
 pub const DEFAULT_VOLUME: f32 = 0.8;
 pub const MAX_OUTPUT_GAIN: f32 = 16.0;
 
-pub const LIVE_SPECTROGRAM_BAND_COUNT: usize = 48;
-pub const LIVE_SPECTROGRAM_MAX_HISTORY: usize = 96;
+pub const LIVE_SPECTROGRAM_BAND_COUNT: usize = 128;
+pub const LIVE_SPECTROGRAM_MAX_HISTORY: usize = 192;
 
 const LIVE_CAPTURE_RING_CAPACITY: usize = 16_384;
-const LIVE_SPECTRUM_FFT_SIZE: usize = 1_024;
-const LIVE_SPECTRUM_HOP_SIZE: usize = LIVE_SPECTRUM_FFT_SIZE / 2;
-const LIVE_SPECTRUM_MIN_FREQUENCY: f32 = 40.0;
-const LIVE_SPECTRUM_MAX_FREQUENCY: f32 = 18_000.0;
-const LIVE_SPECTRUM_FLOOR_DB: f32 = -80.0;
+const LIVE_SPECTRUM_FFT_SIZE: usize = 2_048;
+const LIVE_SPECTRUM_HOP_SIZE: usize = 512;
+pub(crate) const LIVE_SPECTRUM_DISPLAY_MIN_FREQUENCY: f32 = 20.0;
+pub(crate) const LIVE_SPECTRUM_DISPLAY_MAX_FREQUENCY: f32 = 20_000.0;
+pub(crate) const LIVE_SPECTRUM_DISPLAY_FLOOR_DB: f32 = -90.0;
+pub(crate) const LIVE_SPECTRUM_DISPLAY_CEILING_DB: f32 = 0.0;
+pub(crate) const LIVE_SPECTRUM_DISPLAY_TILT_DB_PER_OCTAVE: f32 = 4.5;
+pub(crate) const LIVE_SPECTRUM_DISPLAY_TILT_REFERENCE_FREQUENCY: f32 = 1_000.0;
 const LIVE_SPECTRUM_ATTACK_TIME: Duration = Duration::from_millis(60);
 const LIVE_SPECTRUM_RELEASE_TIME: Duration = Duration::from_millis(240);
 const LIVE_PUBLICATION_INTERVAL: Duration = Duration::from_millis(17);
 const LIVE_ANALYZER_POLL_INTERVAL: Duration = Duration::from_millis(2);
+static NEXT_LIVE_GPU_REVISION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveSpectrogramFrame {
@@ -48,6 +52,10 @@ pub struct LiveSpectrogramFrame {
     pub sample_rate: u32,
     pub row_count: usize,
     pub values: Arc<[u8]>,
+    /// The latest display row after the spectrum-only attack/release smoothing.
+    pub spectrum_values: Arc<[u8]>,
+    packed_values: Arc<[u8]>,
+    gpu_revision: u64,
 }
 
 impl LiveSpectrogramFrame {
@@ -58,6 +66,7 @@ impl LiveSpectrogramFrame {
         sample_rate: u32,
         rows: &[[u8; LIVE_SPECTROGRAM_BAND_COUNT]; LIVE_SPECTROGRAM_MAX_HISTORY],
         row_count: usize,
+        spectrum_values: &[u8; LIVE_SPECTROGRAM_BAND_COUNT],
     ) -> Option<Self> {
         if sample_rate == 0 || row_count == 0 || row_count > LIVE_SPECTROGRAM_MAX_HISTORY {
             return None;
@@ -66,16 +75,48 @@ impl LiveSpectrogramFrame {
         for row in rows.iter().take(row_count) {
             values.extend_from_slice(row);
         }
+        Self::from_values(
+            generation,
+            epoch,
+            revision,
+            sample_rate,
+            row_count,
+            Arc::from(values.into_boxed_slice()),
+            Arc::from(spectrum_values.to_vec().into_boxed_slice()),
+        )
+    }
+
+    pub(crate) fn from_values(
+        generation: u64,
+        epoch: u64,
+        revision: u64,
+        sample_rate: u32,
+        row_count: usize,
+        values: Arc<[u8]>,
+        spectrum_values: Arc<[u8]>,
+    ) -> Option<Self> {
+        if sample_rate == 0
+            || row_count == 0
+            || row_count > LIVE_SPECTROGRAM_MAX_HISTORY
+            || values.len() != row_count * LIVE_SPECTROGRAM_BAND_COUNT
+            || spectrum_values.len() != LIVE_SPECTROGRAM_BAND_COUNT
+        {
+            return None;
+        }
         Some(Self {
             generation,
             epoch,
             revision,
             sample_rate,
             row_count,
-            values: Arc::from(values.into_boxed_slice()),
+            packed_values: pack_u8_samples(&values),
+            values,
+            spectrum_values,
+            gpu_revision: NEXT_LIVE_GPU_REVISION.fetch_add(1, Ordering::Relaxed),
         })
     }
 
+    #[allow(dead_code)]
     pub fn value(&self, row: usize, band: usize) -> u8 {
         if row >= self.row_count || band >= LIVE_SPECTROGRAM_BAND_COUNT {
             return 0;
@@ -86,12 +127,41 @@ impl LiveSpectrogramFrame {
             .unwrap_or_default()
     }
 
+    #[allow(dead_code)]
+    pub fn spectrum_value(&self, band: usize) -> u8 {
+        self.spectrum_values.get(band).copied().unwrap_or_default()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn packed_values(&self) -> &Arc<[u8]> {
+        &self.packed_values
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn gpu_revision(&self) -> u64 {
+        self.gpu_revision
+    }
+
     pub fn is_valid(&self) -> bool {
         self.sample_rate > 0
             && self.row_count > 0
             && self.row_count <= LIVE_SPECTROGRAM_MAX_HISTORY
             && self.values.len() == self.row_count * LIVE_SPECTROGRAM_BAND_COUNT
+            && self.spectrum_values.len() == LIVE_SPECTROGRAM_BAND_COUNT
+            && self.packed_values.len() == self.values.len().div_ceil(4) * 4
     }
+}
+
+fn pack_u8_samples(values: &[u8]) -> Arc<[u8]> {
+    let mut words = vec![0_u32; values.len().div_ceil(4)];
+    for (index, &value) in values.iter().enumerate() {
+        words[index / 4] |= u32::from(value) << ((index % 4) * 8);
+    }
+    let mut packed = Vec::with_capacity(words.len() * std::mem::size_of::<u32>());
+    for word in words {
+        packed.extend_from_slice(&word.to_le_bytes());
+    }
+    Arc::from(packed.into_boxed_slice())
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -165,6 +235,14 @@ struct LiveComplexSample {
 struct LiveBandRange {
     start: usize,
     end: usize,
+    start_frequency: f32,
+    end_frequency: f32,
+}
+
+impl LiveBandRange {
+    fn center_frequency(self) -> f32 {
+        (self.start_frequency * self.end_frequency).sqrt()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -568,6 +646,7 @@ struct LiveAnalyzer {
     window_len: usize,
     fft: [LiveComplexSample; LIVE_SPECTRUM_FFT_SIZE],
     rows: [[u8; LIVE_SPECTROGRAM_BAND_COUNT]; LIVE_SPECTROGRAM_MAX_HISTORY],
+    spectrum_values: [u8; LIVE_SPECTROGRAM_BAND_COUNT],
     row_count: usize,
     revision: u64,
     fft_count: usize,
@@ -590,6 +669,7 @@ impl LiveAnalyzer {
             window_len: 0,
             fft: [LiveComplexSample::default(); LIVE_SPECTRUM_FFT_SIZE],
             rows: [[0; LIVE_SPECTROGRAM_BAND_COUNT]; LIVE_SPECTROGRAM_MAX_HISTORY],
+            spectrum_values: [0; LIVE_SPECTROGRAM_BAND_COUNT],
             row_count: 0,
             revision: 0,
             fft_count: 0,
@@ -600,6 +680,7 @@ impl LiveAnalyzer {
         self.smoothed_levels = [0.0; LIVE_SPECTROGRAM_BAND_COUNT];
         self.has_smoothed_levels = false;
         self.window_len = 0;
+        self.spectrum_values = [0; LIVE_SPECTROGRAM_BAND_COUNT];
         self.row_count = 0;
         self.revision = 0;
         self.fft_count = 0;
@@ -615,7 +696,7 @@ impl LiveAnalyzer {
         self.analyze_window();
         self.window
             .copy_within(LIVE_SPECTRUM_HOP_SIZE..LIVE_SPECTRUM_FFT_SIZE, 0);
-        self.window_len = LIVE_SPECTRUM_HOP_SIZE;
+        self.window_len = LIVE_SPECTRUM_FFT_SIZE - LIVE_SPECTRUM_HOP_SIZE;
         true
     }
 
@@ -641,21 +722,30 @@ impl LiveAnalyzer {
                 })
                 .fold(0.0_f32, f32::max);
             let decibels = 20.0 * magnitude.max(1.0e-8).log10();
-            let normalized =
-                ((decibels - LIVE_SPECTRUM_FLOOR_DB) / -LIVE_SPECTRUM_FLOOR_DB).clamp(0.0, 1.0);
+            let display_decibels = (decibels + display_tilt_db(range.center_frequency())).clamp(
+                LIVE_SPECTRUM_DISPLAY_FLOOR_DB,
+                LIVE_SPECTRUM_DISPLAY_CEILING_DB,
+            );
+            let normalized = ((display_decibels - LIVE_SPECTRUM_DISPLAY_FLOOR_DB)
+                / (LIVE_SPECTRUM_DISPLAY_CEILING_DB - LIVE_SPECTRUM_DISPLAY_FLOOR_DB))
+                .clamp(0.0, 1.0);
             target_row[band] = (normalized * u8::MAX as f32).round() as u8;
         }
-        let row = self.smooth_row(target_row);
+        self.record_analyzed_row(target_row);
 
+        self.revision = self.revision.wrapping_add(1);
+        self.fft_count = self.fft_count.saturating_add(1);
+    }
+
+    fn record_analyzed_row(&mut self, raw_row: [u8; LIVE_SPECTROGRAM_BAND_COUNT]) {
+        self.spectrum_values = self.smooth_row(raw_row);
         if self.row_count < LIVE_SPECTROGRAM_MAX_HISTORY {
-            self.rows[self.row_count] = row;
+            self.rows[self.row_count] = raw_row;
             self.row_count += 1;
         } else {
             self.rows.copy_within(1..LIVE_SPECTROGRAM_MAX_HISTORY, 0);
-            self.rows[LIVE_SPECTROGRAM_MAX_HISTORY - 1] = row;
+            self.rows[LIVE_SPECTROGRAM_MAX_HISTORY - 1] = raw_row;
         }
-        self.revision = self.revision.wrapping_add(1);
-        self.fft_count = self.fft_count.saturating_add(1);
     }
 
     /// Apply display-only exponential attack/release ballistics. This keeps
@@ -694,6 +784,7 @@ impl LiveAnalyzer {
             self.sample_rate,
             &self.rows,
             self.row_count,
+            &self.spectrum_values,
         )
         .map(Arc::new)
     }
@@ -705,11 +796,31 @@ fn live_ballistic_coefficient(time_constant: Duration, sample_rate: u32) -> f32 
     (1.0 - (-hop_seconds / time_constant_seconds).exp()).clamp(0.0, 1.0)
 }
 
+/// Return the analyzer's audible display range after clamping its upper edge
+/// to the source Nyquist frequency.
+pub(crate) fn live_display_frequency_bounds(sample_rate: u32) -> (f32, f32) {
+    let sample_rate = sample_rate.max(1) as f32;
+    let nyquist = (sample_rate * 0.5).max(f32::MIN_POSITIVE);
+    let minimum = LIVE_SPECTRUM_DISPLAY_MIN_FREQUENCY.min(nyquist);
+    let maximum = LIVE_SPECTRUM_DISPLAY_MAX_FREQUENCY
+        .min(nyquist)
+        .max(minimum);
+    (minimum, maximum)
+}
+
+/// Apply the display-only analyzer tilt around 1 kHz.
+///
+/// The positive 4.5 dB/octave sign boosts frequencies above 1 kHz and cuts
+/// frequencies below it. The result is only used for the quantized analyzer
+/// frame; decoder samples, transport output, and their levels are untouched.
+fn display_tilt_db(frequency: f32) -> f32 {
+    LIVE_SPECTRUM_DISPLAY_TILT_DB_PER_OCTAVE
+        * (frequency / LIVE_SPECTRUM_DISPLAY_TILT_REFERENCE_FREQUENCY).log2()
+}
+
 fn live_band_ranges(sample_rate: u32) -> [LiveBandRange; LIVE_SPECTROGRAM_BAND_COUNT] {
     let sample_rate = sample_rate.max(1) as f32;
-    let nyquist = sample_rate * 0.5;
-    let minimum = LIVE_SPECTRUM_MIN_FREQUENCY.min(nyquist.max(1.0));
-    let maximum = LIVE_SPECTRUM_MAX_FREQUENCY.min(nyquist.max(minimum));
+    let (minimum, maximum) = live_display_frequency_bounds(sample_rate as u32);
     let ratio = (maximum / minimum.max(1.0)).max(1.0);
     let maximum_bin = LIVE_SPECTRUM_FFT_SIZE / 2 + 1;
 
@@ -724,7 +835,12 @@ fn live_band_ranges(sample_rate: u32) -> [LiveBandRange; LIVE_SPECTROGRAM_BAND_C
             ((end_frequency / sample_rate) * LIVE_SPECTRUM_FFT_SIZE as f32).ceil() as usize;
         let start = start_bin.clamp(1, maximum_bin.saturating_sub(1));
         let end = end_bin.clamp(start.saturating_add(1), maximum_bin);
-        LiveBandRange { start, end }
+        LiveBandRange {
+            start,
+            end,
+            start_frequency,
+            end_frequency,
+        }
     })
 }
 
@@ -1925,11 +2041,14 @@ pub fn normalize_output_gain(gain: f32) -> f32 {
 mod tests {
     use super::{
         AudioTransport, CONTROLS_BUSY_ERROR, CaptureFrame, Command, DEFAULT_VOLUME,
-        LIVE_SPECTROGRAM_BAND_COUNT, LIVE_SPECTROGRAM_MAX_HISTORY, LIVE_SPECTRUM_FFT_SIZE,
-        LiveAnalysisSource, LiveAnalyzer, LiveCaptureSession, MAX_OUTPUT_GAIN, PendingLoad,
-        SharedSnapshot, clamp_position, finish_analyzer_fallback, handle_command, is_current,
-        normalize_output_gain, normalize_volume, publish_live_frame_if_due,
-        run_live_analyzer_iteration,
+        LIVE_SPECTROGRAM_BAND_COUNT, LIVE_SPECTROGRAM_MAX_HISTORY,
+        LIVE_SPECTRUM_DISPLAY_MAX_FREQUENCY, LIVE_SPECTRUM_DISPLAY_MIN_FREQUENCY,
+        LIVE_SPECTRUM_DISPLAY_TILT_DB_PER_OCTAVE, LIVE_SPECTRUM_DISPLAY_TILT_REFERENCE_FREQUENCY,
+        LIVE_SPECTRUM_FFT_SIZE, LIVE_SPECTRUM_HOP_SIZE, LiveAnalysisSource, LiveAnalyzer,
+        LiveCaptureSession, MAX_OUTPUT_GAIN, PendingLoad, SharedSnapshot, clamp_position,
+        display_tilt_db, finish_analyzer_fallback, handle_command, is_current, live_band_ranges,
+        live_display_frequency_bounds, normalize_output_gain, normalize_volume,
+        publish_live_frame_if_due, run_live_analyzer_iteration,
     };
     use rodio::{Player, Source, buffer::SamplesBuffer, source::SeekError};
     use std::path::PathBuf;
@@ -2110,6 +2229,96 @@ mod tests {
     }
 
     #[test]
+    fn analyzer_history_retains_raw_step_while_spectrum_payload_is_smoothed() {
+        let mut analyzer = LiveAnalyzer::new(48_000);
+        let quiet = [0_u8; LIVE_SPECTROGRAM_BAND_COUNT];
+        let mut loud = [0_u8; LIVE_SPECTROGRAM_BAND_COUNT];
+        loud[0] = u8::MAX;
+
+        analyzer.record_analyzed_row(quiet);
+        analyzer.record_analyzed_row(loud);
+
+        let frame = analyzer.frame(1, 1).expect("two analyzer rows");
+        assert_eq!(frame.value(0, 0), 0);
+        assert_eq!(frame.value(1, 0), u8::MAX);
+        assert_eq!(frame.spectrum_values.len(), LIVE_SPECTROGRAM_BAND_COUNT);
+        assert_eq!(frame.spectrum_value(0), frame.spectrum_values[0]);
+        assert!(frame.spectrum_value(0) > 0);
+        assert!(frame.spectrum_value(0) < u8::MAX);
+
+        analyzer.reset();
+        assert_eq!(analyzer.row_count, 0);
+        assert!(analyzer.spectrum_values.iter().all(|&value| value == 0));
+        assert!(analyzer.frame(1, 1).is_none());
+    }
+
+    #[test]
+    fn analyzer_defaults_and_frame_shapes_stay_bounded() {
+        assert_eq!(LIVE_SPECTROGRAM_BAND_COUNT, 128);
+        assert_eq!(LIVE_SPECTROGRAM_MAX_HISTORY, 192);
+        assert_eq!(LIVE_SPECTRUM_FFT_SIZE, 2_048);
+        assert_eq!(LIVE_SPECTRUM_HOP_SIZE, 512);
+        assert_eq!(LIVE_SPECTRUM_HOP_SIZE, LIVE_SPECTRUM_FFT_SIZE / 4);
+
+        let mut analyzer = LiveAnalyzer::new(48_000);
+        for index in 0..=LIVE_SPECTROGRAM_MAX_HISTORY {
+            let mut row = [0_u8; LIVE_SPECTROGRAM_BAND_COUNT];
+            row[index % LIVE_SPECTROGRAM_BAND_COUNT] = index as u8;
+            analyzer.record_analyzed_row(row);
+        }
+
+        assert_eq!(analyzer.row_count, LIVE_SPECTROGRAM_MAX_HISTORY);
+        let frame = analyzer.frame(1, 1).expect("bounded analyzer frame");
+        assert_eq!(
+            frame.values.len(),
+            LIVE_SPECTROGRAM_MAX_HISTORY * LIVE_SPECTROGRAM_BAND_COUNT
+        );
+        assert_eq!(frame.spectrum_values.len(), LIVE_SPECTROGRAM_BAND_COUNT);
+        assert!(frame.is_valid());
+    }
+
+    #[test]
+    fn analyzer_display_tilt_is_four_point_five_db_per_octave_around_one_khz() {
+        let reference = LIVE_SPECTRUM_DISPLAY_TILT_REFERENCE_FREQUENCY;
+        assert!(display_tilt_db(reference).abs() < f32::EPSILON);
+        assert!(
+            (display_tilt_db(reference * 2.0) - LIVE_SPECTRUM_DISPLAY_TILT_DB_PER_OCTAVE).abs()
+                < 0.001
+        );
+        assert!(
+            (display_tilt_db(reference / 2.0) + LIVE_SPECTRUM_DISPLAY_TILT_DB_PER_OCTAVE).abs()
+                < 0.001
+        );
+    }
+
+    #[test]
+    fn analyzer_display_frequency_range_is_logarithmic_and_nyquist_clamped() {
+        assert_eq!(
+            live_display_frequency_bounds(48_000),
+            (
+                LIVE_SPECTRUM_DISPLAY_MIN_FREQUENCY,
+                LIVE_SPECTRUM_DISPLAY_MAX_FREQUENCY
+            )
+        );
+        assert_eq!(live_display_frequency_bounds(16_000).1, 8_000.0);
+
+        let bands = live_band_ranges(48_000);
+        assert!((bands[0].start_frequency - 20.0).abs() < 0.001);
+        assert!((bands[LIVE_SPECTROGRAM_BAND_COUNT - 1].end_frequency - 20_000.0).abs() < 0.001);
+        assert!(bands.windows(2).all(|pair| {
+            pair[0].start_frequency < pair[0].end_frequency
+                && pair[0].end_frequency <= pair[1].start_frequency
+        }));
+
+        let nyquist_clamped = live_band_ranges(16_000);
+        assert!(
+            nyquist_clamped
+                .last()
+                .is_some_and(|band| band.end_frequency <= 8_000.0)
+        );
+    }
+
+    #[test]
     fn full_capture_ring_marks_a_discontinuity_before_accepting_again() {
         let (shared, session) = active_test_session(4);
         let (mut producer, mut consumer) = super::RingBuffer::new(1);
@@ -2152,14 +2361,16 @@ mod tests {
     fn analyzer_emits_at_one_row_per_512_frame_hop_and_caps_history() {
         let mut analyzer = LiveAnalyzer::new(48_000);
         let mut emitted = 0;
-        for index in 0..(1_024 + 512 * 100) {
+        for index in
+            0..(LIVE_SPECTRUM_FFT_SIZE + LIVE_SPECTRUM_HOP_SIZE * LIVE_SPECTROGRAM_MAX_HISTORY)
+        {
             if analyzer.push((index as f32 * 0.01).sin()) {
                 emitted += 1;
             }
         }
-        assert_eq!(emitted, 101);
-        assert_eq!(analyzer.fft_count, 101);
-        assert_eq!(analyzer.revision, 101);
+        assert_eq!(emitted, LIVE_SPECTROGRAM_MAX_HISTORY + 1);
+        assert_eq!(analyzer.fft_count, LIVE_SPECTROGRAM_MAX_HISTORY + 1);
+        assert_eq!(analyzer.revision, (LIVE_SPECTROGRAM_MAX_HISTORY + 1) as u64);
         assert_eq!(analyzer.row_count, LIVE_SPECTROGRAM_MAX_HISTORY);
     }
 
@@ -2301,10 +2512,10 @@ mod tests {
 
     fn strongest_band_for_tone(frequency: f32) -> usize {
         let mut analyzer = LiveAnalyzer::new(48_000);
-        for index in 0..1_024 {
+        for index in 0..LIVE_SPECTRUM_FFT_SIZE {
             assert!(
                 !analyzer.push((std::f32::consts::TAU * frequency * index as f32 / 48_000.0).sin())
-                    || index == 1_023
+                    || index == LIVE_SPECTRUM_FFT_SIZE - 1
             );
         }
         let frame = analyzer.frame(1, 1).expect("one FFT row");
@@ -2394,14 +2605,18 @@ mod tests {
     #[test]
     fn analysis_source_failed_seek_preserves_epoch_and_visible_frame() {
         let (shared, session) = active_test_session(5);
-        let frame = Arc::new(super::LiveSpectrogramFrame {
-            generation: 5,
-            epoch: session.current_epoch(),
-            revision: 1,
-            sample_rate: 48_000,
-            row_count: 1,
-            values: Arc::from(vec![1_u8; LIVE_SPECTROGRAM_BAND_COUNT].into_boxed_slice()),
-        });
+        let frame = Arc::new(
+            super::LiveSpectrogramFrame::from_values(
+                5,
+                session.current_epoch(),
+                1,
+                48_000,
+                1,
+                Arc::from(vec![1_u8; LIVE_SPECTROGRAM_BAND_COUNT].into_boxed_slice()),
+                Arc::from(vec![1_u8; LIVE_SPECTROGRAM_BAND_COUNT].into_boxed_slice()),
+            )
+            .expect("valid live spectrogram test frame"),
+        );
         assert!(shared.publish_live_frame(&session, Arc::clone(&frame)));
         let (producer, _consumer) = super::RingBuffer::new(8);
         let source = SeekableSource {
@@ -2441,14 +2656,18 @@ mod tests {
     fn analyzer_spawn_failure_keeps_raw_player_ready_and_publishes_warning() {
         let (shared, session) = active_test_session(9);
         shared.generation.store(9, Ordering::Release);
-        let frame = Arc::new(super::LiveSpectrogramFrame {
-            generation: 9,
-            epoch: 1,
-            revision: 1,
-            sample_rate: 48_000,
-            row_count: 1,
-            values: Arc::from(vec![1_u8; LIVE_SPECTROGRAM_BAND_COUNT].into_boxed_slice()),
-        });
+        let frame = Arc::new(
+            super::LiveSpectrogramFrame::from_values(
+                9,
+                1,
+                1,
+                48_000,
+                1,
+                Arc::from(vec![1_u8; LIVE_SPECTROGRAM_BAND_COUNT].into_boxed_slice()),
+                Arc::from(vec![1_u8; LIVE_SPECTROGRAM_BAND_COUNT].into_boxed_slice()),
+            )
+            .expect("valid live spectrogram test frame"),
+        );
         assert!(shared.publish_live_frame(&session, frame));
 
         let (player_handle, _queue) = Player::new();
@@ -2495,14 +2714,18 @@ mod tests {
         let old_session = Arc::new(LiveCaptureSession::new(7, 1, 1));
         shared.begin_live_session(&old_session);
         assert!(shared.set_live_analysis_frozen(&old_session, false));
-        let old_frame = Arc::new(super::LiveSpectrogramFrame {
-            generation: 7,
-            epoch: 1,
-            revision: 1,
-            sample_rate: 48_000,
-            row_count: 1,
-            values: Arc::from(vec![1_u8; LIVE_SPECTROGRAM_BAND_COUNT].into_boxed_slice()),
-        });
+        let old_frame = Arc::new(
+            super::LiveSpectrogramFrame::from_values(
+                7,
+                1,
+                1,
+                48_000,
+                1,
+                Arc::from(vec![1_u8; LIVE_SPECTROGRAM_BAND_COUNT].into_boxed_slice()),
+                Arc::from(vec![1_u8; LIVE_SPECTROGRAM_BAND_COUNT].into_boxed_slice()),
+            )
+            .expect("valid live spectrogram test frame"),
+        );
         assert!(shared.publish_live_frame(&old_session, old_frame.clone()));
 
         old_session.retire();
