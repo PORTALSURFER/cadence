@@ -820,6 +820,16 @@ fn playback_shortcut(state: &AppState, press: ui::KeyPress) -> ui::ShortcutResol
     }
 }
 
+fn animation_requested(state: &AppState) -> bool {
+    state.transport_playing
+        || state.transport_polling
+        || state.reference_transport_playing
+        || state.reference_transport_polling
+        || state.audition_pending_play_track_id.is_some()
+        || state.playhead_drag_active
+        || state.reference_playhead_drag_active
+}
+
 fn native_launch_options() -> NativeRunOptions {
     let mut options = NativeRunOptions::default();
     options.window.behavior.maximized = true;
@@ -847,16 +857,7 @@ fn main() -> radiant::Result {
         .min_size(900, 560)
         .view(project_surface)
         .auxiliary_windows(reference_settings_auxiliary_windows)
-        .animation(|state| {
-            state.transport_playing
-                || state.transport_polling
-                || state.reference_transport_playing
-                || state.reference_transport_polling
-                || state.audition_pending_play_track_id.is_some()
-                || state.playhead_drag_active
-                || state.reference_playhead_drag_active
-                || state.planner_drag_source_track_id.is_some()
-        })
+        .animation(|state| animation_requested(state))
         .on_frame(|| Message::Frame)
         .on_startup(|_state, context| schedule_library_load(context))
         .shortcuts(|state, _pending, press, _focus| playback_shortcut(state, press))
@@ -1599,9 +1600,6 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             context.request_repaint();
         }
         Message::Frame => {
-            if state.planner_drag_source_track_id.is_some() {
-                state.planner_drag_pointer = context.current_pointer_position();
-            }
             let was_audition_playing = state.workspace_mode == WorkspaceMode::Audition
                 && state.audition_auto_advance
                 && state.transport_playing;
@@ -6188,23 +6186,23 @@ fn planner_column(
         ui::column(children).padding(12.0).spacing(8.0).fill(),
     ])
     .fill();
-    let actions = ui::InteractiveRowActions::new().tracked_drop_candidate_key(
-        stage,
-        Message::PlannerStageDropped,
-        |stage, _position| Message::PlannerStageHovered(stage),
-        |stage, _position| Message::PlannerStageHoverCleared(stage),
-    );
-    let drop_target = ui::interactive_row()
-        .tracked_drop_candidate(drag_active, current_target, candidate, current_target)
-        .actions(actions)
-        .key(format!("planner-column-drop-{}", stage.label()))
-        .fill()
-        .input_only();
-    if drag_active {
-        ui::stack([content, drop_target]).fill()
+    let drop_target = if drag_active {
+        let actions = ui::InteractiveRowActions::new().tracked_drop_candidate_key(
+            stage,
+            Message::PlannerStageDropped,
+            |stage, _position| Message::PlannerStageHovered(stage),
+            |stage, _position| Message::PlannerStageHoverCleared(stage),
+        );
+        ui::interactive_row()
+            .tracked_drop_candidate(drag_active, current_target, candidate, current_target)
+            .actions(actions)
+            .key(format!("planner-column-drop-{}", stage.label()))
+            .fill()
+            .input_only()
     } else {
-        content
-    }
+        ui::spacer().fill()
+    };
+    ui::stack([content, drop_target]).fill()
 }
 
 fn planner_column_heading(stage: storage::TrackStage) -> &'static str {
@@ -8166,13 +8164,14 @@ mod tests {
         SETTINGS_REFERENCE_ROW_METADATA_HEIGHT, SETTINGS_REFERENCE_ROW_TEXT_HEIGHT,
         SETTINGS_REFERENCE_ROW_TEXT_SPACING, SETTINGS_REFERENCE_ROW_TITLE_HEIGHT,
         STATUS_BAR_VERSION_WIDTH, StatusMenuHost, TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER,
-        TRACK_CARD_SELECTED_CORAL, WAVEFORM_HEIGHT, WorkspaceMode, apply_transport_snapshot,
-        audition_panel, audition_shuffle_seed, audition_statuses, current_loudness_match_gain_db,
-        current_lufs_meter_value, current_reference_lufs_meter_value, decode_result_is_current,
-        deterministic_shuffle, enforce_loop, favorite_toggle, library_track_title_id, loop_bounds,
-        main_output_gain, native_launch_options, note_editor, note_ratio_for_id,
-        planner_drop_is_valid, playback_shortcut, project_surface, rebuild_audition_queue,
-        reconcile_audition_queue, reference_decode_result_is_current, reference_output_gain,
+        TRACK_CARD_SELECTED_CORAL, WAVEFORM_HEIGHT, WorkspaceMode, animation_requested,
+        apply_transport_snapshot, audition_panel, audition_shuffle_seed, audition_statuses,
+        current_loudness_match_gain_db, current_lufs_meter_value,
+        current_reference_lufs_meter_value, decode_result_is_current, deterministic_shuffle,
+        enforce_loop, favorite_toggle, library_track_title_id, loop_bounds, main_output_gain,
+        native_launch_options, note_editor, note_ratio_for_id, planner_drop_is_valid,
+        playback_shortcut, project_surface, rebuild_audition_queue, reconcile_audition_queue,
+        reference_decode_result_is_current, reference_output_gain,
         reference_settings_auxiliary_windows, reference_settings_window_view,
         review_status_filter_message, selected_reference_notes, selected_track, stage_dropdown,
         stage_menu_anchor_from_pointer, stage_menu_popover, status_dropdown_for_host,
@@ -8190,8 +8189,8 @@ mod tests {
         gui::types::{Point, Rect, Vector2},
         prelude as ui,
         runtime::{
-            Command, DeclarativeOwnedRuntimeBridge, Event, FocusTraversal, PaintPrimitive,
-            PaintTextAlign, PlatformRequest, PlatformResponse, RuntimeUpdateSnapshot,
+            Command, DeclarativeOwnedCommandRuntimeBridge, DeclarativeOwnedRuntimeBridge, Event,
+            FocusTraversal, PaintPrimitive, PaintTextAlign, PlatformRequest, PlatformResponse,
             SurfaceRuntime,
         },
         theme::ThemeTokens,
@@ -13379,25 +13378,118 @@ mod tests {
     }
 
     #[test]
-    fn planner_drag_frame_syncs_preview_to_native_pointer() {
-        let previous_pointer = Point::new(120.0, 90.0);
-        let current_pointer = Point::new(460.0, 310.0);
-        let mut state = planner_drag_state(previous_pointer);
-        let previous_preview = planner_drag_preview_rect(&state)
-            .expect("an active planner drag should paint its preview before frame sync");
-        let mut context = ui::UiUpdateContext::from_runtime_snapshot(
-            RuntimeUpdateSnapshot::with_current_pointer_position(Some(current_pointer)),
-        );
+    fn planner_drag_messages_move_preview_without_frame_sync() {
+        let started_pointer = Point::new(120.0, 90.0);
+        let first_moved_pointer = Point::new(260.0, 180.0);
+        let second_moved_pointer = Point::new(460.0, 310.0);
+        let mut state = planner_drag_state(started_pointer);
+        state.planner_drag_source_track_id = None;
+        state.planner_drag_pointer = None;
+        let mut context = ui::UiUpdateContext::default();
 
-        update(&mut state, Message::Frame, &mut context);
-
-        assert_eq!(state.planner_drag_pointer, Some(current_pointer));
-        let current_preview = planner_drag_preview_rect(&state)
-            .expect("an active planner drag should paint its preview after frame sync");
-        assert_ne!(
-            previous_preview.min, current_preview.min,
-            "native pointer changes must move the rendered drag preview"
+        update(
+            &mut state,
+            Message::PlannerCardDrag {
+                track_id: String::from("drag"),
+                message: ui::DragHandleMessage::started(started_pointer),
+            },
+            &mut context,
         );
+        assert_eq!(state.planner_drag_pointer, Some(started_pointer));
+        let started_preview = planner_drag_preview_rect(&state)
+            .expect("a started planner drag should paint its preview");
+
+        update(
+            &mut state,
+            Message::PlannerCardDrag {
+                track_id: String::from("drag"),
+                message: ui::DragHandleMessage::moved(first_moved_pointer),
+            },
+            &mut context,
+        );
+        assert_eq!(state.planner_drag_pointer, Some(first_moved_pointer));
+        let first_moved_preview = planner_drag_preview_rect(&state)
+            .expect("the first planner drag move should keep its preview visible");
+        assert_ne!(started_preview.min, first_moved_preview.min);
+
+        update(
+            &mut state,
+            Message::PlannerCardDrag {
+                track_id: String::from("drag"),
+                message: ui::DragHandleMessage::moved(second_moved_pointer),
+            },
+            &mut context,
+        );
+        assert_eq!(state.planner_drag_pointer, Some(second_moved_pointer));
+        let second_moved_preview = planner_drag_preview_rect(&state)
+            .expect("the second planner drag move should keep its preview visible");
+        assert_ne!(first_moved_preview.min, second_moved_preview.min);
+    }
+
+    #[test]
+    fn planner_drag_runtime_routes_captured_moves_to_preview() {
+        let mut state = planner_drag_state(Point::new(120.0, 90.0));
+        state.planner_drag_source_track_id = None;
+        state.planner_drag_pointer = None;
+        let bridge = DeclarativeOwnedCommandRuntimeBridge::new(
+            state,
+            |state| project_surface(state).into_surface(),
+            |state, message| {
+                let mut context = ui::UiUpdateContext::default();
+                update(state, message, &mut context);
+                context.into_command()
+            },
+        );
+        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1180.0, 720.0));
+        let handle_point = runtime
+            .frame_with_default_theme()
+            .paint_plan
+            .first_text_rect("↕")
+            .expect("the planner drag handle should paint")
+            .center();
+
+        runtime.dispatch_event(Event::primary_press(handle_point));
+        let started_pointer = Point::new(handle_point.x + 80.0, handle_point.y + 80.0);
+        let outcome = runtime.dispatch_pointer_move_deferred_refresh_with_outcome(started_pointer);
+
+        assert!(outcome.pointer_captured);
+        assert_eq!(
+            runtime.bridge().state().planner_drag_pointer,
+            Some(started_pointer)
+        );
+        let captured_handle = runtime
+            .pointer_capture()
+            .expect("the drag handle should retain pointer capture after starting");
+        runtime.refresh();
+        assert_eq!(
+            runtime.pointer_capture(),
+            Some(captured_handle),
+            "refreshing the active drag preview must retain the source handle capture"
+        );
+        let moved_pointer = Point::new(handle_point.x + 180.0, handle_point.y + 180.0);
+        let outcome = runtime.dispatch_pointer_move_deferred_refresh_with_outcome(moved_pointer);
+
+        assert!(outcome.pointer_captured);
+        assert_eq!(
+            runtime.bridge().state().planner_drag_pointer,
+            Some(moved_pointer)
+        );
+        runtime.refresh();
+        assert!(
+            runtime
+                .frame_with_default_theme()
+                .paint_plan
+                .first_text_rect("↕ Preview me")
+                .is_some(),
+            "a captured drag move must refresh the declarative preview"
+        );
+    }
+
+    #[test]
+    fn planner_drag_does_not_request_animation() {
+        let state = planner_drag_state(Point::new(120.0, 90.0));
+
+        assert!(!animation_requested(&state));
     }
 
     #[test]
