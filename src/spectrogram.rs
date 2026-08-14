@@ -241,6 +241,21 @@ impl SpectrogramWidget {
         plot.min.x + plot.width() * position.clamp(0.0, 1.0)
     }
 
+    fn frequency_grid(&self) -> Vec<(f32, String)> {
+        let (minimum, maximum) = live_display_frequency_bounds(self.frame.sample_rate);
+        let mut entries = Vec::with_capacity(FREQUENCY_GRID.len() + 1);
+        entries.push((minimum, format_frequency_label(minimum)));
+        for &(frequency, label) in &FREQUENCY_GRID {
+            if frequency > minimum && frequency < maximum {
+                entries.push((frequency, String::from(label)));
+            }
+        }
+        if maximum > minimum {
+            entries.push((maximum, format_frequency_label(maximum)));
+        }
+        entries
+    }
+
     fn y_for_decibels(plot: Rect, decibels: f32) -> f32 {
         let position = (LIVE_SPECTRUM_DISPLAY_CEILING_DB - decibels)
             / (LIVE_SPECTRUM_DISPLAY_CEILING_DB - LIVE_SPECTRUM_DISPLAY_FLOOR_DB);
@@ -277,7 +292,7 @@ impl SpectrogramWidget {
         }
 
         let mut previous_x: Option<f32> = None;
-        for &(frequency, label) in &FREQUENCY_GRID {
+        for (frequency, label) in self.frequency_grid() {
             let x = self.x_for_frequency(plot, frequency);
             if previous_x.is_some_and(|previous| (x - previous).abs() < 2.0) {
                 continue;
@@ -300,7 +315,7 @@ impl SpectrogramWidget {
                 push_text_run_with_metrics(
                     primitives,
                     self.common.id,
-                    label,
+                    &label,
                     label_rect,
                     label_color,
                     PaintTextAlign::Center,
@@ -352,6 +367,19 @@ impl SpectrogramWidget {
                 color: theme.highlight_orange,
                 width: 1.5,
             }));
+        }
+    }
+}
+
+fn format_frequency_label(frequency: f32) -> String {
+    if frequency < 1_000.0 {
+        format!("{frequency:.0} Hz")
+    } else {
+        let kilohertz = frequency / 1_000.0;
+        if (kilohertz - kilohertz.round()).abs() < 0.05 {
+            format!("{kilohertz:.0} kHz")
+        } else {
+            format!("{kilohertz:.1} kHz")
         }
     }
 }
@@ -686,6 +714,39 @@ mod tests {
         let low_rate_frame = Arc::new(low_rate_frame);
         let low_rate_widget = SpectrogramWidget::new(low_rate_frame, LiveSpectrogramMode::Spectrum);
         assert_eq!(low_rate_widget.x_for_frequency(plot, 20_000.0), plot.max.x);
+    }
+
+    #[test]
+    fn frequency_grid_labels_follow_source_nyquist() {
+        let bounds = Rect::from_min_size(Point::new(0.0, 0.0), Vector2::new(720.0, super::HEIGHT));
+
+        for (sample_rate, expected_endpoint, forbidden_endpoint) in [
+            (16_000, "8 kHz", ["10 kHz", "20 kHz"]),
+            (22_050, "11 kHz", ["20 kHz", ""]),
+        ] {
+            let mut frame = (*test_frame()).clone();
+            frame.sample_rate = sample_rate;
+            let primitives =
+                SpectrogramWidget::new(Arc::new(frame), LiveSpectrogramMode::Waterfall)
+                    .paint_primitives(bounds, &LayoutOutput::default(), &ThemeTokens::default());
+            let labels = primitives
+                .iter()
+                .filter_map(|primitive| match primitive {
+                    PaintPrimitive::Text(text) => Some(text.text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+
+            assert!(
+                labels.contains(&expected_endpoint),
+                "missing {expected_endpoint} for {sample_rate} Hz"
+            );
+            for forbidden in forbidden_endpoint {
+                if !forbidden.is_empty() {
+                    assert!(!labels.contains(&forbidden), "unexpected {forbidden}");
+                }
+            }
+        }
     }
 
     #[test]
