@@ -26,6 +26,12 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PlannerInsertionTarget {
+    stage: storage::TrackStage,
+    slot: usize,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 enum Message {
     ImportPressed,
@@ -119,10 +125,10 @@ enum Message {
         track_id: String,
         message: ui::DragHandleMessage,
     },
-    PlannerCardHandleActivated(String),
-    PlannerStageHovered(storage::TrackStage),
-    PlannerStageHoverCleared(storage::TrackStage),
-    PlannerStageDropped(storage::TrackStage),
+    PlannerInsertionHovered(PlannerInsertionTarget),
+    PlannerInsertionHoverCleared(PlannerInsertionTarget),
+    PlannerInsertionCleared,
+    PlannerInsertionDropped(PlannerInsertionTarget),
     RequestRemoveTrack(String),
     ConfirmRemoveTrack(String),
     CancelRemoveTrack,
@@ -343,6 +349,13 @@ const STATUS_RAIL_WIDTH: f32 = 4.0;
 const STATUS_RAIL_GAP: f32 = 4.0;
 const TRACK_CARD_SELECTED_CORAL: ui::Rgba8 = ui::Rgba8::new(233, 88, 67, 255);
 const TRACK_CARD_FAVORITE_FILL_BLEND: f32 = 0.18;
+const PLANNER_DRAG_PREVIEW_OFFSET_X: f32 = 14.0;
+const PLANNER_DRAG_PREVIEW_OFFSET_Y: f32 = 18.0;
+const PLANNER_DRAG_PREVIEW_CARD_WIDTH: f32 = 300.0;
+const PLANNER_DRAG_PREVIEW_CARD_HEIGHT: f32 = 154.0;
+const PLANNER_DROP_MARKER_ORANGE: ui::Rgba8 = ui::Rgba8::new(255, 160, 82, 255);
+const PLANNER_DROP_MARKER_HEIGHT: f32 = 4.0;
+const PLANNER_DROP_SENTINEL_HEIGHT: f32 = 20.0;
 
 #[derive(Clone, Debug)]
 struct TrackCardChromeWidget {
@@ -676,7 +689,7 @@ struct AppState {
     status_menu_host: Option<StatusMenuHost>,
     remove_confirmation_track_id: Option<String>,
     planner_drag_source_track_id: Option<String>,
-    planner_drag_target_stage: Option<storage::TrackStage>,
+    planner_drag_target: Option<PlannerInsertionTarget>,
     planner_drag_pointer: Option<Point>,
     review_status_filter: Option<storage::TrackStatus>,
     review_filter_menu_open: bool,
@@ -776,7 +789,7 @@ impl Default for AppState {
             status_menu_host: None,
             remove_confirmation_track_id: None,
             planner_drag_source_track_id: None,
-            planner_drag_target_stage: None,
+            planner_drag_target: None,
             planner_drag_pointer: None,
             review_status_filter: None,
             review_filter_menu_open: false,
@@ -1246,6 +1259,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             clear_planner_drag(state);
             match result {
                 Ok(mut library) => {
+                    storage::normalize_planner_order(&mut library);
                     let (startup_track_id, startup_selection_changed) =
                         normalize_startup_track_selection(&mut library);
                     state.status = if library.tracks.is_empty() {
@@ -1921,7 +1935,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             match message {
                 ui::DragHandleMessage::Started { .. } => {
                     state.planner_drag_source_track_id = Some(track_id.clone());
-                    state.planner_drag_target_stage = None;
+                    state.planner_drag_target = None;
                     close_stage_menu(state);
                     close_status_menu(state);
                     state.remove_confirmation_track_id = None;
@@ -1944,12 +1958,8 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     if state.planner_drag_source_track_id.as_deref() != Some(track_id.as_str()) {
                         return;
                     }
-                    if state.planner_drag_target_stage.is_none() {
-                        clear_planner_drag(state);
-                        state.status = String::from("Drag canceled.");
-                    } else {
-                        state.planner_drag_pointer = drag_message_position(message);
-                    }
+                    clear_planner_drag(state);
+                    state.status = String::from("Drag canceled.");
                 }
                 ui::DragHandleMessage::Cancelled { .. } => {
                     if state.planner_drag_source_track_id.as_deref() != Some(track_id.as_str()) {
@@ -1962,66 +1972,68 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
             context.request_repaint();
         }
-        Message::PlannerCardHandleActivated(_) => {}
-        Message::PlannerStageHovered(stage) => {
+        Message::PlannerInsertionHovered(target) => {
             let Some(source_id) = state.planner_drag_source_track_id.as_deref() else {
                 return;
             };
-            let Some(source) = state
-                .library
-                .tracks
-                .iter()
-                .find(|track| track.id == source_id)
-            else {
-                clear_planner_drag(state);
+            if !planner_insertion_target_is_valid(
+                &state.library,
+                source_id,
+                &target,
+                state.planner_status_filter,
+            ) {
+                state.planner_drag_target = None;
                 context.request_repaint();
                 return;
-            };
-            if planner_drop_is_valid(Some(source.stage), stage) {
-                state.planner_drag_target_stage = Some(stage);
-                state.status = format!("Release to move to {}.", stage.label());
+            }
+            if state.planner_drag_target.as_ref() != Some(&target) {
+                state.planner_drag_target = Some(target.clone());
+                state.status =
+                    planner_insertion_status(&state.library, &target, state.planner_status_filter);
             }
             context.request_repaint();
         }
-        Message::PlannerStageHoverCleared(stage) => {
-            if state.planner_drag_target_stage == Some(stage) {
-                state.planner_drag_target_stage = None;
+        Message::PlannerInsertionHoverCleared(target) => {
+            if state.planner_drag_target.as_ref() == Some(&target) {
+                state.planner_drag_target = None;
                 context.request_repaint();
             }
         }
-        Message::PlannerStageDropped(stage) => {
+        Message::PlannerInsertionCleared => {
+            if state.planner_drag_target.take().is_some() {
+                context.request_repaint();
+            }
+        }
+        Message::PlannerInsertionDropped(target) => {
             if state.busy || state.workspace_mode != WorkspaceMode::Planner {
                 return;
             }
             let Some(source_id) = state.planner_drag_source_track_id.clone() else {
                 return;
             };
-            let source_stage = state
-                .library
-                .tracks
-                .iter()
-                .find(|track| track.id == source_id)
-                .map(|track| track.stage);
             clear_planner_drag(state);
-            let Some(source_stage) = source_stage else {
-                state.status = String::from("That track is no longer in the library.");
-                context.request_repaint();
-                return;
-            };
-            if !planner_drop_is_valid(Some(source_stage), stage) {
-                state.status = format!("Track is already in {}.", stage.label());
-                context.request_repaint();
-                return;
-            }
-            match storage::set_track_stage(&mut state.library, &source_id, stage) {
+            match storage::move_track_to_planner_slot(
+                &mut state.library,
+                &source_id,
+                target.stage,
+                target.slot,
+                state.planner_status_filter,
+            ) {
                 Ok(true) => {
                     close_stage_menu(state);
                     close_status_menu(state);
-                    state.status = format!("Moved track to {}.", stage.label());
+                    state.status = planner_insertion_status(
+                        &state.library,
+                        &PlannerInsertionTarget {
+                            stage: target.stage,
+                            slot: target.slot,
+                        },
+                        state.planner_status_filter,
+                    );
                     schedule_library_save(state, context);
                 }
                 Ok(false) => {
-                    state.status = format!("Track is already in {}.", stage.label());
+                    state.status = String::from("Track is already at that position.");
                 }
                 Err(error) => state.status = error,
             }
@@ -5304,7 +5316,7 @@ fn toggle_status_menu(
 
 fn clear_planner_drag(state: &mut AppState) {
     state.planner_drag_source_track_id = None;
-    state.planner_drag_target_stage = None;
+    state.planner_drag_target = None;
     state.planner_drag_pointer = None;
 }
 
@@ -5431,6 +5443,34 @@ fn planner_board_surface(content: ui::View<Message>) -> ui::View<Message> {
         .fill()
 }
 
+fn planner_drag_preview(
+    track: &storage::Track,
+    selected_id: Option<&str>,
+    pointer: Point,
+) -> ui::View<Message> {
+    ui::floating_layer(
+        Point::new(
+            pointer.x + PLANNER_DRAG_PREVIEW_OFFSET_X,
+            pointer.y + PLANNER_DRAG_PREVIEW_OFFSET_Y,
+        ),
+        Vector2::new(
+            PLANNER_DRAG_PREVIEW_CARD_WIDTH,
+            PLANNER_DRAG_PREVIEW_CARD_HEIGHT,
+        ),
+        planner_card_with_key(
+            track.clone(),
+            selected_id,
+            None,
+            None,
+            None,
+            None,
+            format!("planner-card-drag-preview-{}", track.id),
+        ),
+    )
+    .key("planner-card-drag-preview")
+    .fill()
+}
+
 fn project_surface(state: &AppState) -> ui::View<Message> {
     let workspace = match state.workspace_mode {
         WorkspaceMode::Review => ui::row([
@@ -5452,14 +5492,18 @@ fn project_surface(state: &AppState) -> ui::View<Message> {
         .planner_drag_source_track_id
         .as_deref()
         .and_then(|track_id| {
-            let title = state
+            let track = state
                 .library
                 .tracks
                 .iter()
                 .find(|track| track.id == track_id)
-                .map(|track| track.title.clone())?;
+                .cloned()?;
             let pointer = state.planner_drag_pointer?;
-            Some(ui::drag_preview(format!("↕ {title}"), pointer).key("planner-card-drag-preview"))
+            Some(planner_drag_preview(
+                &track,
+                state.library.selected_track_id.as_deref(),
+                pointer,
+            ))
         });
     let stage_menu = state
         .stage_menu_track_id
@@ -6021,18 +6065,10 @@ fn planner_panel(state: &AppState) -> ui::View<Message> {
         storage::TrackStage::Mixdown,
         storage::TrackStage::Mastering,
     ];
-    let filtered_tracks = tracks_with_status(&state.library.tracks, state.planner_status_filter);
+    let filtered_tracks = planner_tracks_with_status(&state.library, state.planner_status_filter);
     let drag_source_track_id = state.planner_drag_source_track_id.as_deref();
-    let drag_source_stage = drag_source_track_id.and_then(|track_id| {
-        state
-            .library
-            .tracks
-            .iter()
-            .find(|track| track.id == track_id)
-            .map(|track| track.stage)
-    });
     let drag_active = drag_source_track_id.is_some();
-    let drag_target_stage = state.planner_drag_target_stage;
+    let drag_target = state.planner_drag_target.as_ref();
     let columns = stages.into_iter().map(|stage| {
         planner_column(
             stage,
@@ -6046,46 +6082,51 @@ fn planner_panel(state: &AppState) -> ui::View<Message> {
                 remove_confirmation_track_id: state.remove_confirmation_track_id.as_deref(),
             },
             drag_active,
-            drag_source_stage,
-            drag_target_stage,
+            drag_target,
         )
     });
     let track_count = filtered_tracks.len();
-    let content = ui::column([
-        ui::row([
-            ui::column([
-                ui::text("FINISHING BOARD")
-                    .style(ui::WidgetStyle::strong(ui::WidgetTone::Neutral))
-                    .height(18.0)
-                    .fill_width(),
-                ui::text("Move every track toward release.")
-                    .height(30.0)
-                    .fill_width()
-                    .muted_text(),
-            ])
-            .fill_width(),
-            status_filter_controls(
-                state.planner_status_filter,
-                "planner",
-                planner_status_filter_message,
-            )
-            .width(480.0),
-            ui::text(format!(
-                "{} track{} · derived from the library",
-                track_count,
-                plural(track_count)
-            ))
-            .height(24.0)
-            .subtle(),
+    let header = ui::row([
+        ui::column([
+            ui::text("FINISHING BOARD")
+                .style(ui::WidgetStyle::strong(ui::WidgetTone::Neutral))
+                .height(18.0)
+                .fill_width(),
+            ui::text("Move every track toward release.")
+                .height(30.0)
+                .fill_width()
+                .muted_text(),
         ])
-        .fill_width()
-        .spacing(12.0),
-        ui::row(columns).spacing(10.0).fill(),
+        .fill_width(),
+        status_filter_controls(
+            state.planner_status_filter,
+            "planner",
+            planner_status_filter_message,
+        )
+        .width(480.0),
+        ui::text(format!(
+            "{} track{} · derived from the library",
+            track_count,
+            plural(track_count)
+        ))
+        .height(24.0)
+        .subtle(),
     ])
-    .padding(WORKSPACE_PANEL_PADDING)
-    .spacing(WORKSPACE_PANEL_SPACING)
-    .fill();
-    planner_board_surface(content)
+    .fill_width()
+    .spacing(12.0);
+    let header = ui::input_overlay(
+        header,
+        planner_insertion_clear_target(drag_active, "planner-insertion-clear-header"),
+    );
+    let content = ui::column([header, ui::row(columns).spacing(10.0).fill()])
+        .padding(WORKSPACE_PANEL_PADDING)
+        .spacing(WORKSPACE_PANEL_SPACING)
+        .fill();
+    let content = planner_board_surface(content);
+    ui::input_underlay(
+        content,
+        planner_insertion_clear_target(drag_active, "planner-insertion-clear-board"),
+    )
 }
 
 struct PlannerColumnContext<'a> {
@@ -6102,8 +6143,7 @@ fn planner_column(
     status_filter: Option<storage::TrackStatus>,
     context: PlannerColumnContext<'_>,
     drag_active: bool,
-    drag_source_stage: Option<storage::TrackStage>,
-    drag_target_stage: Option<storage::TrackStage>,
+    drag_target: Option<&PlannerInsertionTarget>,
 ) -> ui::View<Message> {
     let PlannerColumnContext {
         selected_id,
@@ -6113,8 +6153,10 @@ fn planner_column(
         remove_confirmation_track_id,
     } = context;
     let count = tracks.len();
-    let candidate = drag_active && planner_drop_is_valid(drag_source_stage, stage);
-    let current_target = drag_target_stage == Some(stage);
+    let current_target = drag_target.is_some_and(|target| target.stage == stage);
+    let active_slot = drag_target
+        .filter(|target| target.stage == stage)
+        .map(|target| target.slot);
     let mut children = vec![
         ui::row([
             ui::text(if current_target {
@@ -6134,7 +6176,7 @@ fn planner_column(
         .spacing(8.0),
     ];
     if tracks.is_empty() {
-        children.push(if status_filter.is_some() {
+        let empty_content = if status_filter.is_some() {
             ui::column([
                 ui::text("No matching tracks.").height(24.0).fill_width(),
                 ui::text(format!(
@@ -6161,48 +6203,214 @@ fn planner_column(
             .padding(10.0)
             .spacing(6.0)
             .fill_width()
-        });
+        };
+        children.push(empty_content);
     } else {
+        let mut rows = Vec::with_capacity(tracks.len() + usize::from(drag_active));
+        for (index, track) in tracks.into_iter().enumerate() {
+            let card = planner_card(
+                track,
+                selected_id,
+                stage_menu_track_id,
+                status_menu_track_id,
+                status_menu_host,
+                remove_confirmation_track_id,
+            );
+            rows.push(planner_card_drop_row(
+                card,
+                PlannerInsertionTarget { stage, slot: index },
+                PlannerInsertionTarget {
+                    stage,
+                    slot: index + 1,
+                },
+                active_slot,
+                index,
+                index + 1 == count,
+                drag_active,
+            ));
+        }
+        if drag_active {
+            rows.push(planner_drop_slot(
+                ui::spacer()
+                    .fill_width()
+                    .height(PLANNER_DROP_SENTINEL_HEIGHT),
+                PlannerInsertionTarget { stage, slot: count },
+                active_slot == Some(count),
+                "planner-end-drop",
+                false,
+            ));
+        }
         children.push(
-            ui::list(tracks, move |track| {
-                planner_card(
-                    track,
-                    selected_id,
-                    stage_menu_track_id,
-                    status_menu_track_id,
-                    status_menu_host,
-                    remove_confirmation_track_id,
-                )
-            })
+            ui::scroll(
+                ui::column(rows)
+                    .spacing(TRACK_CARD_LIST_SPACING)
+                    .fill_width(),
+            )
             .without_chrome()
-            .spacing(TRACK_CARD_LIST_SPACING)
             .fill_height(),
         );
     }
-    let content = ui::stack([
-        ui::card()
-            .style(ui::WidgetStyle::strong(ui::WidgetTone::Neutral))
-            .fill(),
-        ui::column(children).padding(12.0).spacing(8.0).fill(),
+    let column_content = ui::column(children).padding(12.0).spacing(8.0).fill();
+    let column_content = if count == 0 {
+        let empty_target = PlannerInsertionTarget { stage, slot: 0 };
+        let visual = ui::stack([
+            column_content,
+            planner_insertion_marker(active_slot == Some(0), false),
+        ])
+        .fill();
+        ui::input_overlay(
+            visual,
+            planner_drop_hit_target(
+                empty_target,
+                drag_active,
+                active_slot == Some(0),
+                "planner-empty-column-slot",
+            ),
+        )
+    } else {
+        column_content
+    };
+    let background = ui::card()
+        .style(ui::WidgetStyle::strong(ui::WidgetTone::Neutral))
+        .fill();
+    let background = if count == 0 {
+        background
+    } else {
+        ui::input_overlay(
+            background,
+            planner_insertion_clear_target(
+                drag_active,
+                format!("planner-insertion-clear-column-{}", stage.label()),
+            ),
+        )
+    };
+    ui::stack([background, column_content]).fill()
+}
+
+fn planner_card_drop_row(
+    card: ui::View<Message>,
+    top_target: PlannerInsertionTarget,
+    bottom_target: PlannerInsertionTarget,
+    active_slot: Option<usize>,
+    index: usize,
+    is_last: bool,
+    drag_active: bool,
+) -> ui::View<Message> {
+    let card_with_marker = ui::stack([
+        card,
+        planner_insertion_marker(
+            active_slot == Some(index) || (is_last && active_slot == Some(index + 1)),
+            is_last && active_slot == Some(index + 1),
+        ),
     ])
-    .fill();
-    let drop_target = if drag_active {
-        let actions = ui::InteractiveRowActions::new().tracked_drop_candidate_key(
-            stage,
-            Message::PlannerStageDropped,
-            |stage, _position| Message::PlannerStageHovered(stage),
-            |stage, _position| Message::PlannerStageHoverCleared(stage),
-        );
-        ui::interactive_row()
-            .tracked_drop_candidate(drag_active, current_target, candidate, current_target)
-            .actions(actions)
-            .key(format!("planner-column-drop-{}", stage.label()))
-            .fill()
-            .input_only()
+    .fill_width();
+    let hit_targets = if drag_active {
+        ui::column([
+            planner_drop_hit_target(
+                top_target.clone(),
+                drag_active,
+                active_slot == Some(index),
+                format!("top-{index}"),
+            ),
+            planner_drop_hit_target(
+                bottom_target.clone(),
+                drag_active,
+                active_slot == Some(index + 1),
+                format!("bottom-{index}"),
+            ),
+        ])
+        .fill()
     } else {
         ui::spacer().fill()
     };
-    ui::stack([content, drop_target]).fill()
+    ui::input_overlay(card_with_marker, hit_targets)
+        .key(format!(
+            "planner-card-drop-{}-{}",
+            top_target.stage.label(),
+            index
+        ))
+        .fill_width()
+}
+
+fn planner_drop_slot(
+    content: ui::View<Message>,
+    target: PlannerInsertionTarget,
+    active: bool,
+    key_prefix: &str,
+    show_marker: bool,
+) -> ui::View<Message> {
+    let visual = ui::stack([
+        content,
+        planner_insertion_marker(active && show_marker, false),
+    ])
+    .fill_width();
+    ui::input_overlay(
+        visual,
+        planner_drop_hit_target(target.clone(), true, active, format!("{key_prefix}-slot")),
+    )
+    .key(format!(
+        "{key_prefix}-{}-{}",
+        target.stage.label(),
+        target.slot
+    ))
+    .fill_width()
+}
+
+fn planner_drop_hit_target(
+    target: PlannerInsertionTarget,
+    drag_active: bool,
+    active: bool,
+    key_suffix: impl ToString,
+) -> ui::View<Message> {
+    let key = format!(
+        "planner-insertion-{}-{}-{}",
+        target.stage.label(),
+        target.slot,
+        key_suffix.to_string(),
+    );
+    let actions = ui::InteractiveRowActions::new().tracked_drop_candidate_key(
+        target.clone(),
+        Message::PlannerInsertionDropped,
+        |target, _position| Message::PlannerInsertionHovered(target),
+        |target, _position| Message::PlannerInsertionHoverCleared(target),
+    );
+    ui::interactive_row()
+        .tracked_drop_candidate(drag_active, active, true, active)
+        .actions(actions)
+        .key(key)
+        .fill()
+        .input_only()
+}
+
+fn planner_insertion_clear_target(active: bool, key: impl ToString) -> ui::View<Message> {
+    ui::interactive_row()
+        .tracked_drop_candidate(active, false, false, active)
+        .actions(ui::InteractiveRowActions::new().clear_drop(|_| Message::PlannerInsertionCleared))
+        .key(key)
+        .fill()
+        .input_only()
+}
+
+fn planner_insertion_marker(active: bool, at_bottom: bool) -> ui::View<Message> {
+    if active {
+        let marker = ui::local_drop_marker(
+            0.0,
+            PLANNER_DROP_MARKER_ORANGE,
+            10_000.0,
+            PLANNER_DROP_MARKER_HEIGHT,
+        )
+        .fill_width()
+        .height(PLANNER_DROP_MARKER_HEIGHT);
+        if at_bottom {
+            ui::column([ui::spacer().fill_height(), marker])
+                .fill_width()
+                .fill_height()
+        } else {
+            marker
+        }
+    } else {
+        ui::spacer().fill_width().height(PLANNER_DROP_MARKER_HEIGHT)
+    }
 }
 
 fn planner_column_heading(stage: storage::TrackStage) -> &'static str {
@@ -6219,6 +6427,27 @@ fn planner_card(
     status_menu_track_id: Option<&str>,
     status_menu_host: Option<StatusMenuHost>,
     remove_confirmation_track_id: Option<&str>,
+) -> ui::View<Message> {
+    let card_key = format!("planner-card-{}", track.id);
+    planner_card_with_key(
+        track,
+        selected_id,
+        stage_menu_track_id,
+        status_menu_track_id,
+        status_menu_host,
+        remove_confirmation_track_id,
+        card_key,
+    )
+}
+
+fn planner_card_with_key(
+    track: storage::Track,
+    selected_id: Option<&str>,
+    stage_menu_track_id: Option<&str>,
+    status_menu_track_id: Option<&str>,
+    status_menu_host: Option<StatusMenuHost>,
+    remove_confirmation_track_id: Option<&str>,
+    card_key: String,
 ) -> ui::View<Message> {
     let selected = selected_id == Some(track.id.as_str());
     let stage_menu_open = stage_menu_track_id == Some(track.id.as_str());
@@ -6267,16 +6496,22 @@ fn planner_card(
             card_control(
                 selected,
                 "↕",
-                ui::button("↕")
-                    .click_or_drag(
-                        Message::PlannerCardHandleActivated(track.id.clone()),
-                        move |message| Message::PlannerCardDrag {
-                            track_id: drag_track_id.clone(),
-                            message,
-                        },
-                    )
-                    .key(format!("planner-card-drag-{}", track.id))
-                    .size(22.0, 22.0),
+                ui::input_overlay(
+                    ui::text("↕").width(22.0).height(22.0).input_only(),
+                    ui::interactive_row()
+                        .draggable()
+                        .actions(ui::InteractiveRowActions::new().drag(move |message| {
+                            Message::PlannerCardDrag {
+                                track_id: drag_track_id.clone(),
+                                message,
+                            }
+                        }))
+                        .key(format!("planner-card-drag-{}", track.id))
+                        .size(22.0, 22.0)
+                        .input_only(),
+                )
+                .key(format!("planner-card-drag-surface-{}", track.id))
+                .size(22.0, 22.0),
             )
             .width(22.0)
             .height(22.0),
@@ -6318,7 +6553,7 @@ fn planner_card(
     .spacing(TRACK_CARD_CONTENT_SPACING)
     .fill_width();
     ui::stack([track_card_chrome(selected, track.favorite), card_content])
-        .key(format!("planner-card-{}", track.id))
+        .key(card_key)
         .fill_width()
 }
 
@@ -6334,6 +6569,18 @@ fn tracks_with_status(
     favorites.into_iter().chain(non_favorites).collect()
 }
 
+fn planner_tracks_with_status(
+    library: &storage::Library,
+    status: Option<storage::TrackStatus>,
+) -> Vec<storage::Track> {
+    storage::planner_order(library)
+        .into_iter()
+        .filter_map(|id| library.tracks.iter().find(|track| track.id == id))
+        .filter(|track| status.is_none_or(|status| track.status == status))
+        .cloned()
+        .collect()
+}
+
 fn tracks_in_stage(tracks: &[storage::Track], stage: storage::TrackStage) -> Vec<storage::Track> {
     tracks
         .iter()
@@ -6342,11 +6589,42 @@ fn tracks_in_stage(tracks: &[storage::Track], stage: storage::TrackStage) -> Vec
         .collect()
 }
 
-fn planner_drop_is_valid(
-    source_stage: Option<storage::TrackStage>,
-    target_stage: storage::TrackStage,
+fn planner_insertion_target_is_valid(
+    library: &storage::Library,
+    source_id: &str,
+    target: &PlannerInsertionTarget,
+    status_filter: Option<storage::TrackStatus>,
 ) -> bool {
-    source_stage.is_some_and(|source_stage| source_stage != target_stage)
+    let Some(source) = library.tracks.iter().find(|track| track.id == source_id) else {
+        return false;
+    };
+    if status_filter.is_some_and(|status| source.status != status) {
+        return false;
+    }
+    let target_count = planner_tracks_with_status(library, status_filter)
+        .iter()
+        .filter(|track| track.stage == target.stage)
+        .count();
+    target.slot <= target_count
+}
+
+fn planner_insertion_status(
+    library: &storage::Library,
+    target: &PlannerInsertionTarget,
+    status_filter: Option<storage::TrackStatus>,
+) -> String {
+    let tracks = planner_tracks_with_status(library, status_filter)
+        .into_iter()
+        .filter(|track| track.stage == target.stage)
+        .collect::<Vec<_>>();
+    if let Some(track) = tracks.get(target.slot) {
+        format!("Release above {}.", track.title)
+    } else {
+        format!(
+            "Release at the end of {}.",
+            planner_column_heading(target.stage)
+        )
+    }
 }
 
 const STAGE_MENU_WIDTH: f32 = 174.0;
@@ -8160,23 +8438,23 @@ fn plural(count: usize) -> &'static str {
 mod tests {
     use super::{
         APP_VERSION_LABEL, AppState, AuditionSource, FavoriteMarkerWidget, ImportBatchProgress,
-        LoopBounds, LoopSelection, LoopSelections, Message, NoteDraft, REFERENCE_MENU_WIDTH,
-        SETTINGS_REFERENCE_ROW_METADATA_HEIGHT, SETTINGS_REFERENCE_ROW_TEXT_HEIGHT,
-        SETTINGS_REFERENCE_ROW_TEXT_SPACING, SETTINGS_REFERENCE_ROW_TITLE_HEIGHT,
-        STATUS_BAR_VERSION_WIDTH, StatusMenuHost, TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER,
-        TRACK_CARD_SELECTED_CORAL, WAVEFORM_HEIGHT, WorkspaceMode, animation_requested,
-        apply_transport_snapshot, audition_panel, audition_shuffle_seed, audition_statuses,
-        current_loudness_match_gain_db, current_lufs_meter_value,
-        current_reference_lufs_meter_value, decode_result_is_current, deterministic_shuffle,
-        enforce_loop, favorite_toggle, library_track_title_id, loop_bounds, main_output_gain,
-        native_launch_options, note_editor, note_ratio_for_id, planner_drop_is_valid,
-        playback_shortcut, project_surface, rebuild_audition_queue, reconcile_audition_queue,
-        reference_decode_result_is_current, reference_output_gain,
-        reference_settings_auxiliary_windows, reference_settings_window_view,
-        review_status_filter_message, selected_reference_notes, selected_track, stage_dropdown,
-        stage_menu_anchor_from_pointer, stage_menu_popover, status_dropdown_for_host,
-        status_filter_dropdown, sync_audition_queue_after_status_change, tracks_in_stage,
-        tracks_with_status, transport_command_is_confirmed, update,
+        LoopBounds, LoopSelection, LoopSelections, Message, NoteDraft, PlannerInsertionTarget,
+        REFERENCE_MENU_WIDTH, SETTINGS_REFERENCE_ROW_METADATA_HEIGHT,
+        SETTINGS_REFERENCE_ROW_TEXT_HEIGHT, SETTINGS_REFERENCE_ROW_TEXT_SPACING,
+        SETTINGS_REFERENCE_ROW_TITLE_HEIGHT, STATUS_BAR_VERSION_WIDTH, StatusMenuHost,
+        TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER, TRACK_CARD_SELECTED_CORAL, WAVEFORM_HEIGHT,
+        WorkspaceMode, animation_requested, apply_transport_snapshot, audition_panel,
+        audition_shuffle_seed, audition_statuses, current_loudness_match_gain_db,
+        current_lufs_meter_value, current_reference_lufs_meter_value, decode_result_is_current,
+        deterministic_shuffle, enforce_loop, favorite_toggle, library_track_title_id, loop_bounds,
+        main_output_gain, native_launch_options, note_editor, note_ratio_for_id,
+        planner_insertion_target_is_valid, playback_shortcut, project_surface,
+        rebuild_audition_queue, reconcile_audition_queue, reference_decode_result_is_current,
+        reference_output_gain, reference_settings_auxiliary_windows,
+        reference_settings_window_view, review_status_filter_message, selected_reference_notes,
+        selected_track, stage_dropdown, stage_menu_anchor_from_pointer, stage_menu_popover,
+        status_dropdown_for_host, status_filter_dropdown, sync_audition_queue_after_status_change,
+        tracks_in_stage, tracks_with_status, transport_command_is_confirmed, update,
     };
     use crate::transport::Snapshot;
     use crate::{
@@ -8529,14 +8807,45 @@ mod tests {
     }
 
     fn planner_drag_preview_rect(state: &AppState) -> Option<Rect> {
+        let pointer = state.planner_drag_pointer?;
+        let expected_min = Point::new(
+            pointer.x + super::PLANNER_DRAG_PREVIEW_OFFSET_X,
+            pointer.y + super::PLANNER_DRAG_PREVIEW_OFFSET_Y,
+        );
         project_surface(state)
             .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 720.0))
             .paint_plan
             .primitives
             .iter()
             .find_map(|primitive| match primitive {
-                PaintPrimitive::Text(text) if text.text.as_str() == "↕ Preview me" => {
-                    Some(text.rect)
+                PaintPrimitive::FillPolygon(fill)
+                    if fill.points.first().is_some_and(|point| {
+                        (point.x - expected_min.x).abs() < 0.01
+                            && (point.y - expected_min.y).abs() < 0.01
+                    }) =>
+                {
+                    Some(Rect::from_min_max(
+                        Point::new(
+                            fill.points
+                                .iter()
+                                .map(|point| point.x)
+                                .fold(f32::INFINITY, f32::min),
+                            fill.points
+                                .iter()
+                                .map(|point| point.y)
+                                .fold(f32::INFINITY, f32::min),
+                        ),
+                        Point::new(
+                            fill.points
+                                .iter()
+                                .map(|point| point.x)
+                                .fold(f32::NEG_INFINITY, f32::max),
+                            fill.points
+                                .iter()
+                                .map(|point| point.y)
+                                .fold(f32::NEG_INFINITY, f32::max),
+                        ),
+                    ))
                 }
                 _ => None,
             })
@@ -9073,6 +9382,7 @@ mod tests {
                 path: path.clone(),
                 notes: Vec::new(),
             }],
+            planner_order: Vec::new(),
         };
         let mut state = AppState {
             busy: true,
@@ -13332,7 +13642,10 @@ mod tests {
         state.status_menu_track_id = Some(String::from("hidden-track"));
         state.status_menu_host = Some(StatusMenuHost::Planner);
         state.planner_drag_source_track_id = Some(String::from("hidden-track"));
-        state.planner_drag_target_stage = Some(TrackStage::Mixdown);
+        state.planner_drag_target = Some(PlannerInsertionTarget {
+            stage: TrackStage::Mixdown,
+            slot: 0,
+        });
         state.planner_drag_pointer = Some(Point::new(100.0, 120.0));
 
         update(
@@ -13345,35 +13658,351 @@ mod tests {
         assert!(state.status_menu_track_id.is_none());
         assert!(state.status_menu_host.is_none());
         assert!(state.planner_drag_source_track_id.is_none());
-        assert!(state.planner_drag_target_stage.is_none());
+        assert!(state.planner_drag_target.is_none());
         assert!(state.planner_drag_pointer.is_none());
     }
 
     #[test]
-    fn planner_drop_requires_a_different_known_stage() {
-        assert!(planner_drop_is_valid(
-            Some(TrackStage::SoundDesign),
-            TrackStage::Production
+    fn planner_insertion_targets_allow_same_stage_and_reject_stale_slots() {
+        let state = planner_drag_state(Point::new(120.0, 90.0));
+        assert!(planner_insertion_target_is_valid(
+            &state.library,
+            "drag",
+            &PlannerInsertionTarget {
+                stage: TrackStage::SoundDesign,
+                slot: 0,
+            },
+            None,
         ));
-        assert!(!planner_drop_is_valid(
-            Some(TrackStage::Mixdown),
+        assert!(planner_insertion_target_is_valid(
+            &state.library,
+            "drag",
+            &PlannerInsertionTarget {
+                stage: TrackStage::SoundDesign,
+                slot: 1,
+            },
+            None,
+        ));
+        assert!(!planner_insertion_target_is_valid(
+            &state.library,
+            "drag",
+            &PlannerInsertionTarget {
+                stage: TrackStage::SoundDesign,
+                slot: 2,
+            },
+            None,
+        ));
+        assert!(!planner_insertion_target_is_valid(
+            &state.library,
+            "missing",
+            &PlannerInsertionTarget {
+                stage: TrackStage::Mastering,
+                slot: 0,
+            },
+            None,
+        ));
+    }
+
+    #[test]
+    fn active_planner_insertion_paints_one_orange_bar_at_the_selected_slot() {
+        let track = |id: &str| Track {
+            id: String::from(id),
+            title: format!("{id} track"),
+            original_name: format!("{id}.wav"),
+            path: PathBuf::from(format!("/external/{id}.wav")),
+            reference_path: None,
+            size: 0,
+            favorite: false,
+            stage: TrackStage::Production,
+            status: TrackStatus::Inbox,
+            notes: Vec::new(),
+        };
+        let mut state = AppState {
+            busy: false,
+            workspace_mode: WorkspaceMode::Planner,
+            planner_drag_source_track_id: Some(String::from("first")),
+            planner_drag_pointer: Some(Point::new(120.0, 90.0)),
+            ..AppState::default()
+        };
+        state.library.tracks = vec![track("first"), track("second"), track("third")];
+        state.library.planner_order = vec![
+            String::from("first"),
+            String::from("second"),
+            String::from("third"),
+        ];
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::PlannerInsertionHovered(PlannerInsertionTarget {
+                stage: TrackStage::Production,
+                slot: 1,
+            }),
+            &mut context,
+        );
+        let middle_frame = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 900.0));
+        let middle_markers = middle_frame
+            .paint_plan
+            .fill_rects()
+            .filter(|fill| fill.color == super::PLANNER_DROP_MARKER_ORANGE)
+            .collect::<Vec<_>>();
+        assert_eq!(middle_markers.len(), 1);
+        let middle_y = middle_markers[0].rect.min.y;
+
+        update(
+            &mut state,
+            Message::PlannerInsertionHovered(PlannerInsertionTarget {
+                stage: TrackStage::Production,
+                slot: 3,
+            }),
+            &mut context,
+        );
+        let end_frame = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 900.0));
+        let end_markers = end_frame
+            .paint_plan
+            .fill_rects()
+            .filter(|fill| fill.color == super::PLANNER_DROP_MARKER_ORANGE)
+            .collect::<Vec<_>>();
+        assert_eq!(end_markers.len(), 1);
+        assert!(end_markers[0].rect.min.y > middle_y);
+        assert_eq!(
+            end_markers[0].rect.height(),
+            super::PLANNER_DROP_MARKER_HEIGHT
+        );
+
+        update(
+            &mut state,
+            Message::PlannerInsertionHovered(PlannerInsertionTarget {
+                stage: TrackStage::Mastering,
+                slot: 0,
+            }),
+            &mut context,
+        );
+        let empty_frame = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 900.0));
+        let empty_markers = empty_frame
+            .paint_plan
+            .fill_rects()
+            .filter(|fill| fill.color == super::PLANNER_DROP_MARKER_ORANGE)
+            .collect::<Vec<_>>();
+        assert_eq!(empty_markers.len(), 1);
+        assert_eq!(
+            empty_markers[0].rect.height(),
+            super::PLANNER_DROP_MARKER_HEIGHT
+        );
+    }
+
+    #[test]
+    fn planner_drag_hover_routes_to_an_insertion_slot() {
+        let track = |id: &str| Track {
+            id: String::from(id),
+            title: format!("{id} track"),
+            original_name: format!("{id}.wav"),
+            path: PathBuf::from(format!("/external/{id}.wav")),
+            reference_path: None,
+            size: 0,
+            favorite: false,
+            stage: TrackStage::Production,
+            status: TrackStatus::Inbox,
+            notes: Vec::new(),
+        };
+        let mut state = AppState {
+            busy: false,
+            workspace_mode: WorkspaceMode::Planner,
+            ..AppState::default()
+        };
+        state.library.tracks = vec![track("first"), track("second"), track("third")];
+        state.library.planner_order = vec![
+            String::from("first"),
+            String::from("second"),
+            String::from("third"),
+        ];
+        let bridge = DeclarativeOwnedCommandRuntimeBridge::new(
+            state,
+            |state| project_surface(state).into_surface(),
+            |state, message| {
+                let mut context = ui::UiUpdateContext::default();
+                update(state, message, &mut context);
+                context.into_command()
+            },
+        );
+        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1180.0, 900.0));
+        let handle_point = runtime
+            .frame_with_default_theme()
+            .paint_plan
+            .first_text_rect("↕")
+            .expect("the planner drag handle should paint")
+            .center();
+        runtime.dispatch_event(Event::primary_press(handle_point));
+        runtime.dispatch_pointer_move_deferred_refresh_with_outcome(Point::new(
+            handle_point.x + 80.0,
+            handle_point.y + 80.0,
+        ));
+        runtime.refresh();
+        runtime.dispatch_pointer_move_deferred_refresh_with_outcome(Point::new(450.0, 480.0));
+
+        assert_eq!(
+            runtime.bridge().state().planner_drag_target,
+            Some(PlannerInsertionTarget {
+                stage: TrackStage::Production,
+                slot: 2,
+            })
+        );
+        let invalid_point = runtime
+            .frame_with_default_theme()
+            .paint_plan
+            .first_text_rect("FINISHING BOARD")
+            .expect("the Planner header should paint")
+            .center();
+        runtime.dispatch_pointer_move_deferred_refresh_with_outcome(invalid_point);
+        assert!(
+            runtime.bridge().state().planner_drag_target.is_none(),
+            "moving outside the insertion zones must clear the stale target"
+        );
+        runtime.refresh();
+        assert_eq!(
+            runtime
+                .frame_with_default_theme()
+                .paint_plan
+                .fill_rects()
+                .filter(|fill| fill.color == super::PLANNER_DROP_MARKER_ORANGE)
+                .count(),
+            0,
+            "clearing the target must remove the orange bar from the frame"
+        );
+        runtime.dispatch_event(Event::primary_release(invalid_point));
+        assert!(
+            runtime
+                .bridge()
+                .state()
+                .planner_drag_source_track_id
+                .is_none()
+        );
+        assert_eq!(
+            runtime.bridge().state().library.planner_order,
+            ["first", "second", "third"]
+        );
+    }
+
+    #[test]
+    fn planner_drag_drops_into_empty_column_from_bottom() {
+        let track = |id: &str| Track {
+            id: String::from(id),
+            title: format!("{id} track"),
+            original_name: format!("{id}.wav"),
+            path: PathBuf::from(format!("/external/{id}.wav")),
+            reference_path: None,
+            size: 0,
+            favorite: false,
+            stage: TrackStage::Production,
+            status: TrackStatus::Inbox,
+            notes: Vec::new(),
+        };
+        let mut state = AppState {
+            busy: false,
+            workspace_mode: WorkspaceMode::Planner,
+            ..AppState::default()
+        };
+        state.library.tracks = vec![track("first"), track("second")];
+        state.library.planner_order = vec![String::from("first"), String::from("second")];
+        let bridge = DeclarativeOwnedCommandRuntimeBridge::new(
+            state,
+            |state| project_surface(state).into_surface(),
+            |state, message| {
+                let mut context = ui::UiUpdateContext::default();
+                update(state, message, &mut context);
+                context.into_command()
+            },
+        );
+        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1180.0, 900.0));
+        let handle_point = runtime
+            .frame_with_default_theme()
+            .paint_plan
+            .first_text_rect("↕")
+            .expect("the Planner drag handle should paint")
+            .center();
+        runtime.dispatch_event(Event::primary_press(handle_point));
+        runtime.dispatch_pointer_move_deferred_refresh_with_outcome(Point::new(
+            handle_point.x + 80.0,
+            handle_point.y + 80.0,
+        ));
+        runtime.refresh();
+
+        let empty_column_point = runtime
+            .frame_with_default_theme()
+            .paint_plan
+            .first_text_run_after_x("No tracks here yet.", 600.0)
+            .expect("an empty column should paint its empty-state text")
+            .rect
+            .center();
+        runtime.dispatch_pointer_move_deferred_refresh_with_outcome(empty_column_point);
+        assert_eq!(
+            runtime.bridge().state().planner_drag_target,
+            Some(PlannerInsertionTarget {
+                stage: TrackStage::Mixdown,
+                slot: 0,
+            })
+        );
+
+        let bottom_of_empty_column = Point::new(empty_column_point.x, 700.0);
+        runtime.dispatch_pointer_move_deferred_refresh_with_outcome(bottom_of_empty_column);
+        assert_eq!(
+            runtime.bridge().state().planner_drag_target,
+            Some(PlannerInsertionTarget {
+                stage: TrackStage::Mixdown,
+                slot: 0,
+            }),
+            "the whole empty column should retain its slot-0 drop target"
+        );
+        runtime.refresh();
+        assert_eq!(
+            runtime
+                .frame_with_default_theme()
+                .paint_plan
+                .fill_rects()
+                .filter(|fill| fill.color == super::PLANNER_DROP_MARKER_ORANGE)
+                .count(),
+            1,
+            "dropping in empty space should keep one visible insertion marker"
+        );
+
+        runtime.dispatch_event(Event::primary_release(bottom_of_empty_column));
+        assert!(
+            runtime
+                .bridge()
+                .state()
+                .planner_drag_source_track_id
+                .is_none()
+        );
+        assert_eq!(
+            runtime.bridge().state().library.tracks[0].stage,
             TrackStage::Mixdown
-        ));
-        assert!(!planner_drop_is_valid(None, TrackStage::Mastering));
+        );
+        assert_eq!(
+            runtime.bridge().state().library.planner_order,
+            ["second", "first"]
+        );
     }
 
     #[test]
     fn active_planner_drag_projects_a_visible_preview() {
         let state = planner_drag_state(Point::new(120.0, 90.0));
 
-        let labels = project_surface(&state)
-            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 720.0))
-            .paint_plan
-            .text_label_strings();
+        let frame = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 720.0));
+        let labels = frame.paint_plan.text_label_strings();
 
         assert!(
-            labels.iter().any(|label| label == "↕ Preview me"),
-            "active planner drags must add their preview to the paint plan"
+            labels.iter().any(|label| label == "Preview me"),
+            "active planner drags must retain the source card title in the preview"
+        );
+        assert!(labels.iter().any(|label| label == "preview.wav"));
+        assert!(!labels.iter().any(|label| label == "↕ Preview me"));
+        assert!(
+            track_card_paint_snapshots(&frame.paint_plan.primitives).len() >= 2,
+            "active planner drags must paint both the source card and its card-shaped preview"
         );
     }
 
@@ -13398,6 +14027,21 @@ mod tests {
         assert_eq!(state.planner_drag_pointer, Some(started_pointer));
         let started_preview = planner_drag_preview_rect(&state)
             .expect("a started planner drag should paint its preview");
+        assert_eq!(
+            started_preview.min,
+            Point::new(
+                started_pointer.x + super::PLANNER_DRAG_PREVIEW_OFFSET_X,
+                started_pointer.y + super::PLANNER_DRAG_PREVIEW_OFFSET_Y,
+            )
+        );
+        assert_eq!(
+            started_preview.width(),
+            super::PLANNER_DRAG_PREVIEW_CARD_WIDTH
+        );
+        assert_eq!(
+            started_preview.height(),
+            super::PLANNER_DRAG_PREVIEW_CARD_HEIGHT
+        );
 
         update(
             &mut state,
@@ -13479,9 +14123,11 @@ mod tests {
             runtime
                 .frame_with_default_theme()
                 .paint_plan
-                .first_text_rect("↕ Preview me")
-                .is_some(),
-            "a captured drag move must refresh the declarative preview"
+                .text_runs()
+                .filter(|run| run.text.as_str() == "Preview me")
+                .count()
+                >= 2,
+            "a captured drag move must refresh the declarative card preview"
         );
     }
 
@@ -13516,21 +14162,32 @@ mod tests {
     }
 
     #[test]
-    fn successful_planner_stage_drop_removes_the_rendered_preview() {
+    fn successful_planner_insertion_drop_removes_the_rendered_preview() {
         let mut state = planner_drag_state(Point::new(120.0, 90.0));
         assert!(planner_drag_preview_rect(&state).is_some());
         let mut context = ui::UiUpdateContext::default();
 
         update(
             &mut state,
-            Message::PlannerStageDropped(TrackStage::Production),
+            Message::PlannerInsertionDropped(PlannerInsertionTarget {
+                stage: TrackStage::Production,
+                slot: 0,
+            }),
             &mut context,
         );
 
         assert_eq!(state.library.tracks[0].stage, TrackStage::Production);
+        assert_eq!(state.library.planner_order, ["drag"]);
         assert!(
             planner_drag_preview_rect(&state).is_none(),
-            "a successful stage drop must remove its rendered preview"
+            "a successful Planner insertion must remove its rendered preview"
+        );
+        assert!(
+            context
+                .into_command()
+                .business_task_priority("cadence-save-library")
+                .is_some(),
+            "a successful Planner insertion must schedule one library save"
         );
     }
 
