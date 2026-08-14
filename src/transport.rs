@@ -1570,10 +1570,13 @@ fn load_track(
 
     let analyzer_session = Arc::clone(&session);
     let analyzer_shared = Arc::clone(shared);
-    thread::Builder::new()
+    if let Err(error) = thread::Builder::new()
         .name(String::from("cadence-live-spectrogram"))
         .spawn(move || run_live_analyzer(consumer, analyzer_session, analyzer_shared, sample_rate))
-        .expect("Cadence live spectrogram analyzer should spawn");
+    {
+        handle_live_analyzer_spawn_error(shared, generation, &session, error);
+        return true;
+    }
 
     let player_handle = Player::connect_new(output.mixer());
     player_handle.append(LiveAnalysisSource::new(
@@ -1593,6 +1596,19 @@ fn load_track(
     *live_session = Some(session);
     shared.ready.store(true, Ordering::Release);
     true
+}
+
+fn handle_live_analyzer_spawn_error(
+    shared: &SharedSnapshot,
+    generation: u64,
+    session: &Arc<LiveCaptureSession>,
+    error: std::io::Error,
+) {
+    shared.retire_live_session(Some(session));
+    shared.set_error(
+        generation,
+        format!("Could not start live spectrogram analysis: {error}"),
+    );
 }
 
 fn retire_live_session(
@@ -1676,8 +1692,8 @@ mod tests {
         AudioTransport, CONTROLS_BUSY_ERROR, CaptureFrame, Command, DEFAULT_VOLUME,
         LIVE_SPECTROGRAM_BAND_COUNT, LIVE_SPECTROGRAM_MAX_HISTORY, LIVE_SPECTRUM_FFT_SIZE,
         LiveAnalysisSource, LiveAnalyzer, LiveCaptureSession, MAX_OUTPUT_GAIN, PendingLoad,
-        SharedSnapshot, clamp_position, is_current, normalize_output_gain, normalize_volume,
-        publish_live_frame_if_due,
+        SharedSnapshot, clamp_position, handle_live_analyzer_spawn_error, is_current,
+        normalize_output_gain, normalize_volume, publish_live_frame_if_due,
     };
     use rodio::{Source, buffer::SamplesBuffer, source::SeekError};
     use std::path::PathBuf;
@@ -2034,6 +2050,37 @@ mod tests {
         assert!(!reset.pending);
         assert!(reset.epoch > pending.epoch);
         session.retire();
+    }
+
+    #[test]
+    fn analyzer_spawn_error_retires_session_and_publishes_generation_error() {
+        let (shared, session) = active_test_session(9);
+        let frame = Arc::new(super::LiveSpectrogramFrame {
+            generation: 9,
+            epoch: 1,
+            revision: 1,
+            sample_rate: 48_000,
+            row_count: 1,
+            values: Arc::from(vec![1_u8; LIVE_SPECTROGRAM_BAND_COUNT].into_boxed_slice()),
+        });
+        assert!(shared.publish_live_frame(&session, frame));
+
+        handle_live_analyzer_spawn_error(
+            &shared,
+            9,
+            &session,
+            std::io::Error::other("thread limit reached"),
+        );
+
+        assert!(!session.active.load(Ordering::Acquire));
+        assert_eq!(shared.live_session_id.load(Ordering::Acquire), 0);
+        assert!(shared.latest_live_frame().is_none());
+        assert_eq!(
+            shared.take_error(9),
+            Some(String::from(
+                "Could not start live spectrogram analysis: thread limit reached"
+            ))
+        );
     }
 
     #[test]
