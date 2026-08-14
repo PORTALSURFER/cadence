@@ -58,7 +58,7 @@ const GRID_LABEL_FONT_SIZE: f32 = 9.0;
 const WATERFALL_SURFACE_KEY: u64 = 0x4341_4445_4e43_4553;
 pub const LIVE_SPECTROGRAM_OVERLAY_WIDGET_ID: u64 = 0xCAD3_2201;
 const WATERFALL_SHADER_KEY: &str = "cadence/live-spectrogram-waterfall";
-const OVERLAY_HISTORY_ROWS: usize = 96;
+const OVERLAY_HISTORY_ROWS: usize = LIVE_SPECTROGRAM_MAX_HISTORY;
 const OVERLAY_COLOR_LEVELS: usize = 24;
 
 const WATERFALL_SHADER_WGSL: &str = r#"
@@ -879,8 +879,11 @@ mod tests {
         let row_count = LIVE_SPECTROGRAM_MAX_HISTORY;
         let mut values = vec![0_u8; row_count * LIVE_SPECTROGRAM_BAND_COUNT];
         for row in 0..row_count {
+            let level = row % (super::OVERLAY_COLOR_LEVELS - 1) + 1;
+            let value =
+                (level * usize::from(u8::MAX)).div_ceil(super::OVERLAY_COLOR_LEVELS - 1) as u8;
             for band in 0..LIVE_SPECTROGRAM_BAND_COUNT {
-                values[row * LIVE_SPECTROGRAM_BAND_COUNT + band] = ((row + band) % 256) as u8;
+                values[row * LIVE_SPECTROGRAM_BAND_COUNT + band] = value;
             }
         }
         let frame = Arc::new(
@@ -912,7 +915,7 @@ mod tests {
                 _ => None,
             })
             .sum::<usize>();
-        assert!(batched_rects > 0);
+        assert_eq!(batched_rects, row_count);
     }
 
     #[test]
