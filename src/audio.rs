@@ -33,6 +33,14 @@ const PREVIEW_INTERVAL_MILLIS: u64 = 250;
 const LOUDNESS_PROFILE_STEP_MILLIS: u64 = 100;
 const MAX_LOUDNESS_PROFILE_POINTS: usize = 8192;
 pub const MAX_LOUDNESS_MATCH_DB: f32 = 24.0;
+pub const SPECTROGRAM_BAND_COUNT: usize = 48;
+pub const MAX_SPECTROGRAM_COLUMNS: usize = 512;
+
+const SPECTRUM_FFT_SIZE: usize = 1024;
+const SPECTRUM_HOP_SIZE: usize = SPECTRUM_FFT_SIZE / 2;
+const SPECTRUM_MIN_FREQUENCY: f32 = 40.0;
+const SPECTRUM_MAX_FREQUENCY: f32 = 18_000.0;
+const SPECTRUM_FLOOR_DB: f32 = -80.0;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct WaveformData {
@@ -43,6 +51,47 @@ pub struct WaveformData {
     pub integrated_lufs: Option<f32>,
     pub loudness_profile: Arc<[LoudnessPoint]>,
     pub summary: Arc<GpuSignalSummary>,
+    pub spectrogram: Arc<SpectrogramData>,
+}
+
+/// A bounded, display-oriented frequency heatmap.
+///
+/// Values are quantized to a byte so the decoded analysis remains cheap to
+/// clone, cache, and move from the blocking decoder to the retained UI.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpectrogramData {
+    pub column_count: usize,
+    pub values: Arc<[u8]>,
+}
+
+impl SpectrogramData {
+    pub fn empty() -> Self {
+        Self {
+            column_count: 0,
+            values: Arc::from([]),
+        }
+    }
+
+    fn from_values(column_count: usize, values: Vec<u8>) -> Option<Self> {
+        let expected_values = column_count.checked_mul(SPECTROGRAM_BAND_COUNT)?;
+        if column_count > MAX_SPECTROGRAM_COLUMNS || values.len() != expected_values {
+            return None;
+        }
+        Some(Self {
+            column_count,
+            values: Arc::from(values.into_boxed_slice()),
+        })
+    }
+
+    pub fn value(&self, column: usize, band: usize) -> u8 {
+        if column >= self.column_count || band >= SPECTROGRAM_BAND_COUNT {
+            return 0;
+        }
+        self.values
+            .get(column * SPECTROGRAM_BAND_COUNT + band)
+            .copied()
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -60,7 +109,7 @@ pub struct LoudnessPoint {
     pub lufs: f32,
 }
 
-const WAVEFORM_CACHE_VERSION: u32 = 1;
+const WAVEFORM_CACHE_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WaveformCacheFingerprint {
@@ -81,6 +130,13 @@ struct CachedWaveform {
     integrated_lufs: Option<f32>,
     loudness_profile: Vec<LoudnessPoint>,
     summary: CachedSummary,
+    spectrogram: CachedSpectrogram,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CachedSpectrogram {
+    column_count: usize,
+    values: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -221,6 +277,10 @@ impl CachedWaveform {
                     })
                     .collect(),
             },
+            spectrogram: CachedSpectrogram {
+                column_count: waveform.spectrogram.column_count,
+                values: waveform.spectrogram.values.to_vec(),
+            },
         }
     }
 
@@ -283,6 +343,8 @@ impl CachedWaveform {
                 })
             })
             .collect::<Option<Vec<_>>>()?;
+        let spectrogram =
+            SpectrogramData::from_values(self.spectrogram.column_count, self.spectrogram.values)?;
 
         Some(WaveformData {
             sample_rate: self.sample_rate,
@@ -296,6 +358,7 @@ impl CachedWaveform {
                 band_count,
                 levels,
             }),
+            spectrogram: Arc::new(spectrogram),
         })
     }
 }
@@ -908,6 +971,221 @@ impl PeakReducer {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct ComplexSample {
+    real: f32,
+    imaginary: f32,
+}
+
+/// Bounded FFT analysis used by the review spectrogram.
+///
+/// This deliberately lives beside the waveform decoder so the UI receives a
+/// single immutable analysis result. The pending sample buffer is kept to a
+/// small FFT window plus the current hop, and long files are folded into a
+/// fixed number of display columns.
+struct SpectrogramAccumulator {
+    band_ranges: Vec<(usize, usize)>,
+    pending: Vec<f32>,
+    pending_start: usize,
+    columns: Vec<[u8; SPECTROGRAM_BAND_COUNT]>,
+    fft: Vec<ComplexSample>,
+}
+
+impl SpectrogramAccumulator {
+    fn new(sample_rate: u32) -> Self {
+        Self {
+            band_ranges: spectrogram_band_ranges(sample_rate),
+            pending: Vec::with_capacity(SPECTRUM_FFT_SIZE + SPECTRUM_HOP_SIZE),
+            pending_start: 0,
+            columns: Vec::new(),
+            fft: vec![ComplexSample::default(); SPECTRUM_FFT_SIZE],
+        }
+    }
+
+    fn add_interleaved(&mut self, samples: &[f32], channels: usize) {
+        if channels == 0 {
+            return;
+        }
+        self.pending
+            .extend(samples.chunks_exact(channels).map(|frame| {
+                let sum = frame
+                    .iter()
+                    .map(|sample| sample.clamp(-1.0, 1.0))
+                    .sum::<f32>();
+                sum / channels as f32
+            }));
+        self.process_available();
+    }
+
+    fn process_available(&mut self) {
+        while self.pending.len().saturating_sub(self.pending_start) >= SPECTRUM_FFT_SIZE {
+            self.process_window(self.pending_start, SPECTRUM_FFT_SIZE);
+            self.pending_start = self.pending_start.saturating_add(SPECTRUM_HOP_SIZE);
+        }
+        if self.pending_start >= SPECTRUM_FFT_SIZE {
+            self.pending.drain(..self.pending_start);
+            self.pending_start = 0;
+        }
+    }
+
+    fn process_window(&mut self, start: usize, available: usize) {
+        for index in 0..SPECTRUM_FFT_SIZE {
+            let sample = if index < available {
+                self.pending.get(start + index).copied().unwrap_or_default()
+            } else {
+                0.0
+            };
+            let window =
+                0.5 - 0.5 * (std::f32::consts::TAU * index as f32 / SPECTRUM_FFT_SIZE as f32).cos();
+            self.fft[index] = ComplexSample {
+                real: sample * window,
+                imaginary: 0.0,
+            };
+        }
+        fft_in_place(&mut self.fft);
+
+        let mut column = [0_u8; SPECTROGRAM_BAND_COUNT];
+        for (band, &(start_bin, end_bin)) in self.band_ranges.iter().enumerate() {
+            let peak_magnitude = (start_bin..end_bin)
+                .map(|bin| {
+                    let sample = self.fft[bin];
+                    (sample.real * sample.real + sample.imaginary * sample.imaginary).sqrt()
+                        / SPECTRUM_FFT_SIZE as f32
+                })
+                .fold(0.0_f32, f32::max);
+            let decibels = 20.0 * peak_magnitude.max(1.0e-8).log10();
+            let normalized = ((decibels - SPECTRUM_FLOOR_DB) / -SPECTRUM_FLOOR_DB).clamp(0.0, 1.0);
+            column[band] = (normalized * u8::MAX as f32).round() as u8;
+        }
+        self.append_column(column);
+    }
+
+    fn append_column(&mut self, column: [u8; SPECTROGRAM_BAND_COUNT]) {
+        if self.columns.len() >= MAX_SPECTROGRAM_COLUMNS {
+            self.reduce_columns();
+        }
+        self.columns.push(column);
+    }
+
+    fn reduce_columns(&mut self) {
+        let mut reduced = Vec::with_capacity(self.columns.len().div_ceil(2));
+        for pair in self.columns.chunks(2) {
+            let mut column = [0_u8; SPECTROGRAM_BAND_COUNT];
+            for band in 0..SPECTROGRAM_BAND_COUNT {
+                column[band] = pair
+                    .iter()
+                    .map(|source| source[band])
+                    .max()
+                    .unwrap_or_default();
+            }
+            reduced.push(column);
+        }
+        self.columns = reduced;
+    }
+
+    fn snapshot(&self) -> Arc<SpectrogramData> {
+        Arc::new(spectrogram_data_from_columns(&self.columns))
+    }
+
+    fn finish(mut self) -> Arc<SpectrogramData> {
+        self.process_available();
+        let remaining = self.pending.len().saturating_sub(self.pending_start);
+        if remaining > 0 {
+            self.process_window(self.pending_start, remaining.min(SPECTRUM_FFT_SIZE));
+        }
+        Arc::new(spectrogram_data_from_columns(&self.columns))
+    }
+}
+
+fn spectrogram_data_from_columns(columns: &[[u8; SPECTROGRAM_BAND_COUNT]]) -> SpectrogramData {
+    let values = columns
+        .iter()
+        .flat_map(|column| column.iter().copied())
+        .collect::<Vec<_>>();
+    SpectrogramData::from_values(columns.len(), values)
+        .expect("spectrogram accumulator must produce bounded data")
+}
+
+fn spectrogram_band_ranges(sample_rate: u32) -> Vec<(usize, usize)> {
+    let nyquist = sample_rate as f32 / 2.0;
+    let minimum = SPECTRUM_MIN_FREQUENCY.min(nyquist.max(1.0));
+    let maximum = SPECTRUM_MAX_FREQUENCY.min(nyquist.max(minimum));
+    let ratio = (maximum / minimum.max(1.0)).max(1.0);
+    let maximum_bin = SPECTRUM_FFT_SIZE / 2 + 1;
+
+    (0..SPECTROGRAM_BAND_COUNT)
+        .map(|band| {
+            let start_frequency = minimum * ratio.powf(band as f32 / SPECTROGRAM_BAND_COUNT as f32);
+            let end_frequency =
+                minimum * ratio.powf((band + 1) as f32 / SPECTROGRAM_BAND_COUNT as f32);
+            let start_bin = ((start_frequency / sample_rate.max(1) as f32)
+                * SPECTRUM_FFT_SIZE as f32)
+                .floor() as usize;
+            let end_bin = ((end_frequency / sample_rate.max(1) as f32) * SPECTRUM_FFT_SIZE as f32)
+                .ceil() as usize;
+            let start_bin = start_bin.clamp(1, maximum_bin.saturating_sub(1));
+            let end_bin = end_bin.clamp(start_bin.saturating_add(1), maximum_bin);
+            (start_bin, end_bin)
+        })
+        .collect()
+}
+
+fn fft_in_place(buffer: &mut [ComplexSample]) {
+    let length = buffer.len();
+    let mut reversed = 0usize;
+    for index in 1..length {
+        let mut bit = length >> 1;
+        while reversed & bit != 0 {
+            reversed ^= bit;
+            bit >>= 1;
+        }
+        reversed ^= bit;
+        if index < reversed {
+            buffer.swap(index, reversed);
+        }
+    }
+
+    let mut block_length = 2;
+    while block_length <= length {
+        let angle = -std::f32::consts::TAU / block_length as f32;
+        let block_rotation = ComplexSample {
+            real: angle.cos(),
+            imaginary: angle.sin(),
+        };
+        for block_start in (0..length).step_by(block_length) {
+            let mut rotation = ComplexSample {
+                real: 1.0,
+                imaginary: 0.0,
+            };
+            for offset in 0..block_length / 2 {
+                let even_index = block_start + offset;
+                let odd_index = even_index + block_length / 2;
+                let odd = buffer[odd_index];
+                let rotated = ComplexSample {
+                    real: odd.real * rotation.real - odd.imaginary * rotation.imaginary,
+                    imaginary: odd.real * rotation.imaginary + odd.imaginary * rotation.real,
+                };
+                let even = buffer[even_index];
+                buffer[even_index] = ComplexSample {
+                    real: even.real + rotated.real,
+                    imaginary: even.imaginary + rotated.imaginary,
+                };
+                buffer[odd_index] = ComplexSample {
+                    real: even.real - rotated.real,
+                    imaginary: even.imaginary - rotated.imaginary,
+                };
+                rotation = ComplexSample {
+                    real: rotation.real * block_rotation.real
+                        - rotation.imaginary * block_rotation.imaginary,
+                    imaginary: rotation.real * block_rotation.imaginary
+                        + rotation.imaginary * block_rotation.real,
+                };
+            }
+        }
+        block_length <<= 1;
+    }
+}
+
 #[allow(dead_code)]
 pub fn decode_waveform(path: &Path) -> Result<WaveformData, String> {
     decode_waveform_with_progress_and_cancellation(path, || false, |_| {})
@@ -979,6 +1257,7 @@ pub fn decode_waveform_with_progress_and_cancellation(
     let mut sample_rate = None;
     let mut channels = None;
     let mut channel_layout = None;
+    let mut spectrogram: Option<SpectrogramAccumulator> = None;
     let expected_frames = codec_params.n_frames;
     let mut next_preview_frame = None;
 
@@ -1056,6 +1335,9 @@ pub fn decode_waveform_with_progress_and_cancellation(
         sample_buffer.copy_interleaved_ref(decoded);
         let samples = sample_buffer.samples();
         loudness.add_frames(samples)?;
+        let spectrogram_accumulator =
+            spectrogram.get_or_insert_with(|| SpectrogramAccumulator::new(decoded_sample_rate));
+        spectrogram_accumulator.add_interleaved(samples, decoded_channels);
         for frame in samples.chunks_exact(decoded_channels) {
             window.add_frame(frame);
             decoded_frames = decoded_frames.saturating_add(1);
@@ -1082,6 +1364,10 @@ pub fn decode_waveform_with_progress_and_cancellation(
                         decoded_channels,
                         decoded_frames,
                         expected_frames,
+                        spectrogram.as_ref().map_or_else(
+                            || Arc::new(SpectrogramData::empty()),
+                            SpectrogramAccumulator::snapshot,
+                        ),
                     ),
                     progress: Some(progress),
                 });
@@ -1110,6 +1396,9 @@ pub fn decode_waveform_with_progress_and_cancellation(
         .map(LoudnessAccumulator::profile)
         .unwrap_or_default();
     let integrated_lufs = loudness.and_then(LoudnessAccumulator::finish);
+    let spectrogram = spectrogram
+        .map(SpectrogramAccumulator::finish)
+        .unwrap_or_else(|| Arc::new(SpectrogramData::empty()));
 
     Ok(WaveformData {
         sample_rate,
@@ -1119,6 +1408,7 @@ pub fn decode_waveform_with_progress_and_cancellation(
         integrated_lufs,
         loudness_profile: Arc::from(loudness_profile.into_boxed_slice()),
         summary,
+        spectrogram,
     })
 }
 
@@ -1128,6 +1418,7 @@ fn preview_waveform(
     channels: usize,
     decoded_frames: usize,
     expected_frames: Option<u64>,
+    spectrogram: Arc<SpectrogramData>,
 ) -> WaveformData {
     let duration_frames = expected_frames.unwrap_or(decoded_frames as u64);
     let duration_millis = ((duration_frames as u128 * 1_000) / sample_rate.max(1) as u128) as u64;
@@ -1140,6 +1431,7 @@ fn preview_waveform(
         integrated_lufs: None,
         loudness_profile: Arc::from([]),
         summary: Arc::new(summary_from_peaks(&peaks)),
+        spectrogram,
     }
 }
 
@@ -1210,10 +1502,11 @@ fn summary_from_peaks(peaks: &[PeakMeasurement]) -> GpuSignalSummary {
 mod tests {
     use super::{
         LoudnessAccumulator, LoudnessPoint, MAX_LOUDNESS_MATCH_DB, MAX_LOUDNESS_PROFILE_POINTS,
-        PeakMeasurement, PeakReducer, PeakWindow, WaveformData,
+        MAX_SPECTROGRAM_COLUMNS, PeakMeasurement, PeakReducer, PeakWindow, SPECTROGRAM_BAND_COUNT,
+        SPECTRUM_FFT_SIZE, SpectrogramAccumulator, WaveformData,
         decode_waveform_with_progress_and_cancellation, linear_gain_for_db, load_waveform_cache,
         loudness_at_position, loudness_channel_map, loudness_match_gain_db, preview_progress,
-        preview_waveform, summary_from_peaks, waveform_cache_fingerprint,
+        preview_waveform, spectrogram_band_ranges, summary_from_peaks, waveform_cache_fingerprint,
         write_waveform_cache_if_unchanged,
     };
     use radiant::runtime::GpuSignalSummary;
@@ -1232,6 +1525,16 @@ mod tests {
             squared_energy: f64::from(level) * f64::from(level),
             frames: 1,
         }
+    }
+
+    fn spectrogram_fixture(column_count: usize) -> Arc<crate::audio::SpectrogramData> {
+        let values = (0..column_count * SPECTROGRAM_BAND_COUNT)
+            .map(|index| (index % 256) as u8)
+            .collect::<Vec<_>>();
+        Arc::new(crate::audio::SpectrogramData {
+            column_count,
+            values: Arc::from(values.into_boxed_slice()),
+        })
     }
 
     #[test]
@@ -1258,6 +1561,7 @@ mod tests {
                 end_frame: 4_800,
                 lufs: -8.5,
             }]),
+            spectrogram: spectrogram_fixture(2),
             summary: Arc::new(summary_from_peaks(&[rms_peak(0.5), rms_peak(0.25)])),
         };
 
@@ -1274,6 +1578,18 @@ mod tests {
             waveform_cache_fingerprint(&source).expect("source fingerprint should exist");
         write_waveform_cache_if_unchanged(&source, &cache, source_fingerprint, &waveform)
             .expect("rewrite waveform cache");
+        let mut old_cache: serde_json::Value =
+            serde_json::from_slice(&fs::read(&cache).expect("read waveform cache"))
+                .expect("cache should be valid JSON");
+        old_cache["version"] = serde_json::json!(1);
+        fs::write(
+            &cache,
+            serde_json::to_vec(&old_cache).expect("encode old cache fixture"),
+        )
+        .expect("write old cache fixture");
+        assert_eq!(load_waveform_cache(&source, &cache), None);
+        write_waveform_cache_if_unchanged(&source, &cache, source_fingerprint, &waveform)
+            .expect("restore current waveform cache");
         let source_fingerprint =
             waveform_cache_fingerprint(&source).expect("source fingerprint should exist");
         fs::write(&source, b"changed source").expect("change source fixture");
@@ -1466,6 +1782,7 @@ mod tests {
             2,
             24_000,
             Some(48_000),
+            Arc::new(crate::audio::SpectrogramData::empty()),
         );
 
         assert_eq!(preview.duration_millis, 1_000);
@@ -1510,6 +1827,7 @@ mod tests {
                     lufs: -12.0,
                 },
             ]),
+            spectrogram: std::sync::Arc::new(crate::audio::SpectrogramData::empty()),
             summary: std::sync::Arc::new(GpuSignalSummary::from_interleaved_samples(
                 &[0.1, 0.8, 0.2, 0.4],
                 4,
@@ -1533,6 +1851,7 @@ mod tests {
             render_frames: 48_000,
             integrated_lufs: Some(-14.0),
             loudness_profile: std::sync::Arc::from([]),
+            spectrogram: std::sync::Arc::new(crate::audio::SpectrogramData::empty()),
             summary: std::sync::Arc::new(GpuSignalSummary::from_interleaved_samples(
                 &[0.1, 0.8, 0.2, 0.4],
                 4,
@@ -1716,6 +2035,51 @@ mod tests {
     fn loudness_match_db_converts_to_linear_gain() {
         assert!((linear_gain_for_db(6.0206) - 2.0).abs() < 0.001);
         assert!((linear_gain_for_db(-6.0206) - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn spectrogram_accumulator_localizes_a_tone_and_stays_bounded() {
+        let sample_rate = 48_000;
+        let samples = one_khz_tone(sample_rate, 1, 2, 0.8);
+        let mut accumulator = SpectrogramAccumulator::new(sample_rate);
+        accumulator.add_interleaved(&samples, 1);
+        let spectrogram = accumulator.finish();
+
+        assert!(spectrogram.column_count > 0);
+        assert!(spectrogram.column_count <= MAX_SPECTROGRAM_COLUMNS);
+        assert_eq!(
+            spectrogram.values.len(),
+            spectrogram.column_count * SPECTROGRAM_BAND_COUNT
+        );
+
+        let target_bin = (1_000 * SPECTRUM_FFT_SIZE) / sample_rate as usize;
+        let target_band = spectrogram_band_ranges(sample_rate)
+            .iter()
+            .position(|(start, end)| target_bin >= *start && target_bin < *end)
+            .expect("1 kHz should map to a display band");
+        let middle_column = spectrogram.column_count / 2;
+        let strongest_band = (0..SPECTROGRAM_BAND_COUNT)
+            .max_by_key(|band| spectrogram.value(middle_column, *band))
+            .expect("spectrogram should expose frequency bands");
+        assert!(
+            strongest_band.abs_diff(target_band) <= 1,
+            "1 kHz peak landed in band {strongest_band}, expected {target_band}"
+        );
+    }
+
+    #[test]
+    fn spectrogram_accumulator_reduces_long_input_to_the_display_bound() {
+        let sample_count = (MAX_SPECTROGRAM_COLUMNS + 64) * super::SPECTRUM_HOP_SIZE;
+        let samples = vec![0.25_f32; sample_count];
+        let mut accumulator = SpectrogramAccumulator::new(48_000);
+        accumulator.add_interleaved(&samples, 1);
+
+        let spectrogram = accumulator.finish();
+        assert!(spectrogram.column_count <= MAX_SPECTROGRAM_COLUMNS);
+        assert_eq!(
+            spectrogram.values.len(),
+            spectrogram.column_count * SPECTROGRAM_BAND_COUNT
+        );
     }
 
     fn one_khz_tone(sample_rate: u32, channels: usize, seconds: usize, peak: f32) -> Vec<f32> {

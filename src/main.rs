@@ -1,5 +1,6 @@
 mod audio;
 mod chrome;
+mod spectrogram;
 mod storage;
 mod transport;
 mod waveform;
@@ -328,6 +329,8 @@ const TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER: f32 = 72.0;
 // the review panel while retaining enough height for the split waveform.
 const WAVEFORM_HEIGHT: f32 = 124.0;
 const REFERENCE_WAVEFORM_HEIGHT: f32 = WAVEFORM_HEIGHT;
+const SPECTROGRAM_HEADER_HEIGHT: f32 = 22.0;
+const SPECTROGRAM_SECTION_SPACING: f32 = 4.0;
 const MAIN_WAVEFORM_HEADER_HEIGHT: f32 = 22.0;
 const LUFS_METER_WIDTH: f32 = 76.0;
 const REFERENCE_HEADER_HEIGHT: f32 = 26.0;
@@ -7627,6 +7630,95 @@ fn review_transport_icon(icon: &'static ui::SvgIconTintCache, active: bool) -> u
     icon.icon_for_state(REVIEW_TRANSPORT_ICON_TINTS, true, active)
 }
 
+fn review_spectrogram_source<'a>(
+    state: &'a AppState,
+    track: &storage::Track,
+) -> Option<(AuditionSource, &'a audio::WaveformData)> {
+    let main = state
+        .waveform
+        .as_ref()
+        .filter(|_| state.waveform_track_id.as_deref() == Some(track.id.as_str()));
+    let reference = state
+        .reference_waveform
+        .as_ref()
+        .filter(|_| state.reference_waveform_track_id.as_deref() == Some(track.id.as_str()));
+    let requested = if state.reference_only_playback {
+        AuditionSource::Reference
+    } else if state.transport_playing && !state.reference_transport_playing {
+        AuditionSource::Main
+    } else if state.reference_transport_playing && !state.transport_playing {
+        AuditionSource::Reference
+    } else {
+        state.audition_source
+    };
+    match requested {
+        AuditionSource::Main => main
+            .map(|waveform| (AuditionSource::Main, waveform))
+            .or_else(|| reference.map(|waveform| (AuditionSource::Reference, waveform))),
+        AuditionSource::Reference => reference
+            .map(|waveform| (AuditionSource::Reference, waveform))
+            .or_else(|| main.map(|waveform| (AuditionSource::Main, waveform))),
+    }
+}
+
+fn review_spectrogram_section(state: &AppState, track: &storage::Track) -> ui::View<Message> {
+    let selected = review_spectrogram_source(state, track);
+    let source_label = selected.map_or_else(
+        || String::from("SPECTROGRAM · WAITING FOR AUDIO ANALYSIS"),
+        |(source, waveform)| {
+            let label = match source {
+                AuditionSource::Main => "MAIN",
+                AuditionSource::Reference => "REFERENCE",
+            };
+            let name = if source == AuditionSource::Main {
+                track.original_name.clone()
+            } else {
+                track.reference_path.as_ref().map_or_else(
+                    || String::from("reference"),
+                    |path| reference_track_name(path),
+                )
+            };
+            let status = if waveform.spectrogram.column_count == 0 {
+                " · BUILDING"
+            } else {
+                ""
+            };
+            format!("SPECTROGRAM · {label} · {name}{status}")
+        },
+    );
+    let header = ui::row([
+        ui::spacer().fill_width(),
+        ui::text(source_label)
+            .truncate()
+            .height(SPECTROGRAM_HEADER_HEIGHT)
+            .align_text(ui::TextAlign::Right)
+            .subtle(),
+    ])
+    .fill_width()
+    .height(SPECTROGRAM_HEADER_HEIGHT);
+    let body = if let Some((source, waveform)) = selected {
+        let cursor_millis = source_position(state, source);
+        let cursor_ratio = waveform::ratio_for_millis(cursor_millis, waveform.duration_millis);
+        spectrogram::view::<Message>(Arc::clone(&waveform.spectrogram), cursor_ratio)
+            .fill_width()
+            .height(spectrogram::HEIGHT)
+    } else {
+        ui::column([
+            ui::text("The spectrogram will appear when the selected track is analyzed.")
+                .height(28.0)
+                .fill_width()
+                .subtle(),
+        ])
+        .padding(12.0)
+        .fill_width()
+        .height(spectrogram::HEIGHT)
+    };
+    ui::column([header, body])
+        .spacing(SPECTROGRAM_SECTION_SPACING)
+        .fill_width()
+        .height(SPECTROGRAM_HEADER_HEIGHT + SPECTROGRAM_SECTION_SPACING + spectrogram::HEIGHT)
+}
+
 fn review_panel(state: &AppState) -> ui::View<Message> {
     let Some(track) = selected_track(state).cloned() else {
         let content = ui::column([
@@ -7863,10 +7955,15 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
         .fill_width()
         .height(waveform_pair_height);
 
-    let content = ui::column([waveform_with_source, comments_panel(state, &track)])
-        .padding(WORKSPACE_PANEL_PADDING)
-        .spacing(WORKSPACE_PANEL_SPACING)
-        .fill();
+    let spectrogram_section = review_spectrogram_section(state, &track);
+    let content = ui::column([
+        spectrogram_section,
+        waveform_with_source,
+        comments_panel(state, &track),
+    ])
+    .padding(WORKSPACE_PANEL_PADDING)
+    .spacing(WORKSPACE_PANEL_SPACING)
+    .fill();
     workspace_surface(content)
 }
 
@@ -8997,6 +9094,7 @@ mod tests {
             render_frames: 48_000,
             integrated_lufs: Some(-7.0),
             loudness_profile: Arc::from([]),
+            spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
             summary: Arc::new(
                 radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                     &[0.0, 0.5, 0.0, 0.5],
@@ -9959,6 +10057,7 @@ mod tests {
                 render_frames: 48_000,
                 integrated_lufs: Some(-7.0),
                 loudness_profile: std::sync::Arc::from([]),
+                spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
                 summary: Arc::new(
                     radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                         &[0.1, 0.8, 0.2, 0.4],
@@ -10018,6 +10117,7 @@ mod tests {
                 render_frames: 48_000,
                 integrated_lufs: Some(-7.0),
                 loudness_profile: std::sync::Arc::from([]),
+                spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
                 summary: Arc::new(
                     radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                         &[0.1, 0.8, 0.2, 0.4],
@@ -10087,6 +10187,7 @@ mod tests {
             render_frames: 96_000,
             integrated_lufs: Some(-7.0),
             loudness_profile: Arc::from([]),
+            spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
             summary: Arc::new(
                 radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                     &[0.1, 0.8, 0.2, 0.4],
@@ -10379,6 +10480,7 @@ mod tests {
                 render_frames: 48_000,
                 integrated_lufs: Some(-7.0),
                 loudness_profile: std::sync::Arc::from([]),
+                spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
                 summary: Arc::new(
                     radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                         &[0.1, 0.8, 0.2, 0.4],
@@ -10427,6 +10529,7 @@ mod tests {
                         lufs: -12.0,
                     },
                 ]),
+                spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
                 summary: Arc::new(
                     radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                         &[0.1, 0.8, 0.2, 0.4],
@@ -10466,6 +10569,7 @@ mod tests {
                 render_frames: 80,
                 integrated_lufs: Some(-8.0),
                 loudness_profile: std::sync::Arc::from([]),
+                spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
                 summary: Arc::new(
                     radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                         &[0.1, 0.8, 0.2, 0.4],
@@ -10491,6 +10595,7 @@ mod tests {
                         lufs: -12.0,
                     },
                 ]),
+                spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
                 summary: Arc::new(
                     radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                         &[0.1, 0.8, 0.2, 0.4],
@@ -10528,6 +10633,7 @@ mod tests {
             render_frames: 48_000,
             integrated_lufs: Some(-8.0),
             loudness_profile: std::sync::Arc::from([]),
+            spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
             summary: Arc::new(
                 radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                     &[0.1, 0.8, 0.2, 0.4],
@@ -10595,6 +10701,7 @@ mod tests {
             render_frames: 48_000,
             integrated_lufs: Some(-8.0),
             loudness_profile: std::sync::Arc::from([]),
+            spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
             summary: Arc::new(
                 radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                     &[0.1, 0.8, 0.2, 0.4],
@@ -10658,6 +10765,7 @@ mod tests {
             render_frames: 48_000,
             integrated_lufs: Some(-8.0),
             loudness_profile: std::sync::Arc::from([]),
+            spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
             summary: Arc::new(
                 radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                     &[0.1, 0.8, 0.2, 0.4],
@@ -10810,6 +10918,7 @@ mod tests {
             render_frames: 96_000,
             integrated_lufs: Some(-8.0),
             loudness_profile: std::sync::Arc::from([]),
+            spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
             summary: Arc::new(
                 radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                     &[0.1, 0.8, 0.2, 0.4],
@@ -10924,6 +11033,7 @@ mod tests {
             render_frames: 96_000,
             integrated_lufs: Some(-8.0),
             loudness_profile: std::sync::Arc::from([]),
+            spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
             summary: Arc::new(
                 radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                     &[0.1, 0.8, 0.2, 0.4],
@@ -11006,6 +11116,7 @@ mod tests {
             render_frames: 96_000,
             integrated_lufs: Some(-8.0),
             loudness_profile: std::sync::Arc::from([]),
+            spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
             summary: Arc::new(
                 radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                     &[0.1, 0.8, 0.2, 0.4],
@@ -11090,6 +11201,7 @@ mod tests {
             render_frames: 96_000,
             integrated_lufs: Some(-8.0),
             loudness_profile: std::sync::Arc::from([]),
+            spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
             summary: Arc::new(
                 radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                     &[0.1, 0.8, 0.2, 0.4],
@@ -11614,6 +11726,7 @@ mod tests {
             render_frames: 96_000,
             integrated_lufs: Some(-8.0),
             loudness_profile: std::sync::Arc::from([]),
+            spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
             summary: Arc::new(
                 radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                     &[0.1, 0.8, 0.2, 0.4],
@@ -11687,6 +11800,7 @@ mod tests {
             render_frames: 96_000,
             integrated_lufs: Some(-8.0),
             loudness_profile: std::sync::Arc::from([]),
+            spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
             summary: Arc::new(
                 radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                     &[0.1, 0.8, 0.2, 0.4],
@@ -12179,6 +12293,7 @@ mod tests {
                 render_frames: 96_000,
                 integrated_lufs: Some(-7.0),
                 loudness_profile: std::sync::Arc::from([]),
+                spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
                 summary: Arc::new(
                     radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                         &[0.1, 0.8, 0.2, 0.4],
@@ -12326,6 +12441,65 @@ mod tests {
     }
 
     #[test]
+    fn review_spectrogram_source_follows_audible_source_and_rejects_stale_data() {
+        let track_id = String::from("spectrogram-source-track");
+        let mut state = audition_state(&[track_id.as_str()]);
+        let waveform_with_value = |value: u8| {
+            let mut waveform = audition_waveform();
+            waveform.spectrogram = Arc::new(crate::audio::SpectrogramData {
+                column_count: 1,
+                values: Arc::from(
+                    vec![value; crate::audio::SPECTROGRAM_BAND_COUNT].into_boxed_slice(),
+                ),
+            });
+            waveform
+        };
+        state.waveform = Some(waveform_with_value(32));
+        state.waveform_track_id = Some(track_id.clone());
+        state.reference_waveform = Some(waveform_with_value(224));
+        state.reference_waveform_track_id = Some(track_id.clone());
+        let track = state
+            .library
+            .tracks
+            .first()
+            .cloned()
+            .expect("the audition fixture should contain a track");
+
+        let selected = super::review_spectrogram_source(&state, &track)
+            .map(|(source, waveform)| (source, waveform.spectrogram.value(0, 0)));
+        assert_eq!(selected, Some((AuditionSource::Main, 32)));
+
+        state.audition_source = AuditionSource::Reference;
+        let selected = super::review_spectrogram_source(&state, &track)
+            .map(|(source, waveform)| (source, waveform.spectrogram.value(0, 0)));
+        assert_eq!(selected, Some((AuditionSource::Reference, 224)));
+
+        state.audition_source = AuditionSource::Reference;
+        state.transport_playing = true;
+        state.reference_transport_playing = false;
+        assert_eq!(
+            super::review_spectrogram_source(&state, &track).map(|(source, _)| source),
+            Some(AuditionSource::Main)
+        );
+
+        state.transport_playing = false;
+        state.reference_transport_playing = true;
+        assert_eq!(
+            super::review_spectrogram_source(&state, &track).map(|(source, _)| source),
+            Some(AuditionSource::Reference)
+        );
+
+        state.reference_waveform_track_id = None;
+        assert_eq!(
+            super::review_spectrogram_source(&state, &track).map(|(source, _)| source),
+            Some(AuditionSource::Main)
+        );
+
+        state.waveform_track_id = Some(String::from("different-track"));
+        assert!(super::review_spectrogram_source(&state, &track).is_none());
+    }
+
+    #[test]
     fn selected_reference_track_projects_a_matching_waveform_below_the_main_review() {
         let track_id = String::from("reference-track");
         let waveform = WaveformData {
@@ -12335,6 +12509,12 @@ mod tests {
             render_frames: 96_000,
             integrated_lufs: Some(-8.0),
             loudness_profile: std::sync::Arc::from([]),
+            spectrogram: Arc::new(crate::audio::SpectrogramData {
+                column_count: 2,
+                values: Arc::from(
+                    vec![64_u8; 2 * crate::audio::SPECTROGRAM_BAND_COUNT].into_boxed_slice(),
+                ),
+            }),
             summary: Arc::new(
                 radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                     &[0.1, 0.8, 0.2, 0.4],
@@ -12347,8 +12527,17 @@ mod tests {
             busy: false,
             waveform: Some(waveform.clone()),
             waveform_track_id: Some(track_id.clone()),
-            reference_waveform: Some(waveform),
+            reference_waveform: Some(WaveformData {
+                spectrogram: Arc::new(crate::audio::SpectrogramData {
+                    column_count: 2,
+                    values: Arc::from(
+                        vec![220_u8; 2 * crate::audio::SPECTROGRAM_BAND_COUNT].into_boxed_slice(),
+                    ),
+                }),
+                ..waveform
+            }),
             reference_waveform_track_id: Some(track_id.clone()),
+            audition_source: AuditionSource::Reference,
             ..AppState::default()
         };
         state.library.selected_track_id = Some(track_id.clone());
@@ -12397,6 +12586,22 @@ mod tests {
             .filter(|primitive| matches!(primitive, PaintPrimitive::Svg(_)))
             .count();
         let labels = frame.paint_plan.text_label_strings();
+
+        assert!(
+            labels
+                .iter()
+                .any(|label| { label.starts_with("SPECTROGRAM · REFERENCE · reference.wav") }),
+            "the spectrogram should identify the audible reference source"
+        );
+        assert!(
+            frame.paint_plan.primitives.iter().any(|primitive| {
+                matches!(
+                    primitive,
+                    PaintPrimitive::FillRectBatch(batch) if batch.rects.len() >= 2
+                )
+            }),
+            "the spectrogram should paint batched heatmap cells"
+        );
 
         assert!(labels.iter().any(|label| label == "Replace reference"));
         assert!(paint_plan_contains_icon(
@@ -13212,6 +13417,7 @@ mod tests {
                 render_frames: 96_000,
                 integrated_lufs: Some(-7.0),
                 loudness_profile: Arc::from([]),
+                spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
                 summary: Arc::new(
                     radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                         &[0.1, 0.8, 0.2, 0.4],
@@ -13535,6 +13741,7 @@ mod tests {
             render_frames: 96_000,
             integrated_lufs: Some(-7.0),
             loudness_profile: Arc::from([]),
+            spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
             summary: Arc::new(
                 radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                     &[0.1, 0.8, 0.2, 0.4],
@@ -13800,6 +14007,7 @@ mod tests {
                 render_frames: 96_000,
                 integrated_lufs: Some(-7.0),
                 loudness_profile: Arc::from([]),
+                spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
                 summary: Arc::new(
                     radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                         &[0.1, 0.8, 0.2, 0.4],
@@ -14133,6 +14341,7 @@ mod tests {
             render_frames: 2,
             integrated_lufs: None,
             loudness_profile: Arc::from([]),
+            spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
             summary: Arc::new(
                 radiant::runtime::GpuSignalSummary::from_interleaved_samples(&[0.2, 0.4], 2, 1),
             ),
@@ -16591,6 +16800,7 @@ mod tests {
                 render_frames: 48_000,
                 integrated_lufs: Some(-7.0),
                 loudness_profile: Arc::from([]),
+                spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
                 summary: Arc::new(
                     radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                         &[0.0, 0.0, 0.0, 0.0],
@@ -16765,6 +16975,7 @@ mod tests {
                 render_frames: 48,
                 integrated_lufs: Some(-7.0),
                 loudness_profile: Arc::from([]),
+                spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
                 summary: Arc::new(
                     radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                         &[0.0, 0.0, 0.0, 0.0],
@@ -16781,6 +16992,7 @@ mod tests {
                 render_frames: 48_000,
                 integrated_lufs: Some(-7.0),
                 loudness_profile: Arc::from([]),
+                spectrogram: Arc::new(crate::audio::SpectrogramData::empty()),
                 summary: Arc::new(
                     radiant::runtime::GpuSignalSummary::from_interleaved_samples(
                         &[0.0, 0.0, 0.0, 0.0],
