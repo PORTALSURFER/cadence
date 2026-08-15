@@ -114,7 +114,11 @@ impl LiveSpectrogramFrame {
             revision,
             sample_rate,
             row_count,
-            packed_values: pack_u8_samples(&values),
+            // The validated history length is always a multiple of four
+            // because every row has 128 bands. The same immutable byte Arc
+            // can therefore be used directly by the storage buffer without
+            // a second full-history allocation and copy.
+            packed_values: Arc::clone(&values),
             values,
             spectrum_values,
             gpu_revision: NEXT_LIVE_GPU_REVISION.fetch_add(1, Ordering::Relaxed),
@@ -155,14 +159,6 @@ impl LiveSpectrogramFrame {
             && self.spectrum_values.len() == LIVE_SPECTROGRAM_BAND_COUNT
             && self.packed_values.len() == self.values.len().div_ceil(4) * 4
     }
-}
-
-fn pack_u8_samples(values: &[u8]) -> Arc<[u8]> {
-    // WGSL reads the storage words in little-endian byte order, so the
-    // quantized bytes are already the packed representation the shader needs.
-    let mut packed = vec![0_u8; values.len().div_ceil(4) * 4];
-    packed[..values.len()].copy_from_slice(values);
-    Arc::from(packed.into_boxed_slice())
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2362,6 +2358,7 @@ mod tests {
             &frame.packed_values()[..LIVE_SPECTROGRAM_BAND_COUNT],
             frame.values.as_ref()
         );
+        assert!(Arc::ptr_eq(frame.packed_values(), &frame.values));
     }
 
     #[test]

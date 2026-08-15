@@ -353,6 +353,7 @@ const TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER: f32 = 72.0;
 // the review panel while retaining enough height for the split waveform.
 const WAVEFORM_HEIGHT: f32 = 124.0;
 const REFERENCE_WAVEFORM_HEIGHT: f32 = WAVEFORM_HEIGHT;
+const DEFAULT_LIVE_SPECTROGRAM_DISPLAY_SAMPLE_RATE: u32 = 48_000;
 const LIVE_SPECTROGRAM_RESIZE_HANDLE_ID: u64 = 0xCAD3_2001;
 const LIVE_SPECTROGRAM_BODY_ID: u64 = 0xCAD3_2002;
 const LIVE_PLAYBACK_OVERLAY_KEY: u64 = 0xCAD3_2301;
@@ -1074,8 +1075,6 @@ fn frame_surface_revisions(state: &mut AppState) -> SurfaceRevisions {
         state.reference_waveform.is_some() as u64,
         state.waveform_busy as u64,
         state.reference_waveform_busy as u64,
-        state.live_spectrogram.is_some() as u64,
-        state.reference_live_spectrogram.is_some() as u64,
         selected_track.is_some_and(|track| track.reference_path.is_some()) as u64,
         state.draft_note.is_some() as u64,
         state.reference_draft_note.is_some() as u64,
@@ -1096,6 +1095,10 @@ fn frame_surface_revisions(state: &mut AppState) -> SurfaceRevisions {
         state.reference_transport_waiting_token.is_some() as u64,
         state.waveform_progress.map_or(0, f32::to_bits) as u64,
         state.reference_waveform_progress.map_or(0, f32::to_bits) as u64,
+        // The header changes when the first valid frame becomes available,
+        // but active frame revisions remain paint-only below.
+        state.live_spectrogram.is_some() as u64,
+        state.reference_live_spectrogram.is_some() as u64,
         // Active playback keeps live frames in the paint-only overlay. Once
         // playback is stopped, accepted frame revisions must reproject the
         // retained scene so the final analyzer rows are included.
@@ -1195,7 +1198,8 @@ fn paint_live_playback_overlay(
     let Some(track) = selected_track(state) else {
         return;
     };
-    let Some((_, frame)) = review_spectrogram_source(state, track) else {
+    let source = review_spectrogram_source(state);
+    let Some(frame) = current_live_frame_for_source(state, &track.id, source) else {
         return;
     };
     let Some(bounds) = context.plan.first_widget_rect(LIVE_SPECTROGRAM_BODY_ID) else {
@@ -8099,11 +8103,8 @@ fn current_live_frame_for_source(
     }
 }
 
-fn review_spectrogram_source(
-    state: &AppState,
-    track: &storage::Track,
-) -> Option<(AuditionSource, Arc<transport::LiveSpectrogramFrame>)> {
-    let source = if state.reference_only_playback {
+fn review_spectrogram_source(state: &AppState) -> AuditionSource {
+    if state.reference_only_playback {
         AuditionSource::Reference
     } else {
         match (state.transport_playing, state.reference_transport_playing) {
@@ -8111,13 +8112,53 @@ fn review_spectrogram_source(
             (false, true) => AuditionSource::Reference,
             (true, true) | (false, false) => state.audition_source,
         }
+    }
+}
+
+fn live_spectrogram_display_sample_rate(
+    state: &AppState,
+    track_id: &str,
+    source: AuditionSource,
+    frame: Option<&transport::LiveSpectrogramFrame>,
+) -> u32 {
+    if let Some(frame) = frame {
+        return frame.sample_rate;
+    }
+
+    // Before the analyzer publishes its first frame, match the selected
+    // source's decoded waveform metadata so the empty shell uses the source
+    // Nyquist range. Fall back to 48 kHz only when that metadata is unavailable.
+    let sample_rate = match source {
+        AuditionSource::Main => state
+            .waveform_track_id
+            .as_deref()
+            .filter(|id| *id == track_id)
+            .and(state.waveform.as_ref())
+            .map(|waveform| waveform.sample_rate),
+        AuditionSource::Reference => state
+            .reference_waveform_track_id
+            .as_deref()
+            .filter(|id| *id == track_id)
+            .and(state.reference_waveform.as_ref())
+            .map(|waveform| waveform.sample_rate),
     };
-    current_live_frame_for_source(state, &track.id, source).map(|frame| (source, frame))
+    sample_rate
+        .filter(|sample_rate| *sample_rate > 0)
+        .unwrap_or(DEFAULT_LIVE_SPECTROGRAM_DISPLAY_SAMPLE_RATE)
+}
+
+fn live_spectrogram_frame_for_review(
+    state: &AppState,
+    track: &storage::Track,
+) -> (AuditionSource, Option<Arc<transport::LiveSpectrogramFrame>>) {
+    let source = review_spectrogram_source(state);
+    let frame = current_live_frame_for_source(state, &track.id, source);
+    (source, frame)
 }
 
 fn live_spectrogram_section(state: &AppState, track: &storage::Track) -> ui::View<Message> {
-    let selected = review_spectrogram_source(state, track);
-    let label = selected.as_ref().map_or_else(
+    let (source, frame) = live_spectrogram_frame_for_review(state, track);
+    let label = frame.as_ref().map_or_else(
         || {
             if state.transport_playing
                 || state.reference_transport_playing
@@ -8132,7 +8173,7 @@ fn live_spectrogram_section(state: &AppState, track: &storage::Track) -> ui::Vie
                 String::from("LIVE SPECTROGRAM · WAITING FOR PLAYBACK")
             }
         },
-        |(source, frame)| {
+        |frame| {
             format!(
                 "LIVE SPECTROGRAM · {} · {} BANDS",
                 match source {
@@ -8144,28 +8185,15 @@ fn live_spectrogram_section(state: &AppState, track: &storage::Track) -> ui::Vie
         },
     );
     let body_height = spectrogram::clamp_height(state.live_spectrogram_height);
-    let body = selected.map_or_else(
-        || {
-            ui::column([
-                ui::text("Play a track to build the live frequency history.")
-                    .height(24.0)
-                    .fill_width(),
-                ui::text(
-                    "Low frequencies enter from the left; newest scanlines settle at the bottom.",
-                )
-                .wrap()
-                .height(30.0)
-                .fill_width()
-                .subtle(),
-            ])
-            .padding(10.0)
-            .spacing(4.0)
-            .fill_width()
-            .height(body_height)
-        },
-        |(_, frame)| spectrogram::view::<Message>(frame, state.live_spectrogram_mode, body_height),
-    );
-    let body = body.id(LIVE_SPECTROGRAM_BODY_ID);
+    let display_sample_rate =
+        live_spectrogram_display_sample_rate(state, &track.id, source, frame.as_deref());
+    let body = spectrogram::view::<Message>(
+        frame,
+        display_sample_rate,
+        state.live_spectrogram_mode,
+        body_height,
+    )
+    .id(LIVE_SPECTROGRAM_BODY_ID);
     let resize_handle = ui::panel_section_resize_header(
         "live-spectrogram-resize",
         spectrogram::RESIZE_HANDLE_HEIGHT,
@@ -9443,26 +9471,27 @@ fn plural(count: usize) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        APP_VERSION_LABEL, AppState, AuditionSource, FavoriteMarkerWidget, ImportBatchProgress,
-        LiveSpectrogramMode, LoopBounds, LoopSelection, LoopSelections, Message, NoteDraft,
-        PlannerInsertionTarget, REFERENCE_MENU_WIDTH, SETTINGS_REFERENCE_ROW_METADATA_HEIGHT,
-        SETTINGS_REFERENCE_ROW_TEXT_HEIGHT, SETTINGS_REFERENCE_ROW_TEXT_SPACING,
-        SETTINGS_REFERENCE_ROW_TITLE_HEIGHT, STATUS_BAR_VERSION_WIDTH, StatusMenuHost,
-        TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER, TRACK_CARD_SELECTED_CORAL, WAVEFORM_HEIGHT,
-        WorkspaceMode, animation_requested, apply_transport_snapshot, audition_panel,
-        audition_shuffle_seed, audition_statuses, current_loudness_match_gain_db,
-        current_lufs_meter_value, current_reference_lufs_meter_value, decode_result_is_current,
-        deterministic_shuffle, enforce_loop, favorite_toggle, frame_surface_revisions,
-        library_track_title_id, live_frame_matches_current_session, loop_bounds, main_output_gain,
-        native_launch_options, note_editor, note_ratio_for_id, planner_insertion_target_is_valid,
-        playback_shortcut, project_surface, rebuild_audition_queue, reconcile_audition_queue,
-        reference_decode_result_is_current, reference_output_gain,
-        reference_settings_auxiliary_windows, reference_settings_window_view,
-        refresh_live_spectrogram, refresh_live_spectrograms, review_spectrogram_source,
-        review_status_filter_message, selected_reference_notes, selected_track, stage_dropdown,
-        stage_menu_anchor_from_pointer, stage_menu_popover, status_dropdown_for_host,
-        status_filter_dropdown, sync_audition_queue_after_status_change, tracks_in_stage,
-        tracks_with_status, transport_command_is_confirmed, update,
+        APP_VERSION_LABEL, AppState, AuditionSource, DEFAULT_LIVE_SPECTROGRAM_DISPLAY_SAMPLE_RATE,
+        FavoriteMarkerWidget, ImportBatchProgress, LiveSpectrogramMode, LoopBounds, LoopSelection,
+        LoopSelections, Message, NoteDraft, PlannerInsertionTarget, REFERENCE_MENU_WIDTH,
+        SETTINGS_REFERENCE_ROW_METADATA_HEIGHT, SETTINGS_REFERENCE_ROW_TEXT_HEIGHT,
+        SETTINGS_REFERENCE_ROW_TEXT_SPACING, SETTINGS_REFERENCE_ROW_TITLE_HEIGHT,
+        STATUS_BAR_VERSION_WIDTH, StatusMenuHost, TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER,
+        TRACK_CARD_SELECTED_CORAL, WAVEFORM_HEIGHT, WorkspaceMode, animation_requested,
+        apply_transport_snapshot, audition_panel, audition_shuffle_seed, audition_statuses,
+        current_live_frame_for_source, current_loudness_match_gain_db, current_lufs_meter_value,
+        current_reference_lufs_meter_value, decode_result_is_current, deterministic_shuffle,
+        enforce_loop, favorite_toggle, frame_surface_revisions, library_track_title_id,
+        live_frame_matches_current_session, live_spectrogram_display_sample_rate, loop_bounds,
+        main_output_gain, native_launch_options, note_editor, note_ratio_for_id,
+        planner_insertion_target_is_valid, playback_shortcut, project_surface,
+        rebuild_audition_queue, reconcile_audition_queue, reference_decode_result_is_current,
+        reference_output_gain, reference_settings_auxiliary_windows,
+        reference_settings_window_view, refresh_live_spectrogram, refresh_live_spectrograms,
+        review_spectrogram_source, review_status_filter_message, selected_reference_notes,
+        selected_track, stage_dropdown, stage_menu_anchor_from_pointer, stage_menu_popover,
+        status_dropdown_for_host, status_filter_dropdown, sync_audition_queue_after_status_change,
+        tracks_in_stage, tracks_with_status, transport_command_is_confirmed, update,
     };
     use crate::transport::{LiveFrameState, Snapshot};
     use crate::{
@@ -9662,27 +9691,50 @@ mod tests {
         state.transport_playing = true;
         state.reference_transport_playing = false;
         state.audition_source = AuditionSource::Main;
-        assert_eq!(
-            review_spectrogram_source(&state, &track).map(|(source, _)| source),
-            Some(AuditionSource::Main)
-        );
+        assert_eq!(review_spectrogram_source(&state), AuditionSource::Main);
 
         state.live_spectrogram = None;
         state.live_spectrogram_revision = 0;
-        assert!(review_spectrogram_source(&state, &track).is_none());
+        assert_eq!(review_spectrogram_source(&state), AuditionSource::Main);
+        assert!(current_live_frame_for_source(&state, &track.id, AuditionSource::Main).is_none());
 
         state.transport_playing = false;
         state.reference_transport_playing = true;
         state.audition_source = AuditionSource::Reference;
-        assert_eq!(
-            review_spectrogram_source(&state, &track).map(|(source, _)| source),
-            Some(AuditionSource::Reference)
-        );
+        assert_eq!(review_spectrogram_source(&state), AuditionSource::Reference);
 
         state.transport_playing = true;
         state.reference_transport_playing = true;
         state.audition_source = AuditionSource::Main;
-        assert!(review_spectrogram_source(&state, &track).is_none());
+        assert_eq!(review_spectrogram_source(&state), AuditionSource::Main);
+        assert!(current_live_frame_for_source(&state, &track.id, AuditionSource::Main).is_none());
+    }
+
+    #[test]
+    fn live_spectrogram_display_sample_rate_uses_matching_metadata_until_frame_arrives() {
+        let mut state = audition_state(&["main"]);
+        let track = selected_track(&state).expect("selected test track").clone();
+        state.waveform.as_mut().expect("main waveform").sample_rate = 22_050;
+
+        assert_eq!(
+            live_spectrogram_display_sample_rate(&state, &track.id, AuditionSource::Main, None,),
+            22_050
+        );
+        assert_eq!(
+            live_spectrogram_display_sample_rate(
+                &state,
+                &track.id,
+                AuditionSource::Main,
+                Some(live_frame(0, 0, 1).as_ref()),
+            ),
+            48_000
+        );
+
+        state.waveform_track_id = Some(String::from("other"));
+        assert_eq!(
+            live_spectrogram_display_sample_rate(&state, &track.id, AuditionSource::Main, None,),
+            DEFAULT_LIVE_SPECTROGRAM_DISPLAY_SAMPLE_RATE
+        );
     }
 
     #[test]
@@ -9817,7 +9869,7 @@ mod tests {
         ));
         state.transport_playing = true;
         let track = selected_track(&state).expect("selected test track").clone();
-        assert!(review_spectrogram_source(&state, &track).is_some());
+        assert!(current_live_frame_for_source(&state, &track.id, AuditionSource::Main).is_some());
     }
 
     #[test]
@@ -11685,7 +11737,9 @@ mod tests {
                 .is_none()
         );
         let track = selected_track(&state).expect("the paired state should have a track");
-        assert!(review_spectrogram_source(&state, track).is_none());
+        assert!(
+            current_live_frame_for_source(&state, &track.id, AuditionSource::Reference).is_none()
+        );
     }
 
     #[test]
@@ -11756,7 +11810,7 @@ mod tests {
             Some(Arc::clone(&reference_frame))
         );
         let track = selected_track(&state).expect("the paired state should have a track");
-        assert!(review_spectrogram_source(&state, track).is_none());
+        assert!(current_live_frame_for_source(&state, &track.id, AuditionSource::Main).is_none());
     }
 
     #[test]
