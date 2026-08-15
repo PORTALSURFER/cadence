@@ -710,6 +710,178 @@ impl Widget for SpectrogramWidget {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OverlayRectKey {
+    min_x: u32,
+    min_y: u32,
+    max_x: u32,
+    max_y: u32,
+}
+
+impl OverlayRectKey {
+    fn from_rect(rect: Rect) -> Self {
+        Self {
+            min_x: rect.min.x.to_bits(),
+            min_y: rect.min.y.to_bits(),
+            max_x: rect.max.x.to_bits(),
+            max_y: rect.max.y.to_bits(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SpectrogramOverlayThemeKey {
+    bg_primary: Rgba8,
+    surface_overlay: Rgba8,
+    border: Rgba8,
+    text_muted: Rgba8,
+    border_emphasis: Rgba8,
+    highlight_orange: Rgba8,
+}
+
+impl SpectrogramOverlayThemeKey {
+    fn from_theme(theme: &ThemeTokens) -> Self {
+        Self {
+            bg_primary: theme.bg_primary,
+            surface_overlay: theme.surface_overlay,
+            border: theme.border,
+            text_muted: theme.text_muted,
+            border_emphasis: theme.border_emphasis,
+            highlight_orange: theme.highlight_orange,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SpectrogramOverlayPaintCacheKey {
+    frame: Arc<LiveSpectrogramFrame>,
+    mode: crate::LiveSpectrogramMode,
+    outer_bounds: OverlayRectKey,
+    plot_bounds: OverlayRectKey,
+    theme: SpectrogramOverlayThemeKey,
+}
+
+impl SpectrogramOverlayPaintCacheKey {
+    fn new(
+        frame: Arc<LiveSpectrogramFrame>,
+        mode: crate::LiveSpectrogramMode,
+        outer_bounds: Rect,
+        plot_bounds: Rect,
+        theme: &ThemeTokens,
+    ) -> Self {
+        Self {
+            frame,
+            mode,
+            outer_bounds: OverlayRectKey::from_rect(outer_bounds),
+            plot_bounds: OverlayRectKey::from_rect(plot_bounds),
+            theme: SpectrogramOverlayThemeKey::from_theme(theme),
+        }
+    }
+
+    fn matches(
+        &self,
+        frame: &Arc<LiveSpectrogramFrame>,
+        mode: crate::LiveSpectrogramMode,
+        outer_bounds: Rect,
+        plot_bounds: Rect,
+        theme: &ThemeTokens,
+    ) -> bool {
+        Arc::ptr_eq(&self.frame, frame)
+            && self.mode == mode
+            && self.outer_bounds == OverlayRectKey::from_rect(outer_bounds)
+            && self.plot_bounds == OverlayRectKey::from_rect(plot_bounds)
+            && self.theme == SpectrogramOverlayThemeKey::from_theme(theme)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SpectrogramOverlayPaintCacheEntry {
+    key: SpectrogramOverlayPaintCacheKey,
+    primitives: Arc<[PaintPrimitive]>,
+}
+
+/// Bounded, presentation-local replay storage for one live spectrogram overlay.
+///
+/// The transient compositor clears its primitive list every frame, so cache hits
+/// always clone the complete immutable sequence back into the current output.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SpectrogramOverlayPaintCache {
+    entry: Option<SpectrogramOverlayPaintCacheEntry>,
+    #[cfg(test)]
+    rebuild_count: usize,
+}
+
+impl SpectrogramOverlayPaintCache {
+    fn paint(
+        &mut self,
+        frame: Option<Arc<LiveSpectrogramFrame>>,
+        mode: crate::LiveSpectrogramMode,
+        bounds: Rect,
+        primitives: &mut Vec<PaintPrimitive>,
+        theme: &ThemeTokens,
+    ) {
+        let Some(frame) = frame else {
+            self.entry = None;
+            return;
+        };
+        if !bounds.has_finite_positive_area() {
+            return;
+        }
+
+        let plot = SpectrogramWidget::plot_rect(bounds);
+        if !plot.is_finite() {
+            let display_sample_rate = frame.sample_rate;
+            SpectrogramWidget::new_with_id(
+                LIVE_SPECTROGRAM_OVERLAY_WIDGET_ID,
+                Some(frame),
+                display_sample_rate,
+                mode,
+            )
+            .append_overlay_paint(primitives, bounds, theme);
+            return;
+        }
+
+        if let Some(entry) = self.entry.as_ref()
+            && entry.key.matches(&frame, mode, bounds, plot, theme)
+        {
+            primitives.extend(entry.primitives.iter().cloned());
+            return;
+        }
+
+        let display_sample_rate = frame.sample_rate;
+        let mut built = Vec::new();
+        SpectrogramWidget::new_with_id(
+            LIVE_SPECTROGRAM_OVERLAY_WIDGET_ID,
+            Some(frame.clone()),
+            display_sample_rate,
+            mode,
+        )
+        .append_overlay_paint(&mut built, bounds, theme);
+        let entry = SpectrogramOverlayPaintCacheEntry {
+            key: SpectrogramOverlayPaintCacheKey::new(frame, mode, bounds, plot, theme),
+            primitives: Arc::from(built.into_boxed_slice()),
+        };
+        #[cfg(test)]
+        {
+            self.rebuild_count += 1;
+        }
+        self.entry = Some(entry);
+        primitives.extend(
+            self.entry
+                .as_ref()
+                .expect("spectrogram overlay cache entry was just stored")
+                .primitives
+                .iter()
+                .cloned(),
+        );
+    }
+
+    #[cfg(test)]
+    fn rebuild_count(&self) -> usize {
+        self.rebuild_count
+    }
+}
+
 fn overlay_stripe_budget(plot_height: f32) -> usize {
     if !plot_height.is_finite() {
         return 1;
@@ -785,26 +957,22 @@ pub fn view<Message: 'static>(
 /// Paint the current live frame over the retained review surface using only
 /// primitives that the native transient compositor can replay after the base
 /// scene's GPU surfaces.
-pub fn paint_overlay(
-    frame: Arc<LiveSpectrogramFrame>,
+pub(crate) fn paint_overlay(
+    cache: &mut SpectrogramOverlayPaintCache,
+    frame: Option<Arc<LiveSpectrogramFrame>>,
     mode: crate::LiveSpectrogramMode,
     bounds: Rect,
     primitives: &mut Vec<PaintPrimitive>,
     theme: &ThemeTokens,
 ) {
-    let display_sample_rate = frame.sample_rate;
-    let widget = SpectrogramWidget::new_with_id(
-        LIVE_SPECTROGRAM_OVERLAY_WIDGET_ID,
-        Some(frame),
-        display_sample_rate,
-        mode,
-    );
-    widget.append_overlay_paint(primitives, bounds, theme);
+    cache.paint(frame, mode, bounds, primitives, theme);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{SPECTRUM_PLOT_BACKGROUND, SpectrogramWidget};
+    use super::{
+        SPECTRUM_PLOT_BACKGROUND, SpectrogramOverlayPaintCache, SpectrogramWidget, paint_overlay,
+    };
     use crate::LiveSpectrogramMode;
     use crate::transport::{
         LIVE_SPECTROGRAM_BAND_COUNT, LIVE_SPECTROGRAM_MAX_HISTORY, LiveSpectrogramFrame,
@@ -838,6 +1006,22 @@ mod tests {
             )
             .expect("valid live spectrogram test frame"),
         )
+    }
+
+    fn overlay_bounds() -> Rect {
+        Rect::from_min_size(Point::new(0.0, 0.0), Vector2::new(720.0, super::HEIGHT))
+    }
+
+    fn cached_overlay(
+        cache: &mut SpectrogramOverlayPaintCache,
+        frame: Option<Arc<LiveSpectrogramFrame>>,
+        mode: LiveSpectrogramMode,
+        bounds: Rect,
+        theme: &ThemeTokens,
+    ) -> Vec<PaintPrimitive> {
+        let mut primitives = Vec::new();
+        paint_overlay(cache, frame, mode, bounds, &mut primitives, theme);
+        primitives
     }
 
     #[test]
@@ -1025,6 +1209,246 @@ mod tests {
             .sum::<usize>();
         let plot = SpectrogramWidget::plot_rect(bounds);
         assert_eq!(batched_rects, super::overlay_stripe_budget(plot.height()));
+    }
+
+    #[test]
+    fn overlay_cache_reuses_waterfall_batches_for_same_frame() {
+        let frame = test_frame();
+        let bounds = overlay_bounds();
+        let theme = ThemeTokens::default();
+        let mut cache = SpectrogramOverlayPaintCache::default();
+
+        let first = cached_overlay(
+            &mut cache,
+            Some(frame.clone()),
+            LiveSpectrogramMode::Waterfall,
+            bounds,
+            &theme,
+        );
+        let second = cached_overlay(
+            &mut cache,
+            Some(frame),
+            LiveSpectrogramMode::Waterfall,
+            bounds,
+            &theme,
+        );
+
+        assert_eq!(cache.rebuild_count(), 1);
+        assert_eq!(first, second);
+        let fresh = {
+            let mut primitives = Vec::new();
+            SpectrogramWidget::new_with_id(
+                super::LIVE_SPECTROGRAM_OVERLAY_WIDGET_ID,
+                Some(test_frame()),
+                48_000,
+                LiveSpectrogramMode::Waterfall,
+            )
+            .append_overlay_paint(&mut primitives, bounds, &theme);
+            primitives
+        };
+        assert_eq!(first, fresh);
+
+        let first_batch = first.iter().find_map(|primitive| match primitive {
+            PaintPrimitive::FillRectBatch(batch) => Some(batch),
+            _ => None,
+        });
+        let second_batch = second.iter().find_map(|primitive| match primitive {
+            PaintPrimitive::FillRectBatch(batch) => Some(batch),
+            _ => None,
+        });
+        let (Some(first_batch), Some(second_batch)) = (first_batch, second_batch) else {
+            panic!("waterfall overlay should contain a rectangle batch");
+        };
+        assert!(Arc::ptr_eq(&first_batch.rects, &second_batch.rects));
+    }
+
+    #[test]
+    fn overlay_cache_reuses_spectrum_polygon_for_same_frame() {
+        let frame = test_frame();
+        let bounds = overlay_bounds();
+        let theme = ThemeTokens::default();
+        let mut cache = SpectrogramOverlayPaintCache::default();
+
+        let first = cached_overlay(
+            &mut cache,
+            Some(frame.clone()),
+            LiveSpectrogramMode::Spectrum,
+            bounds,
+            &theme,
+        );
+        let second = cached_overlay(
+            &mut cache,
+            Some(frame),
+            LiveSpectrogramMode::Spectrum,
+            bounds,
+            &theme,
+        );
+
+        assert_eq!(cache.rebuild_count(), 1);
+        assert_eq!(first, second);
+        let fresh = {
+            let mut primitives = Vec::new();
+            SpectrogramWidget::new_with_id(
+                super::LIVE_SPECTROGRAM_OVERLAY_WIDGET_ID,
+                Some(test_frame()),
+                48_000,
+                LiveSpectrogramMode::Spectrum,
+            )
+            .append_overlay_paint(&mut primitives, bounds, &theme);
+            primitives
+        };
+        assert_eq!(first, fresh);
+
+        let first_polygon = first.iter().find_map(|primitive| match primitive {
+            PaintPrimitive::FillPolygon(polygon) => Some(polygon),
+            _ => None,
+        });
+        let second_polygon = second.iter().find_map(|primitive| match primitive {
+            PaintPrimitive::FillPolygon(polygon) => Some(polygon),
+            _ => None,
+        });
+        let (Some(first_polygon), Some(second_polygon)) = (first_polygon, second_polygon) else {
+            panic!("spectrum overlay should contain a polygon");
+        };
+        assert!(Arc::ptr_eq(&first_polygon.points, &second_polygon.points));
+    }
+
+    #[test]
+    fn overlay_cache_misses_for_distinct_equal_metadata_frames() {
+        let frame = test_frame();
+        let distinct_frame = Arc::new((*frame).clone());
+        assert!(!Arc::ptr_eq(&frame, &distinct_frame));
+        let theme = ThemeTokens::default();
+        let mut cache = SpectrogramOverlayPaintCache::default();
+
+        cached_overlay(
+            &mut cache,
+            Some(frame),
+            LiveSpectrogramMode::Waterfall,
+            overlay_bounds(),
+            &theme,
+        );
+        cached_overlay(
+            &mut cache,
+            Some(distinct_frame),
+            LiveSpectrogramMode::Waterfall,
+            overlay_bounds(),
+            &theme,
+        );
+
+        assert_eq!(cache.rebuild_count(), 2);
+    }
+
+    #[test]
+    fn overlay_cache_misses_for_mode_bounds_and_style_changes() {
+        let frame = test_frame();
+        let bounds = overlay_bounds();
+        let resized_bounds =
+            Rect::from_min_size(Point::new(0.0, 0.0), Vector2::new(720.0, super::MIN_HEIGHT));
+        let theme = ThemeTokens::default();
+        let mut changed_theme = theme;
+        changed_theme.highlight_orange = changed_theme.highlight_orange.with_alpha(254);
+        let mut cache = SpectrogramOverlayPaintCache::default();
+
+        cached_overlay(
+            &mut cache,
+            Some(frame.clone()),
+            LiveSpectrogramMode::Waterfall,
+            bounds,
+            &theme,
+        );
+        cached_overlay(
+            &mut cache,
+            Some(frame.clone()),
+            LiveSpectrogramMode::Spectrum,
+            bounds,
+            &theme,
+        );
+        cached_overlay(
+            &mut cache,
+            Some(frame.clone()),
+            LiveSpectrogramMode::Spectrum,
+            resized_bounds,
+            &theme,
+        );
+        cached_overlay(
+            &mut cache,
+            Some(frame),
+            LiveSpectrogramMode::Spectrum,
+            resized_bounds,
+            &changed_theme,
+        );
+
+        assert_eq!(cache.rebuild_count(), 4);
+    }
+
+    #[test]
+    fn absent_frame_does_not_replay_stale_overlay_data() {
+        let frame = test_frame();
+        let bounds = overlay_bounds();
+        let theme = ThemeTokens::default();
+        let mut cache = SpectrogramOverlayPaintCache::default();
+
+        let first = cached_overlay(
+            &mut cache,
+            Some(frame.clone()),
+            LiveSpectrogramMode::Spectrum,
+            bounds,
+            &theme,
+        );
+        assert!(!first.is_empty());
+
+        let absent = cached_overlay(
+            &mut cache,
+            None,
+            LiveSpectrogramMode::Spectrum,
+            bounds,
+            &theme,
+        );
+        assert!(absent.is_empty());
+        assert_eq!(cache.rebuild_count(), 1);
+
+        cached_overlay(
+            &mut cache,
+            Some(frame),
+            LiveSpectrogramMode::Spectrum,
+            bounds,
+            &theme,
+        );
+        assert_eq!(cache.rebuild_count(), 2);
+    }
+
+    #[test]
+    fn overlay_cache_replaces_its_single_entry() {
+        let first_frame = test_frame();
+        let second_frame = Arc::new((*first_frame).clone());
+        let bounds = overlay_bounds();
+        let theme = ThemeTokens::default();
+        let mut cache = SpectrogramOverlayPaintCache::default();
+
+        cached_overlay(
+            &mut cache,
+            Some(first_frame.clone()),
+            LiveSpectrogramMode::Spectrum,
+            bounds,
+            &theme,
+        );
+        cached_overlay(
+            &mut cache,
+            Some(second_frame),
+            LiveSpectrogramMode::Spectrum,
+            bounds,
+            &theme,
+        );
+        cached_overlay(
+            &mut cache,
+            Some(first_frame),
+            LiveSpectrogramMode::Spectrum,
+            bounds,
+            &theme,
+        );
+
+        assert_eq!(cache.rebuild_count(), 3);
     }
 
     #[test]

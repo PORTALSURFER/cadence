@@ -816,6 +816,7 @@ struct AppState {
     live_spectrogram_revision: u64,
     live_spectrogram_mode: LiveSpectrogramMode,
     live_spectrogram_height: f32,
+    live_spectrogram_overlay_cache: spectrogram::SpectrogramOverlayPaintCache,
     live_spectrogram_resize: Option<LiveSpectrogramResize>,
     reference_waveform: Option<audio::WaveformData>,
     reference_waveform_track_id: Option<String>,
@@ -931,6 +932,7 @@ impl Default for AppState {
             live_spectrogram_revision: 0,
             live_spectrogram_mode: LiveSpectrogramMode::Waterfall,
             live_spectrogram_height: spectrogram::HEIGHT,
+            live_spectrogram_overlay_cache: spectrogram::SpectrogramOverlayPaintCache::default(),
             live_spectrogram_resize: None,
             reference_waveform: None,
             reference_waveform_track_id: None,
@@ -1195,19 +1197,18 @@ fn paint_live_playback_overlay(
         );
     }
 
-    let Some(track) = selected_track(state) else {
-        return;
-    };
-    let source = review_spectrogram_source(state);
-    let Some(frame) = current_live_frame_for_source(state, &track.id, source) else {
-        return;
-    };
+    let frame = selected_track(state).and_then(|track| {
+        let source = review_spectrogram_source(state);
+        current_live_frame_for_source(state, &track.id, source)
+    });
     let Some(bounds) = context.plan.first_widget_rect(LIVE_SPECTROGRAM_BODY_ID) else {
         return;
     };
+    let mode = state.live_spectrogram_mode;
     spectrogram::paint_overlay(
+        &mut state.live_spectrogram_overlay_cache,
         frame,
-        state.live_spectrogram_mode,
+        mode,
         bounds,
         primitives,
         &theme,
