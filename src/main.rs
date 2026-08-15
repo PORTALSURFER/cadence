@@ -138,6 +138,7 @@ enum Message {
     TogglePlayback,
     StopPlayback,
     ToggleLiveSpectrogramMode,
+    SetLiveSpectrogramHistoryScale(f32),
     ResizeLiveSpectrogram(ui::DragHandleMessage),
     NewNoteAtCurrentTime,
     AuditionPlay,
@@ -815,6 +816,7 @@ struct AppState {
     live_spectrogram: Option<Arc<transport::LiveSpectrogramFrame>>,
     live_spectrogram_revision: u64,
     live_spectrogram_mode: LiveSpectrogramMode,
+    live_spectrogram_history_scale: f32,
     live_spectrogram_height: f32,
     live_spectrogram_overlay_cache: spectrogram::SpectrogramOverlayPaintCache,
     live_spectrogram_resize: Option<LiveSpectrogramResize>,
@@ -931,6 +933,7 @@ impl Default for AppState {
             live_spectrogram: None,
             live_spectrogram_revision: 0,
             live_spectrogram_mode: LiveSpectrogramMode::Waterfall,
+            live_spectrogram_history_scale: spectrogram::DEFAULT_HISTORY_SCALE,
             live_spectrogram_height: spectrogram::HEIGHT,
             live_spectrogram_overlay_cache: spectrogram::SpectrogramOverlayPaintCache::default(),
             live_spectrogram_resize: None,
@@ -1106,6 +1109,7 @@ fn frame_surface_revisions(state: &mut AppState) -> SurfaceRevisions {
         // retained scene so the final analyzer rows are included.
         retained_live_spectrogram_revision(state),
         state.live_spectrogram_mode as u64,
+        spectrogram::clamp_history_scale(state.live_spectrogram_history_scale).to_bits() as u64,
         state.audition_source as u64,
         state.audition_queue_index as u64,
         state.audition_auto_advance as u64,
@@ -1209,6 +1213,7 @@ fn paint_live_playback_overlay(
         &mut state.live_spectrogram_overlay_cache,
         frame,
         mode,
+        state.live_spectrogram_history_scale,
         bounds,
         primitives,
         &theme,
@@ -2113,6 +2118,10 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
         }
         Message::ToggleLiveSpectrogramMode => {
             state.live_spectrogram_mode = state.live_spectrogram_mode.toggled();
+            context.request_repaint();
+        }
+        Message::SetLiveSpectrogramHistoryScale(scale) => {
+            state.live_spectrogram_history_scale = spectrogram::clamp_history_scale(scale);
             context.request_repaint();
         }
         Message::ResizeLiveSpectrogram(message) => {
@@ -8193,6 +8202,7 @@ fn live_spectrogram_section(state: &AppState, track: &storage::Track) -> ui::Vie
         display_sample_rate,
         state.live_spectrogram_mode,
         body_height,
+        state.live_spectrogram_history_scale,
     )
     .id(LIVE_SPECTROGRAM_BODY_ID);
     let resize_handle = ui::panel_section_resize_header(
@@ -8212,12 +8222,28 @@ fn live_spectrogram_section(state: &AppState, track: &storage::Track) -> ui::Vie
         .tooltip("Toggle live waterfall / spectrum view")
         .width(82.0)
         .height(LIVE_SPECTROGRAM_HEADER_HEIGHT);
+    let history_scale_slider = ui::slider(spectrogram::history_scale_to_normalized(
+        state.live_spectrogram_history_scale,
+    ))
+    .subtle()
+    .compact()
+    .track_height(4.0)
+    .message(|normalized| {
+        Message::SetLiveSpectrogramHistoryScale(spectrogram::history_scale_from_normalized(
+            normalized,
+        ))
+    })
+    .key("Waterfall history scale")
+    .tooltip("Waterfall history scale")
+    .width(92.0)
+    .height(LIVE_SPECTROGRAM_HEADER_HEIGHT);
     let header = ui::row([
         ui::spacer().fill_width(),
         ui::text(label)
             .style(ui::WidgetStyle::strong(ui::WidgetTone::Neutral))
             .height(LIVE_SPECTROGRAM_HEADER_HEIGHT)
             .align_text(ui::TextAlign::Right),
+        history_scale_slider,
         mode_toggle,
     ])
     .spacing(8.0)
@@ -9653,7 +9679,7 @@ mod tests {
                 48_000,
                 1,
                 Arc::from(vec![64_u8; transport::LIVE_SPECTROGRAM_BAND_COUNT].into_boxed_slice()),
-                Arc::from(vec![64_u8; transport::LIVE_SPECTROGRAM_BAND_COUNT].into_boxed_slice()),
+                Arc::from(vec![64_u8; transport::LIVE_SPECTRUM_POINT_COUNT].into_boxed_slice()),
             )
             .expect("valid live spectrogram test frame"),
         )
@@ -9919,6 +9945,53 @@ mod tests {
     }
 
     #[test]
+    fn live_spectrogram_history_scale_defaults_clamps_and_requests_repaint() {
+        let mut state = AppState::default();
+        assert_eq!(
+            state.live_spectrogram_history_scale,
+            super::spectrogram::DEFAULT_HISTORY_SCALE
+        );
+
+        let before = frame_surface_revisions(&mut state);
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::SetLiveSpectrogramHistoryScale(5.0),
+            &mut context,
+        );
+        assert_eq!(
+            state.live_spectrogram_history_scale,
+            super::spectrogram::MAX_HISTORY_SCALE
+        );
+        assert_eq!(
+            context.into_command().repaint_scope(),
+            Some(RepaintScope::Surface)
+        );
+
+        let after = frame_surface_revisions(&mut state);
+        assert_eq!(
+            after.repaint_scope_since(before),
+            RepaintScope::Projection,
+            "history scale changes projection but not layout"
+        );
+
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::SetLiveSpectrogramHistoryScale(f32::NAN),
+            &mut context,
+        );
+        assert_eq!(
+            state.live_spectrogram_history_scale,
+            super::spectrogram::DEFAULT_HISTORY_SCALE
+        );
+        assert_eq!(
+            context.into_command().repaint_scope(),
+            Some(RepaintScope::Surface)
+        );
+    }
+
+    #[test]
     fn live_spectrogram_resize_clamps_and_clears_drag_lifecycle() {
         let mut state = AppState::default();
         let mut context = ui::UiUpdateContext::default();
@@ -9996,6 +10069,23 @@ mod tests {
         let labels = frame.paint_plan.text_label_strings();
 
         assert!(labels.iter().any(|label| label == "SPECTRUM"));
+    }
+
+    #[test]
+    fn live_spectrogram_history_scale_slider_is_present_in_both_modes() {
+        for mode in [
+            LiveSpectrogramMode::Waterfall,
+            LiveSpectrogramMode::Spectrum,
+        ] {
+            let mut state = audition_state(&["main"]);
+            state.live_spectrogram_mode = mode;
+            let frame = project_surface(&state)
+                .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1100.0));
+
+            assert!(frame.layout.rects.values().any(|rect| {
+                (rect.width() - 92.0).abs() < 0.01 && (rect.height() - 22.0).abs() < 0.01
+            }));
+        }
     }
 
     fn focus_request_id(command: &radiant::runtime::Command<Message>) -> Option<u64> {

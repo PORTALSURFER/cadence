@@ -27,6 +27,7 @@ pub const DEFAULT_VOLUME: f32 = 0.8;
 pub const MAX_OUTPUT_GAIN: f32 = 16.0;
 
 pub const LIVE_SPECTROGRAM_BAND_COUNT: usize = 128;
+pub const LIVE_SPECTRUM_POINT_COUNT: usize = 768;
 pub const LIVE_SPECTROGRAM_MAX_HISTORY: usize = 192;
 
 const LIVE_CAPTURE_RING_CAPACITY: usize = 16_384;
@@ -39,8 +40,8 @@ pub(crate) const LIVE_SPECTRUM_DISPLAY_FLOOR_DB: f32 = -90.0;
 pub(crate) const LIVE_SPECTRUM_DISPLAY_CEILING_DB: f32 = 0.0;
 pub(crate) const LIVE_SPECTRUM_DISPLAY_TILT_DB_PER_OCTAVE: f32 = 4.5;
 pub(crate) const LIVE_SPECTRUM_DISPLAY_TILT_REFERENCE_FREQUENCY: f32 = 1_000.0;
-const LIVE_SPECTRUM_ATTACK_TIME: Duration = Duration::from_millis(60);
-const LIVE_SPECTRUM_RELEASE_TIME: Duration = Duration::from_millis(240);
+const LIVE_SPECTRUM_ATTACK_TIME: Duration = Duration::from_millis(30);
+const LIVE_SPECTRUM_RELEASE_TIME: Duration = Duration::from_millis(160);
 // The analyzer still consumes every captured frame and emits FFT rows at the
 // configured hop. The UI only needs a stable presentation cadence; keeping
 // publication at 30 Hz prevents a full retained-app rebuild and GPU storage
@@ -71,7 +72,7 @@ impl LiveSpectrogramFrame {
         sample_rate: u32,
         rows: &[[u8; LIVE_SPECTROGRAM_BAND_COUNT]; LIVE_SPECTROGRAM_MAX_HISTORY],
         row_count: usize,
-        spectrum_values: &[u8; LIVE_SPECTROGRAM_BAND_COUNT],
+        spectrum_values: &[u8; LIVE_SPECTRUM_POINT_COUNT],
     ) -> Option<Self> {
         if sample_rate == 0 || row_count == 0 || row_count > LIVE_SPECTROGRAM_MAX_HISTORY {
             return None;
@@ -104,7 +105,7 @@ impl LiveSpectrogramFrame {
             || row_count == 0
             || row_count > LIVE_SPECTROGRAM_MAX_HISTORY
             || values.len() != row_count * LIVE_SPECTROGRAM_BAND_COUNT
-            || spectrum_values.len() != LIVE_SPECTROGRAM_BAND_COUNT
+            || spectrum_values.len() != LIVE_SPECTRUM_POINT_COUNT
         {
             return None;
         }
@@ -156,7 +157,7 @@ impl LiveSpectrogramFrame {
             && self.row_count > 0
             && self.row_count <= LIVE_SPECTROGRAM_MAX_HISTORY
             && self.values.len() == self.row_count * LIVE_SPECTROGRAM_BAND_COUNT
-            && self.spectrum_values.len() == LIVE_SPECTROGRAM_BAND_COUNT
+            && self.spectrum_values.len() == LIVE_SPECTRUM_POINT_COUNT
             && self.packed_values.len() == self.values.len().div_ceil(4) * 4
     }
 }
@@ -241,6 +242,16 @@ impl LiveBandRange {
     fn center_frequency(self) -> f32 {
         (self.start_frequency * self.end_frequency).sqrt()
     }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct LiveSpectrumPointMapping {
+    max_bin_start: usize,
+    max_bin_end: usize,
+    interpolation_lower_bin: usize,
+    interpolation_upper_bin: usize,
+    interpolation_fraction: f32,
+    display_tilt_db: f32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -651,18 +662,19 @@ where
 struct LiveAnalyzer {
     sample_rate: u32,
     band_ranges: [LiveBandRange; LIVE_SPECTROGRAM_BAND_COUNT],
+    spectrum_point_mappings: [LiveSpectrumPointMapping; LIVE_SPECTRUM_POINT_COUNT],
     window_coefficients: [f32; LIVE_SPECTRUM_FFT_SIZE],
     one_sided_bin_calibration: [f32; LIVE_SPECTRUM_POSITIVE_BIN_COUNT],
-    attack_coefficient: f32,
-    release_coefficient: f32,
-    smoothed_levels: [f32; LIVE_SPECTROGRAM_BAND_COUNT],
-    has_smoothed_levels: bool,
+    spectrum_attack_coefficient: f32,
+    spectrum_release_coefficient: f32,
+    spectrum_levels: [f32; LIVE_SPECTRUM_POINT_COUNT],
+    has_spectrum_levels: bool,
     window: [f32; LIVE_SPECTRUM_FFT_SIZE],
     window_len: usize,
     fft: [LiveComplexSample; LIVE_SPECTRUM_FFT_SIZE],
     positive_magnitudes: [f32; LIVE_SPECTRUM_POSITIVE_BIN_COUNT],
     rows: [[u8; LIVE_SPECTROGRAM_BAND_COUNT]; LIVE_SPECTROGRAM_MAX_HISTORY],
-    spectrum_values: [u8; LIVE_SPECTROGRAM_BAND_COUNT],
+    spectrum_values: [u8; LIVE_SPECTRUM_POINT_COUNT],
     row_count: usize,
     revision: u64,
     fft_count: usize,
@@ -688,21 +700,25 @@ impl LiveAnalyzer {
         Self {
             sample_rate,
             band_ranges: live_band_ranges(sample_rate),
+            spectrum_point_mappings: live_spectrum_point_mappings(sample_rate),
             window_coefficients,
             one_sided_bin_calibration,
-            attack_coefficient: live_ballistic_coefficient(LIVE_SPECTRUM_ATTACK_TIME, sample_rate),
-            release_coefficient: live_ballistic_coefficient(
+            spectrum_attack_coefficient: live_ballistic_coefficient(
+                LIVE_SPECTRUM_ATTACK_TIME,
+                sample_rate,
+            ),
+            spectrum_release_coefficient: live_ballistic_coefficient(
                 LIVE_SPECTRUM_RELEASE_TIME,
                 sample_rate,
             ),
-            smoothed_levels: [0.0; LIVE_SPECTROGRAM_BAND_COUNT],
-            has_smoothed_levels: false,
+            spectrum_levels: [0.0; LIVE_SPECTRUM_POINT_COUNT],
+            has_spectrum_levels: false,
             window: [0.0; LIVE_SPECTRUM_FFT_SIZE],
             window_len: 0,
             fft: [LiveComplexSample::default(); LIVE_SPECTRUM_FFT_SIZE],
             positive_magnitudes: [0.0; LIVE_SPECTRUM_POSITIVE_BIN_COUNT],
             rows: [[0; LIVE_SPECTROGRAM_BAND_COUNT]; LIVE_SPECTROGRAM_MAX_HISTORY],
-            spectrum_values: [0; LIVE_SPECTROGRAM_BAND_COUNT],
+            spectrum_values: [0; LIVE_SPECTRUM_POINT_COUNT],
             row_count: 0,
             revision: 0,
             fft_count: 0,
@@ -710,20 +726,20 @@ impl LiveAnalyzer {
     }
 
     fn reset(&mut self) {
-        self.smoothed_levels = [0.0; LIVE_SPECTROGRAM_BAND_COUNT];
-        self.has_smoothed_levels = false;
+        self.spectrum_levels = [0.0; LIVE_SPECTRUM_POINT_COUNT];
+        self.has_spectrum_levels = false;
         self.window_len = 0;
-        self.spectrum_values = [0; LIVE_SPECTROGRAM_BAND_COUNT];
+        self.spectrum_values = [0; LIVE_SPECTRUM_POINT_COUNT];
         self.row_count = 0;
         self.revision = 0;
         self.fft_count = 0;
     }
 
     fn reset_after_pause(&mut self) {
-        self.smoothed_levels = [0.0; LIVE_SPECTROGRAM_BAND_COUNT];
-        self.has_smoothed_levels = false;
+        self.spectrum_levels = [0.0; LIVE_SPECTRUM_POINT_COUNT];
+        self.has_spectrum_levels = false;
         self.window_len = 0;
-        self.spectrum_values = [0; LIVE_SPECTROGRAM_BAND_COUNT];
+        self.spectrum_values = [0; LIVE_SPECTRUM_POINT_COUNT];
         self.row_count = 0;
     }
 
@@ -772,14 +788,19 @@ impl LiveAnalyzer {
                 .clamp(0.0, 1.0);
             target_row[band] = (normalized * u8::MAX as f32).round() as u8;
         }
-        self.record_analyzed_row(target_row);
+        let target_spectrum = self.spectrum_target_levels();
+        self.record_analyzed_row(target_row, target_spectrum);
 
         self.revision = self.revision.wrapping_add(1);
         self.fft_count = self.fft_count.saturating_add(1);
     }
 
-    fn record_analyzed_row(&mut self, raw_row: [u8; LIVE_SPECTROGRAM_BAND_COUNT]) {
-        self.spectrum_values = self.smooth_row(raw_row);
+    fn record_analyzed_row(
+        &mut self,
+        raw_row: [u8; LIVE_SPECTROGRAM_BAND_COUNT],
+        target_spectrum: [f32; LIVE_SPECTRUM_POINT_COUNT],
+    ) {
+        self.spectrum_values = self.smooth_spectrum(target_spectrum);
         if self.row_count < LIVE_SPECTROGRAM_MAX_HISTORY {
             self.rows[self.row_count] = raw_row;
             self.row_count += 1;
@@ -789,32 +810,56 @@ impl LiveAnalyzer {
         }
     }
 
+    fn spectrum_target_levels(&self) -> [f32; LIVE_SPECTRUM_POINT_COUNT] {
+        std::array::from_fn(|point| {
+            let mapping = self.spectrum_point_mappings[point];
+            let magnitude = if mapping.max_bin_start < mapping.max_bin_end {
+                self.positive_magnitudes[mapping.max_bin_start..mapping.max_bin_end]
+                    .iter()
+                    .copied()
+                    .fold(0.0_f32, f32::max)
+            } else {
+                let lower = self.positive_magnitudes[mapping.interpolation_lower_bin];
+                let upper = self.positive_magnitudes[mapping.interpolation_upper_bin];
+                lower + (upper - lower) * mapping.interpolation_fraction
+            };
+            let decibels = 20.0 * magnitude.max(1.0e-8).log10();
+            let display_decibels = (decibels + mapping.display_tilt_db).clamp(
+                LIVE_SPECTRUM_DISPLAY_FLOOR_DB,
+                LIVE_SPECTRUM_DISPLAY_CEILING_DB,
+            );
+            ((display_decibels - LIVE_SPECTRUM_DISPLAY_FLOOR_DB)
+                / (LIVE_SPECTRUM_DISPLAY_CEILING_DB - LIVE_SPECTRUM_DISPLAY_FLOOR_DB))
+                .clamp(0.0, 1.0)
+        })
+    }
+
     /// Apply display-only exponential attack/release ballistics. This keeps
     /// the line readable without changing the decoder samples or audio path.
-    fn smooth_row(
+    fn smooth_spectrum(
         &mut self,
-        target_row: [u8; LIVE_SPECTROGRAM_BAND_COUNT],
-    ) -> [u8; LIVE_SPECTROGRAM_BAND_COUNT] {
-        let mut row = [0_u8; LIVE_SPECTROGRAM_BAND_COUNT];
-        for (band, &target) in target_row.iter().enumerate() {
-            let target = target as f32 / u8::MAX as f32;
-            let previous = self.smoothed_levels[band];
-            let level = if self.has_smoothed_levels {
+        target_spectrum: [f32; LIVE_SPECTRUM_POINT_COUNT],
+    ) -> [u8; LIVE_SPECTRUM_POINT_COUNT] {
+        let mut values = [0_u8; LIVE_SPECTRUM_POINT_COUNT];
+        for (point, &target) in target_spectrum.iter().enumerate() {
+            let target = target.clamp(0.0, 1.0);
+            let previous = self.spectrum_levels[point];
+            let level = if self.has_spectrum_levels {
                 let coefficient = if target > previous {
-                    self.attack_coefficient
+                    self.spectrum_attack_coefficient
                 } else {
-                    self.release_coefficient
+                    self.spectrum_release_coefficient
                 };
                 previous + coefficient * (target - previous)
             } else {
                 target
             };
             let level = level.clamp(0.0, 1.0);
-            self.smoothed_levels[band] = level;
-            row[band] = (level * u8::MAX as f32).round() as u8;
+            self.spectrum_levels[point] = level;
+            values[point] = (level * u8::MAX as f32).round() as u8;
         }
-        self.has_smoothed_levels = true;
-        row
+        self.has_spectrum_levels = true;
+        values
     }
 
     fn frame(&self, generation: u64, epoch: u64) -> Option<Arc<LiveSpectrogramFrame>> {
@@ -863,6 +908,87 @@ fn live_periodic_hann_window() -> [f32; LIVE_SPECTRUM_FFT_SIZE] {
 fn display_tilt_db(frequency: f32) -> f32 {
     LIVE_SPECTRUM_DISPLAY_TILT_DB_PER_OCTAVE
         * (frequency / LIVE_SPECTRUM_DISPLAY_TILT_REFERENCE_FREQUENCY).log2()
+}
+
+pub(crate) fn live_spectrum_point_frequency(sample_rate: u32, point: usize) -> f32 {
+    let (minimum, maximum) = live_display_frequency_bounds(sample_rate);
+    let last_point = LIVE_SPECTRUM_POINT_COUNT - 1;
+    if point == 0 {
+        return minimum;
+    }
+    if point >= last_point {
+        return maximum;
+    }
+    let ratio = (maximum / minimum.max(f32::MIN_POSITIVE)).max(1.0);
+    if ratio == 1.0 {
+        minimum
+    } else {
+        minimum * ratio.powf(point as f32 / last_point as f32)
+    }
+}
+
+fn live_spectrum_point_mappings(
+    sample_rate: u32,
+) -> [LiveSpectrumPointMapping; LIVE_SPECTRUM_POINT_COUNT] {
+    let sample_rate_hz = sample_rate.max(1);
+    let sample_rate = sample_rate_hz as f32;
+    let maximum_bin = LIVE_SPECTRUM_POSITIVE_BIN_COUNT - 1;
+    let last_point = LIVE_SPECTRUM_POINT_COUNT - 1;
+
+    std::array::from_fn(|point| {
+        let display_frequency = live_spectrum_point_frequency(sample_rate_hz, point);
+        let previous_frequency = if point == 0 {
+            display_frequency
+        } else {
+            live_spectrum_point_frequency(sample_rate_hz, point - 1)
+        };
+        let next_frequency = if point == last_point {
+            display_frequency
+        } else {
+            live_spectrum_point_frequency(sample_rate_hz, point + 1)
+        };
+        let cell_start = if point == 0 {
+            display_frequency
+        } else {
+            (previous_frequency * display_frequency).sqrt()
+        };
+        let cell_end = if point == last_point {
+            display_frequency
+        } else {
+            (display_frequency * next_frequency).sqrt()
+        };
+
+        let mut max_bin_start = LIVE_SPECTRUM_POSITIVE_BIN_COUNT;
+        let mut max_bin_end = 0;
+        for bin in 0..LIVE_SPECTRUM_POSITIVE_BIN_COUNT {
+            let bin_frequency = bin as f32 * sample_rate / LIVE_SPECTRUM_FFT_SIZE as f32;
+            let inside_cell = bin_frequency >= cell_start
+                && (bin_frequency < cell_end || (point == last_point && bin_frequency <= cell_end));
+            if inside_cell {
+                max_bin_start = max_bin_start.min(bin);
+                max_bin_end = max_bin_end.max(bin + 1);
+            }
+        }
+        if max_bin_start == LIVE_SPECTRUM_POSITIVE_BIN_COUNT {
+            max_bin_start = 0;
+        }
+
+        let bin_position = (display_frequency / sample_rate * LIVE_SPECTRUM_FFT_SIZE as f32)
+            .clamp(0.0, maximum_bin as f32);
+        let interpolation_lower_bin = bin_position.floor() as usize;
+        let interpolation_upper_bin = bin_position.ceil() as usize;
+        let interpolation_fraction =
+            (bin_position - interpolation_lower_bin as f32).clamp(0.0, 1.0);
+
+        LiveSpectrumPointMapping {
+            max_bin_start,
+            max_bin_end,
+            interpolation_lower_bin,
+            interpolation_upper_bin,
+            interpolation_fraction,
+            display_tilt_db: display_tilt_db(display_frequency),
+        }
+    })
 }
 
 fn live_band_ranges(sample_rate: u32) -> [LiveBandRange; LIVE_SPECTROGRAM_BAND_COUNT] {
@@ -2107,13 +2233,16 @@ mod tests {
     use super::{
         AudioTransport, CONTROLS_BUSY_ERROR, CaptureFrame, Command, DEFAULT_VOLUME,
         LIVE_SPECTROGRAM_BAND_COUNT, LIVE_SPECTROGRAM_MAX_HISTORY,
+        LIVE_SPECTRUM_DISPLAY_CEILING_DB, LIVE_SPECTRUM_DISPLAY_FLOOR_DB,
         LIVE_SPECTRUM_DISPLAY_MAX_FREQUENCY, LIVE_SPECTRUM_DISPLAY_MIN_FREQUENCY,
         LIVE_SPECTRUM_DISPLAY_TILT_DB_PER_OCTAVE, LIVE_SPECTRUM_DISPLAY_TILT_REFERENCE_FREQUENCY,
-        LIVE_SPECTRUM_FFT_SIZE, LIVE_SPECTRUM_HOP_SIZE, LiveAnalysisSource, LiveAnalyzer,
-        LiveCaptureSession, LiveSpectrogramFrame, MAX_OUTPUT_GAIN, PendingLoad, SharedSnapshot,
-        clamp_position, display_tilt_db, finish_analyzer_fallback, handle_command, is_current,
-        live_band_ranges, live_display_frequency_bounds, normalize_output_gain, normalize_volume,
-        publish_live_frame_if_due, run_live_analyzer_iteration,
+        LIVE_SPECTRUM_FFT_SIZE, LIVE_SPECTRUM_HOP_SIZE, LIVE_SPECTRUM_POINT_COUNT,
+        LiveAnalysisSource, LiveAnalyzer, LiveCaptureSession, LiveSpectrogramFrame,
+        MAX_OUTPUT_GAIN, PendingLoad, SharedSnapshot, clamp_position, display_tilt_db,
+        finish_analyzer_fallback, handle_command, is_current, live_band_ranges,
+        live_display_frequency_bounds, live_spectrum_point_frequency, live_spectrum_point_mappings,
+        normalize_output_gain, normalize_volume, publish_live_frame_if_due,
+        run_live_analyzer_iteration,
     };
     use rodio::{Player, Source, buffer::SamplesBuffer, source::SeekError};
     use std::path::PathBuf;
@@ -2253,6 +2382,10 @@ mod tests {
         (shared, session)
     }
 
+    fn spectrum_levels(level: f32) -> [f32; LIVE_SPECTRUM_POINT_COUNT] {
+        [level; LIVE_SPECTRUM_POINT_COUNT]
+    }
+
     #[test]
     fn analysis_source_downmixes_complete_frames_without_output_gain() {
         let (shared, session) = active_test_session(3);
@@ -2276,12 +2409,12 @@ mod tests {
     #[test]
     fn analyzer_display_uses_exponential_attack_and_slower_release() {
         let mut attack = LiveAnalyzer::new(48_000);
-        attack.smooth_row([0_u8; LIVE_SPECTROGRAM_BAND_COUNT]);
-        let rising = attack.smooth_row([u8::MAX; LIVE_SPECTROGRAM_BAND_COUNT]);
+        attack.smooth_spectrum(spectrum_levels(0.0));
+        let rising = attack.smooth_spectrum(spectrum_levels(1.0));
 
         let mut release = LiveAnalyzer::new(48_000);
-        release.smooth_row([u8::MAX; LIVE_SPECTROGRAM_BAND_COUNT]);
-        let falling = release.smooth_row([0_u8; LIVE_SPECTROGRAM_BAND_COUNT]);
+        release.smooth_spectrum(spectrum_levels(1.0));
+        let falling = release.smooth_spectrum(spectrum_levels(0.0));
 
         assert!(rising[0] > 0 && rising[0] < u8::MAX);
         assert!(falling[0] > 0 && falling[0] < u8::MAX);
@@ -2290,6 +2423,15 @@ mod tests {
         assert!(
             attack_delta > release_delta,
             "attack_delta={attack_delta}, release_delta={release_delta}"
+        );
+        let hop_seconds = LIVE_SPECTRUM_HOP_SIZE as f32 / 48_000.0;
+        assert!(
+            (attack.spectrum_attack_coefficient - (1.0 - (-hop_seconds / 0.030).exp())).abs()
+                < 1.0e-6
+        );
+        assert!(
+            (release.spectrum_release_coefficient - (1.0 - (-hop_seconds / 0.160).exp())).abs()
+                < 1.0e-6
         );
     }
 
@@ -2300,26 +2442,34 @@ mod tests {
         let mut loud = [0_u8; LIVE_SPECTROGRAM_BAND_COUNT];
         loud[0] = u8::MAX;
 
-        analyzer.record_analyzed_row(quiet);
-        analyzer.record_analyzed_row(loud);
+        analyzer.record_analyzed_row(quiet, spectrum_levels(0.0));
+        analyzer.record_analyzed_row(loud, spectrum_levels(1.0));
 
         let frame = analyzer.frame(1, 1).expect("two analyzer rows");
         assert_eq!(frame.value(0, 0), 0);
         assert_eq!(frame.value(1, 0), u8::MAX);
-        assert_eq!(frame.spectrum_values.len(), LIVE_SPECTROGRAM_BAND_COUNT);
+        assert_eq!(frame.spectrum_values.len(), LIVE_SPECTRUM_POINT_COUNT);
         assert_eq!(frame.spectrum_value(0), frame.spectrum_values[0]);
         assert!(frame.spectrum_value(0) > 0);
         assert!(frame.spectrum_value(0) < u8::MAX);
 
         analyzer.reset();
         assert_eq!(analyzer.row_count, 0);
+        assert!(analyzer.spectrum_levels.iter().all(|&level| level == 0.0));
         assert!(analyzer.spectrum_values.iter().all(|&value| value == 0));
         assert!(analyzer.frame(1, 1).is_none());
+
+        analyzer.record_analyzed_row([0_u8; LIVE_SPECTROGRAM_BAND_COUNT], spectrum_levels(1.0));
+        analyzer.reset_after_pause();
+        assert_eq!(analyzer.row_count, 0);
+        assert!(analyzer.spectrum_levels.iter().all(|&level| level == 0.0));
+        assert!(analyzer.spectrum_values.iter().all(|&value| value == 0));
     }
 
     #[test]
     fn analyzer_defaults_and_frame_shapes_stay_bounded() {
         assert_eq!(LIVE_SPECTROGRAM_BAND_COUNT, 128);
+        assert_eq!(LIVE_SPECTRUM_POINT_COUNT, 768);
         assert_eq!(LIVE_SPECTROGRAM_MAX_HISTORY, 192);
         assert_eq!(LIVE_SPECTRUM_FFT_SIZE, 2_048);
         assert_eq!(LIVE_SPECTRUM_HOP_SIZE, 512);
@@ -2329,7 +2479,7 @@ mod tests {
         for index in 0..=LIVE_SPECTROGRAM_MAX_HISTORY {
             let mut row = [0_u8; LIVE_SPECTROGRAM_BAND_COUNT];
             row[index % LIVE_SPECTROGRAM_BAND_COUNT] = index as u8;
-            analyzer.record_analyzed_row(row);
+            analyzer.record_analyzed_row(row, spectrum_levels(0.0));
         }
 
         assert_eq!(analyzer.row_count, LIVE_SPECTROGRAM_MAX_HISTORY);
@@ -2338,8 +2488,20 @@ mod tests {
             frame.values.len(),
             LIVE_SPECTROGRAM_MAX_HISTORY * LIVE_SPECTROGRAM_BAND_COUNT
         );
-        assert_eq!(frame.spectrum_values.len(), LIVE_SPECTROGRAM_BAND_COUNT);
+        assert_eq!(frame.spectrum_values.len(), LIVE_SPECTRUM_POINT_COUNT);
         assert!(frame.is_valid());
+        assert!(
+            LiveSpectrogramFrame::from_values(
+                1,
+                1,
+                1,
+                48_000,
+                1,
+                Arc::from(vec![0_u8; LIVE_SPECTROGRAM_BAND_COUNT].into_boxed_slice()),
+                Arc::from(vec![0_u8; LIVE_SPECTROGRAM_BAND_COUNT].into_boxed_slice()),
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -2350,7 +2512,7 @@ mod tests {
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
         );
-        let spectrum = Arc::from(vec![0_u8; LIVE_SPECTROGRAM_BAND_COUNT].into_boxed_slice());
+        let spectrum = Arc::from(vec![0_u8; LIVE_SPECTRUM_POINT_COUNT].into_boxed_slice());
         let frame = LiveSpectrogramFrame::from_values(1, 1, 1, 48_000, 1, values, spectrum)
             .expect("valid packed history frame");
 
@@ -2484,6 +2646,151 @@ mod tests {
                 .last()
                 .is_some_and(|band| band.end_frequency <= 8_000.0)
         );
+    }
+
+    #[test]
+    fn spectrum_point_mapping_is_logarithmic_inclusive_and_nyquist_clamped() {
+        let mappings = live_spectrum_point_mappings(48_000);
+        assert_eq!(mappings.len(), LIVE_SPECTRUM_POINT_COUNT);
+        assert_eq!(live_spectrum_point_frequency(48_000, 0), 20.0);
+        assert_eq!(
+            live_spectrum_point_frequency(48_000, LIVE_SPECTRUM_POINT_COUNT - 1),
+            20_000.0
+        );
+        assert_eq!(live_spectrum_point_frequency(48_000, 0), 20.0);
+        assert_eq!(
+            live_spectrum_point_frequency(48_000, LIVE_SPECTRUM_POINT_COUNT - 1),
+            20_000.0
+        );
+        assert!((0..LIVE_SPECTRUM_POINT_COUNT - 1).all(|point| {
+            live_spectrum_point_frequency(48_000, point)
+                < live_spectrum_point_frequency(48_000, point + 1)
+        }));
+        assert!(
+            mappings
+                .windows(2)
+                .all(|pair| pair[0].display_tilt_db < pair[1].display_tilt_db)
+        );
+
+        let nyquist_mappings = live_spectrum_point_mappings(16_000);
+        assert_eq!(
+            live_spectrum_point_frequency(16_000, LIVE_SPECTRUM_POINT_COUNT - 1),
+            8_000.0
+        );
+        assert!(nyquist_mappings.iter().all(|mapping| {
+            mapping.max_bin_end <= super::LIVE_SPECTRUM_POSITIVE_BIN_COUNT
+                && mapping.interpolation_upper_bin < super::LIVE_SPECTRUM_POSITIVE_BIN_COUNT
+        }));
+        assert!(
+            nyquist_mappings[LIVE_SPECTRUM_POINT_COUNT - 1].max_bin_start
+                < nyquist_mappings[LIVE_SPECTRUM_POINT_COUNT - 1].max_bin_end
+        );
+        assert_eq!(
+            nyquist_mappings[LIVE_SPECTRUM_POINT_COUNT - 1].max_bin_end,
+            super::LIVE_SPECTRUM_POSITIVE_BIN_COUNT
+        );
+    }
+
+    #[test]
+    fn spectrum_hybrid_mapping_preserves_bin_peaks_and_interpolates_gaps() {
+        let mut analyzer = LiveAnalyzer::new(48_000);
+        let max_point = analyzer
+            .spectrum_point_mappings
+            .iter()
+            .position(|mapping| mapping.max_bin_start < mapping.max_bin_end)
+            .expect("at least one spectrum point should contain a bin center");
+        let max_mapping = analyzer.spectrum_point_mappings[max_point];
+        analyzer.positive_magnitudes[max_mapping.max_bin_start] = 0.25;
+        let max_levels = analyzer.spectrum_target_levels();
+        let expected_max = ((20.0 * 0.25_f32.log10() + max_mapping.display_tilt_db
+            - LIVE_SPECTRUM_DISPLAY_FLOOR_DB)
+            / (LIVE_SPECTRUM_DISPLAY_CEILING_DB - LIVE_SPECTRUM_DISPLAY_FLOOR_DB))
+            .clamp(0.0, 1.0);
+        assert!((max_levels[max_point] - expected_max).abs() < 1.0e-6);
+
+        let interpolation_point = analyzer
+            .spectrum_point_mappings
+            .iter()
+            .position(|mapping| {
+                mapping.max_bin_start == mapping.max_bin_end
+                    && mapping.interpolation_lower_bin != mapping.interpolation_upper_bin
+                    && mapping.interpolation_fraction > 0.25
+                    && mapping.interpolation_fraction < 0.75
+            })
+            .expect("at least one spectrum point should interpolate between bins");
+        let interpolation_mapping = analyzer.spectrum_point_mappings[interpolation_point];
+        let lower_magnitude = 10.0_f32.powf(-30.0 / 20.0);
+        let upper_magnitude = 10.0_f32.powf(-10.0 / 20.0);
+        analyzer.positive_magnitudes[interpolation_mapping.interpolation_lower_bin] =
+            lower_magnitude;
+        analyzer.positive_magnitudes[interpolation_mapping.interpolation_upper_bin] =
+            upper_magnitude;
+        let interpolated_magnitude = lower_magnitude
+            + (upper_magnitude - lower_magnitude) * interpolation_mapping.interpolation_fraction;
+        let interpolated_decibels = 20.0 * interpolated_magnitude.log10();
+        let expected_interpolated = ((interpolated_decibels
+            + interpolation_mapping.display_tilt_db
+            - LIVE_SPECTRUM_DISPLAY_FLOOR_DB)
+            / (LIVE_SPECTRUM_DISPLAY_CEILING_DB - LIVE_SPECTRUM_DISPLAY_FLOOR_DB))
+            .clamp(0.0, 1.0);
+        let interpolated_levels = analyzer.spectrum_target_levels();
+        assert!((interpolated_levels[interpolation_point] - expected_interpolated).abs() < 1.0e-6);
+
+        let point_for_bin = |bin| {
+            analyzer
+                .spectrum_point_mappings
+                .iter()
+                .position(|mapping| mapping.max_bin_start <= bin && mapping.max_bin_end > bin)
+                .expect("bin center should map to a spectrum point")
+        };
+        let nearby_low_point = point_for_bin(64);
+        let nearby_high_point = point_for_bin(68);
+        analyzer.positive_magnitudes[64] = 1.0;
+        analyzer.positive_magnitudes[68] = 0.5;
+        let nearby_levels = analyzer.spectrum_target_levels();
+        assert!(nearby_levels[nearby_low_point] > 0.0);
+        assert!(nearby_levels[nearby_high_point] > 0.0);
+        assert_ne!(
+            nearby_levels[nearby_low_point], nearby_levels[nearby_high_point],
+            "nearby mapped bin peaks should remain distinct"
+        );
+    }
+
+    #[test]
+    fn spectrum_target_levels_apply_calibration_tilt_floor_and_ceiling() {
+        let mut analyzer = LiveAnalyzer::new(48_000);
+        let amplitude = 10.0_f32.powf(-18.0 / 20.0);
+        analyzer.positive_magnitudes = [amplitude; super::LIVE_SPECTRUM_POSITIVE_BIN_COUNT];
+        let target = analyzer.spectrum_target_levels();
+        let nearest_point = |frequency: f32| {
+            analyzer
+                .spectrum_point_mappings
+                .iter()
+                .enumerate()
+                .min_by(|(left_point, _), (right_point, _)| {
+                    (live_spectrum_point_frequency(48_000, *left_point) - frequency)
+                        .abs()
+                        .total_cmp(
+                            &(live_spectrum_point_frequency(48_000, *right_point) - frequency)
+                                .abs(),
+                        )
+                })
+                .map(|(point, _)| point)
+                .expect("spectrum has points")
+        };
+        let reference_point = nearest_point(1_000.0);
+        let low_point = nearest_point(500.0);
+        let high_point = nearest_point(2_000.0);
+        assert!((target[reference_point] - 0.8).abs() < 0.002);
+        assert!((target[low_point] - 0.75).abs() < 0.003);
+        assert!((target[high_point] - 0.85).abs() < 0.003);
+
+        analyzer.positive_magnitudes = [1.0e-12; super::LIVE_SPECTRUM_POSITIVE_BIN_COUNT];
+        let floor = analyzer.spectrum_target_levels();
+        assert!(floor.iter().all(|&level| level == 0.0));
+        analyzer.positive_magnitudes = [2.0; super::LIVE_SPECTRUM_POSITIVE_BIN_COUNT];
+        let ceiling = analyzer.spectrum_target_levels();
+        assert_eq!(ceiling[reference_point], 1.0);
     }
 
     #[test]
@@ -2809,7 +3116,7 @@ mod tests {
                 48_000,
                 1,
                 Arc::from(vec![1_u8; LIVE_SPECTROGRAM_BAND_COUNT].into_boxed_slice()),
-                Arc::from(vec![1_u8; LIVE_SPECTROGRAM_BAND_COUNT].into_boxed_slice()),
+                Arc::from(vec![1_u8; LIVE_SPECTRUM_POINT_COUNT].into_boxed_slice()),
             )
             .expect("valid live spectrogram test frame"),
         );
@@ -2860,7 +3167,7 @@ mod tests {
                 48_000,
                 1,
                 Arc::from(vec![1_u8; LIVE_SPECTROGRAM_BAND_COUNT].into_boxed_slice()),
-                Arc::from(vec![1_u8; LIVE_SPECTROGRAM_BAND_COUNT].into_boxed_slice()),
+                Arc::from(vec![1_u8; LIVE_SPECTRUM_POINT_COUNT].into_boxed_slice()),
             )
             .expect("valid live spectrogram test frame"),
         );
@@ -2918,7 +3225,7 @@ mod tests {
                 48_000,
                 1,
                 Arc::from(vec![1_u8; LIVE_SPECTROGRAM_BAND_COUNT].into_boxed_slice()),
-                Arc::from(vec![1_u8; LIVE_SPECTROGRAM_BAND_COUNT].into_boxed_slice()),
+                Arc::from(vec![1_u8; LIVE_SPECTRUM_POINT_COUNT].into_boxed_slice()),
             )
             .expect("valid live spectrogram test frame"),
         );
