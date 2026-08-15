@@ -2051,6 +2051,36 @@ mod tests {
     }
 
     #[test]
+    fn full_history_fills_max_height_plot_at_minimum_scale() {
+        let bounds =
+            Rect::from_min_size(Point::new(0.0, 0.0), Vector2::new(720.0, super::MAX_HEIGHT));
+        let plot = SpectrogramWidget::plot_rect(bounds);
+        let row_count = LIVE_SPECTROGRAM_MAX_HISTORY;
+        let history_scale = super::MIN_HISTORY_SCALE;
+        let visible = super::visible_waterfall_rows(plot, row_count, history_scale);
+        let excess = row_count.saturating_sub(visible.len());
+
+        assert_eq!(plot.height(), 238.0);
+        assert_eq!(visible.len(), plot.height() as usize);
+        assert!(visible.iter().enumerate().all(|(index, (row, rect))| {
+            *row == excess + index
+                && rect.min.y == plot.min.y + index as f32
+                && rect.max.y == plot.min.y + (index + 1) as f32
+                && rect.height() == history_scale
+        }));
+        assert!(
+            (0..excess).all(
+                |row| super::waterfall_row_rect(plot, row_count, row, history_scale).is_none()
+            )
+        );
+        assert_eq!(
+            visible.first().map(|(_, rect)| rect.min.y),
+            Some(plot.min.y)
+        );
+        assert_eq!(visible.last().map(|(_, rect)| rect.max.y), Some(plot.max.y));
+    }
+
+    #[test]
     fn waterfall_crops_oldest_rows_without_aggregation() {
         let row_count = 5;
         let mut values = vec![0_u8; row_count * LIVE_SPECTROGRAM_BAND_COUNT];

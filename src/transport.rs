@@ -28,7 +28,7 @@ pub const MAX_OUTPUT_GAIN: f32 = 16.0;
 
 pub const LIVE_SPECTROGRAM_BAND_COUNT: usize = 128;
 pub const LIVE_SPECTRUM_POINT_COUNT: usize = 768;
-pub const LIVE_SPECTROGRAM_MAX_HISTORY: usize = 192;
+pub const LIVE_SPECTROGRAM_MAX_HISTORY: usize = 240;
 
 const LIVE_CAPTURE_RING_CAPACITY: usize = 16_384;
 const LIVE_SPECTRUM_FFT_SIZE: usize = 2_048;
@@ -2470,7 +2470,7 @@ mod tests {
     fn analyzer_defaults_and_frame_shapes_stay_bounded() {
         assert_eq!(LIVE_SPECTROGRAM_BAND_COUNT, 128);
         assert_eq!(LIVE_SPECTRUM_POINT_COUNT, 768);
-        assert_eq!(LIVE_SPECTROGRAM_MAX_HISTORY, 192);
+        assert_eq!(LIVE_SPECTROGRAM_MAX_HISTORY, 240);
         assert_eq!(LIVE_SPECTRUM_FFT_SIZE, 2_048);
         assert_eq!(LIVE_SPECTRUM_HOP_SIZE, 512);
         assert_eq!(LIVE_SPECTRUM_HOP_SIZE, LIVE_SPECTRUM_FFT_SIZE / 4);
