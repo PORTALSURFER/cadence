@@ -395,7 +395,7 @@ const PLANNER_DRAG_PREVIEW_CARD_HEIGHT: f32 = 154.0;
 const PLANNER_DROP_MARKER_ORANGE: ui::Rgba8 = ui::Rgba8::new(255, 160, 82, 255);
 const PLANNER_DROP_MARKER_HEIGHT: f32 = 4.0;
 const PLANNER_DROP_SENTINEL_HEIGHT: f32 = 20.0;
-const APP_FRAME_CLOCK_FPS: u32 = 30;
+const APP_FRAME_CLOCK_FPS: u32 = 60;
 
 #[derive(Clone, Debug)]
 struct TrackCardChromeWidget {
@@ -1058,6 +1058,49 @@ fn retained_live_spectrogram_revision(state: &AppState) -> u64 {
     }
 }
 
+fn live_spectrogram_source_revision(state: &AppState, source: AuditionSource) -> u64 {
+    match source {
+        AuditionSource::Main => state.live_spectrogram_revision,
+        AuditionSource::Reference => state.reference_live_spectrogram_revision,
+    }
+}
+
+fn live_spectrogram_source_has_frame(state: &AppState, source: AuditionSource) -> bool {
+    match source {
+        AuditionSource::Main => state.live_spectrogram.is_some(),
+        AuditionSource::Reference => state.reference_live_spectrogram.is_some(),
+    }
+}
+
+fn live_spectrogram_presence_revision(state: &AppState) -> u64 {
+    if state.transport_playing || state.reference_transport_playing {
+        let source = review_spectrogram_source(state);
+        frame_revision_mix(&[
+            source as u64,
+            live_spectrogram_source_has_frame(state, source) as u64,
+        ])
+    } else {
+        frame_revision_mix(&[
+            state.live_spectrogram.is_some() as u64,
+            state.reference_live_spectrogram.is_some() as u64,
+        ])
+    }
+}
+
+fn active_waterfall_projection_revision(state: &AppState) -> u64 {
+    if state.live_spectrogram_mode != LiveSpectrogramMode::Waterfall
+        || !(state.transport_playing || state.reference_transport_playing)
+    {
+        return 0;
+    }
+
+    let source = review_spectrogram_source(state);
+    frame_revision_mix(&[
+        source as u64,
+        live_spectrogram_source_revision(state, source),
+    ])
+}
+
 fn frame_surface_revisions(state: &mut AppState) -> SurfaceRevisions {
     let selected_track = state
         .library
@@ -1100,13 +1143,15 @@ fn frame_surface_revisions(state: &mut AppState) -> SurfaceRevisions {
         state.reference_transport_waiting_token.is_some() as u64,
         state.waveform_progress.map_or(0, f32::to_bits) as u64,
         state.reference_waveform_progress.map_or(0, f32::to_bits) as u64,
-        // The header changes when the first valid frame becomes available,
-        // but active frame revisions remain paint-only below.
-        state.live_spectrogram.is_some() as u64,
-        state.reference_live_spectrogram.is_some() as u64,
-        // Active playback keeps live frames in the paint-only overlay. Once
-        // playback is stopped, accepted frame revisions must reproject the
-        // retained scene so the final analyzer rows are included.
+        // The header follows the displayed source while active. Once playback
+        // is stopped, preserve the existing all-source final-frame behavior.
+        live_spectrogram_presence_revision(state),
+        // Active Waterfall frames live in the retained GPU surface, so only
+        // the displayed source's accepted revision reprojects it. Spectrum
+        // revisions remain paint-only in the transient overlay. Once playback
+        // is stopped, accepted frame revisions must reproject the retained
+        // scene so the final analyzer rows are included.
+        active_waterfall_projection_revision(state),
         retained_live_spectrogram_revision(state),
         state.live_spectrogram_mode as u64,
         spectrogram::clamp_history_scale(state.live_spectrogram_history_scale).to_bits() as u64,
@@ -9738,6 +9783,116 @@ mod tests {
     }
 
     #[test]
+    fn active_waterfall_reprojects_only_the_displayed_source_revision() {
+        let mut state = audition_state(&["main"]);
+        state.reference_transport = Some(transport::AudioTransport::spawn());
+        state.reference_waveform_track_id = Some(String::from("main"));
+        state.live_spectrogram = Some(live_frame(0, 0, 1));
+        state.live_spectrogram_revision = 1;
+        state.transport.set_live_state_for_test(LiveFrameState {
+            generation: 0,
+            epoch: 0,
+            revision: 1,
+            pending: false,
+        });
+        state.transport_playing = true;
+        state.reference_transport_playing = true;
+        state.audition_source = AuditionSource::Main;
+        state.live_spectrogram_mode = LiveSpectrogramMode::Waterfall;
+        state
+            .reference_transport
+            .as_ref()
+            .expect("reference transport")
+            .set_live_state_for_test(LiveFrameState {
+                generation: 0,
+                epoch: 0,
+                revision: 0,
+                pending: false,
+            });
+
+        let before = frame_surface_revisions(&mut state);
+        let same_revision = frame_surface_revisions(&mut state);
+        assert_eq!(
+            same_revision.repaint_scope_since(before),
+            RepaintScope::PaintOnly
+        );
+
+        state.reference_live_spectrogram = Some(live_frame(0, 0, 1));
+        state.reference_live_spectrogram_revision = 1;
+        state
+            .reference_transport
+            .as_ref()
+            .expect("reference transport")
+            .set_live_state_for_test(LiveFrameState {
+                generation: 0,
+                epoch: 0,
+                revision: 1,
+                pending: false,
+            });
+        let hidden_revision = frame_surface_revisions(&mut state);
+        assert_eq!(
+            hidden_revision.repaint_scope_since(same_revision),
+            RepaintScope::PaintOnly,
+            "a hidden reference frame must not reproject the displayed main waterfall"
+        );
+
+        state.live_spectrogram = Some(live_frame(0, 0, 2));
+        state.live_spectrogram_revision = 2;
+        state.transport.set_live_state_for_test(LiveFrameState {
+            generation: 0,
+            epoch: 0,
+            revision: 2,
+            pending: false,
+        });
+        let displayed_revision = frame_surface_revisions(&mut state);
+        assert_eq!(
+            displayed_revision.repaint_scope_since(hidden_revision),
+            RepaintScope::Projection
+        );
+        let repeated_revision = frame_surface_revisions(&mut state);
+        assert_eq!(
+            repeated_revision.repaint_scope_since(displayed_revision),
+            RepaintScope::PaintOnly
+        );
+
+        state.audition_source = AuditionSource::Reference;
+        let switched_source = frame_surface_revisions(&mut state);
+        assert_eq!(
+            switched_source.repaint_scope_since(repeated_revision),
+            RepaintScope::Projection,
+            "switching the displayed source must reproject the retained waterfall"
+        );
+    }
+
+    #[test]
+    fn active_spectrum_revision_remains_paint_only() {
+        let mut state = audition_state(&["main"]);
+        state.live_spectrogram = Some(live_frame(0, 0, 1));
+        state.live_spectrogram_revision = 1;
+        state.transport.set_live_state_for_test(LiveFrameState {
+            generation: 0,
+            epoch: 0,
+            revision: 1,
+            pending: false,
+        });
+        state.transport_playing = true;
+        state.live_spectrogram_mode = LiveSpectrogramMode::Spectrum;
+
+        let before = frame_surface_revisions(&mut state);
+        state.live_spectrogram = Some(live_frame(0, 0, 2));
+        state.live_spectrogram_revision = 2;
+        state.transport.set_live_state_for_test(LiveFrameState {
+            generation: 0,
+            epoch: 0,
+            revision: 2,
+            pending: false,
+        });
+        let after = frame_surface_revisions(&mut state);
+
+        assert_eq!(after.repaint_scope_since(before), RepaintScope::PaintOnly);
+    }
+
+    #[test]
     fn live_spectrogram_display_sample_rate_uses_matching_metadata_until_frame_arrives() {
         let mut state = audition_state(&["main"]);
         let track = selected_track(&state).expect("selected test track").clone();
@@ -9792,7 +9947,7 @@ mod tests {
     }
 
     #[test]
-    fn final_live_frame_after_natural_stop_advances_retained_projection() {
+    fn waterfall_final_live_frame_after_natural_stop_advances_retained_projection() {
         let mut state = audition_state(&["main"]);
         let initial_frame = live_frame(0, 0, 1);
         state.live_spectrogram = Some(Arc::clone(&initial_frame));
@@ -9825,7 +9980,7 @@ mod tests {
         let active_after = frame_surface_revisions(&mut state);
         assert_eq!(
             active_after.repaint_scope_since(active_before),
-            RepaintScope::PaintOnly
+            RepaintScope::Projection
         );
 
         apply_transport_snapshot(
