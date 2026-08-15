@@ -444,6 +444,7 @@ dependencies = [
  "radiant",
  "rfd",
  "rodio",
+ "rtrb",
  "serde",
  "serde_json",
  "symphonia",

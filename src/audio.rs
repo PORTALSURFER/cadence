@@ -1265,6 +1265,11 @@ mod tests {
             waveform_cache_fingerprint(&source).expect("source fingerprint should exist");
         write_waveform_cache_if_unchanged(&source, &cache, source_fingerprint, &waveform)
             .expect("write waveform cache");
+        let encoded = fs::read_to_string(&cache).expect("read waveform cache");
+        assert!(
+            !encoded.contains("spectrogram"),
+            "waveform cache must not retain the removed passive spectrogram"
+        );
         assert_eq!(load_waveform_cache(&source, &cache), Some(waveform.clone()));
 
         fs::write(&cache, b"not a waveform cache").expect("corrupt waveform cache");
