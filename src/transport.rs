@@ -43,10 +43,12 @@ pub(crate) const LIVE_SPECTRUM_DISPLAY_TILT_REFERENCE_FREQUENCY: f32 = 1_000.0;
 const LIVE_SPECTRUM_ATTACK_TIME: Duration = Duration::from_millis(30);
 const LIVE_SPECTRUM_RELEASE_TIME: Duration = Duration::from_millis(160);
 // The analyzer still consumes every captured frame and emits FFT rows at the
-// configured hop. The UI only needs a stable presentation cadence; keeping
-// publication at 30 Hz prevents a full retained-app rebuild and GPU storage
-// upload from competing with the rest of the review surface.
-const LIVE_PUBLICATION_INTERVAL: Duration = Duration::from_millis(33);
+// configured hop. Live publication follows the existing 60 Hz presentation
+// cadence, while the latest-only gate below prevents duplicate or queued
+// frames from competing with the rest of the review surface.
+const LIVE_PRESENTATION_FPS: u64 = 60;
+const LIVE_PUBLICATION_INTERVAL: Duration =
+    Duration::from_nanos(1_000_000_000 / LIVE_PRESENTATION_FPS);
 const LIVE_ANALYZER_POLL_INTERVAL: Duration = Duration::from_millis(2);
 static NEXT_LIVE_GPU_REVISION: AtomicU64 = AtomicU64::new(1);
 
@@ -1288,10 +1290,36 @@ fn publish_live_frame_if_due(
     last_publication: &mut Instant,
     force: bool,
 ) {
+    publish_live_frame_if_due_at(
+        analyzer,
+        session,
+        shared,
+        observed_epoch,
+        published_revision,
+        last_publication,
+        Instant::now(),
+        force,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_live_frame_if_due_at(
+    analyzer: &LiveAnalyzer,
+    session: &LiveCaptureSession,
+    shared: &SharedSnapshot,
+    observed_epoch: u64,
+    published_revision: &mut u64,
+    last_publication: &mut Instant,
+    now: Instant,
+    force: bool,
+) {
     if analyzer.revision <= *published_revision {
         return;
     }
-    if !force && last_publication.elapsed() < LIVE_PUBLICATION_INTERVAL {
+    let elapsed = now
+        .checked_duration_since(*last_publication)
+        .unwrap_or_default();
+    if !force && elapsed < LIVE_PUBLICATION_INTERVAL {
         return;
     }
     if session.current_epoch() != observed_epoch {
@@ -1305,7 +1333,7 @@ fn publish_live_frame_if_due(
     }
     if shared.publish_live_frame(session, frame) {
         *published_revision = analyzer.revision;
-        *last_publication = Instant::now();
+        *last_publication = now;
     }
 }
 
@@ -2244,17 +2272,17 @@ pub fn normalize_output_gain(gain: f32) -> f32 {
 mod tests {
     use super::{
         AudioTransport, CONTROLS_BUSY_ERROR, CaptureFrame, Command, DEFAULT_VOLUME,
-        LIVE_SPECTROGRAM_BAND_COUNT, LIVE_SPECTROGRAM_MAX_HISTORY,
-        LIVE_SPECTRUM_DISPLAY_CEILING_DB, LIVE_SPECTRUM_DISPLAY_FLOOR_DB,
-        LIVE_SPECTRUM_DISPLAY_MAX_FREQUENCY, LIVE_SPECTRUM_DISPLAY_MIN_FREQUENCY,
-        LIVE_SPECTRUM_DISPLAY_TILT_DB_PER_OCTAVE, LIVE_SPECTRUM_DISPLAY_TILT_REFERENCE_FREQUENCY,
-        LIVE_SPECTRUM_FFT_SIZE, LIVE_SPECTRUM_HOP_SIZE, LIVE_SPECTRUM_POINT_COUNT,
-        LiveAnalysisSource, LiveAnalyzer, LiveCaptureSession, LiveSpectrogramFrame,
-        MAX_OUTPUT_GAIN, PendingLoad, SharedSnapshot, clamp_position, display_tilt_db,
-        finish_analyzer_fallback, handle_command, is_current, live_band_ranges,
-        live_display_frequency_bounds, live_spectrum_point_frequency, live_spectrum_point_mappings,
-        normalize_output_gain, normalize_volume, publish_live_frame_if_due,
-        run_live_analyzer_iteration,
+        LIVE_PRESENTATION_FPS, LIVE_PUBLICATION_INTERVAL, LIVE_SPECTROGRAM_BAND_COUNT,
+        LIVE_SPECTROGRAM_MAX_HISTORY, LIVE_SPECTRUM_DISPLAY_CEILING_DB,
+        LIVE_SPECTRUM_DISPLAY_FLOOR_DB, LIVE_SPECTRUM_DISPLAY_MAX_FREQUENCY,
+        LIVE_SPECTRUM_DISPLAY_MIN_FREQUENCY, LIVE_SPECTRUM_DISPLAY_TILT_DB_PER_OCTAVE,
+        LIVE_SPECTRUM_DISPLAY_TILT_REFERENCE_FREQUENCY, LIVE_SPECTRUM_FFT_SIZE,
+        LIVE_SPECTRUM_HOP_SIZE, LIVE_SPECTRUM_POINT_COUNT, LiveAnalysisSource, LiveAnalyzer,
+        LiveCaptureSession, LiveSpectrogramFrame, MAX_OUTPUT_GAIN, PendingLoad, SharedSnapshot,
+        clamp_position, display_tilt_db, finish_analyzer_fallback, handle_command, is_current,
+        live_band_ranges, live_display_frequency_bounds, live_spectrum_point_frequency,
+        live_spectrum_point_mappings, normalize_output_gain, normalize_volume,
+        publish_live_frame_if_due, publish_live_frame_if_due_at, run_live_analyzer_iteration,
     };
     use rodio::{Player, Source, buffer::SamplesBuffer, source::SeekError};
     use std::path::PathBuf;
@@ -2943,6 +2971,117 @@ mod tests {
         assert_eq!(analyzer.fft_count, LIVE_SPECTROGRAM_MAX_HISTORY + 1);
         assert_eq!(analyzer.revision, (LIVE_SPECTROGRAM_MAX_HISTORY + 1) as u64);
         assert_eq!(analyzer.row_count, LIVE_SPECTROGRAM_MAX_HISTORY);
+    }
+
+    #[test]
+    fn live_publication_rejects_early_revisions_and_deduplicates_at_60_hz() {
+        assert_eq!(
+            LIVE_PUBLICATION_INTERVAL,
+            Duration::from_nanos(1_000_000_000 / LIVE_PRESENTATION_FPS)
+        );
+
+        let (shared, session) = active_test_session(7);
+        let observed_epoch = session.current_epoch();
+        let mut analyzer = LiveAnalyzer::new(48_000);
+        for index in 0..LIVE_SPECTRUM_FFT_SIZE {
+            assert_eq!(
+                analyzer.push((index as f32 * 0.01).sin()),
+                index + 1 == LIVE_SPECTRUM_FFT_SIZE
+            );
+        }
+
+        let start = Instant::now();
+        let mut published_revision = 0;
+        let mut last_publication = start;
+        let before_due = start + LIVE_PUBLICATION_INTERVAL - Duration::from_nanos(1);
+        publish_live_frame_if_due_at(
+            &analyzer,
+            &session,
+            &shared,
+            observed_epoch,
+            &mut published_revision,
+            &mut last_publication,
+            before_due,
+            false,
+        );
+        assert_eq!(published_revision, 0);
+        assert!(shared.latest_live_frame().is_none());
+
+        let first_due = start + LIVE_PUBLICATION_INTERVAL;
+        publish_live_frame_if_due_at(
+            &analyzer,
+            &session,
+            &shared,
+            observed_epoch,
+            &mut published_revision,
+            &mut last_publication,
+            first_due,
+            false,
+        );
+        let first_frame = shared
+            .latest_live_frame()
+            .expect("a new revision should publish at the cadence boundary");
+        assert_eq!(published_revision, analyzer.revision);
+        assert_eq!(last_publication, first_due);
+
+        let duplicate_due = first_due + LIVE_PUBLICATION_INTERVAL;
+        publish_live_frame_if_due_at(
+            &analyzer,
+            &session,
+            &shared,
+            observed_epoch,
+            &mut published_revision,
+            &mut last_publication,
+            duplicate_due,
+            false,
+        );
+        let duplicate_frame = shared
+            .latest_live_frame()
+            .expect("the first frame should remain visible");
+        assert!(Arc::ptr_eq(&duplicate_frame, &first_frame));
+        assert_eq!(last_publication, first_due);
+
+        for index in 0..LIVE_SPECTRUM_HOP_SIZE {
+            assert_eq!(
+                analyzer.push((index as f32 * 0.02).cos()),
+                index + 1 == LIVE_SPECTRUM_HOP_SIZE
+            );
+        }
+        publish_live_frame_if_due_at(
+            &analyzer,
+            &session,
+            &shared,
+            observed_epoch,
+            &mut published_revision,
+            &mut last_publication,
+            duplicate_due,
+            false,
+        );
+        let second_frame = shared
+            .latest_live_frame()
+            .expect("a newer revision should publish after the interval");
+        assert_eq!(published_revision, analyzer.revision);
+        assert_eq!(second_frame.revision, first_frame.revision + 1);
+        assert!(!Arc::ptr_eq(&second_frame, &first_frame));
+        assert_eq!(last_publication, duplicate_due);
+
+        let final_due = duplicate_due + LIVE_PUBLICATION_INTERVAL;
+        publish_live_frame_if_due_at(
+            &analyzer,
+            &session,
+            &shared,
+            observed_epoch,
+            &mut published_revision,
+            &mut last_publication,
+            final_due,
+            false,
+        );
+        let final_frame = shared
+            .latest_live_frame()
+            .expect("the newer frame should remain visible");
+        assert!(Arc::ptr_eq(&final_frame, &second_frame));
+        assert_eq!(last_publication, duplicate_due);
+        session.retire();
     }
 
     #[test]
