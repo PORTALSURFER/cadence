@@ -70,15 +70,16 @@ impl LiveSpectrogramFrame {
         epoch: u64,
         revision: u64,
         sample_rate: u32,
-        rows: &[[u8; LIVE_SPECTROGRAM_BAND_COUNT]; LIVE_SPECTROGRAM_MAX_HISTORY],
-        row_count: usize,
+        oldest_rows: &[[u8; LIVE_SPECTROGRAM_BAND_COUNT]],
+        wrapped_rows: &[[u8; LIVE_SPECTROGRAM_BAND_COUNT]],
         spectrum_values: &[u8; LIVE_SPECTRUM_POINT_COUNT],
     ) -> Option<Self> {
+        let row_count = oldest_rows.len() + wrapped_rows.len();
         if sample_rate == 0 || row_count == 0 || row_count > LIVE_SPECTROGRAM_MAX_HISTORY {
             return None;
         }
         let mut values = Vec::with_capacity(row_count * LIVE_SPECTROGRAM_BAND_COUNT);
-        for row in rows.iter().take(row_count) {
+        for row in oldest_rows.iter().chain(wrapped_rows.iter()) {
             values.extend_from_slice(row);
         }
         Self::from_values(
@@ -675,6 +676,7 @@ struct LiveAnalyzer {
     positive_magnitudes: [f32; LIVE_SPECTRUM_POSITIVE_BIN_COUNT],
     rows: [[u8; LIVE_SPECTROGRAM_BAND_COUNT]; LIVE_SPECTROGRAM_MAX_HISTORY],
     spectrum_values: [u8; LIVE_SPECTRUM_POINT_COUNT],
+    history_start: usize,
     row_count: usize,
     revision: u64,
     fft_count: usize,
@@ -719,6 +721,7 @@ impl LiveAnalyzer {
             positive_magnitudes: [0.0; LIVE_SPECTRUM_POSITIVE_BIN_COUNT],
             rows: [[0; LIVE_SPECTROGRAM_BAND_COUNT]; LIVE_SPECTROGRAM_MAX_HISTORY],
             spectrum_values: [0; LIVE_SPECTRUM_POINT_COUNT],
+            history_start: 0,
             row_count: 0,
             revision: 0,
             fft_count: 0,
@@ -730,6 +733,7 @@ impl LiveAnalyzer {
         self.has_spectrum_levels = false;
         self.window_len = 0;
         self.spectrum_values = [0; LIVE_SPECTRUM_POINT_COUNT];
+        self.history_start = 0;
         self.row_count = 0;
         self.revision = 0;
         self.fft_count = 0;
@@ -740,6 +744,7 @@ impl LiveAnalyzer {
         self.has_spectrum_levels = false;
         self.window_len = 0;
         self.spectrum_values = [0; LIVE_SPECTRUM_POINT_COUNT];
+        self.history_start = 0;
         self.row_count = 0;
     }
 
@@ -801,12 +806,12 @@ impl LiveAnalyzer {
         target_spectrum: [f32; LIVE_SPECTRUM_POINT_COUNT],
     ) {
         self.spectrum_values = self.smooth_spectrum(target_spectrum);
+        let physical_row = (self.history_start + self.row_count) % LIVE_SPECTROGRAM_MAX_HISTORY;
+        self.rows[physical_row] = raw_row;
         if self.row_count < LIVE_SPECTROGRAM_MAX_HISTORY {
-            self.rows[self.row_count] = raw_row;
             self.row_count += 1;
         } else {
-            self.rows.copy_within(1..LIVE_SPECTROGRAM_MAX_HISTORY, 0);
-            self.rows[LIVE_SPECTROGRAM_MAX_HISTORY - 1] = raw_row;
+            self.history_start = (self.history_start + 1) % LIVE_SPECTROGRAM_MAX_HISTORY;
         }
     }
 
@@ -863,13 +868,20 @@ impl LiveAnalyzer {
     }
 
     fn frame(&self, generation: u64, epoch: u64) -> Option<Arc<LiveSpectrogramFrame>> {
+        debug_assert!(self.history_start < LIVE_SPECTROGRAM_MAX_HISTORY);
+        let first_span_len = self
+            .row_count
+            .min(LIVE_SPECTROGRAM_MAX_HISTORY - self.history_start);
+        let second_span_len = self.row_count - first_span_len;
+        let oldest_rows = &self.rows[self.history_start..self.history_start + first_span_len];
+        let wrapped_rows = &self.rows[..second_span_len];
         LiveSpectrogramFrame::new(
             generation,
             epoch,
             self.revision,
             self.sample_rate,
-            &self.rows,
-            self.row_count,
+            oldest_rows,
+            wrapped_rows,
             &self.spectrum_values,
         )
         .map(Arc::new)
@@ -2386,6 +2398,16 @@ mod tests {
         [level; LIVE_SPECTRUM_POINT_COUNT]
     }
 
+    fn encoded_history_row(index: usize) -> [u8; LIVE_SPECTROGRAM_BAND_COUNT] {
+        let mut row = [0_u8; LIVE_SPECTROGRAM_BAND_COUNT];
+        let encoded_index = u16::try_from(index).expect("history test index fits in two bytes");
+        row[..2].copy_from_slice(&encoded_index.to_le_bytes());
+        for (band, value) in row.iter_mut().enumerate().skip(2) {
+            *value = encoded_index.wrapping_add(band as u16).to_le_bytes()[0];
+        }
+        row
+    }
+
     #[test]
     fn analysis_source_downmixes_complete_frames_without_output_gain() {
         let (shared, session) = active_test_session(3);
@@ -2464,6 +2486,80 @@ mod tests {
         assert_eq!(analyzer.row_count, 0);
         assert!(analyzer.spectrum_levels.iter().all(|&level| level == 0.0));
         assert!(analyzer.spectrum_values.iter().all(|&value| value == 0));
+    }
+
+    #[test]
+    fn analyzer_history_circular_buffer_preserves_newest_capacity_after_multiple_wraps() {
+        let mut analyzer = LiveAnalyzer::new(48_000);
+        let insertion_count = LIVE_SPECTROGRAM_MAX_HISTORY * 2 + 17;
+
+        for index in 0..insertion_count {
+            analyzer.record_analyzed_row(encoded_history_row(index), spectrum_levels(0.0));
+        }
+
+        assert_eq!(analyzer.row_count, LIVE_SPECTROGRAM_MAX_HISTORY);
+        assert_eq!(
+            analyzer.history_start,
+            (insertion_count - LIVE_SPECTROGRAM_MAX_HISTORY) % LIVE_SPECTROGRAM_MAX_HISTORY
+        );
+
+        let frame = analyzer
+            .frame(1, 1)
+            .expect("wrapped analyzer history should publish");
+        let mut expected =
+            Vec::with_capacity(LIVE_SPECTROGRAM_MAX_HISTORY * LIVE_SPECTROGRAM_BAND_COUNT);
+        for index in insertion_count - LIVE_SPECTROGRAM_MAX_HISTORY..insertion_count {
+            expected.extend_from_slice(&encoded_history_row(index));
+        }
+
+        assert_eq!(frame.values.as_ref(), expected.as_slice());
+        assert!(Arc::ptr_eq(frame.packed_values(), &frame.values));
+    }
+
+    #[test]
+    fn analyzer_history_reset_after_wrap_drops_stale_rows_for_reset_and_pause() {
+        let mut analyzer = LiveAnalyzer::new(48_000);
+        for index in 0..LIVE_SPECTROGRAM_MAX_HISTORY + 9 {
+            analyzer.record_analyzed_row(encoded_history_row(index), spectrum_levels(0.0));
+        }
+        assert_ne!(analyzer.history_start, 0);
+
+        analyzer.reset();
+        assert_eq!(analyzer.history_start, 0);
+        assert_eq!(analyzer.row_count, 0);
+        assert!(analyzer.frame(1, 1).is_none());
+
+        for index in 10_000..10_003 {
+            analyzer.record_analyzed_row(encoded_history_row(index), spectrum_levels(0.0));
+        }
+        let reset_frame = analyzer
+            .frame(1, 1)
+            .expect("post-reset rows should publish");
+        let mut reset_values = Vec::new();
+        for index in 10_000..10_003 {
+            reset_values.extend_from_slice(&encoded_history_row(index));
+        }
+        assert_eq!(reset_frame.values.as_ref(), reset_values.as_slice());
+
+        analyzer.reset_after_pause();
+        assert_eq!(analyzer.history_start, 0);
+        assert_eq!(analyzer.row_count, 0);
+        assert!(analyzer.frame(1, 1).is_none());
+
+        for index in 20_000..20_002 {
+            analyzer.record_analyzed_row(encoded_history_row(index), spectrum_levels(0.0));
+        }
+        let pause_reset_frame = analyzer
+            .frame(1, 1)
+            .expect("post-pause-reset rows should publish");
+        let mut pause_reset_values = Vec::new();
+        for index in 20_000..20_002 {
+            pause_reset_values.extend_from_slice(&encoded_history_row(index));
+        }
+        assert_eq!(
+            pause_reset_frame.values.as_ref(),
+            pause_reset_values.as_slice()
+        );
     }
 
     #[test]
