@@ -8279,9 +8279,7 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
         .waveform
         .as_ref()
         .filter(|_| {
-            !state.waveform_busy
-                && !state.transport_playing
-                && state.waveform_track_id.as_deref() == Some(track.id.as_str())
+            !state.waveform_busy && state.waveform_track_id.as_deref() == Some(track.id.as_str())
         })
         .map(|waveform| {
             track
@@ -8300,7 +8298,9 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
         .waveform
         .as_ref()
         .filter(|_| {
-            !state.waveform_busy && state.waveform_track_id.as_deref() == Some(track.id.as_str())
+            !state.waveform_busy
+                && !state.transport_playing
+                && state.waveform_track_id.as_deref() == Some(track.id.as_str())
         })
         .and_then(|waveform| {
             waveform::ratio_for_millis(state.review_cursor_millis, waveform.duration_millis)
@@ -13720,6 +13720,109 @@ mod tests {
                 "source icon {index} center {source_center} should align with waveform body center {waveform_center} (icon={source_icon_rect:?}, rail={waveform_rect:?})"
             );
         }
+    }
+
+    #[test]
+    fn active_playback_keeps_waveform_markers_and_hides_retained_cursors() {
+        let track_id = String::from("active-playback-comments");
+        let reference_path = PathBuf::from("/external/active-playback-reference.wav");
+        let waveform = audition_waveform();
+        let mut state = AppState {
+            busy: false,
+            waveform: Some(waveform.clone()),
+            waveform_track_id: Some(track_id.clone()),
+            reference_waveform: Some(waveform),
+            reference_waveform_track_id: Some(track_id.clone()),
+            transport_playing: true,
+            transport_position_millis: 500,
+            review_cursor_millis: 500,
+            reference_transport: Some(transport::AudioTransport::spawn()),
+            reference_transport_playing: true,
+            reference_transport_position_millis: 500,
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(track_id.clone());
+        state.library.tracks.push(Track {
+            id: track_id.clone(),
+            title: String::from("Active playback comments"),
+            original_name: String::from("active-playback-comments.wav"),
+            path: PathBuf::from("/external/active-playback-comments.wav"),
+            reference_path: Some(reference_path.clone()),
+            size: 0,
+            favorite: false,
+            stage: TrackStage::Production,
+            status: TrackStatus::Inbox,
+            notes: vec![Note {
+                id: String::from("main-persisted-note"),
+                time_millis: 500,
+                body: String::from("main persisted note"),
+                done: false,
+            }],
+        });
+        state.library.reference_tracks.push(ReferenceTrack {
+            path: reference_path,
+            notes: vec![Note {
+                id: String::from("reference-persisted-note"),
+                time_millis: 500,
+                body: String::from("reference persisted note"),
+                done: false,
+            }],
+        });
+
+        let frame = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(1_180.0, 1_000.0));
+        let marker_count = |widget_id| {
+            frame
+                .paint_plan
+                .primitives
+                .iter()
+                .filter(|primitive| {
+                    matches!(
+                        primitive,
+                        PaintPrimitive::StrokePolygon(stroke)
+                            if stroke.widget_id == widget_id
+                                && stroke.color == ThemeTokens::default().text_primary
+                                && (stroke.width - 2.0).abs() < f32::EPSILON
+                    )
+                })
+                .count()
+        };
+        let retained_cursor_count = |widget_id| {
+            frame
+                .paint_plan
+                .primitives
+                .iter()
+                .filter(|primitive| {
+                    matches!(
+                        primitive,
+                        PaintPrimitive::FillRect(fill)
+                            if fill.widget_id == widget_id
+                                && fill.color == ThemeTokens::default().highlight_orange_soft
+                    )
+                })
+                .count()
+        };
+
+        assert_eq!(
+            marker_count(waveform::MAIN_WAVEFORM_WIDGET_ID),
+            1,
+            "active main playback must retain persisted waveform markers"
+        );
+        assert_eq!(
+            marker_count(waveform::REFERENCE_WAVEFORM_WIDGET_ID),
+            1,
+            "active reference playback must retain persisted waveform markers"
+        );
+        assert_eq!(
+            retained_cursor_count(waveform::MAIN_WAVEFORM_WIDGET_ID),
+            0,
+            "the retained main waveform must leave the moving cursor to the playback overlay"
+        );
+        assert_eq!(
+            retained_cursor_count(waveform::REFERENCE_WAVEFORM_WIDGET_ID),
+            0,
+            "the retained reference waveform must leave the moving cursor to the playback overlay"
+        );
     }
 
     #[test]
