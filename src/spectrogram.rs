@@ -15,10 +15,9 @@ use radiant::{
     prelude as ui,
     runtime::{
         GpuShaderSurfaceDescriptor, GpuShaderSurfaceDescriptorParts, GpuSurfaceCapabilities,
-        GpuSurfaceContent, PaintBrush, PaintFillPath, PaintFillPolygon, PaintFillRect,
-        PaintGpuSurface, PaintLinearGradient, PaintPath, PaintPathCommand, PaintPrimitive,
-        PaintStrokePolyline, PaintStrokeRect, PaintTextAlign, PaintTextMetrics,
-        push_text_run_with_metrics,
+        GpuSurfaceContent, PaintBrush, PaintFillPath, PaintFillRect, PaintGpuSurface,
+        PaintLinearGradient, PaintPath, PaintPathCommand, PaintPrimitive, PaintStrokePolyline,
+        PaintStrokeRect, PaintTextAlign, PaintTextMetrics, push_text_run_with_metrics,
     },
     theme::ThemeTokens,
     widgets::{FocusBehavior, PaintBounds, Widget, WidgetCommon, WidgetInput, WidgetOutput},
@@ -299,8 +298,8 @@ struct SpectrogramWidget {
 
 #[derive(Clone, Debug, PartialEq)]
 struct SpectrumPaintGeometry {
-    ribbon_points: Arc<[Point]>,
     area_path: PaintPath,
+    ribbon_path: PaintPath,
 }
 
 impl SpectrogramWidget {
@@ -529,41 +528,44 @@ impl SpectrogramWidget {
         {
             return None;
         }
-        let mut centerline = Vec::with_capacity(LIVE_SPECTRUM_POINT_COUNT);
-        let mut upper_offsets = Vec::with_capacity(LIVE_SPECTRUM_POINT_COUNT);
-        let mut lower_offsets = Vec::with_capacity(LIVE_SPECTRUM_POINT_COUNT);
         let half_width = SPECTRUM_RIBBON_WIDTH * 0.5;
-        for (point, &x) in x_positions.iter().enumerate() {
+        let center_at = |point: usize, x: f32| {
             let level = frame.spectrum_value(point) as f32 / u8::MAX as f32;
             let y = (plot.max.y - plot.height() * level).clamp(plot.min.y, plot.max.y);
-            let center = Point::new(x.clamp(plot.min.x, plot.max.x), y);
-            centerline.push(center);
-            upper_offsets.push(Point::new(
+            Point::new(x.clamp(plot.min.x, plot.max.x), y)
+        };
+        let mut area_commands = Vec::with_capacity(LIVE_SPECTRUM_POINT_COUNT + 3);
+        let mut ribbon_commands = Vec::with_capacity(LIVE_SPECTRUM_POINT_COUNT * 2 + 1);
+        for (point, &x) in x_positions.iter().enumerate() {
+            let center = center_at(point, x);
+            let upper = Point::new(
                 center.x,
                 (center.y - half_width).clamp(plot.min.y, plot.max.y),
-            ));
-            lower_offsets.push(Point::new(
+            );
+            if point == 0 {
+                area_commands.push(PaintPathCommand::MoveTo(center));
+                ribbon_commands.push(PaintPathCommand::MoveTo(upper));
+            } else {
+                area_commands.push(PaintPathCommand::LineTo(center));
+                ribbon_commands.push(PaintPathCommand::LineTo(upper));
+            }
+        }
+        for (point, &x) in x_positions.iter().enumerate().rev() {
+            let center = center_at(point, x);
+            let lower = Point::new(
                 center.x,
                 (center.y + half_width).clamp(plot.min.y, plot.max.y),
-            ));
-        }
-
-        let mut ribbon_points = Vec::with_capacity(LIVE_SPECTRUM_POINT_COUNT * 2);
-        ribbon_points.extend(upper_offsets);
-        ribbon_points.extend(lower_offsets.into_iter().rev());
-
-        let mut area_commands = Vec::with_capacity(LIVE_SPECTRUM_POINT_COUNT + 3);
-        area_commands.push(PaintPathCommand::MoveTo(centerline[0]));
-        for point in centerline.iter().skip(1).copied() {
-            area_commands.push(PaintPathCommand::LineTo(point));
+            );
+            ribbon_commands.push(PaintPathCommand::LineTo(lower));
         }
         area_commands.push(PaintPathCommand::LineTo(Point::new(plot.max.x, plot.max.y)));
         area_commands.push(PaintPathCommand::LineTo(Point::new(plot.min.x, plot.max.y)));
         area_commands.push(PaintPathCommand::Close);
+        ribbon_commands.push(PaintPathCommand::Close);
 
         Some(SpectrumPaintGeometry {
-            ribbon_points: Arc::from(ribbon_points.into_boxed_slice()),
             area_path: PaintPath::from(area_commands),
+            ribbon_path: PaintPath::from(ribbon_commands),
         })
     }
 
@@ -711,11 +713,11 @@ fn append_spectrum_ribbon(
     geometry: &SpectrumPaintGeometry,
     theme: &ThemeTokens,
 ) {
-    primitives.push(PaintPrimitive::FillPolygon(PaintFillPolygon {
+    primitives.push(PaintPrimitive::FillPath(PaintFillPath::new(
         widget_id,
-        points: Arc::clone(&geometry.ribbon_points),
-        color: theme.highlight_orange,
-    }));
+        geometry.ribbon_path.clone(),
+        PaintBrush::solid(theme.highlight_orange),
+    )));
 }
 
 fn format_frequency_label(frequency: f32) -> String {
@@ -1175,7 +1177,7 @@ mod tests {
     use radiant::{
         gui::types::{Point, Rect, Vector2},
         layout::LayoutOutput,
-        runtime::{GpuSurfaceContent, PaintBrush, PaintPathCommand, PaintPrimitive},
+        runtime::{GpuSurfaceContent, PaintBrush, PaintFillPath, PaintPathCommand, PaintPrimitive},
         theme::ThemeTokens,
         widgets::Widget,
     };
@@ -1243,6 +1245,38 @@ mod tests {
             theme,
         );
         primitives
+    }
+
+    fn fill_path_with_brush(
+        primitives: &[PaintPrimitive],
+        matches_brush: impl Fn(PaintBrush) -> bool,
+    ) -> &PaintFillPath {
+        primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                PaintPrimitive::FillPath(fill) if matches_brush(fill.brush) => Some(fill),
+                _ => None,
+            })
+            .expect("spectrum path should be present")
+    }
+
+    fn area_fill(primitives: &[PaintPrimitive]) -> &PaintFillPath {
+        fill_path_with_brush(primitives, |brush| {
+            matches!(brush, PaintBrush::LinearGradient(_))
+        })
+    }
+
+    fn ribbon_fill(primitives: &[PaintPrimitive]) -> &PaintFillPath {
+        fill_path_with_brush(primitives, |brush| matches!(brush, PaintBrush::Solid(_)))
+    }
+
+    fn path_point(command: &PaintPathCommand) -> Point {
+        match command {
+            PaintPathCommand::MoveTo(point) | PaintPathCommand::LineTo(point) => *point,
+            PaintPathCommand::QuadTo { .. }
+            | PaintPathCommand::CurveTo { .. }
+            | PaintPathCommand::Close => panic!("spectrum path should contain straight segments"),
+        }
     }
 
     #[test]
@@ -1515,33 +1549,17 @@ mod tests {
         };
         assert_eq!(first, fresh);
 
-        let first_polygon = first.iter().find_map(|primitive| match primitive {
-            PaintPrimitive::FillPolygon(polygon) => Some(polygon),
-            _ => None,
-        });
-        let second_polygon = second.iter().find_map(|primitive| match primitive {
-            PaintPrimitive::FillPolygon(polygon) => Some(polygon),
-            _ => None,
-        });
-        let (Some(first_polygon), Some(second_polygon)) = (first_polygon, second_polygon) else {
-            panic!("spectrum overlay should contain a polygon");
-        };
-        assert!(Arc::ptr_eq(&first_polygon.points, &second_polygon.points));
-
-        let first_path = first.iter().find_map(|primitive| match primitive {
-            PaintPrimitive::FillPath(path) => Some(path),
-            _ => None,
-        });
-        let second_path = second.iter().find_map(|primitive| match primitive {
-            PaintPrimitive::FillPath(path) => Some(path),
-            _ => None,
-        });
-        let (Some(first_path), Some(second_path)) = (first_path, second_path) else {
-            panic!("spectrum overlay should contain an area path");
-        };
+        let first_area = area_fill(&first);
+        let second_area = area_fill(&second);
         assert_eq!(
-            first_path.path.commands().as_ptr(),
-            second_path.path.commands().as_ptr()
+            first_area.path.commands().as_ptr(),
+            second_area.path.commands().as_ptr()
+        );
+        let first_ribbon = ribbon_fill(&first);
+        let second_ribbon = ribbon_fill(&second);
+        assert_eq!(
+            first_ribbon.path.commands().as_ptr(),
+            second_ribbon.path.commands().as_ptr()
         );
     }
 
@@ -1553,14 +1571,21 @@ mod tests {
         let theme = ThemeTokens::default();
         let mut cache = SpectrogramOverlayPaintCache::default();
 
-        cached_overlay(
+        let first = cached_overlay(
             &mut cache,
             Some(frame),
             LiveSpectrogramMode::Spectrum,
             overlay_bounds(),
             &theme,
         );
-        cached_overlay(
+        let first_x_positions = Arc::clone(
+            &cache
+                .spectrum_static
+                .as_ref()
+                .expect("spectrum static cache should be present")
+                .x_positions,
+        );
+        let second = cached_overlay(
             &mut cache,
             Some(distinct_frame),
             LiveSpectrogramMode::Spectrum,
@@ -1570,6 +1595,16 @@ mod tests {
 
         assert_eq!(cache.rebuild_count(), 2);
         assert_eq!(cache.static_rebuild_count(), 1);
+        let second_x_positions = &cache
+            .spectrum_static
+            .as_ref()
+            .expect("spectrum static cache should be present")
+            .x_positions;
+        assert!(Arc::ptr_eq(&first_x_positions, second_x_positions));
+        assert_ne!(
+            ribbon_fill(&first).path.commands().as_ptr(),
+            ribbon_fill(&second).path.commands().as_ptr()
+        );
     }
 
     #[test]
@@ -1803,17 +1838,25 @@ mod tests {
         assert!(spectrum.iter().any(|primitive| {
             matches!(primitive, PaintPrimitive::FillRect(fill) if fill.color == SPECTRUM_PLOT_BACKGROUND)
         }));
-        assert!(
-            spectrum
-                .iter()
-                .any(|primitive| matches!(primitive, PaintPrimitive::FillPolygon(polygon) if polygon.points.len() == LIVE_SPECTRUM_POINT_COUNT * 2))
-        );
         assert_eq!(
             spectrum
                 .iter()
                 .filter(|primitive| matches!(primitive, PaintPrimitive::FillPath(_)))
                 .count(),
-            1
+            2
+        );
+        assert!(matches!(
+            ribbon_fill(&spectrum).brush,
+            PaintBrush::Solid(color) if color == ThemeTokens::default().highlight_orange
+        ));
+        assert!(matches!(
+            area_fill(&spectrum).brush,
+            PaintBrush::LinearGradient(_)
+        ));
+        assert!(
+            !spectrum
+                .iter()
+                .any(|primitive| matches!(primitive, PaintPrimitive::FillPolygon(_)))
         );
         assert!(
             !spectrum
@@ -1827,54 +1870,74 @@ mod tests {
         let bounds = Rect::from_min_size(Point::new(0.0, 0.0), Vector2::new(720.0, super::HEIGHT));
         let primitives = SpectrogramWidget::new(test_frame(), LiveSpectrogramMode::Spectrum)
             .paint_primitives(bounds, &LayoutOutput::default(), &ThemeTokens::default());
-        let ribbon = primitives
-            .iter()
-            .find_map(|primitive| match primitive {
-                PaintPrimitive::FillPolygon(area)
-                    if area.points.len() == LIVE_SPECTRUM_POINT_COUNT * 2 =>
-                {
-                    Some(area)
-                }
-                _ => None,
-            })
-            .expect("spectrum mode should paint one filled ribbon");
-        let area = primitives
-            .iter()
-            .find_map(|primitive| match primitive {
-                PaintPrimitive::FillPath(area) => Some(area),
-                _ => None,
-            })
-            .expect("spectrum mode should paint one subtle area");
+        let ribbon = ribbon_fill(&primitives);
+        let area = area_fill(&primitives);
         let plot = SpectrogramWidget::plot_rect(bounds);
+        let ribbon_commands = ribbon.path.commands();
+        let upper_points = ribbon_commands[..LIVE_SPECTRUM_POINT_COUNT]
+            .iter()
+            .map(path_point)
+            .collect::<Vec<_>>();
+        let lower_points = ribbon_commands
+            [LIVE_SPECTRUM_POINT_COUNT..LIVE_SPECTRUM_POINT_COUNT * 2]
+            .iter()
+            .map(path_point)
+            .collect::<Vec<_>>();
 
-        assert_eq!(ribbon.points.len(), LIVE_SPECTRUM_POINT_COUNT * 2);
-        assert_eq!(
-            primitives
-                .iter()
-                .filter(|primitive| matches!(primitive, PaintPrimitive::FillPolygon(_)))
-                .count(),
-            1
-        );
+        assert_eq!(ribbon_commands.len(), LIVE_SPECTRUM_POINT_COUNT * 2 + 1);
         assert_eq!(
             primitives
                 .iter()
                 .filter(|primitive| matches!(primitive, PaintPrimitive::FillPath(_)))
                 .count(),
-            1
+            2
         );
-        assert_eq!(ribbon.color, ThemeTokens::default().highlight_orange);
-        assert_eq!(ribbon.points.first().expect("low band").x, plot.min.x);
-        assert_eq!(ribbon.points[LIVE_SPECTRUM_POINT_COUNT - 1].x, plot.max.x);
-        assert_eq!(ribbon.points[LIVE_SPECTRUM_POINT_COUNT].x, plot.max.x);
+        assert!(matches!(
+            ribbon.brush,
+            PaintBrush::Solid(color) if color == ThemeTokens::default().highlight_orange
+        ));
+        assert_eq!(upper_points.first().expect("low band").x, plot.min.x);
+        assert_eq!(upper_points.last().expect("high band").x, plot.max.x);
         assert_eq!(
-            ribbon.points.last().expect("low band lower edge").x,
+            lower_points.first().expect("high band lower edge").x,
+            plot.max.x
+        );
+        assert_eq!(
+            lower_points.last().expect("low band lower edge").x,
             plot.min.x
         );
         assert!(
-            ribbon.points[..LIVE_SPECTRUM_POINT_COUNT]
+            upper_points
                 .windows(2)
                 .all(|points| points[0].x < points[1].x)
         );
+        assert!(
+            lower_points
+                .windows(2)
+                .all(|points| points[0].x > points[1].x)
+        );
+        assert!(matches!(
+            ribbon_commands.first(),
+            Some(PaintPathCommand::MoveTo(point))
+                if *point == Point::new(plot.min.x, plot.max.y - SPECTRUM_RIBBON_WIDTH * 0.5)
+        ));
+        assert!(matches!(
+            ribbon_commands.get(LIVE_SPECTRUM_POINT_COUNT - 1),
+            Some(PaintPathCommand::LineTo(point)) if *point == Point::new(plot.max.x, plot.min.y)
+        ));
+        assert!(matches!(
+            ribbon_commands.get(LIVE_SPECTRUM_POINT_COUNT),
+            Some(PaintPathCommand::LineTo(point))
+                if *point == Point::new(plot.max.x, plot.min.y + SPECTRUM_RIBBON_WIDTH * 0.5)
+        ));
+        assert!(matches!(
+            ribbon_commands.get(LIVE_SPECTRUM_POINT_COUNT * 2 - 1),
+            Some(PaintPathCommand::LineTo(point)) if *point == Point::new(plot.min.x, plot.max.y)
+        ));
+        assert!(matches!(
+            ribbon_commands.last(),
+            Some(PaintPathCommand::Close)
+        ));
         assert_eq!(area.path.commands().len(), LIVE_SPECTRUM_POINT_COUNT + 3);
         assert!(matches!(
             area.path.commands().first(),
@@ -1896,14 +1959,88 @@ mod tests {
         ));
         let area_index = primitives
             .iter()
-            .position(|primitive| matches!(primitive, PaintPrimitive::FillPath(_)))
+            .position(|primitive| {
+                matches!(
+                    primitive,
+                    PaintPrimitive::FillPath(fill)
+                        if matches!(fill.brush, PaintBrush::LinearGradient(_))
+                )
+            })
             .expect("area index");
         let ribbon_index = primitives
             .iter()
-            .position(|primitive| matches!(primitive, PaintPrimitive::FillPolygon(_)))
+            .position(|primitive| {
+                matches!(
+                    primitive,
+                    PaintPrimitive::FillPath(fill)
+                        if matches!(fill.brush, PaintBrush::Solid(_))
+                )
+            })
             .expect("ribbon index");
         assert!(area_index < ribbon_index);
         assert!(primitives.len() <= 24);
+    }
+
+    #[test]
+    fn spectrum_geometry_matches_reference_area_and_ribbon_paths() {
+        let mut frame = (*test_frame()).clone();
+        let mut spectrum_values = vec![0_u8; LIVE_SPECTRUM_POINT_COUNT];
+        spectrum_values[0] = u8::MAX;
+        spectrum_values[LIVE_SPECTRUM_POINT_COUNT / 2] = 128;
+        spectrum_values[LIVE_SPECTRUM_POINT_COUNT - 1] = 64;
+        frame.spectrum_values = Arc::from(spectrum_values.into_boxed_slice());
+
+        let widget = SpectrogramWidget::new(Arc::new(frame), LiveSpectrogramMode::Spectrum);
+        let bounds = overlay_bounds();
+        let plot = SpectrogramWidget::plot_rect(bounds);
+        let x_positions = widget.spectrum_x_positions(plot);
+        let geometry = widget
+            .spectrum_geometry_with_x_positions(plot, &x_positions)
+            .expect("valid detailed spectrum geometry");
+        let half_width = SPECTRUM_RIBBON_WIDTH * 0.5;
+        let center_at = |point: usize, x: f32| {
+            let level = widget
+                .frame
+                .as_ref()
+                .expect("reference frame")
+                .spectrum_value(point) as f32
+                / u8::MAX as f32;
+            let y = (plot.max.y - plot.height() * level).clamp(plot.min.y, plot.max.y);
+            Point::new(x.clamp(plot.min.x, plot.max.x), y)
+        };
+
+        let mut expected_area = Vec::with_capacity(LIVE_SPECTRUM_POINT_COUNT + 3);
+        let mut expected_ribbon = Vec::with_capacity(LIVE_SPECTRUM_POINT_COUNT * 2 + 1);
+        for (point, &x) in x_positions.iter().enumerate() {
+            let center = center_at(point, x);
+            let upper = Point::new(
+                center.x,
+                (center.y - half_width).clamp(plot.min.y, plot.max.y),
+            );
+            if point == 0 {
+                expected_area.push(PaintPathCommand::MoveTo(center));
+                expected_ribbon.push(PaintPathCommand::MoveTo(upper));
+            } else {
+                expected_area.push(PaintPathCommand::LineTo(center));
+                expected_ribbon.push(PaintPathCommand::LineTo(upper));
+            }
+        }
+        for (point, &x) in x_positions.iter().enumerate().rev() {
+            let center = center_at(point, x);
+            expected_ribbon.push(PaintPathCommand::LineTo(Point::new(
+                center.x,
+                (center.y + half_width).clamp(plot.min.y, plot.max.y),
+            )));
+        }
+        expected_area.extend([
+            PaintPathCommand::LineTo(Point::new(plot.max.x, plot.max.y)),
+            PaintPathCommand::LineTo(Point::new(plot.min.x, plot.max.y)),
+            PaintPathCommand::Close,
+        ]);
+        expected_ribbon.push(PaintPathCommand::Close);
+
+        assert_eq!(geometry.area_path.commands(), expected_area.as_slice());
+        assert_eq!(geometry.ribbon_path.commands(), expected_ribbon.as_slice());
     }
 
     #[test]
@@ -1919,12 +2056,22 @@ mod tests {
         let assert_order = |label: &str, primitives: &[PaintPrimitive]| {
             let area = primitives
                 .iter()
-                .position(|primitive| matches!(primitive, PaintPrimitive::FillPath(_)))
+                .position(|primitive| {
+                    matches!(
+                        primitive,
+                        PaintPrimitive::FillPath(fill)
+                            if matches!(fill.brush, PaintBrush::LinearGradient(_))
+                    )
+                })
                 .expect("spectrum area");
             let ribbon = primitives
                 .iter()
                 .position(|primitive| {
-                    matches!(primitive, PaintPrimitive::FillPolygon(polygon) if polygon.points.len() == LIVE_SPECTRUM_POINT_COUNT * 2)
+                    matches!(
+                        primitive,
+                        PaintPrimitive::FillPath(fill)
+                            if matches!(fill.brush, PaintBrush::Solid(_))
+                    )
                 })
                 .expect("spectrum ribbon");
             let grid = primitives
@@ -1984,26 +2131,34 @@ mod tests {
         let geometry = widget
             .spectrum_geometry(plot)
             .expect("valid detailed spectrum geometry");
-        assert_eq!(geometry.ribbon_points.len(), LIVE_SPECTRUM_POINT_COUNT * 2);
+        let ribbon_commands = geometry.ribbon_path.commands();
+        assert_eq!(ribbon_commands.len(), LIVE_SPECTRUM_POINT_COUNT * 2 + 1);
+        assert!(matches!(
+            ribbon_commands.last(),
+            Some(PaintPathCommand::Close)
+        ));
+        let ribbon_points = ribbon_commands[..LIVE_SPECTRUM_POINT_COUNT * 2]
+            .iter()
+            .map(path_point)
+            .collect::<Vec<_>>();
 
-        for point in geometry.ribbon_points.iter() {
+        for point in &ribbon_points {
             assert!(point.x >= plot.min.x && point.x <= plot.max.x);
             assert!(point.y >= plot.min.y && point.y <= plot.max.y);
         }
         for point in 0..LIVE_SPECTRUM_POINT_COUNT {
-            let upper = geometry.ribbon_points[point];
-            let lower = geometry.ribbon_points[2 * LIVE_SPECTRUM_POINT_COUNT - point - 1];
+            let upper = ribbon_points[point];
+            let lower = ribbon_points[2 * LIVE_SPECTRUM_POINT_COUNT - point - 1];
             let width = lower.y - upper.y;
             assert!((0.0..=SPECTRUM_RIBBON_WIDTH).contains(&width));
         }
         let middle = LIVE_SPECTRUM_POINT_COUNT / 2;
-        let middle_upper = geometry.ribbon_points[middle];
-        let middle_lower = geometry.ribbon_points[2 * LIVE_SPECTRUM_POINT_COUNT - middle - 1];
+        let middle_upper = ribbon_points[middle];
+        let middle_lower = ribbon_points[2 * LIVE_SPECTRUM_POINT_COUNT - middle - 1];
         assert!((middle_lower.y - middle_upper.y - SPECTRUM_RIBBON_WIDTH).abs() < 0.001);
-        let low_width = geometry.ribbon_points[2 * LIVE_SPECTRUM_POINT_COUNT - 1].y
-            - geometry.ribbon_points[0].y;
-        let high_width = geometry.ribbon_points[LIVE_SPECTRUM_POINT_COUNT].y
-            - geometry.ribbon_points[LIVE_SPECTRUM_POINT_COUNT - 1].y;
+        let low_width = ribbon_points[2 * LIVE_SPECTRUM_POINT_COUNT - 1].y - ribbon_points[0].y;
+        let high_width = ribbon_points[LIVE_SPECTRUM_POINT_COUNT].y
+            - ribbon_points[LIVE_SPECTRUM_POINT_COUNT - 1].y;
         assert!(low_width <= SPECTRUM_RIBBON_WIDTH * 0.5 + 0.001);
         assert!(high_width <= SPECTRUM_RIBBON_WIDTH * 0.5 + 0.001);
     }
@@ -2102,7 +2257,7 @@ mod tests {
     }
 
     #[test]
-    fn spectrum_area_geometry_is_shared_by_retained_and_transient_paint() {
+    fn spectrum_paths_are_shared_by_retained_and_transient_paint() {
         let bounds = Rect::from_min_size(Point::new(0.0, 0.0), Vector2::new(720.0, super::HEIGHT));
         let frame = test_frame();
         let widget = SpectrogramWidget::new(frame, LiveSpectrogramMode::Spectrum);
@@ -2111,28 +2266,16 @@ mod tests {
         let mut transient = Vec::new();
         widget.append_overlay_paint(&mut transient, bounds, &ThemeTokens::default());
 
-        let retained_area = retained.iter().find_map(|primitive| match primitive {
-            PaintPrimitive::FillPolygon(area) => Some(area),
-            _ => None,
-        });
-        let transient_area = transient.iter().find_map(|primitive| match primitive {
-            PaintPrimitive::FillPolygon(area) => Some(area),
-            _ => None,
-        });
-        assert_eq!(retained_area, transient_area);
-        assert!(
-            retained_area.is_some_and(|area| area.points.len() == LIVE_SPECTRUM_POINT_COUNT * 2)
+        assert_eq!(area_fill(&retained), area_fill(&transient));
+        assert_eq!(ribbon_fill(&retained), ribbon_fill(&transient));
+        assert_eq!(
+            area_fill(&retained).path.commands().len(),
+            LIVE_SPECTRUM_POINT_COUNT + 3
         );
-
-        let retained_path = retained.iter().find_map(|primitive| match primitive {
-            PaintPrimitive::FillPath(path) => Some(path),
-            _ => None,
-        });
-        let transient_path = transient.iter().find_map(|primitive| match primitive {
-            PaintPrimitive::FillPath(path) => Some(path),
-            _ => None,
-        });
-        assert_eq!(retained_path, transient_path);
+        assert_eq!(
+            ribbon_fill(&retained).path.commands().len(),
+            LIVE_SPECTRUM_POINT_COUNT * 2 + 1
+        );
     }
 
     #[test]
@@ -2151,7 +2294,6 @@ mod tests {
                 PaintPrimitive::FillRect(_)
                     | PaintPrimitive::FillRectBatch(_)
                     | PaintPrimitive::FillPath(_)
-                    | PaintPrimitive::FillPolygon(_)
                     | PaintPrimitive::StrokeRect(_)
                     | PaintPrimitive::StrokeRectBatch(_)
                     | PaintPrimitive::StrokePolygon(_)
@@ -2168,6 +2310,18 @@ mod tests {
             !primitives
                 .iter()
                 .any(|primitive| matches!(primitive, PaintPrimitive::GpuSurface(_)))
+        );
+        assert_eq!(
+            primitives
+                .iter()
+                .filter(|primitive| matches!(primitive, PaintPrimitive::FillPath(_)))
+                .count(),
+            2
+        );
+        assert!(
+            !primitives
+                .iter()
+                .any(|primitive| matches!(primitive, PaintPrimitive::FillPolygon(_)))
         );
     }
 
