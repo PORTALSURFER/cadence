@@ -818,7 +818,6 @@ struct AppState {
     live_spectrogram_mode: LiveSpectrogramMode,
     live_spectrogram_history_scale: f32,
     live_spectrogram_height: f32,
-    live_spectrogram_overlay_cache: spectrogram::SpectrogramOverlayPaintCache,
     live_spectrogram_resize: Option<LiveSpectrogramResize>,
     reference_waveform: Option<audio::WaveformData>,
     reference_waveform_track_id: Option<String>,
@@ -935,7 +934,6 @@ impl Default for AppState {
             live_spectrogram_mode: LiveSpectrogramMode::Waterfall,
             live_spectrogram_history_scale: spectrogram::DEFAULT_HISTORY_SCALE,
             live_spectrogram_height: spectrogram::HEIGHT,
-            live_spectrogram_overlay_cache: spectrogram::SpectrogramOverlayPaintCache::default(),
             live_spectrogram_resize: None,
             reference_waveform: None,
             reference_waveform_track_id: None,
@@ -1087,10 +1085,8 @@ fn live_spectrogram_presence_revision(state: &AppState) -> u64 {
     }
 }
 
-fn active_waterfall_projection_revision(state: &AppState) -> u64 {
-    if state.live_spectrogram_mode != LiveSpectrogramMode::Waterfall
-        || !(state.transport_playing || state.reference_transport_playing)
-    {
+fn active_live_spectrogram_projection_revision(state: &AppState) -> u64 {
+    if !(state.transport_playing || state.reference_transport_playing) {
         return 0;
     }
 
@@ -1146,12 +1142,11 @@ fn frame_surface_revisions(state: &mut AppState) -> SurfaceRevisions {
         // The header follows the displayed source while active. Once playback
         // is stopped, preserve the existing all-source final-frame behavior.
         live_spectrogram_presence_revision(state),
-        // Active Waterfall frames live in the retained GPU surface, so only
-        // the displayed source's accepted revision reprojects it. Spectrum
-        // revisions remain paint-only in the transient overlay. Once playback
-        // is stopped, accepted frame revisions must reproject the retained
-        // scene so the final analyzer rows are included.
-        active_waterfall_projection_revision(state),
+        // Active live Spectrum and Waterfall frames live in retained GPU
+        // surfaces, so only the displayed source's accepted revision
+        // reprojects. Once playback is stopped, accepted frame revisions must
+        // reproject the retained scene so the final analyzer rows are included.
+        active_live_spectrogram_projection_revision(state),
         retained_live_spectrogram_revision(state),
         state.live_spectrogram_mode as u64,
         spectrogram::clamp_history_scale(state.live_spectrogram_history_scale).to_bits() as u64,
@@ -1245,24 +1240,6 @@ fn paint_live_playback_overlay(
             &theme,
         );
     }
-
-    let frame = selected_track(state).and_then(|track| {
-        let source = review_spectrogram_source(state);
-        current_live_frame_for_source(state, &track.id, source)
-    });
-    let Some(bounds) = context.plan.first_widget_rect(LIVE_SPECTROGRAM_BODY_ID) else {
-        return;
-    };
-    let mode = state.live_spectrogram_mode;
-    spectrogram::paint_overlay(
-        &mut state.live_spectrogram_overlay_cache,
-        frame,
-        mode,
-        state.live_spectrogram_history_scale,
-        bounds,
-        primitives,
-        &theme,
-    );
 }
 
 fn workspace_mode_key(mode: WorkspaceMode) -> u64 {
@@ -9783,89 +9760,94 @@ mod tests {
     }
 
     #[test]
-    fn active_waterfall_reprojects_only_the_displayed_source_revision() {
-        let mut state = audition_state(&["main"]);
-        state.reference_transport = Some(transport::AudioTransport::spawn());
-        state.reference_waveform_track_id = Some(String::from("main"));
-        state.live_spectrogram = Some(live_frame(0, 0, 1));
-        state.live_spectrogram_revision = 1;
-        state.transport.set_live_state_for_test(LiveFrameState {
-            generation: 0,
-            epoch: 0,
-            revision: 1,
-            pending: false,
-        });
-        state.transport_playing = true;
-        state.reference_transport_playing = true;
-        state.audition_source = AuditionSource::Main;
-        state.live_spectrogram_mode = LiveSpectrogramMode::Waterfall;
-        state
-            .reference_transport
-            .as_ref()
-            .expect("reference transport")
-            .set_live_state_for_test(LiveFrameState {
-                generation: 0,
-                epoch: 0,
-                revision: 0,
-                pending: false,
-            });
-
-        let before = frame_surface_revisions(&mut state);
-        let same_revision = frame_surface_revisions(&mut state);
-        assert_eq!(
-            same_revision.repaint_scope_since(before),
-            RepaintScope::PaintOnly
-        );
-
-        state.reference_live_spectrogram = Some(live_frame(0, 0, 1));
-        state.reference_live_spectrogram_revision = 1;
-        state
-            .reference_transport
-            .as_ref()
-            .expect("reference transport")
-            .set_live_state_for_test(LiveFrameState {
+    fn active_live_spectrogram_reprojects_only_the_displayed_source_revision() {
+        for mode in [
+            LiveSpectrogramMode::Waterfall,
+            LiveSpectrogramMode::Spectrum,
+        ] {
+            let mut state = audition_state(&["main"]);
+            state.reference_transport = Some(transport::AudioTransport::spawn());
+            state.reference_waveform_track_id = Some(String::from("main"));
+            state.live_spectrogram = Some(live_frame(0, 0, 1));
+            state.live_spectrogram_revision = 1;
+            state.transport.set_live_state_for_test(LiveFrameState {
                 generation: 0,
                 epoch: 0,
                 revision: 1,
                 pending: false,
             });
-        let hidden_revision = frame_surface_revisions(&mut state);
-        assert_eq!(
-            hidden_revision.repaint_scope_since(same_revision),
-            RepaintScope::PaintOnly,
-            "a hidden reference frame must not reproject the displayed main waterfall"
-        );
+            state.transport_playing = true;
+            state.reference_transport_playing = true;
+            state.audition_source = AuditionSource::Main;
+            state.live_spectrogram_mode = mode;
+            state
+                .reference_transport
+                .as_ref()
+                .expect("reference transport")
+                .set_live_state_for_test(LiveFrameState {
+                    generation: 0,
+                    epoch: 0,
+                    revision: 0,
+                    pending: false,
+                });
 
-        state.live_spectrogram = Some(live_frame(0, 0, 2));
-        state.live_spectrogram_revision = 2;
-        state.transport.set_live_state_for_test(LiveFrameState {
-            generation: 0,
-            epoch: 0,
-            revision: 2,
-            pending: false,
-        });
-        let displayed_revision = frame_surface_revisions(&mut state);
-        assert_eq!(
-            displayed_revision.repaint_scope_since(hidden_revision),
-            RepaintScope::Projection
-        );
-        let repeated_revision = frame_surface_revisions(&mut state);
-        assert_eq!(
-            repeated_revision.repaint_scope_since(displayed_revision),
-            RepaintScope::PaintOnly
-        );
+            let before = frame_surface_revisions(&mut state);
+            let same_revision = frame_surface_revisions(&mut state);
+            assert_eq!(
+                same_revision.repaint_scope_since(before),
+                RepaintScope::PaintOnly
+            );
 
-        state.audition_source = AuditionSource::Reference;
-        let switched_source = frame_surface_revisions(&mut state);
-        assert_eq!(
-            switched_source.repaint_scope_since(repeated_revision),
-            RepaintScope::Projection,
-            "switching the displayed source must reproject the retained waterfall"
-        );
+            state.reference_live_spectrogram = Some(live_frame(0, 0, 1));
+            state.reference_live_spectrogram_revision = 1;
+            state
+                .reference_transport
+                .as_ref()
+                .expect("reference transport")
+                .set_live_state_for_test(LiveFrameState {
+                    generation: 0,
+                    epoch: 0,
+                    revision: 1,
+                    pending: false,
+                });
+            let hidden_revision = frame_surface_revisions(&mut state);
+            assert_eq!(
+                hidden_revision.repaint_scope_since(same_revision),
+                RepaintScope::PaintOnly,
+                "a hidden reference frame must not reproject the displayed main live surface"
+            );
+
+            state.live_spectrogram = Some(live_frame(0, 0, 2));
+            state.live_spectrogram_revision = 2;
+            state.transport.set_live_state_for_test(LiveFrameState {
+                generation: 0,
+                epoch: 0,
+                revision: 2,
+                pending: false,
+            });
+            let displayed_revision = frame_surface_revisions(&mut state);
+            assert_eq!(
+                displayed_revision.repaint_scope_since(hidden_revision),
+                RepaintScope::Projection
+            );
+            let repeated_revision = frame_surface_revisions(&mut state);
+            assert_eq!(
+                repeated_revision.repaint_scope_since(displayed_revision),
+                RepaintScope::PaintOnly
+            );
+
+            state.audition_source = AuditionSource::Reference;
+            let switched_source = frame_surface_revisions(&mut state);
+            assert_eq!(
+                switched_source.repaint_scope_since(repeated_revision),
+                RepaintScope::Projection,
+                "switching the displayed source must reproject the retained live surface"
+            );
+        }
     }
 
     #[test]
-    fn active_spectrum_revision_remains_paint_only() {
+    fn active_spectrum_revision_reprojects_retained_surface() {
         let mut state = audition_state(&["main"]);
         state.live_spectrogram = Some(live_frame(0, 0, 1));
         state.live_spectrogram_revision = 1;
@@ -9889,7 +9871,7 @@ mod tests {
         });
         let after = frame_surface_revisions(&mut state);
 
-        assert_eq!(after.repaint_scope_since(before), RepaintScope::PaintOnly);
+        assert_eq!(after.repaint_scope_since(before), RepaintScope::Projection);
     }
 
     #[test]
@@ -9947,80 +9929,86 @@ mod tests {
     }
 
     #[test]
-    fn waterfall_final_live_frame_after_natural_stop_advances_retained_projection() {
-        let mut state = audition_state(&["main"]);
-        let initial_frame = live_frame(0, 0, 1);
-        state.live_spectrogram = Some(Arc::clone(&initial_frame));
-        state.live_spectrogram_revision = initial_frame.revision;
-        state.transport.set_live_state_for_test(LiveFrameState {
-            generation: 0,
-            epoch: 0,
-            revision: 1,
-            pending: false,
-        });
-        state.transport_playing = true;
-
-        let active_before = frame_surface_revisions(&mut state);
-        let active_frame = live_frame(0, 0, 2);
-        state.transport.set_live_state_for_test(LiveFrameState {
-            generation: 0,
-            epoch: 0,
-            revision: 2,
-            pending: false,
-        });
-        let active_live_state = state.transport.live_frame_state();
-        refresh_live_spectrogram(
-            &mut state.live_spectrogram,
-            &mut state.live_spectrogram_revision,
-            state.transport_generation,
-            active_live_state,
-            Some(active_frame),
-        );
-        assert_eq!(state.live_spectrogram_revision, 2);
-        let active_after = frame_surface_revisions(&mut state);
-        assert_eq!(
-            active_after.repaint_scope_since(active_before),
-            RepaintScope::Projection
-        );
-
-        apply_transport_snapshot(
-            &mut state,
-            Snapshot {
+    fn live_spectrogram_final_live_frame_after_natural_stop_advances_retained_projection() {
+        for mode in [
+            LiveSpectrogramMode::Waterfall,
+            LiveSpectrogramMode::Spectrum,
+        ] {
+            let mut state = audition_state(&["main"]);
+            let initial_frame = live_frame(0, 0, 1);
+            state.live_spectrogram = Some(Arc::clone(&initial_frame));
+            state.live_spectrogram_revision = initial_frame.revision;
+            state.live_spectrogram_mode = mode;
+            state.transport.set_live_state_for_test(LiveFrameState {
                 generation: 0,
-                acknowledged_token: 0,
-                position_millis: 1_000,
-                playing: false,
-                ready: true,
-            },
-        );
-        assert!(!state.transport_playing);
-        let stopped_before_final = frame_surface_revisions(&mut state);
-        assert_eq!(
-            stopped_before_final.repaint_scope_since(active_after),
-            RepaintScope::Projection
-        );
+                epoch: 0,
+                revision: 1,
+                pending: false,
+            });
+            state.transport_playing = true;
 
-        let final_frame = live_frame(0, 0, 3);
-        state.transport.set_live_state_for_test(LiveFrameState {
-            generation: 0,
-            epoch: 0,
-            revision: 3,
-            pending: false,
-        });
-        let final_live_state = state.transport.live_frame_state();
-        refresh_live_spectrogram(
-            &mut state.live_spectrogram,
-            &mut state.live_spectrogram_revision,
-            state.transport_generation,
-            final_live_state,
-            Some(final_frame),
-        );
-        assert_eq!(state.live_spectrogram_revision, 3);
-        let stopped_after_final = frame_surface_revisions(&mut state);
-        assert_eq!(
-            stopped_after_final.repaint_scope_since(stopped_before_final),
-            RepaintScope::Projection
-        );
+            let active_before = frame_surface_revisions(&mut state);
+            let active_frame = live_frame(0, 0, 2);
+            state.transport.set_live_state_for_test(LiveFrameState {
+                generation: 0,
+                epoch: 0,
+                revision: 2,
+                pending: false,
+            });
+            let active_live_state = state.transport.live_frame_state();
+            refresh_live_spectrogram(
+                &mut state.live_spectrogram,
+                &mut state.live_spectrogram_revision,
+                state.transport_generation,
+                active_live_state,
+                Some(active_frame),
+            );
+            assert_eq!(state.live_spectrogram_revision, 2);
+            let active_after = frame_surface_revisions(&mut state);
+            assert_eq!(
+                active_after.repaint_scope_since(active_before),
+                RepaintScope::Projection
+            );
+
+            apply_transport_snapshot(
+                &mut state,
+                Snapshot {
+                    generation: 0,
+                    acknowledged_token: 0,
+                    position_millis: 1_000,
+                    playing: false,
+                    ready: true,
+                },
+            );
+            assert!(!state.transport_playing);
+            let stopped_before_final = frame_surface_revisions(&mut state);
+            assert_eq!(
+                stopped_before_final.repaint_scope_since(active_after),
+                RepaintScope::Projection
+            );
+
+            let final_frame = live_frame(0, 0, 3);
+            state.transport.set_live_state_for_test(LiveFrameState {
+                generation: 0,
+                epoch: 0,
+                revision: 3,
+                pending: false,
+            });
+            let final_live_state = state.transport.live_frame_state();
+            refresh_live_spectrogram(
+                &mut state.live_spectrogram,
+                &mut state.live_spectrogram_revision,
+                state.transport_generation,
+                final_live_state,
+                Some(final_frame),
+            );
+            assert_eq!(state.live_spectrogram_revision, 3);
+            let stopped_after_final = frame_surface_revisions(&mut state);
+            assert_eq!(
+                stopped_after_final.repaint_scope_since(stopped_before_final),
+                RepaintScope::Projection
+            );
+        }
     }
 
     #[test]
