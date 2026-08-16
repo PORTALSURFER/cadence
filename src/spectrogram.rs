@@ -381,6 +381,32 @@ impl SpectrogramWidget {
         plot.min.x + plot.width() * position.clamp(0.0, 1.0)
     }
 
+    fn spectrum_x_positions(&self, plot: Rect) -> Arc<[f32]> {
+        let last_point = LIVE_SPECTRUM_POINT_COUNT - 1;
+        let sample_rate = self.sample_rate();
+        let (minimum, maximum) = live_display_frequency_bounds(sample_rate);
+        let frequency_ratio = (maximum / minimum.max(f32::MIN_POSITIVE)).max(1.0);
+        let log_frequency_ratio = frequency_ratio.ln();
+        let positions = (0..LIVE_SPECTRUM_POINT_COUNT)
+            .map(|point| {
+                let frequency = live_spectrum_point_frequency(sample_rate, point);
+                if point == 0 {
+                    plot.min.x
+                } else if point == last_point {
+                    plot.max.x
+                } else {
+                    let position = if frequency_ratio > 1.0 {
+                        (frequency.clamp(minimum, maximum) / minimum).ln() / log_frequency_ratio
+                    } else {
+                        0.0
+                    };
+                    plot.min.x + plot.width() * position.clamp(0.0, 1.0)
+                }
+            })
+            .collect::<Vec<_>>();
+        Arc::from(positions.into_boxed_slice())
+    }
+
     fn frequency_grid(&self) -> Vec<(f32, String)> {
         let (minimum, maximum) = live_display_frequency_bounds(self.sample_rate());
         let mut entries = Vec::with_capacity(FREQUENCY_GRID.len() + 1);
@@ -487,24 +513,27 @@ impl SpectrogramWidget {
     }
 
     fn spectrum_geometry(&self, plot: Rect) -> Option<SpectrumPaintGeometry> {
+        let x_positions = self.spectrum_x_positions(plot);
+        self.spectrum_geometry_with_x_positions(plot, &x_positions)
+    }
+
+    fn spectrum_geometry_with_x_positions(
+        &self,
+        plot: Rect,
+        x_positions: &[f32],
+    ) -> Option<SpectrumPaintGeometry> {
         let frame = self.frame.as_ref()?;
-        if !plot.has_finite_positive_area() || !frame.is_valid() {
+        if !plot.has_finite_positive_area()
+            || !frame.is_valid()
+            || x_positions.len() != LIVE_SPECTRUM_POINT_COUNT
+        {
             return None;
         }
-        let last_point = LIVE_SPECTRUM_POINT_COUNT - 1;
         let mut centerline = Vec::with_capacity(LIVE_SPECTRUM_POINT_COUNT);
         let mut upper_offsets = Vec::with_capacity(LIVE_SPECTRUM_POINT_COUNT);
         let mut lower_offsets = Vec::with_capacity(LIVE_SPECTRUM_POINT_COUNT);
         let half_width = SPECTRUM_RIBBON_WIDTH * 0.5;
-        for point in 0..LIVE_SPECTRUM_POINT_COUNT {
-            let frequency = live_spectrum_point_frequency(self.sample_rate(), point);
-            let x = if point == 0 {
-                plot.min.x
-            } else if point == last_point {
-                plot.max.x
-            } else {
-                self.x_for_frequency(plot, frequency)
-            };
+        for (point, &x) in x_positions.iter().enumerate() {
             let level = frame.spectrum_value(point) as f32 / u8::MAX as f32;
             let y = (plot.max.y - plot.height() * level).clamp(plot.min.y, plot.max.y);
             let center = Point::new(x.clamp(plot.min.x, plot.max.x), y);
@@ -832,6 +861,36 @@ impl SpectrogramOverlayThemeKey {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SpectrumStaticPaintCacheKey {
+    sample_rate: u32,
+    outer_bounds: OverlayRectKey,
+    plot_bounds: OverlayRectKey,
+    theme: SpectrogramOverlayThemeKey,
+}
+
+impl SpectrumStaticPaintCacheKey {
+    fn new(sample_rate: u32, outer_bounds: Rect, plot_bounds: Rect, theme: &ThemeTokens) -> Self {
+        Self {
+            sample_rate,
+            outer_bounds: OverlayRectKey::from_rect(outer_bounds),
+            plot_bounds: OverlayRectKey::from_rect(plot_bounds),
+            theme: SpectrogramOverlayThemeKey::from_theme(theme),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SpectrumStaticPaintCacheEntry {
+    // This cache contains no frame samples: it is safe to reuse across source,
+    // epoch, and revision changes as long as geometry and theme are unchanged.
+    key: SpectrumStaticPaintCacheKey,
+    x_positions: Arc<[f32]>,
+    prefix: Arc<[PaintPrimitive]>,
+    grid: Arc<[PaintPrimitive]>,
+    suffix: Arc<[PaintPrimitive]>,
+}
+
 #[derive(Clone, Debug)]
 struct SpectrogramOverlayPaintCacheKey {
     frame: Arc<LiveSpectrogramFrame>,
@@ -882,6 +941,44 @@ impl SpectrogramOverlayPaintCacheKey {
     }
 }
 
+fn build_spectrum_static_paint_cache_entry(
+    widget: &SpectrogramWidget,
+    bounds: Rect,
+    plot: Rect,
+    theme: &ThemeTokens,
+) -> SpectrumStaticPaintCacheEntry {
+    let prefix = vec![
+        PaintPrimitive::FillRect(PaintFillRect {
+            widget_id: widget.common.id,
+            rect: bounds,
+            color: theme.bg_primary.blend_toward(theme.surface_overlay, 0.35),
+        }),
+        PaintPrimitive::FillRect(PaintFillRect {
+            widget_id: widget.common.id,
+            rect: plot,
+            color: SPECTRUM_PLOT_BACKGROUND,
+        }),
+    ];
+
+    let mut grid = Vec::new();
+    widget.overlay_grid(&mut grid, plot, theme);
+
+    let suffix = [PaintPrimitive::StrokeRect(PaintStrokeRect {
+        widget_id: widget.common.id,
+        rect: plot,
+        color: theme.border_emphasis,
+        width: 1.0,
+    })];
+
+    SpectrumStaticPaintCacheEntry {
+        key: SpectrumStaticPaintCacheKey::new(widget.sample_rate(), bounds, plot, theme),
+        x_positions: widget.spectrum_x_positions(plot),
+        prefix: Arc::from(prefix.into_boxed_slice()),
+        grid: Arc::from(grid.into_boxed_slice()),
+        suffix: Arc::from(suffix),
+    }
+}
+
 #[derive(Clone, Debug)]
 struct SpectrogramOverlayPaintCacheEntry {
     key: SpectrogramOverlayPaintCacheKey,
@@ -895,8 +992,11 @@ struct SpectrogramOverlayPaintCacheEntry {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SpectrogramOverlayPaintCache {
     entry: Option<SpectrogramOverlayPaintCacheEntry>,
+    spectrum_static: Option<SpectrumStaticPaintCacheEntry>,
     #[cfg(test)]
     rebuild_count: usize,
+    #[cfg(test)]
+    static_rebuild_count: usize,
 }
 
 impl SpectrogramOverlayPaintCache {
@@ -911,6 +1011,7 @@ impl SpectrogramOverlayPaintCache {
     ) {
         if mode == crate::LiveSpectrogramMode::Waterfall {
             self.entry = None;
+            self.spectrum_static = None;
             return;
         }
         let Some(frame) = frame else {
@@ -923,7 +1024,7 @@ impl SpectrogramOverlayPaintCache {
 
         let history_scale = clamp_history_scale(history_scale);
         let plot = SpectrogramWidget::plot_rect(bounds);
-        if !plot.is_finite() {
+        if !plot.is_finite() || !plot.has_finite_positive_area() {
             let display_sample_rate = frame.sample_rate;
             SpectrogramWidget::new_with_history_scale_with_id(
                 LIVE_SPECTROGRAM_OVERLAY_WIDGET_ID,
@@ -946,15 +1047,46 @@ impl SpectrogramOverlayPaintCache {
         }
 
         let display_sample_rate = frame.sample_rate;
-        let mut built = Vec::new();
-        SpectrogramWidget::new_with_history_scale_with_id(
+        let widget = SpectrogramWidget::new_with_history_scale_with_id(
             LIVE_SPECTROGRAM_OVERLAY_WIDGET_ID,
             Some(frame.clone()),
             display_sample_rate,
             mode,
             history_scale,
-        )
-        .append_overlay_paint(&mut built, bounds, theme);
+        );
+        let static_key =
+            SpectrumStaticPaintCacheKey::new(widget.sample_rate(), bounds, plot, theme);
+        let static_entry = if self
+            .spectrum_static
+            .as_ref()
+            .is_some_and(|entry| entry.key == static_key)
+        {
+            self.spectrum_static
+                .as_ref()
+                .expect("spectrum static cache entry was just matched")
+                .clone()
+        } else {
+            let entry = build_spectrum_static_paint_cache_entry(&widget, bounds, plot, theme);
+            #[cfg(test)]
+            {
+                self.static_rebuild_count += 1;
+            }
+            self.spectrum_static = Some(entry.clone());
+            entry
+        };
+        let mut built = Vec::with_capacity(
+            static_entry.prefix.len() + static_entry.grid.len() + static_entry.suffix.len() + 2,
+        );
+        built.extend(static_entry.prefix.iter().cloned());
+        let geometry = widget.spectrum_geometry_with_x_positions(plot, &static_entry.x_positions);
+        if let Some(geometry) = geometry.as_ref() {
+            append_spectrum_area(&mut built, widget.common.id, plot, geometry, theme);
+            built.extend(static_entry.grid.iter().cloned());
+            append_spectrum_ribbon(&mut built, widget.common.id, geometry, theme);
+        } else {
+            built.extend(static_entry.grid.iter().cloned());
+        }
+        built.extend(static_entry.suffix.iter().cloned());
         let entry = SpectrogramOverlayPaintCacheEntry {
             key: SpectrogramOverlayPaintCacheKey::new(
                 frame,
@@ -984,6 +1116,11 @@ impl SpectrogramOverlayPaintCache {
     #[cfg(test)]
     fn rebuild_count(&self) -> usize {
         self.rebuild_count
+    }
+
+    #[cfg(test)]
+    fn static_rebuild_count(&self) -> usize {
+        self.static_rebuild_count
     }
 }
 
@@ -1303,6 +1440,7 @@ mod tests {
         );
 
         assert_eq!(cache.rebuild_count(), 1);
+        assert_eq!(cache.static_rebuild_count(), 1);
     }
 
     #[test]
@@ -1362,6 +1500,7 @@ mod tests {
         );
 
         assert_eq!(cache.rebuild_count(), 1);
+        assert_eq!(cache.static_rebuild_count(), 1);
         assert_eq!(first, second);
         let fresh = {
             let mut primitives = Vec::new();
@@ -1430,6 +1569,7 @@ mod tests {
         );
 
         assert_eq!(cache.rebuild_count(), 2);
+        assert_eq!(cache.static_rebuild_count(), 1);
     }
 
     #[test]
@@ -1474,6 +1614,34 @@ mod tests {
         );
 
         assert_eq!(cache.rebuild_count(), 4);
+        assert_eq!(cache.static_rebuild_count(), 3);
+    }
+
+    #[test]
+    fn overlay_cache_invalidates_static_spectrum_for_sample_rate_changes() {
+        let frame = test_frame();
+        let mut changed_frame = (*frame).clone();
+        changed_frame.sample_rate = 96_000;
+        let theme = ThemeTokens::default();
+        let mut cache = SpectrogramOverlayPaintCache::default();
+
+        cached_overlay(
+            &mut cache,
+            Some(frame),
+            LiveSpectrogramMode::Spectrum,
+            overlay_bounds(),
+            &theme,
+        );
+        cached_overlay(
+            &mut cache,
+            Some(Arc::new(changed_frame)),
+            LiveSpectrogramMode::Spectrum,
+            overlay_bounds(),
+            &theme,
+        );
+
+        assert_eq!(cache.rebuild_count(), 2);
+        assert_eq!(cache.static_rebuild_count(), 2);
     }
 
     #[test]
@@ -1501,6 +1669,7 @@ mod tests {
         );
         assert!(absent.is_empty());
         assert_eq!(cache.rebuild_count(), 1);
+        assert_eq!(cache.static_rebuild_count(), 1);
 
         cached_overlay(
             &mut cache,
@@ -1510,6 +1679,63 @@ mod tests {
             &theme,
         );
         assert_eq!(cache.rebuild_count(), 2);
+        assert_eq!(cache.static_rebuild_count(), 1);
+    }
+
+    #[test]
+    fn overlay_cache_preserves_empty_plot_shell_for_tiny_bounds() {
+        let mut cache = SpectrogramOverlayPaintCache::default();
+        let bounds = Rect::from_min_size(Point::new(0.0, 0.0), Vector2::new(1.0, 1.0));
+        let primitives = cached_overlay(
+            &mut cache,
+            Some(test_frame()),
+            LiveSpectrogramMode::Spectrum,
+            bounds,
+            &ThemeTokens::default(),
+        );
+
+        assert_eq!(primitives.len(), 1);
+        assert!(matches!(
+            primitives.first(),
+            Some(PaintPrimitive::FillRect(fill)) if fill.rect == bounds
+        ));
+        assert_eq!(cache.static_rebuild_count(), 0);
+    }
+
+    #[test]
+    fn overlay_cache_clears_spectrum_static_state_when_switching_to_waterfall() {
+        let bounds = overlay_bounds();
+        let theme = ThemeTokens::default();
+        let mut cache = SpectrogramOverlayPaintCache::default();
+
+        let spectrum = cached_overlay(
+            &mut cache,
+            Some(test_frame()),
+            LiveSpectrogramMode::Spectrum,
+            bounds,
+            &theme,
+        );
+        assert!(!spectrum.is_empty());
+        assert_eq!(cache.static_rebuild_count(), 1);
+
+        let waterfall = cached_overlay(
+            &mut cache,
+            Some(test_frame()),
+            LiveSpectrogramMode::Waterfall,
+            bounds,
+            &theme,
+        );
+        assert!(waterfall.is_empty());
+
+        let spectrum_again = cached_overlay(
+            &mut cache,
+            Some(test_frame()),
+            LiveSpectrogramMode::Spectrum,
+            bounds,
+            &theme,
+        );
+        assert!(!spectrum_again.is_empty());
+        assert_eq!(cache.static_rebuild_count(), 2);
     }
 
     #[test]
@@ -1543,6 +1769,7 @@ mod tests {
         );
 
         assert_eq!(cache.rebuild_count(), 3);
+        assert_eq!(cache.static_rebuild_count(), 1);
     }
 
     #[test]
