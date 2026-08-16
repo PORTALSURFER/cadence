@@ -7,7 +7,6 @@
 use crate::transport::{
     LIVE_SPECTROGRAM_BAND_COUNT, LIVE_SPECTRUM_DISPLAY_CEILING_DB, LIVE_SPECTRUM_DISPLAY_FLOOR_DB,
     LIVE_SPECTRUM_POINT_COUNT, LiveSpectrogramFrame, live_display_frequency_bounds,
-    live_spectrum_point_frequency,
 };
 use radiant::{
     gui::types::{Point, Rect, Rgba8},
@@ -15,8 +14,7 @@ use radiant::{
     prelude as ui,
     runtime::{
         GpuShaderSurfaceDescriptor, GpuShaderSurfaceDescriptorParts, GpuSurfaceCapabilities,
-        GpuSurfaceContent, PaintBrush, PaintFillPath, PaintFillRect, PaintGpuSurface,
-        PaintLinearGradient, PaintPath, PaintPathCommand, PaintPrimitive, PaintStrokePolyline,
+        GpuSurfaceContent, PaintFillRect, PaintGpuSurface, PaintPrimitive, PaintStrokePolyline,
         PaintStrokeRect, PaintTextAlign, PaintTextMetrics, push_text_run_with_metrics,
     },
     theme::ThemeTokens,
@@ -60,8 +58,11 @@ const GRID_LINE_ALPHA: u8 = 82;
 const GRID_LABEL_ALPHA: u8 = 200;
 const GRID_LABEL_FONT_SIZE: f32 = 9.0;
 const WATERFALL_SURFACE_KEY: u64 = 0x4341_4445_4e43_4553;
+const SPECTRUM_SURFACE_KEY: u64 = 0x4341_4445_4e43_5350;
+const SPECTRUM_STORAGE_IDENTITY: u64 = 0x4341_4445_4e43_5356;
 pub const LIVE_SPECTROGRAM_OVERLAY_WIDGET_ID: u64 = 0xCAD3_2201;
 const WATERFALL_SHADER_KEY: &str = "cadence/live-spectrogram-waterfall";
+const SPECTRUM_SHADER_KEY: &str = "cadence/live-spectrogram-spectrum";
 const SPECTRUM_RIBBON_WIDTH: f32 = 1.5;
 const SPECTRUM_AREA_ALPHA: u8 = 48;
 
@@ -169,6 +170,102 @@ fn fragment_main(input: VertexOut) -> @location(0) vec4<f32> {
     let upper = history_sample(row_offset + upper_band);
     let level = lower + (upper - lower) * band_blend;
     return vec4<f32>(palette_color(level), 1.0);
+}
+"#;
+
+const SPECTRUM_SHADER_WGSL: &str = r#"
+struct SurfaceParams {
+    dest: vec4<f32>,
+    source: vec4<f32>,
+    target_size: vec2<f32>,
+    _padding: vec2<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> surface: SurfaceParams;
+
+struct SpectrumParams {
+    point_count: u32,
+    half_ribbon_width: f32,
+    area_alpha: f32,
+    _padding: u32,
+    orange: vec4<f32>,
+};
+
+@group(0) @binding(1)
+var<uniform> params: SpectrumParams;
+
+@group(0) @binding(2)
+var<storage, read> spectrum: array<u32>;
+
+struct VertexOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) local: vec2<f32>,
+};
+
+@vertex
+fn vertex_main(@builtin(vertex_index) vertex_index: u32) -> VertexOut {
+    var corners = array<vec2<f32>, 6>(
+        vec2<f32>(0.0, 0.0),
+        vec2<f32>(1.0, 0.0),
+        vec2<f32>(0.0, 1.0),
+        vec2<f32>(0.0, 1.0),
+        vec2<f32>(1.0, 0.0),
+        vec2<f32>(1.0, 1.0),
+    );
+    let local = corners[vertex_index];
+    let pixel = surface.dest.xy + local * surface.dest.zw;
+    let clip = vec2<f32>(
+        pixel.x / surface.target_size.x * 2.0 - 1.0,
+        1.0 - pixel.y / surface.target_size.y * 2.0,
+    );
+    var output: VertexOut;
+    output.position = vec4<f32>(clip, 0.0, 1.0);
+    output.local = local;
+    return output;
+}
+
+fn spectrum_sample(sample_index: u32) -> f32 {
+    let word = spectrum[sample_index / 4u];
+    let shift = (sample_index % 4u) * 8u;
+    let value = (word >> shift) & 0xffu;
+    return f32(value) / 255.0;
+}
+
+fn spectrum_level(local_x: f32) -> f32 {
+    // The 768 values are logarithmically distributed in frequency. Their
+    // normalized x coordinates are therefore evenly spaced in log-frequency;
+    // interpolate linearly between the adjacent quantized display values.
+    let last_point = params.point_count - 1u;
+    let sample_position = clamp(local_x, 0.0, 1.0) * f32(last_point);
+    let lower_point = min(u32(floor(sample_position)), last_point);
+    let upper_point = min(lower_point + 1u, last_point);
+    let blend = sample_position - f32(lower_point);
+    let lower = spectrum_sample(lower_point);
+    let upper = spectrum_sample(upper_point);
+    return lower + (upper - lower) * blend;
+}
+
+@fragment
+fn fragment_main(input: VertexOut) -> @location(0) vec4<f32> {
+    if params.point_count < 2u {
+        return vec4<f32>(0.0);
+    }
+
+    let center_y = 1.0 - spectrum_level(input.local.x);
+    let ribbon_top = max(center_y - params.half_ribbon_width, 0.0);
+    let ribbon_bottom = min(center_y + params.half_ribbon_width, 1.0);
+    if input.local.y >= ribbon_top && input.local.y <= ribbon_bottom {
+        return params.orange;
+    }
+
+    // Match the existing vertical gradient: the orange area begins at the
+    // centerline and fades from alpha 48 at the plot top to zero at bottom.
+    if input.local.y >= center_y {
+        let alpha = params.area_alpha * (1.0 - input.local.y);
+        return vec4<f32>(params.orange.rgb, alpha);
+    }
+    return vec4<f32>(0.0);
 }
 "#;
 
@@ -287,6 +384,70 @@ fn waterfall_shader_descriptor(
     ))
 }
 
+fn spectrum_uniform_bytes(plot: Rect, orange: Rgba8) -> [u8; 32] {
+    let values = [LIVE_SPECTRUM_POINT_COUNT as u32, 0_u32, 0_u32, 0_u32];
+    let half_ribbon_width = (SPECTRUM_RIBBON_WIDTH * 0.5) / plot.height().max(f32::MIN_POSITIVE);
+    let float_values = [
+        half_ribbon_width,
+        SPECTRUM_AREA_ALPHA as f32 / u8::MAX as f32,
+    ];
+    let color = [
+        orange.r as f32 / u8::MAX as f32,
+        orange.g as f32 / u8::MAX as f32,
+        orange.b as f32 / u8::MAX as f32,
+        orange.a as f32 / u8::MAX as f32,
+    ];
+    let mut bytes = [0_u8; 32];
+    bytes[0..4].copy_from_slice(&values[0].to_le_bytes());
+    bytes[4..8].copy_from_slice(&float_values[0].to_le_bytes());
+    bytes[8..12].copy_from_slice(&float_values[1].to_le_bytes());
+    for (index, value) in color.into_iter().enumerate() {
+        let start = 16 + index * std::mem::size_of::<f32>();
+        bytes[start..start + std::mem::size_of::<f32>()].copy_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
+fn spectrum_storage_identity(plot: Rect, orange: Rgba8) -> u64 {
+    // Radiant's immutable-payload fence covers both uniform and storage
+    // bytes. Include the static plot/style inputs so a resize or theme change
+    // refreshes those bytes without changing the frame data revision.
+    let color = u32::from(orange.r) << 24
+        | u32::from(orange.g) << 16
+        | u32::from(orange.b) << 8
+        | u32::from(orange.a);
+    let identity = SPECTRUM_STORAGE_IDENTITY
+        ^ u64::from(plot.height().to_bits()).rotate_left(17)
+        ^ u64::from(color).rotate_left(41);
+    if identity == 0 { 1 } else { identity }
+}
+
+fn spectrum_shader_descriptor(
+    frame: &LiveSpectrogramFrame,
+    plot: Rect,
+    theme: &ThemeTokens,
+) -> Arc<GpuShaderSurfaceDescriptor> {
+    static SHADER_SOURCE: OnceLock<Arc<str>> = OnceLock::new();
+    let uniform_bytes = spectrum_uniform_bytes(plot, theme.highlight_orange);
+    Arc::new(GpuShaderSurfaceDescriptor::from_parts(
+        GpuShaderSurfaceDescriptorParts {
+            shader_key: String::from(SPECTRUM_SHADER_KEY),
+            wgsl_source: Some(Arc::clone(
+                SHADER_SOURCE.get_or_init(|| Arc::<str>::from(SPECTRUM_SHADER_WGSL)),
+            )),
+            entry_point: String::from("vertex_main"),
+            fragment_entry_point: Some(String::from("fragment_main")),
+            uniform_bytes: Arc::<[u8]>::from(uniform_bytes.as_slice()),
+            storage_bytes: Arc::clone(&frame.spectrum_values),
+            storage_identity: spectrum_storage_identity(plot, theme.highlight_orange),
+            storage_revision: frame.gpu_revision(),
+            presentation_uniform_bytes: None,
+            presentation_uniform_revision: None,
+            vertex_count: 6,
+        },
+    ))
+}
+
 #[derive(Clone, Debug)]
 struct SpectrogramWidget {
     common: WidgetCommon,
@@ -294,12 +455,6 @@ struct SpectrogramWidget {
     display_sample_rate: u32,
     mode: crate::LiveSpectrogramMode,
     history_scale: f32,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-struct SpectrumPaintGeometry {
-    area_path: PaintPath,
-    ribbon_path: PaintPath,
 }
 
 impl SpectrogramWidget {
@@ -378,32 +533,6 @@ impl SpectrogramWidget {
             0.0
         };
         plot.min.x + plot.width() * position.clamp(0.0, 1.0)
-    }
-
-    fn spectrum_x_positions(&self, plot: Rect) -> Arc<[f32]> {
-        let last_point = LIVE_SPECTRUM_POINT_COUNT - 1;
-        let sample_rate = self.sample_rate();
-        let (minimum, maximum) = live_display_frequency_bounds(sample_rate);
-        let frequency_ratio = (maximum / minimum.max(f32::MIN_POSITIVE)).max(1.0);
-        let log_frequency_ratio = frequency_ratio.ln();
-        let positions = (0..LIVE_SPECTRUM_POINT_COUNT)
-            .map(|point| {
-                let frequency = live_spectrum_point_frequency(sample_rate, point);
-                if point == 0 {
-                    plot.min.x
-                } else if point == last_point {
-                    plot.max.x
-                } else {
-                    let position = if frequency_ratio > 1.0 {
-                        (frequency.clamp(minimum, maximum) / minimum).ln() / log_frequency_ratio
-                    } else {
-                        0.0
-                    };
-                    plot.min.x + plot.width() * position.clamp(0.0, 1.0)
-                }
-            })
-            .collect::<Vec<_>>();
-        Arc::from(positions.into_boxed_slice())
     }
 
     fn frequency_grid(&self) -> Vec<(f32, String)> {
@@ -511,213 +640,30 @@ impl SpectrogramWidget {
         }));
     }
 
-    fn spectrum_geometry(&self, plot: Rect) -> Option<SpectrumPaintGeometry> {
-        let x_positions = self.spectrum_x_positions(plot);
-        self.spectrum_geometry_with_x_positions(plot, &x_positions)
-    }
-
-    fn spectrum_geometry_with_x_positions(
-        &self,
-        plot: Rect,
-        x_positions: &[f32],
-    ) -> Option<SpectrumPaintGeometry> {
-        let frame = self.frame.as_ref()?;
-        if !plot.has_finite_positive_area()
-            || !frame.is_valid()
-            || x_positions.len() != LIVE_SPECTRUM_POINT_COUNT
-        {
-            return None;
-        }
-        let half_width = SPECTRUM_RIBBON_WIDTH * 0.5;
-        let center_at = |point: usize, x: f32| {
-            let level = frame.spectrum_value(point) as f32 / u8::MAX as f32;
-            let y = (plot.max.y - plot.height() * level).clamp(plot.min.y, plot.max.y);
-            Point::new(x.clamp(plot.min.x, plot.max.x), y)
-        };
-        let mut area_commands = Vec::with_capacity(LIVE_SPECTRUM_POINT_COUNT + 3);
-        let mut ribbon_commands = Vec::with_capacity(LIVE_SPECTRUM_POINT_COUNT * 2 + 1);
-        for (point, &x) in x_positions.iter().enumerate() {
-            let center = center_at(point, x);
-            let upper = Point::new(
-                center.x,
-                (center.y - half_width).clamp(plot.min.y, plot.max.y),
-            );
-            if point == 0 {
-                area_commands.push(PaintPathCommand::MoveTo(center));
-                ribbon_commands.push(PaintPathCommand::MoveTo(upper));
-            } else {
-                area_commands.push(PaintPathCommand::LineTo(center));
-                ribbon_commands.push(PaintPathCommand::LineTo(upper));
-            }
-        }
-        for (point, &x) in x_positions.iter().enumerate().rev() {
-            let center = center_at(point, x);
-            let lower = Point::new(
-                center.x,
-                (center.y + half_width).clamp(plot.min.y, plot.max.y),
-            );
-            ribbon_commands.push(PaintPathCommand::LineTo(lower));
-        }
-        area_commands.push(PaintPathCommand::LineTo(Point::new(plot.max.x, plot.max.y)));
-        area_commands.push(PaintPathCommand::LineTo(Point::new(plot.min.x, plot.max.y)));
-        area_commands.push(PaintPathCommand::Close);
-        ribbon_commands.push(PaintPathCommand::Close);
-
-        Some(SpectrumPaintGeometry {
-            area_path: PaintPath::from(area_commands),
-            ribbon_path: PaintPath::from(ribbon_commands),
-        })
-    }
-
-    fn overlay_grid(&self, primitives: &mut Vec<PaintPrimitive>, plot: Rect, theme: &ThemeTokens) {
-        let grid_color = theme.border.with_alpha(GRID_LINE_ALPHA);
-        let label_color = theme.text_muted.with_alpha(GRID_LABEL_ALPHA);
-
-        for &(decibels, label) in &DECIBEL_GRID {
-            let y = Self::y_for_decibels(plot, decibels);
-            let line_bottom = (y + 1.0).min(plot.max.y);
-            if line_bottom > y {
-                primitives.push(PaintPrimitive::StrokeRect(PaintStrokeRect {
-                    widget_id: self.common.id,
-                    rect: Rect::from_min_max(
-                        Point::new(plot.min.x, y),
-                        Point::new(plot.max.x, line_bottom),
-                    ),
-                    color: grid_color,
-                    width: 1.0,
-                }));
-            }
-            let label_rect = Rect::from_min_max(
-                Point::new(plot.min.x + 4.0, (y - 8.0).max(plot.min.y)),
-                Point::new(plot.min.x + 42.0, (y + 8.0).min(plot.max.y)),
-            );
-            if label_rect.has_finite_positive_area() {
-                push_text_run_with_metrics(
-                    primitives,
-                    self.common.id,
-                    label,
-                    label_rect,
-                    label_color,
-                    PaintTextAlign::Left,
-                    PaintTextMetrics::new(GRID_LABEL_FONT_SIZE, Some(10.0)),
-                );
-            }
-        }
-
-        let mut previous_x: Option<f32> = None;
-        for (frequency, label) in self.frequency_grid() {
-            let x = self.x_for_frequency(plot, frequency);
-            if previous_x.is_some_and(|previous| (x - previous).abs() < 2.0) {
-                continue;
-            }
-            previous_x = Some(x);
-            let line_right = (x + 1.0).min(plot.max.x);
-            if line_right > x {
-                primitives.push(PaintPrimitive::StrokeRect(PaintStrokeRect {
-                    widget_id: self.common.id,
-                    rect: Rect::from_min_max(
-                        Point::new(x, plot.min.y),
-                        Point::new(line_right, plot.max.y),
-                    ),
-                    color: grid_color,
-                    width: 1.0,
-                }));
-            }
-            let label_rect = Rect::from_min_max(
-                Point::new(
-                    (x - 24.0).max(plot.min.x),
-                    (plot.max.y - 16.0).max(plot.min.y),
-                ),
-                Point::new((x + 24.0).min(plot.max.x), plot.max.y),
-            );
-            if label_rect.has_finite_positive_area() {
-                push_text_run_with_metrics(
-                    primitives,
-                    self.common.id,
-                    &label,
-                    label_rect,
-                    label_color,
-                    PaintTextAlign::Center,
-                    PaintTextMetrics::new(GRID_LABEL_FONT_SIZE, Some(10.0)),
-                );
-            }
-        }
-    }
-
-    fn append_overlay_paint(
+    fn append_spectrum(
         &self,
         primitives: &mut Vec<PaintPrimitive>,
-        bounds: Rect,
+        plot: Rect,
         theme: &ThemeTokens,
     ) {
-        if self.mode == crate::LiveSpectrogramMode::Waterfall || !bounds.has_finite_positive_area()
-        {
+        let Some(frame) = self.frame.as_ref() else {
+            return;
+        };
+        if !plot.has_finite_positive_area() || !frame.is_valid() {
             return;
         }
-        let plot = Self::plot_rect(bounds);
-        primitives.push(PaintPrimitive::FillRect(PaintFillRect {
+        primitives.push(PaintPrimitive::GpuSurface(PaintGpuSurface {
             widget_id: self.common.id,
-            rect: bounds,
-            color: theme.bg_primary.blend_toward(theme.surface_overlay, 0.35),
-        }));
-        if !plot.has_finite_positive_area() {
-            return;
-        }
-        primitives.push(PaintPrimitive::FillRect(PaintFillRect {
-            widget_id: self.common.id,
+            key: SPECTRUM_SURFACE_KEY,
+            revision: frame.gpu_revision(),
             rect: plot,
-            color: match self.mode {
-                crate::LiveSpectrogramMode::Waterfall => PALETTE[0],
-                crate::LiveSpectrogramMode::Spectrum => SPECTRUM_PLOT_BACKGROUND,
+            content: GpuSurfaceContent::CustomShader {
+                descriptor: spectrum_shader_descriptor(frame, plot, theme),
             },
-        }));
-        let spectrum_geometry = self.spectrum_geometry(plot);
-        if let Some(geometry) = spectrum_geometry.as_ref() {
-            append_spectrum_area(primitives, self.common.id, plot, geometry, theme);
-        }
-        self.overlay_grid(primitives, plot, theme);
-        if let Some(geometry) = spectrum_geometry.as_ref() {
-            append_spectrum_ribbon(primitives, self.common.id, geometry, theme);
-        }
-        primitives.push(PaintPrimitive::StrokeRect(PaintStrokeRect {
-            widget_id: self.common.id,
-            rect: plot,
-            color: theme.border_emphasis,
-            width: 1.0,
+            capabilities: GpuSurfaceCapabilities::default(),
+            overlays: Vec::new(),
         }));
     }
-}
-
-fn append_spectrum_area(
-    primitives: &mut Vec<PaintPrimitive>,
-    widget_id: u64,
-    plot: Rect,
-    geometry: &SpectrumPaintGeometry,
-    theme: &ThemeTokens,
-) {
-    let gradient = PaintLinearGradient::vertical(
-        plot,
-        theme.highlight_orange.with_alpha(SPECTRUM_AREA_ALPHA),
-        theme.highlight_orange.with_alpha(0),
-    );
-    primitives.push(PaintPrimitive::FillPath(PaintFillPath::new(
-        widget_id,
-        geometry.area_path.clone(),
-        PaintBrush::linear_gradient(gradient),
-    )));
-}
-
-fn append_spectrum_ribbon(
-    primitives: &mut Vec<PaintPrimitive>,
-    widget_id: u64,
-    geometry: &SpectrumPaintGeometry,
-    theme: &ThemeTokens,
-) {
-    primitives.push(PaintPrimitive::FillPath(PaintFillPath::new(
-        widget_id,
-        geometry.ribbon_path.clone(),
-        PaintBrush::solid(theme.highlight_orange),
-    )));
 }
 
 fn format_frequency_label(frequency: f32) -> String {
@@ -779,24 +725,15 @@ impl Widget for SpectrogramWidget {
                     crate::LiveSpectrogramMode::Spectrum => SPECTRUM_PLOT_BACKGROUND,
                 },
             }));
-            let spectrum_geometry = match self.mode {
-                crate::LiveSpectrogramMode::Waterfall => None,
-                crate::LiveSpectrogramMode::Spectrum => self.spectrum_geometry(plot),
-            };
             match self.mode {
                 crate::LiveSpectrogramMode::Waterfall => self.append_waterfall(primitives, plot),
                 crate::LiveSpectrogramMode::Spectrum => {
-                    if let Some(geometry) = spectrum_geometry.as_ref() {
-                        append_spectrum_area(primitives, self.common.id, plot, geometry, theme);
-                    }
+                    self.append_spectrum(primitives, plot, theme)
                 }
             }
             // Both modes consume the same frame, already normalized to the
             // display-only -90..0 dB range with the signed +4.5 dB/octave tilt.
             self.append_grid(primitives, plot, theme);
-            if let Some(geometry) = spectrum_geometry.as_ref() {
-                append_spectrum_ribbon(primitives, self.common.id, geometry, theme);
-            }
             primitives.push(PaintPrimitive::StrokeRect(PaintStrokeRect {
                 widget_id: self.common.id,
                 rect: plot,
@@ -818,311 +755,6 @@ impl Widget for SpectrogramWidget {
         if same_frame && self.display_sample_rate == previous.display_sample_rate {
             self.common.state = previous.common.state;
         }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct OverlayRectKey {
-    min_x: u32,
-    min_y: u32,
-    max_x: u32,
-    max_y: u32,
-}
-
-impl OverlayRectKey {
-    fn from_rect(rect: Rect) -> Self {
-        Self {
-            min_x: rect.min.x.to_bits(),
-            min_y: rect.min.y.to_bits(),
-            max_x: rect.max.x.to_bits(),
-            max_y: rect.max.y.to_bits(),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct SpectrogramOverlayThemeKey {
-    bg_primary: Rgba8,
-    surface_overlay: Rgba8,
-    border: Rgba8,
-    text_muted: Rgba8,
-    border_emphasis: Rgba8,
-    highlight_orange: Rgba8,
-}
-
-impl SpectrogramOverlayThemeKey {
-    fn from_theme(theme: &ThemeTokens) -> Self {
-        Self {
-            bg_primary: theme.bg_primary,
-            surface_overlay: theme.surface_overlay,
-            border: theme.border,
-            text_muted: theme.text_muted,
-            border_emphasis: theme.border_emphasis,
-            highlight_orange: theme.highlight_orange,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct SpectrumStaticPaintCacheKey {
-    sample_rate: u32,
-    outer_bounds: OverlayRectKey,
-    plot_bounds: OverlayRectKey,
-    theme: SpectrogramOverlayThemeKey,
-}
-
-impl SpectrumStaticPaintCacheKey {
-    fn new(sample_rate: u32, outer_bounds: Rect, plot_bounds: Rect, theme: &ThemeTokens) -> Self {
-        Self {
-            sample_rate,
-            outer_bounds: OverlayRectKey::from_rect(outer_bounds),
-            plot_bounds: OverlayRectKey::from_rect(plot_bounds),
-            theme: SpectrogramOverlayThemeKey::from_theme(theme),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct SpectrumStaticPaintCacheEntry {
-    // This cache contains no frame samples: it is safe to reuse across source,
-    // epoch, and revision changes as long as geometry and theme are unchanged.
-    key: SpectrumStaticPaintCacheKey,
-    x_positions: Arc<[f32]>,
-    prefix: Arc<[PaintPrimitive]>,
-    grid: Arc<[PaintPrimitive]>,
-    suffix: Arc<[PaintPrimitive]>,
-}
-
-#[derive(Clone, Debug)]
-struct SpectrogramOverlayPaintCacheKey {
-    frame: Arc<LiveSpectrogramFrame>,
-    mode: crate::LiveSpectrogramMode,
-    history_scale_bits: Option<u32>,
-    outer_bounds: OverlayRectKey,
-    plot_bounds: OverlayRectKey,
-    theme: SpectrogramOverlayThemeKey,
-}
-
-impl SpectrogramOverlayPaintCacheKey {
-    fn new(
-        frame: Arc<LiveSpectrogramFrame>,
-        mode: crate::LiveSpectrogramMode,
-        history_scale: f32,
-        outer_bounds: Rect,
-        plot_bounds: Rect,
-        theme: &ThemeTokens,
-    ) -> Self {
-        Self {
-            frame,
-            mode,
-            history_scale_bits: (mode == crate::LiveSpectrogramMode::Waterfall)
-                .then_some(clamp_history_scale(history_scale).to_bits()),
-            outer_bounds: OverlayRectKey::from_rect(outer_bounds),
-            plot_bounds: OverlayRectKey::from_rect(plot_bounds),
-            theme: SpectrogramOverlayThemeKey::from_theme(theme),
-        }
-    }
-
-    fn matches(
-        &self,
-        frame: &Arc<LiveSpectrogramFrame>,
-        mode: crate::LiveSpectrogramMode,
-        history_scale: f32,
-        outer_bounds: Rect,
-        plot_bounds: Rect,
-        theme: &ThemeTokens,
-    ) -> bool {
-        Arc::ptr_eq(&self.frame, frame)
-            && self.mode == mode
-            && self.history_scale_bits
-                == (mode == crate::LiveSpectrogramMode::Waterfall)
-                    .then_some(clamp_history_scale(history_scale).to_bits())
-            && self.outer_bounds == OverlayRectKey::from_rect(outer_bounds)
-            && self.plot_bounds == OverlayRectKey::from_rect(plot_bounds)
-            && self.theme == SpectrogramOverlayThemeKey::from_theme(theme)
-    }
-}
-
-fn build_spectrum_static_paint_cache_entry(
-    widget: &SpectrogramWidget,
-    bounds: Rect,
-    plot: Rect,
-    theme: &ThemeTokens,
-) -> SpectrumStaticPaintCacheEntry {
-    let prefix = vec![
-        PaintPrimitive::FillRect(PaintFillRect {
-            widget_id: widget.common.id,
-            rect: bounds,
-            color: theme.bg_primary.blend_toward(theme.surface_overlay, 0.35),
-        }),
-        PaintPrimitive::FillRect(PaintFillRect {
-            widget_id: widget.common.id,
-            rect: plot,
-            color: SPECTRUM_PLOT_BACKGROUND,
-        }),
-    ];
-
-    let mut grid = Vec::new();
-    widget.overlay_grid(&mut grid, plot, theme);
-
-    let suffix = [PaintPrimitive::StrokeRect(PaintStrokeRect {
-        widget_id: widget.common.id,
-        rect: plot,
-        color: theme.border_emphasis,
-        width: 1.0,
-    })];
-
-    SpectrumStaticPaintCacheEntry {
-        key: SpectrumStaticPaintCacheKey::new(widget.sample_rate(), bounds, plot, theme),
-        x_positions: widget.spectrum_x_positions(plot),
-        prefix: Arc::from(prefix.into_boxed_slice()),
-        grid: Arc::from(grid.into_boxed_slice()),
-        suffix: Arc::from(suffix),
-    }
-}
-
-#[derive(Clone, Debug)]
-struct SpectrogramOverlayPaintCacheEntry {
-    key: SpectrogramOverlayPaintCacheKey,
-    primitives: Arc<[PaintPrimitive]>,
-}
-
-/// Bounded, presentation-local replay storage for one live spectrogram overlay.
-///
-/// The transient compositor clears its primitive list every frame, so cache hits
-/// always clone the complete immutable sequence back into the current output.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct SpectrogramOverlayPaintCache {
-    entry: Option<SpectrogramOverlayPaintCacheEntry>,
-    spectrum_static: Option<SpectrumStaticPaintCacheEntry>,
-    #[cfg(test)]
-    rebuild_count: usize,
-    #[cfg(test)]
-    static_rebuild_count: usize,
-}
-
-impl SpectrogramOverlayPaintCache {
-    fn paint(
-        &mut self,
-        frame: Option<Arc<LiveSpectrogramFrame>>,
-        mode: crate::LiveSpectrogramMode,
-        history_scale: f32,
-        bounds: Rect,
-        primitives: &mut Vec<PaintPrimitive>,
-        theme: &ThemeTokens,
-    ) {
-        if mode == crate::LiveSpectrogramMode::Waterfall {
-            self.entry = None;
-            self.spectrum_static = None;
-            return;
-        }
-        let Some(frame) = frame else {
-            self.entry = None;
-            return;
-        };
-        if !bounds.has_finite_positive_area() {
-            return;
-        }
-
-        let history_scale = clamp_history_scale(history_scale);
-        let plot = SpectrogramWidget::plot_rect(bounds);
-        if !plot.is_finite() || !plot.has_finite_positive_area() {
-            let display_sample_rate = frame.sample_rate;
-            SpectrogramWidget::new_with_history_scale_with_id(
-                LIVE_SPECTROGRAM_OVERLAY_WIDGET_ID,
-                Some(frame),
-                display_sample_rate,
-                mode,
-                history_scale,
-            )
-            .append_overlay_paint(primitives, bounds, theme);
-            return;
-        }
-
-        if let Some(entry) = self.entry.as_ref()
-            && entry
-                .key
-                .matches(&frame, mode, history_scale, bounds, plot, theme)
-        {
-            primitives.extend(entry.primitives.iter().cloned());
-            return;
-        }
-
-        let display_sample_rate = frame.sample_rate;
-        let widget = SpectrogramWidget::new_with_history_scale_with_id(
-            LIVE_SPECTROGRAM_OVERLAY_WIDGET_ID,
-            Some(frame.clone()),
-            display_sample_rate,
-            mode,
-            history_scale,
-        );
-        let static_key =
-            SpectrumStaticPaintCacheKey::new(widget.sample_rate(), bounds, plot, theme);
-        let static_entry = if self
-            .spectrum_static
-            .as_ref()
-            .is_some_and(|entry| entry.key == static_key)
-        {
-            self.spectrum_static
-                .as_ref()
-                .expect("spectrum static cache entry was just matched")
-                .clone()
-        } else {
-            let entry = build_spectrum_static_paint_cache_entry(&widget, bounds, plot, theme);
-            #[cfg(test)]
-            {
-                self.static_rebuild_count += 1;
-            }
-            self.spectrum_static = Some(entry.clone());
-            entry
-        };
-        let mut built = Vec::with_capacity(
-            static_entry.prefix.len() + static_entry.grid.len() + static_entry.suffix.len() + 2,
-        );
-        built.extend(static_entry.prefix.iter().cloned());
-        let geometry = widget.spectrum_geometry_with_x_positions(plot, &static_entry.x_positions);
-        if let Some(geometry) = geometry.as_ref() {
-            append_spectrum_area(&mut built, widget.common.id, plot, geometry, theme);
-            built.extend(static_entry.grid.iter().cloned());
-            append_spectrum_ribbon(&mut built, widget.common.id, geometry, theme);
-        } else {
-            built.extend(static_entry.grid.iter().cloned());
-        }
-        built.extend(static_entry.suffix.iter().cloned());
-        let entry = SpectrogramOverlayPaintCacheEntry {
-            key: SpectrogramOverlayPaintCacheKey::new(
-                frame,
-                mode,
-                history_scale,
-                bounds,
-                plot,
-                theme,
-            ),
-            primitives: Arc::from(built.into_boxed_slice()),
-        };
-        #[cfg(test)]
-        {
-            self.rebuild_count += 1;
-        }
-        self.entry = Some(entry);
-        primitives.extend(
-            self.entry
-                .as_ref()
-                .expect("spectrogram overlay cache entry was just stored")
-                .primitives
-                .iter()
-                .cloned(),
-        );
-    }
-
-    #[cfg(test)]
-    fn rebuild_count(&self) -> usize {
-        self.rebuild_count
-    }
-
-    #[cfg(test)]
-    fn static_rebuild_count(&self) -> usize {
-        self.static_rebuild_count
     }
 }
 
@@ -1148,26 +780,14 @@ pub fn view<Message: 'static>(
     .fill_width()
 }
 
-/// Paint the current live frame over the retained review surface using only
-/// primitives that the native transient compositor can replay after the base
-/// scene's GPU surfaces.
-pub(crate) fn paint_overlay(
-    cache: &mut SpectrogramOverlayPaintCache,
-    frame: Option<Arc<LiveSpectrogramFrame>>,
-    mode: crate::LiveSpectrogramMode,
-    history_scale: f32,
-    bounds: Rect,
-    primitives: &mut Vec<PaintPrimitive>,
-    theme: &ThemeTokens,
-) {
-    cache.paint(frame, mode, history_scale, bounds, primitives, theme);
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        SPECTRUM_PLOT_BACKGROUND, SPECTRUM_RIBBON_WIDTH, SpectrogramOverlayPaintCache,
-        SpectrogramWidget, paint_overlay,
+        DEFAULT_HISTORY_SCALE, SPECTRUM_AREA_ALPHA, SPECTRUM_PLOT_BACKGROUND,
+        SPECTRUM_RIBBON_WIDTH, SPECTRUM_SHADER_KEY, SPECTRUM_SHADER_WGSL, SPECTRUM_SURFACE_KEY,
+        SpectrogramWidget, clamp_height, clamp_history_scale, history_scale_from_normalized,
+        history_scale_to_normalized, visible_waterfall_rows, waterfall_row_rect,
+        waterfall_row_y_interval,
     };
     use crate::LiveSpectrogramMode;
     use crate::transport::{
@@ -1177,11 +797,15 @@ mod tests {
     use radiant::{
         gui::types::{Point, Rect, Vector2},
         layout::LayoutOutput,
-        runtime::{GpuSurfaceContent, PaintBrush, PaintFillPath, PaintPathCommand, PaintPrimitive},
+        runtime::{GpuShaderSurfaceDescriptor, GpuSurfaceContent, PaintGpuSurface, PaintPrimitive},
         theme::ThemeTokens,
         widgets::Widget,
     };
     use std::sync::Arc;
+
+    fn bounds() -> Rect {
+        Rect::from_min_size(Point::new(0.0, 0.0), Vector2::new(720.0, super::HEIGHT))
+    }
 
     fn test_frame() -> Arc<LiveSpectrogramFrame> {
         let row_count = 2;
@@ -1190,6 +814,8 @@ mod tests {
         values[(row_count - 1) * LIVE_SPECTROGRAM_BAND_COUNT + LIVE_SPECTROGRAM_BAND_COUNT - 1] =
             u8::MAX;
         let mut spectrum_values = vec![0_u8; LIVE_SPECTRUM_POINT_COUNT];
+        spectrum_values[1] = 64;
+        spectrum_values[2] = 128;
         spectrum_values[LIVE_SPECTRUM_POINT_COUNT - 1] = u8::MAX;
         Arc::new(
             LiveSpectrogramFrame::from_values(
@@ -1205,91 +831,48 @@ mod tests {
         )
     }
 
-    fn overlay_bounds() -> Rect {
-        Rect::from_min_size(Point::new(0.0, 0.0), Vector2::new(720.0, super::HEIGHT))
+    fn paint(widget: SpectrogramWidget) -> Vec<PaintPrimitive> {
+        widget.paint_primitives(bounds(), &LayoutOutput::default(), &ThemeTokens::default())
     }
 
-    fn cached_overlay(
-        cache: &mut SpectrogramOverlayPaintCache,
-        frame: Option<Arc<LiveSpectrogramFrame>>,
-        mode: LiveSpectrogramMode,
-        bounds: Rect,
-        theme: &ThemeTokens,
-    ) -> Vec<PaintPrimitive> {
-        cached_overlay_with_scale(
-            cache,
-            frame,
-            mode,
-            super::DEFAULT_HISTORY_SCALE,
-            bounds,
-            theme,
+    fn gpu_surfaces(primitives: &[PaintPrimitive]) -> Vec<&PaintGpuSurface> {
+        primitives
+            .iter()
+            .filter_map(|primitive| match primitive {
+                PaintPrimitive::GpuSurface(surface) => Some(surface),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn custom_descriptor(surface: &PaintGpuSurface) -> &GpuShaderSurfaceDescriptor {
+        let GpuSurfaceContent::CustomShader { descriptor } = &surface.content else {
+            panic!("spectrogram surface should use a custom shader");
+        };
+        descriptor.as_ref()
+    }
+
+    fn uniform_f32(bytes: &[u8], offset: usize) -> f32 {
+        f32::from_le_bytes(
+            bytes[offset..offset + std::mem::size_of::<f32>()]
+                .try_into()
+                .expect("uniform f32 bytes"),
         )
     }
 
-    fn cached_overlay_with_scale(
-        cache: &mut SpectrogramOverlayPaintCache,
-        frame: Option<Arc<LiveSpectrogramFrame>>,
-        mode: LiveSpectrogramMode,
-        history_scale: f32,
-        bounds: Rect,
-        theme: &ThemeTokens,
-    ) -> Vec<PaintPrimitive> {
-        let mut primitives = Vec::new();
-        paint_overlay(
-            cache,
-            frame,
-            mode,
-            history_scale,
-            bounds,
-            &mut primitives,
-            theme,
-        );
-        primitives
-    }
-
-    fn fill_path_with_brush(
-        primitives: &[PaintPrimitive],
-        matches_brush: impl Fn(PaintBrush) -> bool,
-    ) -> &PaintFillPath {
-        primitives
-            .iter()
-            .find_map(|primitive| match primitive {
-                PaintPrimitive::FillPath(fill) if matches_brush(fill.brush) => Some(fill),
-                _ => None,
-            })
-            .expect("spectrum path should be present")
-    }
-
-    fn area_fill(primitives: &[PaintPrimitive]) -> &PaintFillPath {
-        fill_path_with_brush(primitives, |brush| {
-            matches!(brush, PaintBrush::LinearGradient(_))
-        })
-    }
-
-    fn ribbon_fill(primitives: &[PaintPrimitive]) -> &PaintFillPath {
-        fill_path_with_brush(primitives, |brush| matches!(brush, PaintBrush::Solid(_)))
-    }
-
-    fn path_point(command: &PaintPathCommand) -> Point {
-        match command {
-            PaintPathCommand::MoveTo(point) | PaintPathCommand::LineTo(point) => *point,
-            PaintPathCommand::QuadTo { .. }
-            | PaintPathCommand::CurveTo { .. }
-            | PaintPathCommand::Close => panic!("spectrum path should contain straight segments"),
-        }
-    }
-
     #[test]
-    fn empty_frame_keeps_the_spectrogram_shell_visible() {
-        let bounds = Rect::from_min_size(Point::new(0.0, 0.0), Vector2::new(720.0, super::HEIGHT));
-        let primitives = SpectrogramWidget::empty(16_000, LiveSpectrogramMode::Waterfall)
-            .paint_primitives(bounds, &LayoutOutput::default(), &ThemeTokens::default());
+    fn empty_frame_keeps_shell_grid_labels_and_border_visible() {
+        let primitives = paint(SpectrogramWidget::empty(
+            16_000,
+            LiveSpectrogramMode::Spectrum,
+        ));
+        let plot = SpectrogramWidget::plot_rect(bounds());
 
         assert!(primitives.iter().any(|primitive| {
-            matches!(primitive, PaintPrimitive::FillRect(fill) if fill.rect == bounds)
+            matches!(primitive, PaintPrimitive::FillRect(fill) if fill.rect == bounds())
         }));
         assert!(primitives.iter().any(|primitive| {
-            matches!(primitive, PaintPrimitive::FillRect(fill) if fill.rect == SpectrogramWidget::plot_rect(bounds))
+            matches!(primitive, PaintPrimitive::FillRect(fill) if fill.rect == plot)
         }));
         assert!(
             primitives
@@ -1300,39 +883,23 @@ mod tests {
             matches!(primitive, PaintPrimitive::Text(text) if text.text == "8 kHz")
         }));
         assert!(primitives.iter().any(|primitive| {
-            matches!(primitive, PaintPrimitive::StrokeRect(border) if border.rect == SpectrogramWidget::plot_rect(bounds))
+            matches!(primitive, PaintPrimitive::StrokeRect(border) if border.rect == plot)
         }));
-        assert!(
-            !primitives
-                .iter()
-                .any(|primitive| matches!(primitive, PaintPrimitive::GpuSurface(_)))
-        );
-        assert!(
-            !primitives
-                .iter()
-                .any(|primitive| matches!(primitive, PaintPrimitive::FillRectBatch(_)))
-        );
+        assert!(gpu_surfaces(&primitives).is_empty());
     }
 
     #[test]
-    fn retained_waterfall_paints_exactly_one_custom_shader_surface() {
-        let widget = SpectrogramWidget::new(test_frame(), LiveSpectrogramMode::Waterfall);
-        let bounds = Rect::from_min_size(Point::new(0.0, 0.0), Vector2::new(720.0, super::HEIGHT));
-        let primitives =
-            widget.paint_primitives(bounds, &LayoutOutput::default(), &ThemeTokens::default());
-        let surfaces = primitives
-            .iter()
-            .filter_map(|primitive| match primitive {
-                PaintPrimitive::GpuSurface(surface) => Some(surface),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
+    fn retained_waterfall_stays_on_its_existing_gpu_contract() {
+        let frame = test_frame();
+        let primitives = paint(SpectrogramWidget::new(
+            frame,
+            LiveSpectrogramMode::Waterfall,
+        ));
+        let surfaces = gpu_surfaces(&primitives);
         assert_eq!(surfaces.len(), 1);
-        let surface = surfaces[0];
-        assert_eq!(surface.rect, SpectrogramWidget::plot_rect(bounds));
-        let GpuSurfaceContent::CustomShader { descriptor } = &surface.content else {
-            panic!("waterfall should use a custom GPU shader");
-        };
+        assert_eq!(surfaces[0].rect, SpectrogramWidget::plot_rect(bounds()));
+
+        let descriptor = custom_descriptor(surfaces[0]);
         assert_eq!(descriptor.shader_key, "cadence/live-spectrogram-waterfall");
         assert_eq!(descriptor.entry_point, "vertex_main");
         assert_eq!(
@@ -1349,6 +916,7 @@ mod tests {
             descriptor.storage_bytes.len(),
             (2 * LIVE_SPECTROGRAM_BAND_COUNT).div_ceil(4) * 4
         );
+
         let first_word = u32::from_le_bytes(
             descriptor.storage_bytes[0..4]
                 .try_into()
@@ -1366,14 +934,15 @@ mod tests {
             (last_word >> ((last_index % 4) * 8)) & 0xff,
             u32::from(u8::MAX)
         );
-        assert!(descriptor.wgsl_source.as_deref().is_some_and(
-            |source| source.contains("row_index")
+        let source = descriptor.wgsl_source.as_deref().expect("waterfall shader");
+        assert!(
+            source.contains("row_index")
                 && source.contains("row_step")
                 && source.contains("row_age")
                 && source.contains("band_position")
                 && source.contains("oldest-to-newest")
                 && source.contains("age zero is anchored at the bottom")
-        ));
+        );
         assert!(
             !primitives
                 .iter()
@@ -1382,125 +951,23 @@ mod tests {
     }
 
     #[test]
-    fn active_waterfall_transient_paint_omits_heatmap_and_gpu_surface() {
-        let mut cache = SpectrogramOverlayPaintCache::default();
-        let primitives = cached_overlay(
-            &mut cache,
-            Some(test_frame()),
+    fn retained_waterfall_uniform_keeps_normalized_row_step() {
+        let plot = SpectrogramWidget::plot_rect(bounds());
+        let primitives = paint(SpectrogramWidget::new_with_scale(
+            test_frame(),
             LiveSpectrogramMode::Waterfall,
-            overlay_bounds(),
-            &ThemeTokens::default(),
-        );
-
-        assert!(
-            !primitives
-                .iter()
-                .any(|primitive| matches!(primitive, PaintPrimitive::FillRectBatch(_)))
-        );
-        assert!(
-            !primitives
-                .iter()
-                .any(|primitive| matches!(primitive, PaintPrimitive::GpuSurface(_)))
-        );
-        assert!(primitives.is_empty());
-        assert_eq!(cache.rebuild_count(), 0);
-    }
-
-    #[test]
-    fn live_frame_paint_is_batched_and_bounded() {
-        let mut values = vec![0_u8; LIVE_SPECTROGRAM_MAX_HISTORY * LIVE_SPECTROGRAM_BAND_COUNT];
-        let last = values.len() - 1;
-        values[last] = u8::MAX;
-        let expected_storage_len = values.len().div_ceil(4) * 4;
-        let frame = Arc::new(
-            LiveSpectrogramFrame::from_values(
-                1,
-                1,
-                1,
-                48_000,
-                LIVE_SPECTROGRAM_MAX_HISTORY,
-                Arc::from(values.into_boxed_slice()),
-                Arc::from(vec![0_u8; LIVE_SPECTRUM_POINT_COUNT].into_boxed_slice()),
-            )
-            .expect("valid live spectrogram test frame"),
-        );
-        let widget = SpectrogramWidget::new(frame, LiveSpectrogramMode::Waterfall);
-        let bounds = Rect::from_min_size(Point::new(0.0, 0.0), Vector2::new(720.0, super::HEIGHT));
-        let primitives =
-            widget.paint_primitives(bounds, &LayoutOutput::default(), &ThemeTokens::default());
-        let surfaces = primitives
-            .iter()
-            .filter_map(|primitive| match primitive {
-                PaintPrimitive::GpuSurface(surface) => Some(surface),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(surfaces.len(), 1);
-        assert_eq!(surfaces[0].rect, SpectrogramWidget::plot_rect(bounds));
-        let GpuSurfaceContent::CustomShader { descriptor } = &surfaces[0].content else {
-            panic!("waterfall should use a custom GPU shader");
-        };
-        assert_eq!(descriptor.storage_bytes.len(), expected_storage_len);
-        assert!(
-            !primitives
-                .iter()
-                .any(|primitive| matches!(primitive, PaintPrimitive::FillRectBatch(_)))
-        );
-        assert!(primitives.len() <= 32);
-    }
-
-    #[test]
-    fn spectrum_cache_identity_ignores_history_scale() {
-        let frame = test_frame();
-        let bounds = overlay_bounds();
-        let theme = ThemeTokens::default();
-        let mut cache = SpectrogramOverlayPaintCache::default();
-
-        cached_overlay_with_scale(
-            &mut cache,
-            Some(frame.clone()),
-            LiveSpectrogramMode::Spectrum,
-            1.0,
-            bounds,
-            &theme,
-        );
-        cached_overlay_with_scale(
-            &mut cache,
-            Some(frame),
-            LiveSpectrogramMode::Spectrum,
-            4.0,
-            bounds,
-            &theme,
-        );
-
-        assert_eq!(cache.rebuild_count(), 1);
-        assert_eq!(cache.static_rebuild_count(), 1);
-    }
-
-    #[test]
-    fn retained_uniform_encodes_normalized_row_step() {
-        let bounds = overlay_bounds();
-        let plot = SpectrogramWidget::plot_rect(bounds);
-        let widget =
-            SpectrogramWidget::new_with_scale(test_frame(), LiveSpectrogramMode::Waterfall, 2.5);
-        let primitives =
-            widget.paint_primitives(bounds, &LayoutOutput::default(), &ThemeTokens::default());
-        let surface = primitives
-            .iter()
-            .find_map(|primitive| match primitive {
-                PaintPrimitive::GpuSurface(surface) => Some(surface),
-                _ => None,
-            })
+            2.5,
+        ));
+        let surface = gpu_surfaces(&primitives)
+            .into_iter()
+            .next()
             .expect("waterfall should retain a GPU surface");
-        let GpuSurfaceContent::CustomShader { descriptor } = &surface.content else {
-            panic!("waterfall should use a custom shader");
-        };
-        let row_step = f32::from_le_bytes(
-            descriptor.uniform_bytes[8..12]
-                .try_into()
-                .expect("row step bytes"),
+        let descriptor = custom_descriptor(surface);
+
+        assert_eq!(
+            uniform_f32(&descriptor.uniform_bytes, 8),
+            2.5 / plot.height()
         );
-        assert_eq!(row_step, 2.5 / plot.height());
         assert_eq!(
             u32::from_le_bytes(
                 descriptor.uniform_bytes[4..8]
@@ -1512,897 +979,258 @@ mod tests {
     }
 
     #[test]
-    fn overlay_cache_reuses_spectrum_geometry_for_same_frame() {
+    fn retained_spectrum_uses_one_gpu_surface_with_direct_revisioned_payload() {
         let frame = test_frame();
-        let bounds = overlay_bounds();
-        let theme = ThemeTokens::default();
-        let mut cache = SpectrogramOverlayPaintCache::default();
-
-        let first = cached_overlay(
-            &mut cache,
-            Some(frame.clone()),
+        let primitives = paint(SpectrogramWidget::new(
+            Arc::clone(&frame),
             LiveSpectrogramMode::Spectrum,
-            bounds,
-            &theme,
-        );
-        let second = cached_overlay(
-            &mut cache,
-            Some(frame),
-            LiveSpectrogramMode::Spectrum,
-            bounds,
-            &theme,
-        );
-
-        assert_eq!(cache.rebuild_count(), 1);
-        assert_eq!(cache.static_rebuild_count(), 1);
-        assert_eq!(first, second);
-        let fresh = {
-            let mut primitives = Vec::new();
-            SpectrogramWidget::new_with_id(
-                super::LIVE_SPECTROGRAM_OVERLAY_WIDGET_ID,
-                Some(test_frame()),
-                48_000,
-                LiveSpectrogramMode::Spectrum,
-            )
-            .append_overlay_paint(&mut primitives, bounds, &theme);
-            primitives
-        };
-        assert_eq!(first, fresh);
-
-        let first_area = area_fill(&first);
-        let second_area = area_fill(&second);
-        assert_eq!(
-            first_area.path.commands().as_ptr(),
-            second_area.path.commands().as_ptr()
-        );
-        let first_ribbon = ribbon_fill(&first);
-        let second_ribbon = ribbon_fill(&second);
-        assert_eq!(
-            first_ribbon.path.commands().as_ptr(),
-            second_ribbon.path.commands().as_ptr()
-        );
-    }
-
-    #[test]
-    fn overlay_cache_misses_for_distinct_equal_metadata_frames() {
-        let frame = test_frame();
-        let distinct_frame = Arc::new((*frame).clone());
-        assert!(!Arc::ptr_eq(&frame, &distinct_frame));
-        let theme = ThemeTokens::default();
-        let mut cache = SpectrogramOverlayPaintCache::default();
-
-        let first = cached_overlay(
-            &mut cache,
-            Some(frame),
-            LiveSpectrogramMode::Spectrum,
-            overlay_bounds(),
-            &theme,
-        );
-        let first_x_positions = Arc::clone(
-            &cache
-                .spectrum_static
-                .as_ref()
-                .expect("spectrum static cache should be present")
-                .x_positions,
-        );
-        let second = cached_overlay(
-            &mut cache,
-            Some(distinct_frame),
-            LiveSpectrogramMode::Spectrum,
-            overlay_bounds(),
-            &theme,
-        );
-
-        assert_eq!(cache.rebuild_count(), 2);
-        assert_eq!(cache.static_rebuild_count(), 1);
-        let second_x_positions = &cache
-            .spectrum_static
-            .as_ref()
-            .expect("spectrum static cache should be present")
-            .x_positions;
-        assert!(Arc::ptr_eq(&first_x_positions, second_x_positions));
-        assert_ne!(
-            ribbon_fill(&first).path.commands().as_ptr(),
-            ribbon_fill(&second).path.commands().as_ptr()
-        );
-    }
-
-    #[test]
-    fn overlay_cache_misses_for_frame_bounds_and_style_changes() {
-        let frame = test_frame();
-        let distinct_frame = Arc::new((*frame).clone());
-        let bounds = overlay_bounds();
-        let resized_bounds =
-            Rect::from_min_size(Point::new(0.0, 0.0), Vector2::new(720.0, super::MIN_HEIGHT));
-        let theme = ThemeTokens::default();
-        let mut changed_theme = theme;
-        changed_theme.highlight_orange = changed_theme.highlight_orange.with_alpha(254);
-        let mut cache = SpectrogramOverlayPaintCache::default();
-
-        cached_overlay(
-            &mut cache,
-            Some(frame.clone()),
-            LiveSpectrogramMode::Spectrum,
-            bounds,
-            &theme,
-        );
-        cached_overlay(
-            &mut cache,
-            Some(distinct_frame),
-            LiveSpectrogramMode::Spectrum,
-            bounds,
-            &theme,
-        );
-        cached_overlay(
-            &mut cache,
-            Some(frame.clone()),
-            LiveSpectrogramMode::Spectrum,
-            resized_bounds,
-            &theme,
-        );
-        cached_overlay(
-            &mut cache,
-            Some(frame),
-            LiveSpectrogramMode::Spectrum,
-            resized_bounds,
-            &changed_theme,
-        );
-
-        assert_eq!(cache.rebuild_count(), 4);
-        assert_eq!(cache.static_rebuild_count(), 3);
-    }
-
-    #[test]
-    fn overlay_cache_invalidates_static_spectrum_for_sample_rate_changes() {
-        let frame = test_frame();
-        let mut changed_frame = (*frame).clone();
-        changed_frame.sample_rate = 96_000;
-        let theme = ThemeTokens::default();
-        let mut cache = SpectrogramOverlayPaintCache::default();
-
-        cached_overlay(
-            &mut cache,
-            Some(frame),
-            LiveSpectrogramMode::Spectrum,
-            overlay_bounds(),
-            &theme,
-        );
-        cached_overlay(
-            &mut cache,
-            Some(Arc::new(changed_frame)),
-            LiveSpectrogramMode::Spectrum,
-            overlay_bounds(),
-            &theme,
-        );
-
-        assert_eq!(cache.rebuild_count(), 2);
-        assert_eq!(cache.static_rebuild_count(), 2);
-    }
-
-    #[test]
-    fn absent_frame_does_not_replay_stale_overlay_data() {
-        let frame = test_frame();
-        let bounds = overlay_bounds();
-        let theme = ThemeTokens::default();
-        let mut cache = SpectrogramOverlayPaintCache::default();
-
-        let first = cached_overlay(
-            &mut cache,
-            Some(frame.clone()),
-            LiveSpectrogramMode::Spectrum,
-            bounds,
-            &theme,
-        );
-        assert!(!first.is_empty());
-
-        let absent = cached_overlay(
-            &mut cache,
-            None,
-            LiveSpectrogramMode::Spectrum,
-            bounds,
-            &theme,
-        );
-        assert!(absent.is_empty());
-        assert_eq!(cache.rebuild_count(), 1);
-        assert_eq!(cache.static_rebuild_count(), 1);
-
-        cached_overlay(
-            &mut cache,
-            Some(frame),
-            LiveSpectrogramMode::Spectrum,
-            bounds,
-            &theme,
-        );
-        assert_eq!(cache.rebuild_count(), 2);
-        assert_eq!(cache.static_rebuild_count(), 1);
-    }
-
-    #[test]
-    fn overlay_cache_preserves_empty_plot_shell_for_tiny_bounds() {
-        let mut cache = SpectrogramOverlayPaintCache::default();
-        let bounds = Rect::from_min_size(Point::new(0.0, 0.0), Vector2::new(1.0, 1.0));
-        let primitives = cached_overlay(
-            &mut cache,
-            Some(test_frame()),
-            LiveSpectrogramMode::Spectrum,
-            bounds,
-            &ThemeTokens::default(),
-        );
-
-        assert_eq!(primitives.len(), 1);
-        assert!(matches!(
-            primitives.first(),
-            Some(PaintPrimitive::FillRect(fill)) if fill.rect == bounds
         ));
-        assert_eq!(cache.static_rebuild_count(), 0);
-    }
+        let surfaces = gpu_surfaces(&primitives);
+        assert_eq!(surfaces.len(), 1);
+        let surface = surfaces[0];
+        let descriptor = custom_descriptor(surface);
 
-    #[test]
-    fn overlay_cache_clears_spectrum_static_state_when_switching_to_waterfall() {
-        let bounds = overlay_bounds();
-        let theme = ThemeTokens::default();
-        let mut cache = SpectrogramOverlayPaintCache::default();
-
-        let spectrum = cached_overlay(
-            &mut cache,
-            Some(test_frame()),
-            LiveSpectrogramMode::Spectrum,
-            bounds,
-            &theme,
-        );
-        assert!(!spectrum.is_empty());
-        assert_eq!(cache.static_rebuild_count(), 1);
-
-        let waterfall = cached_overlay(
-            &mut cache,
-            Some(test_frame()),
-            LiveSpectrogramMode::Waterfall,
-            bounds,
-            &theme,
-        );
-        assert!(waterfall.is_empty());
-
-        let spectrum_again = cached_overlay(
-            &mut cache,
-            Some(test_frame()),
-            LiveSpectrogramMode::Spectrum,
-            bounds,
-            &theme,
-        );
-        assert!(!spectrum_again.is_empty());
-        assert_eq!(cache.static_rebuild_count(), 2);
-    }
-
-    #[test]
-    fn overlay_cache_replaces_its_single_entry() {
-        let first_frame = test_frame();
-        let second_frame = Arc::new((*first_frame).clone());
-        let bounds = overlay_bounds();
-        let theme = ThemeTokens::default();
-        let mut cache = SpectrogramOverlayPaintCache::default();
-
-        cached_overlay(
-            &mut cache,
-            Some(first_frame.clone()),
-            LiveSpectrogramMode::Spectrum,
-            bounds,
-            &theme,
-        );
-        cached_overlay(
-            &mut cache,
-            Some(second_frame),
-            LiveSpectrogramMode::Spectrum,
-            bounds,
-            &theme,
-        );
-        cached_overlay(
-            &mut cache,
-            Some(first_frame),
-            LiveSpectrogramMode::Spectrum,
-            bounds,
-            &theme,
-        );
-
-        assert_eq!(cache.rebuild_count(), 3);
-        assert_eq!(cache.static_rebuild_count(), 1);
-    }
-
-    #[test]
-    fn mode_selects_waterfall_or_spectrum_paint_path() {
-        let bounds = Rect::from_min_size(Point::new(0.0, 0.0), Vector2::new(720.0, super::HEIGHT));
-        let waterfall = SpectrogramWidget::new(test_frame(), LiveSpectrogramMode::Waterfall)
-            .paint_primitives(bounds, &LayoutOutput::default(), &ThemeTokens::default());
-        let spectrum = SpectrogramWidget::new(test_frame(), LiveSpectrogramMode::Spectrum)
-            .paint_primitives(bounds, &LayoutOutput::default(), &ThemeTokens::default());
-
-        let waterfall_surfaces = waterfall
-            .iter()
-            .filter_map(|primitive| match primitive {
-                PaintPrimitive::GpuSurface(surface) => Some(surface),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(waterfall_surfaces.len(), 1);
-        assert!(matches!(
-            &waterfall_surfaces[0].content,
-            GpuSurfaceContent::CustomShader { .. }
+        assert_eq!(surface.key, SPECTRUM_SURFACE_KEY);
+        assert_ne!(surface.key, super::WATERFALL_SURFACE_KEY);
+        assert_eq!(surface.revision, frame.gpu_revision());
+        assert_eq!(descriptor.shader_key, SPECTRUM_SHADER_KEY);
+        assert_ne!(descriptor.shader_key, "cadence/live-spectrogram-waterfall");
+        assert_eq!(descriptor.storage_bytes.len(), LIVE_SPECTRUM_POINT_COUNT);
+        assert!(Arc::ptr_eq(
+            &descriptor.storage_bytes,
+            &frame.spectrum_values
         ));
-        assert!(
-            !waterfall
-                .iter()
-                .any(|primitive| matches!(primitive, PaintPrimitive::FillRectBatch(_)))
-        );
-        assert!(!waterfall.iter().any(|primitive| {
-            matches!(primitive, PaintPrimitive::FillPolygon(polygon) if polygon.points.len() == LIVE_SPECTROGRAM_BAND_COUNT + 2)
-        }));
-        assert!(spectrum.iter().any(|primitive| {
-            matches!(primitive, PaintPrimitive::FillRect(fill) if fill.color == SPECTRUM_PLOT_BACKGROUND)
-        }));
+        assert_ne!(descriptor.storage_identity, 0);
+        assert_eq!(descriptor.storage_revision, frame.gpu_revision());
+        assert_eq!(descriptor.entry_point, "vertex_main");
         assert_eq!(
-            spectrum
-                .iter()
-                .filter(|primitive| matches!(primitive, PaintPrimitive::FillPath(_)))
-                .count(),
-            2
+            descriptor.fragment_entry_point.as_deref(),
+            Some("fragment_main")
         );
-        assert!(matches!(
-            ribbon_fill(&spectrum).brush,
-            PaintBrush::Solid(color) if color == ThemeTokens::default().highlight_orange
-        ));
-        assert!(matches!(
-            area_fill(&spectrum).brush,
-            PaintBrush::LinearGradient(_)
-        ));
-        assert!(
-            !spectrum
-                .iter()
-                .any(|primitive| matches!(primitive, PaintPrimitive::FillPolygon(_)))
-        );
-        assert!(
-            !spectrum
-                .iter()
-                .any(|primitive| matches!(primitive, PaintPrimitive::FillRectBatch(_)))
-        );
-    }
-
-    #[test]
-    fn spectrum_uses_latest_row_with_low_to_high_frequency_geometry() {
-        let bounds = Rect::from_min_size(Point::new(0.0, 0.0), Vector2::new(720.0, super::HEIGHT));
-        let primitives = SpectrogramWidget::new(test_frame(), LiveSpectrogramMode::Spectrum)
-            .paint_primitives(bounds, &LayoutOutput::default(), &ThemeTokens::default());
-        let ribbon = ribbon_fill(&primitives);
-        let area = area_fill(&primitives);
-        let plot = SpectrogramWidget::plot_rect(bounds);
-        let ribbon_commands = ribbon.path.commands();
-        let upper_points = ribbon_commands[..LIVE_SPECTRUM_POINT_COUNT]
-            .iter()
-            .map(path_point)
-            .collect::<Vec<_>>();
-        let lower_points = ribbon_commands
-            [LIVE_SPECTRUM_POINT_COUNT..LIVE_SPECTRUM_POINT_COUNT * 2]
-            .iter()
-            .map(path_point)
-            .collect::<Vec<_>>();
-
-        assert_eq!(ribbon_commands.len(), LIVE_SPECTRUM_POINT_COUNT * 2 + 1);
-        assert_eq!(
-            primitives
-                .iter()
-                .filter(|primitive| matches!(primitive, PaintPrimitive::FillPath(_)))
-                .count(),
-            2
-        );
-        assert!(matches!(
-            ribbon.brush,
-            PaintBrush::Solid(color) if color == ThemeTokens::default().highlight_orange
-        ));
-        assert_eq!(upper_points.first().expect("low band").x, plot.min.x);
-        assert_eq!(upper_points.last().expect("high band").x, plot.max.x);
-        assert_eq!(
-            lower_points.first().expect("high band lower edge").x,
-            plot.max.x
-        );
-        assert_eq!(
-            lower_points.last().expect("low band lower edge").x,
-            plot.min.x
-        );
-        assert!(
-            upper_points
-                .windows(2)
-                .all(|points| points[0].x < points[1].x)
-        );
-        assert!(
-            lower_points
-                .windows(2)
-                .all(|points| points[0].x > points[1].x)
-        );
-        assert!(matches!(
-            ribbon_commands.first(),
-            Some(PaintPathCommand::MoveTo(point))
-                if *point == Point::new(plot.min.x, plot.max.y - SPECTRUM_RIBBON_WIDTH * 0.5)
-        ));
-        assert!(matches!(
-            ribbon_commands.get(LIVE_SPECTRUM_POINT_COUNT - 1),
-            Some(PaintPathCommand::LineTo(point)) if *point == Point::new(plot.max.x, plot.min.y)
-        ));
-        assert!(matches!(
-            ribbon_commands.get(LIVE_SPECTRUM_POINT_COUNT),
-            Some(PaintPathCommand::LineTo(point))
-                if *point == Point::new(plot.max.x, plot.min.y + SPECTRUM_RIBBON_WIDTH * 0.5)
-        ));
-        assert!(matches!(
-            ribbon_commands.get(LIVE_SPECTRUM_POINT_COUNT * 2 - 1),
-            Some(PaintPathCommand::LineTo(point)) if *point == Point::new(plot.min.x, plot.max.y)
-        ));
-        assert!(matches!(
-            ribbon_commands.last(),
-            Some(PaintPathCommand::Close)
-        ));
-        assert_eq!(area.path.commands().len(), LIVE_SPECTRUM_POINT_COUNT + 3);
-        assert!(matches!(
-            area.path.commands().first(),
-            Some(PaintPathCommand::MoveTo(point)) if *point == Point::new(plot.min.x, plot.max.y)
-        ));
-        assert!(matches!(
-            area.path.commands().get(LIVE_SPECTRUM_POINT_COUNT - 1),
-            Some(PaintPathCommand::LineTo(point)) if *point == Point::new(plot.max.x, plot.min.y)
-        ));
-        assert!(matches!(
-            area.path.commands().last(),
-            Some(PaintPathCommand::Close)
-        ));
-        assert!(matches!(
-            area.brush,
-            PaintBrush::LinearGradient(gradient)
-                if gradient.start_color == ThemeTokens::default().highlight_orange.with_alpha(48)
-                    && gradient.end_color == ThemeTokens::default().highlight_orange.with_alpha(0)
-        ));
-        let area_index = primitives
-            .iter()
-            .position(|primitive| {
-                matches!(
-                    primitive,
-                    PaintPrimitive::FillPath(fill)
-                        if matches!(fill.brush, PaintBrush::LinearGradient(_))
-                )
-            })
-            .expect("area index");
-        let ribbon_index = primitives
-            .iter()
-            .position(|primitive| {
-                matches!(
-                    primitive,
-                    PaintPrimitive::FillPath(fill)
-                        if matches!(fill.brush, PaintBrush::Solid(_))
-                )
-            })
-            .expect("ribbon index");
-        assert!(area_index < ribbon_index);
-        assert!(primitives.len() <= 24);
-    }
-
-    #[test]
-    fn spectrum_geometry_matches_reference_area_and_ribbon_paths() {
-        let mut frame = (*test_frame()).clone();
-        let mut spectrum_values = vec![0_u8; LIVE_SPECTRUM_POINT_COUNT];
-        spectrum_values[0] = u8::MAX;
-        spectrum_values[LIVE_SPECTRUM_POINT_COUNT / 2] = 128;
-        spectrum_values[LIVE_SPECTRUM_POINT_COUNT - 1] = 64;
-        frame.spectrum_values = Arc::from(spectrum_values.into_boxed_slice());
-
-        let widget = SpectrogramWidget::new(Arc::new(frame), LiveSpectrogramMode::Spectrum);
-        let bounds = overlay_bounds();
-        let plot = SpectrogramWidget::plot_rect(bounds);
-        let x_positions = widget.spectrum_x_positions(plot);
-        let geometry = widget
-            .spectrum_geometry_with_x_positions(plot, &x_positions)
-            .expect("valid detailed spectrum geometry");
-        let half_width = SPECTRUM_RIBBON_WIDTH * 0.5;
-        let center_at = |point: usize, x: f32| {
-            let level = widget
-                .frame
-                .as_ref()
-                .expect("reference frame")
-                .spectrum_value(point) as f32
-                / u8::MAX as f32;
-            let y = (plot.max.y - plot.height() * level).clamp(plot.min.y, plot.max.y);
-            Point::new(x.clamp(plot.min.x, plot.max.x), y)
-        };
-
-        let mut expected_area = Vec::with_capacity(LIVE_SPECTRUM_POINT_COUNT + 3);
-        let mut expected_ribbon = Vec::with_capacity(LIVE_SPECTRUM_POINT_COUNT * 2 + 1);
-        for (point, &x) in x_positions.iter().enumerate() {
-            let center = center_at(point, x);
-            let upper = Point::new(
-                center.x,
-                (center.y - half_width).clamp(plot.min.y, plot.max.y),
-            );
-            if point == 0 {
-                expected_area.push(PaintPathCommand::MoveTo(center));
-                expected_ribbon.push(PaintPathCommand::MoveTo(upper));
-            } else {
-                expected_area.push(PaintPathCommand::LineTo(center));
-                expected_ribbon.push(PaintPathCommand::LineTo(upper));
-            }
-        }
-        for (point, &x) in x_positions.iter().enumerate().rev() {
-            let center = center_at(point, x);
-            expected_ribbon.push(PaintPathCommand::LineTo(Point::new(
-                center.x,
-                (center.y + half_width).clamp(plot.min.y, plot.max.y),
-            )));
-        }
-        expected_area.extend([
-            PaintPathCommand::LineTo(Point::new(plot.max.x, plot.max.y)),
-            PaintPathCommand::LineTo(Point::new(plot.min.x, plot.max.y)),
-            PaintPathCommand::Close,
-        ]);
-        expected_ribbon.push(PaintPathCommand::Close);
-
-        assert_eq!(geometry.area_path.commands(), expected_area.as_slice());
-        assert_eq!(geometry.ribbon_path.commands(), expected_ribbon.as_slice());
-    }
-
-    #[test]
-    fn spectrum_layers_area_under_grid_ribbon_above_grid_and_border_last() {
-        let bounds = overlay_bounds();
-        let plot = SpectrogramWidget::plot_rect(bounds);
-        let theme = ThemeTokens::default();
-        let widget = SpectrogramWidget::new(test_frame(), LiveSpectrogramMode::Spectrum);
-        let retained = widget.paint_primitives(bounds, &LayoutOutput::default(), &theme);
-        let mut transient = Vec::new();
-        widget.append_overlay_paint(&mut transient, bounds, &theme);
-
-        let assert_order = |label: &str, primitives: &[PaintPrimitive]| {
-            let area = primitives
-                .iter()
-                .position(|primitive| {
-                    matches!(
-                        primitive,
-                        PaintPrimitive::FillPath(fill)
-                            if matches!(fill.brush, PaintBrush::LinearGradient(_))
-                    )
-                })
-                .expect("spectrum area");
-            let ribbon = primitives
-                .iter()
-                .position(|primitive| {
-                    matches!(
-                        primitive,
-                        PaintPrimitive::FillPath(fill)
-                            if matches!(fill.brush, PaintBrush::Solid(_))
-                    )
-                })
-                .expect("spectrum ribbon");
-            let grid = primitives
-                .iter()
-                .enumerate()
-                .find_map(|(index, primitive)| {
-                    if index > area
-                        && index < ribbon
-                        && matches!(
-                            primitive,
-                            PaintPrimitive::StrokePolyline(_) | PaintPrimitive::StrokeRect(_)
-                        )
-                    {
-                        Some(index)
-                    } else {
-                        None
-                    }
-                })
-                .expect("spectrum grid");
-            let border = primitives
-                .iter()
-                .enumerate()
-                .find_map(|(index, primitive)| {
-                    if index > ribbon
-                        && matches!(
-                            primitive,
-                            PaintPrimitive::StrokeRect(border)
-                                if border.rect == plot && border.color == theme.border_emphasis
-                        )
-                    {
-                        Some(index)
-                    } else {
-                        None
-                    }
-                })
-                .expect("spectrum plot border");
-
-            assert!(
-                area < grid && grid < ribbon && ribbon < border,
-                "{label} spectrum order was area={area}, grid={grid}, ribbon={ribbon}, border={border}"
-            );
-        };
-
-        assert_order("retained", &retained);
-        assert_order("transient", &transient);
-    }
-
-    #[test]
-    fn spectrum_ribbon_is_clamped_and_keeps_nominal_width_inside_plot() {
-        let mut frame = (*test_frame()).clone();
-        let mut spectrum_values = vec![0_u8; LIVE_SPECTRUM_POINT_COUNT];
-        spectrum_values[LIVE_SPECTRUM_POINT_COUNT / 2] = 128;
-        frame.spectrum_values = Arc::from(spectrum_values.into_boxed_slice());
-        let widget = SpectrogramWidget::new(Arc::new(frame), LiveSpectrogramMode::Spectrum);
-        let bounds = overlay_bounds();
-        let plot = SpectrogramWidget::plot_rect(bounds);
-        let geometry = widget
-            .spectrum_geometry(plot)
-            .expect("valid detailed spectrum geometry");
-        let ribbon_commands = geometry.ribbon_path.commands();
-        assert_eq!(ribbon_commands.len(), LIVE_SPECTRUM_POINT_COUNT * 2 + 1);
-        assert!(matches!(
-            ribbon_commands.last(),
-            Some(PaintPathCommand::Close)
-        ));
-        let ribbon_points = ribbon_commands[..LIVE_SPECTRUM_POINT_COUNT * 2]
-            .iter()
-            .map(path_point)
-            .collect::<Vec<_>>();
-
-        for point in &ribbon_points {
-            assert!(point.x >= plot.min.x && point.x <= plot.max.x);
-            assert!(point.y >= plot.min.y && point.y <= plot.max.y);
-        }
-        for point in 0..LIVE_SPECTRUM_POINT_COUNT {
-            let upper = ribbon_points[point];
-            let lower = ribbon_points[2 * LIVE_SPECTRUM_POINT_COUNT - point - 1];
-            let width = lower.y - upper.y;
-            assert!((0.0..=SPECTRUM_RIBBON_WIDTH).contains(&width));
-        }
-        let middle = LIVE_SPECTRUM_POINT_COUNT / 2;
-        let middle_upper = ribbon_points[middle];
-        let middle_lower = ribbon_points[2 * LIVE_SPECTRUM_POINT_COUNT - middle - 1];
-        assert!((middle_lower.y - middle_upper.y - SPECTRUM_RIBBON_WIDTH).abs() < 0.001);
-        let low_width = ribbon_points[2 * LIVE_SPECTRUM_POINT_COUNT - 1].y - ribbon_points[0].y;
-        let high_width = ribbon_points[LIVE_SPECTRUM_POINT_COUNT].y
-            - ribbon_points[LIVE_SPECTRUM_POINT_COUNT - 1].y;
-        assert!(low_width <= SPECTRUM_RIBBON_WIDTH * 0.5 + 0.001);
-        assert!(high_width <= SPECTRUM_RIBBON_WIDTH * 0.5 + 0.001);
-    }
-
-    #[test]
-    fn waterfall_scale_helpers_clamp_and_round_trip_normalized_values() {
-        assert_eq!(super::clamp_history_scale(f32::NAN), 1.0);
-        assert_eq!(super::clamp_history_scale(f32::NEG_INFINITY), 1.0);
-        assert_eq!(super::clamp_history_scale(0.5), 1.0);
-        assert_eq!(super::clamp_history_scale(8.0), 4.0);
-        assert_eq!(super::history_scale_from_normalized(-1.0), 1.0);
-        assert_eq!(super::history_scale_from_normalized(2.0), 4.0);
-        assert_eq!(super::history_scale_from_normalized(f32::NAN), 1.0);
-
-        for normalized in [0.0, 0.125, 0.5, 0.875, 1.0] {
-            let scale = super::history_scale_from_normalized(normalized);
-            assert!((super::history_scale_to_normalized(scale) - normalized).abs() < 1.0e-6);
-        }
-    }
-
-    #[test]
-    fn waterfall_row_intervals_use_exact_age_and_stable_height() {
-        let plot = Rect::from_min_max(Point::new(10.0, 20.0), Point::new(110.0, 120.0));
-        let scale = 2.5;
-
-        assert_eq!(
-            super::waterfall_row_y_interval(plot, 4, 3, scale),
-            Some((117.5, 120.0))
-        );
-        assert_eq!(
-            super::waterfall_row_y_interval(plot, 4, 0, scale),
-            Some((110.0, 112.5))
-        );
-
-        for row_count in [1, 4, LIVE_SPECTROGRAM_MAX_HISTORY] {
-            let rows = super::visible_waterfall_rows(plot, row_count, scale);
-            for pair in rows.windows(2) {
-                if pair[0].1.height() == scale && pair[1].1.height() == scale {
-                    assert_eq!(pair[0].1.height(), pair[1].1.height());
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn full_history_fills_max_height_plot_at_minimum_scale() {
-        let bounds =
-            Rect::from_min_size(Point::new(0.0, 0.0), Vector2::new(720.0, super::MAX_HEIGHT));
-        let plot = SpectrogramWidget::plot_rect(bounds);
-        let row_count = LIVE_SPECTROGRAM_MAX_HISTORY;
-        let history_scale = super::MIN_HISTORY_SCALE;
-        let visible = super::visible_waterfall_rows(plot, row_count, history_scale);
-        let excess = row_count.saturating_sub(visible.len());
-
-        assert_eq!(plot.height(), 238.0);
-        assert_eq!(visible.len(), plot.height() as usize);
-        assert!(visible.iter().enumerate().all(|(index, (row, rect))| {
-            *row == excess + index
-                && rect.min.y == plot.min.y + index as f32
-                && rect.max.y == plot.min.y + (index + 1) as f32
-                && rect.height() == history_scale
-        }));
-        assert!(
-            (0..excess).all(
-                |row| super::waterfall_row_rect(plot, row_count, row, history_scale).is_none()
-            )
-        );
-        assert_eq!(
-            visible.first().map(|(_, rect)| rect.min.y),
-            Some(plot.min.y)
-        );
-        assert_eq!(visible.last().map(|(_, rect)| rect.max.y), Some(plot.max.y));
-    }
-
-    #[test]
-    fn waterfall_crops_oldest_rows_without_aggregation() {
-        let row_count = 5;
-        let plot = Rect::from_min_max(Point::new(0.0, 0.0), Point::new(100.0, 5.0));
-        let visible = super::visible_waterfall_rows(plot, row_count, 2.0);
-        assert_eq!(
-            visible.iter().map(|(row, _)| *row).collect::<Vec<_>>(),
-            vec![2, 3, 4]
-        );
-        assert_eq!(
-            visible[0].1,
-            Rect::from_min_max(Point::new(0.0, 0.0), Point::new(100.0, 1.0))
-        );
-        assert_eq!(
-            visible[1].1,
-            Rect::from_min_max(Point::new(0.0, 1.0), Point::new(100.0, 3.0))
-        );
-        assert_eq!(
-            visible[2].1,
-            Rect::from_min_max(Point::new(0.0, 3.0), Point::new(100.0, 5.0))
-        );
-    }
-
-    #[test]
-    fn spectrum_paths_are_shared_by_retained_and_transient_paint() {
-        let bounds = Rect::from_min_size(Point::new(0.0, 0.0), Vector2::new(720.0, super::HEIGHT));
-        let frame = test_frame();
-        let widget = SpectrogramWidget::new(frame, LiveSpectrogramMode::Spectrum);
-        let retained =
-            widget.paint_primitives(bounds, &LayoutOutput::default(), &ThemeTokens::default());
-        let mut transient = Vec::new();
-        widget.append_overlay_paint(&mut transient, bounds, &ThemeTokens::default());
-
-        assert_eq!(area_fill(&retained), area_fill(&transient));
-        assert_eq!(ribbon_fill(&retained), ribbon_fill(&transient));
-        assert_eq!(
-            area_fill(&retained).path.commands().len(),
-            LIVE_SPECTRUM_POINT_COUNT + 3
-        );
-        assert_eq!(
-            ribbon_fill(&retained).path.commands().len(),
-            LIVE_SPECTRUM_POINT_COUNT * 2 + 1
-        );
-    }
-
-    #[test]
-    fn transient_paint_contains_only_replayable_primitives() {
-        let bounds = Rect::from_min_size(Point::new(0.0, 0.0), Vector2::new(720.0, super::HEIGHT));
-        let mut primitives = Vec::new();
-        SpectrogramWidget::new(test_frame(), LiveSpectrogramMode::Spectrum).append_overlay_paint(
-            &mut primitives,
-            bounds,
-            &ThemeTokens::default(),
-        );
-
-        assert!(primitives.iter().all(|primitive| {
+        assert_eq!(descriptor.presentation_uniform_bytes, None);
+        assert_eq!(descriptor.presentation_uniform_revision, None);
+        assert_eq!(descriptor.vertex_count, 6);
+        assert_eq!(descriptor.uniform_bytes.len(), 32);
+        assert!(!primitives.iter().any(|primitive| {
             matches!(
                 primitive,
-                PaintPrimitive::FillRect(_)
-                    | PaintPrimitive::FillRectBatch(_)
-                    | PaintPrimitive::FillPath(_)
-                    | PaintPrimitive::StrokeRect(_)
-                    | PaintPrimitive::StrokeRectBatch(_)
-                    | PaintPrimitive::StrokePolygon(_)
-                    | PaintPrimitive::Svg(_)
-                    | PaintPrimitive::Text(_)
+                PaintPrimitive::FillPath(_) | PaintPrimitive::FillPolygon(_)
             )
         }));
-        assert!(
-            !primitives
-                .iter()
-                .any(|primitive| matches!(primitive, PaintPrimitive::StrokePolyline(_)))
-        );
-        assert!(
-            !primitives
-                .iter()
-                .any(|primitive| matches!(primitive, PaintPrimitive::GpuSurface(_)))
+    }
+
+    #[test]
+    fn spectrum_uniform_preserves_area_ribbon_and_color_parameters() {
+        let theme = ThemeTokens::default();
+        let plot = SpectrogramWidget::plot_rect(bounds());
+        let primitives = SpectrogramWidget::new(test_frame(), LiveSpectrogramMode::Spectrum)
+            .paint_primitives(bounds(), &LayoutOutput::default(), &theme);
+        let surface = gpu_surfaces(&primitives)
+            .into_iter()
+            .next()
+            .expect("spectrum should retain a GPU surface");
+        let descriptor = custom_descriptor(surface);
+
+        assert_eq!(
+            u32::from_le_bytes(
+                descriptor.uniform_bytes[0..4]
+                    .try_into()
+                    .expect("point count bytes")
+            ),
+            LIVE_SPECTRUM_POINT_COUNT as u32
         );
         assert_eq!(
-            primitives
-                .iter()
-                .filter(|primitive| matches!(primitive, PaintPrimitive::FillPath(_)))
-                .count(),
-            2
+            uniform_f32(&descriptor.uniform_bytes, 4),
+            (SPECTRUM_RIBBON_WIDTH * 0.5) / plot.height()
         );
-        assert!(
-            !primitives
-                .iter()
-                .any(|primitive| matches!(primitive, PaintPrimitive::FillPolygon(_)))
+        assert_eq!(
+            uniform_f32(&descriptor.uniform_bytes, 8),
+            SPECTRUM_AREA_ALPHA as f32 / u8::MAX as f32
         );
-    }
-
-    #[test]
-    fn display_grid_labels_expose_frequency_and_db_conventions() {
-        let bounds = Rect::from_min_size(Point::new(0.0, 0.0), Vector2::new(720.0, super::HEIGHT));
-        let primitives = SpectrogramWidget::new(test_frame(), LiveSpectrogramMode::Waterfall)
-            .paint_primitives(bounds, &LayoutOutput::default(), &ThemeTokens::default());
-        let labels = primitives
-            .iter()
-            .filter_map(|primitive| match primitive {
-                PaintPrimitive::Text(text) => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-
-        for label in ["20 Hz", "1 kHz", "20 kHz", "0 dB", "-90"] {
-            assert!(labels.contains(&label), "missing grid label {label:?}");
-        }
-    }
-
-    #[test]
-    fn frequency_grid_is_logarithmic_and_clamps_to_frame_nyquist() {
-        let frame = test_frame();
-        let widget = SpectrogramWidget::new(frame, LiveSpectrogramMode::Spectrum);
-        let bounds = Rect::from_min_size(Point::new(0.0, 0.0), Vector2::new(720.0, 240.0));
-        let plot = SpectrogramWidget::plot_rect(bounds);
-
-        assert_eq!(widget.x_for_frequency(plot, 20.0), plot.min.x);
-        assert_eq!(widget.x_for_frequency(plot, 20_000.0), plot.max.x);
-        let reference_position = (1_000.0_f32 / 20.0).ln() / (20_000.0_f32 / 20.0).ln();
-        let expected_reference_x = plot.min.x + plot.width() * reference_position;
-        assert!((widget.x_for_frequency(plot, 1_000.0) - expected_reference_x).abs() < 0.001);
-
-        let mut low_rate_frame = (*test_frame()).clone();
-        low_rate_frame.sample_rate = 16_000;
-        let low_rate_frame = Arc::new(low_rate_frame);
-        let low_rate_widget = SpectrogramWidget::new(low_rate_frame, LiveSpectrogramMode::Spectrum);
-        assert_eq!(low_rate_widget.x_for_frequency(plot, 20_000.0), plot.max.x);
-    }
-
-    #[test]
-    fn frequency_grid_labels_follow_source_nyquist() {
-        let bounds = Rect::from_min_size(Point::new(0.0, 0.0), Vector2::new(720.0, super::HEIGHT));
-
-        for (sample_rate, expected_endpoint, forbidden_endpoint) in [
-            (16_000, "8 kHz", ["10 kHz", "20 kHz"]),
-            (22_050, "11 kHz", ["20 kHz", ""]),
-        ] {
-            let mut frame = (*test_frame()).clone();
-            frame.sample_rate = sample_rate;
-            let primitives =
-                SpectrogramWidget::new(Arc::new(frame), LiveSpectrogramMode::Waterfall)
-                    .paint_primitives(bounds, &LayoutOutput::default(), &ThemeTokens::default());
-            let labels = primitives
-                .iter()
-                .filter_map(|primitive| match primitive {
-                    PaintPrimitive::Text(text) => Some(text.text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-
-            assert!(
-                labels.contains(&expected_endpoint),
-                "missing {expected_endpoint} for {sample_rate} Hz"
+        for (index, channel) in [
+            theme.highlight_orange.r,
+            theme.highlight_orange.g,
+            theme.highlight_orange.b,
+            theme.highlight_orange.a,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                uniform_f32(&descriptor.uniform_bytes, 16 + index * 4),
+                channel as f32 / u8::MAX as f32
             );
-            for forbidden in forbidden_endpoint {
-                if !forbidden.is_empty() {
-                    assert!(!labels.contains(&forbidden), "unexpected {forbidden}");
-                }
-            }
         }
     }
 
     #[test]
-    fn height_clamping_keeps_the_plot_in_a_sensible_range() {
-        assert_eq!(super::clamp_height(-1.0), super::MIN_HEIGHT);
-        assert_eq!(
-            super::clamp_height(super::MAX_HEIGHT + 1.0),
-            super::MAX_HEIGHT
+    fn spectrum_surface_keeps_normal_paint_order_and_has_no_transient_graph() {
+        let primitives = paint(SpectrogramWidget::new(
+            test_frame(),
+            LiveSpectrogramMode::Spectrum,
+        ));
+        let plot = SpectrogramWidget::plot_rect(bounds());
+        let surface_index = primitives
+            .iter()
+            .position(|primitive| matches!(primitive, PaintPrimitive::GpuSurface(_)))
+            .expect("spectrum GPU surface");
+        let first_grid_index = primitives
+            .iter()
+            .position(|primitive| {
+                matches!(
+                    primitive,
+                    PaintPrimitive::StrokePolyline(_) | PaintPrimitive::Text(_)
+                )
+            })
+            .expect("normal spectrum grid");
+        let border_index = primitives
+            .iter()
+            .rposition(|primitive| {
+                matches!(primitive, PaintPrimitive::StrokeRect(border) if border.rect == plot)
+            })
+            .expect("spectrum border");
+
+        assert_eq!(surface_index, 2);
+        assert!(surface_index < first_grid_index);
+        assert!(first_grid_index < border_index);
+        assert_eq!(border_index, primitives.len() - 1);
+        assert!(primitives.iter().any(|primitive| {
+            matches!(primitive, PaintPrimitive::FillRect(fill) if fill.rect == bounds())
+        }));
+        assert!(primitives.iter().any(|primitive| {
+            matches!(primitive, PaintPrimitive::FillRect(fill) if fill.rect == plot && fill.color == SPECTRUM_PLOT_BACKGROUND)
+        }));
+        assert!(!primitives.iter().any(|primitive| {
+            matches!(
+                primitive,
+                PaintPrimitive::FillPath(_) | PaintPrimitive::FillPolygon(_)
+            )
+        }));
+    }
+
+    #[test]
+    fn spectrum_shader_declares_log_linear_interpolation_and_clamped_ribbon() {
+        assert!(SPECTRUM_SHADER_WGSL.contains("spectrum[sample_index / 4u]"));
+        assert!(SPECTRUM_SHADER_WGSL.contains("sample_position"));
+        assert!(SPECTRUM_SHADER_WGSL.contains("lower + (upper - lower) * blend"));
+        assert!(SPECTRUM_SHADER_WGSL.contains("half_ribbon_width"));
+        assert!(SPECTRUM_SHADER_WGSL.contains("ribbon_top"));
+        assert!(SPECTRUM_SHADER_WGSL.contains("ribbon_bottom"));
+        assert!(SPECTRUM_SHADER_WGSL.contains("params.area_alpha * (1.0 - input.local.y)"));
+        assert!(SPECTRUM_SHADER_WGSL.contains("logarithmically distributed"));
+    }
+
+    #[test]
+    fn spectrum_surface_revision_follows_frame_gpu_revision() {
+        let first = test_frame();
+        let second = Arc::new(
+            LiveSpectrogramFrame::from_values(
+                first.generation,
+                first.epoch,
+                first.revision + 1,
+                first.sample_rate,
+                first.row_count,
+                Arc::clone(&first.values),
+                Arc::clone(&first.spectrum_values),
+            )
+            .expect("valid second frame"),
         );
-        assert_eq!(super::clamp_height(f32::NAN), super::HEIGHT);
+        let first_primitives = paint(SpectrogramWidget::new(
+            Arc::clone(&first),
+            LiveSpectrogramMode::Spectrum,
+        ));
+        let first_surface = gpu_surfaces(&first_primitives)
+            .into_iter()
+            .next()
+            .expect("first spectrum surface");
+        let second_primitives = paint(SpectrogramWidget::new(
+            Arc::clone(&second),
+            LiveSpectrogramMode::Spectrum,
+        ));
+        let second_surface = gpu_surfaces(&second_primitives)
+            .into_iter()
+            .next()
+            .expect("second spectrum surface");
+
+        assert_ne!(first.gpu_revision(), second.gpu_revision());
+        assert_eq!(first_surface.revision, first.gpu_revision());
+        assert_eq!(second_surface.revision, second.gpu_revision());
+        assert_eq!(
+            custom_descriptor(first_surface).storage_revision,
+            first.gpu_revision()
+        );
+        assert_eq!(
+            custom_descriptor(second_surface).storage_revision,
+            second.gpu_revision()
+        );
+    }
+
+    #[test]
+    fn waterfall_storage_stays_bounded_for_maximum_history() {
+        let values = vec![0_u8; LIVE_SPECTROGRAM_MAX_HISTORY * LIVE_SPECTROGRAM_BAND_COUNT];
+        let expected_storage_len = values.len().div_ceil(4) * 4;
+        let frame = Arc::new(
+            LiveSpectrogramFrame::from_values(
+                1,
+                1,
+                1,
+                48_000,
+                LIVE_SPECTROGRAM_MAX_HISTORY,
+                Arc::from(values.into_boxed_slice()),
+                Arc::from(vec![0_u8; LIVE_SPECTRUM_POINT_COUNT].into_boxed_slice()),
+            )
+            .expect("valid maximum-history frame"),
+        );
+        let primitives = paint(SpectrogramWidget::new(
+            frame,
+            LiveSpectrogramMode::Waterfall,
+        ));
+        let surface = gpu_surfaces(&primitives)
+            .into_iter()
+            .next()
+            .expect("waterfall surface");
+        assert_eq!(
+            custom_descriptor(surface).storage_bytes.len(),
+            expected_storage_len
+        );
+        assert!(
+            !primitives
+                .iter()
+                .any(|primitive| matches!(primitive, PaintPrimitive::FillRectBatch(_)))
+        );
+        assert!(primitives.len() <= 32);
+    }
+
+    #[test]
+    fn waterfall_row_geometry_is_clipped_and_newest_row_is_at_bottom() {
+        let plot = Rect::from_min_size(Point::new(10.0, 20.0), Vector2::new(100.0, 40.0));
+        assert_eq!(
+            waterfall_row_y_interval(plot, 3, 2, 2.5),
+            Some((57.5, 60.0))
+        );
+        assert_eq!(
+            waterfall_row_y_interval(plot, 3, 0, 2.5),
+            Some((52.5, 55.0))
+        );
+        assert_eq!(
+            waterfall_row_rect(plot, 20, 4, 2.5),
+            Some(Rect::from_min_max(
+                Point::new(10.0, 20.0),
+                Point::new(110.0, 22.5)
+            ))
+        );
+        assert_eq!(visible_waterfall_rows(plot, 3, 2.5).len(), 3);
+    }
+
+    #[test]
+    fn scale_helpers_clamp_and_round_trip() {
+        assert_eq!(clamp_height(f32::NAN), super::HEIGHT);
+        assert_eq!(clamp_height(1.0), super::MIN_HEIGHT);
+        assert_eq!(clamp_height(999.0), super::MAX_HEIGHT);
+        assert_eq!(clamp_history_scale(f32::NAN), DEFAULT_HISTORY_SCALE);
+        assert_eq!(clamp_history_scale(0.0), super::MIN_HISTORY_SCALE);
+        assert_eq!(clamp_history_scale(99.0), super::MAX_HISTORY_SCALE);
+        assert_eq!(history_scale_from_normalized(0.5), 2.5);
+        assert_eq!(history_scale_to_normalized(2.5), 0.5);
     }
 }
