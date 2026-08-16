@@ -279,6 +279,10 @@ fn waterfall_shader_descriptor(
             fragment_entry_point: Some(String::from("fragment_main")),
             uniform_bytes: Arc::<[u8]>::from(uniform_bytes.as_slice()),
             storage_bytes: Arc::clone(frame.packed_values()),
+            storage_identity: 0,
+            storage_revision: 0,
+            presentation_uniform_bytes: None,
+            presentation_uniform_revision: None,
             vertex_count: 6,
         },
     ))
@@ -1164,6 +1168,10 @@ mod tests {
             descriptor.fragment_entry_point.as_deref(),
             Some("fragment_main")
         );
+        assert_eq!(descriptor.storage_identity, 0);
+        assert_eq!(descriptor.storage_revision, 0);
+        assert_eq!(descriptor.presentation_uniform_bytes, None);
+        assert_eq!(descriptor.presentation_uniform_revision, None);
         assert_eq!(descriptor.vertex_count, 6);
         assert_eq!(descriptor.uniform_bytes.len(), 16);
         assert_eq!(
