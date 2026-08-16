@@ -29,6 +29,7 @@ const NOTE_HOVER_RADIUS: f32 = MARKER_RADIUS + COMMENT_DRAG_HIT_RADIUS;
 const NOTE_RATIO_MATCH_EPSILON: f32 = 0.0001;
 const CURSOR_WIDTH: f32 = 2.0;
 const CURSOR_GAP_ABOVE_RAIL: f32 = 7.0;
+const ACTIVE_PLAYBACK_FILL_ALPHA: u8 = 64;
 const MAX_DISPLAY_BAR_COUNT: usize = 512;
 const BAR_PITCH: f32 = 4.0;
 const BAR_GAP: f32 = 0.0;
@@ -1139,15 +1140,42 @@ pub fn paint_playhead_overlay(
     let colors = WaveformColors::from_theme(theme);
     let timeline = TimelineSurface::new();
     let plot_bounds = timeline.plot_bounds(bounds);
+    let rail_y = comment_rail_y(bounds);
+    let played_bounds = visible_bounds(plot_bounds, Some(ratio));
+    let upper_played_bounds = Rect::from_min_max(
+        played_bounds.min,
+        Point::new(played_bounds.max.x, rail_y - 1.0),
+    );
+    let lower_played_bounds = Rect::from_min_max(
+        Point::new(played_bounds.min.x, rail_y + 1.0),
+        played_bounds.max,
+    );
+    let played_upper_color = colors.bar_played.with_alpha(ACTIVE_PLAYBACK_FILL_ALPHA);
+    let played_lower_color = colors
+        .lower_bar_played
+        .with_alpha(ACTIVE_PLAYBACK_FILL_ALPHA);
+    let widget_id = match source {
+        WaveformSource::Main => MAIN_WAVEFORM_WIDGET_ID,
+        WaveformSource::Reference => REFERENCE_WAVEFORM_WIDGET_ID,
+    };
+    fill_rect(
+        primitives,
+        widget_id,
+        upper_played_bounds,
+        played_upper_color,
+    );
+    fill_rect(
+        primitives,
+        widget_id,
+        lower_played_bounds,
+        played_lower_color,
+    );
     paint_cursor(
         primitives,
-        match source {
-            WaveformSource::Main => MAIN_WAVEFORM_WIDGET_ID,
-            WaveformSource::Reference => REFERENCE_WAVEFORM_WIDGET_ID,
-        },
+        widget_id,
         plot_bounds,
         ratio,
-        comment_rail_y(bounds),
+        rail_y,
         colors.cursor,
     );
 }
@@ -1717,6 +1745,53 @@ mod tests {
                 .iter()
                 .any(|(rect, color)| { *color == colors.lower_bar && rect.min.y > rail_y })
         );
+    }
+
+    #[test]
+    fn active_playhead_overlay_paints_played_upper_and_lower_regions() {
+        let bounds = Rect::from_size(320.0, 120.0);
+        let ratio = 0.5;
+        let theme = ThemeTokens::default();
+        let colors = colors();
+        let plot_bounds = TimelineSurface::new().plot_bounds(bounds);
+        let rail_y = comment_rail_y(bounds);
+        let end_x = plot_bounds.x_for_ratio(ratio);
+        let mut primitives = Vec::new();
+
+        paint_playhead_overlay(&mut primitives, bounds, WaveformSource::Main, ratio, &theme);
+
+        assert!(primitives.iter().any(|primitive| {
+            matches!(
+                primitive,
+                PaintPrimitive::FillRect(fill)
+                    if fill.widget_id == MAIN_WAVEFORM_WIDGET_ID
+                        && fill.color == colors.bar_played.with_alpha(ACTIVE_PLAYBACK_FILL_ALPHA)
+                        && (fill.rect.min.x - plot_bounds.min.x).abs() < f32::EPSILON
+                        && (fill.rect.max.x - end_x).abs() < f32::EPSILON
+                        && (fill.rect.max.y - (rail_y - 1.0)).abs() < f32::EPSILON
+            )
+        }));
+        assert!(primitives.iter().any(|primitive| {
+            matches!(
+                primitive,
+                PaintPrimitive::FillRect(fill)
+                    if fill.widget_id == MAIN_WAVEFORM_WIDGET_ID
+                        && fill.color
+                            == colors
+                                .lower_bar_played
+                                .with_alpha(ACTIVE_PLAYBACK_FILL_ALPHA)
+                        && (fill.rect.min.x - plot_bounds.min.x).abs() < f32::EPSILON
+                        && (fill.rect.max.x - end_x).abs() < f32::EPSILON
+                        && (fill.rect.min.y - (rail_y + 1.0)).abs() < f32::EPSILON
+                        && (fill.rect.max.y - plot_bounds.max.y).abs() < f32::EPSILON
+            )
+        }));
+        assert!(matches!(
+            primitives.last(),
+            Some(PaintPrimitive::FillRect(fill))
+                if fill.widget_id == MAIN_WAVEFORM_WIDGET_ID
+                    && fill.color == colors.cursor
+        ));
     }
 
     #[test]
