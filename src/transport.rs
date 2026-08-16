@@ -1098,9 +1098,7 @@ fn run_live_analyzer(
     let mut analyzer = LiveAnalyzer::new(sample_rate);
     let mut observed_epoch = session.current_epoch();
     let mut published_revision = 0_u64;
-    let mut last_publication = Instant::now()
-        .checked_sub(LIVE_PUBLICATION_INTERVAL)
-        .unwrap_or_else(Instant::now);
+    let mut next_publication_deadline = Instant::now();
 
     loop {
         if session.current_epoch() != observed_epoch {
@@ -1117,7 +1115,7 @@ fn run_live_analyzer(
             &mut analyzer,
             &mut observed_epoch,
             &mut published_revision,
-            &mut last_publication,
+            &mut next_publication_deadline,
         );
 
         if frozen {
@@ -1135,9 +1133,10 @@ fn run_live_analyzer(
         let retired = !session.active.load(Ordering::Acquire);
         if producer_gone && consumer.is_empty() {
             if !retired && analyzer.revision > published_revision {
-                let elapsed = last_publication.elapsed();
-                if elapsed < LIVE_PUBLICATION_INTERVAL {
-                    thread::sleep(LIVE_PUBLICATION_INTERVAL - elapsed);
+                if let Some(remaining) =
+                    next_publication_deadline.checked_duration_since(Instant::now())
+                {
+                    thread::sleep(remaining);
                 }
                 publish_live_frame_if_due(
                     &analyzer,
@@ -1145,7 +1144,7 @@ fn run_live_analyzer(
                     &shared,
                     observed_epoch,
                     &mut published_revision,
-                    &mut last_publication,
+                    &mut next_publication_deadline,
                     true,
                 );
             }
@@ -1184,7 +1183,7 @@ fn run_live_analyzer_iteration(
     analyzer: &mut LiveAnalyzer,
     observed_epoch: &mut u64,
     published_revision: &mut u64,
-    last_publication: &mut Instant,
+    next_publication_deadline: &mut Instant,
 ) -> (bool, bool) {
     let current_epoch = session.current_epoch();
     if current_epoch != *observed_epoch {
@@ -1236,7 +1235,7 @@ fn run_live_analyzer_iteration(
                 shared,
                 *observed_epoch,
                 published_revision,
-                last_publication,
+                next_publication_deadline,
                 false,
             );
         }
@@ -1260,17 +1259,15 @@ fn run_live_analyzer_iteration(
         return (consumed || discarded, true);
     }
 
-    if analyzer.revision > *published_revision {
-        publish_live_frame_if_due(
-            analyzer,
-            session,
-            shared,
-            *observed_epoch,
-            published_revision,
-            last_publication,
-            false,
-        );
-    }
+    publish_live_frame_if_due(
+        analyzer,
+        session,
+        shared,
+        *observed_epoch,
+        published_revision,
+        next_publication_deadline,
+        false,
+    );
 
     if consumer.is_empty()
         && analyzer.revision <= *published_revision
@@ -1287,7 +1284,7 @@ fn publish_live_frame_if_due(
     shared: &SharedSnapshot,
     observed_epoch: u64,
     published_revision: &mut u64,
-    last_publication: &mut Instant,
+    next_publication_deadline: &mut Instant,
     force: bool,
 ) {
     publish_live_frame_if_due_at(
@@ -1296,7 +1293,7 @@ fn publish_live_frame_if_due(
         shared,
         observed_epoch,
         published_revision,
-        last_publication,
+        next_publication_deadline,
         Instant::now(),
         force,
     );
@@ -1309,17 +1306,19 @@ fn publish_live_frame_if_due_at(
     shared: &SharedSnapshot,
     observed_epoch: u64,
     published_revision: &mut u64,
-    last_publication: &mut Instant,
+    next_publication_deadline: &mut Instant,
     now: Instant,
     force: bool,
 ) {
-    if analyzer.revision <= *published_revision {
-        return;
+    if !force {
+        if now < *next_publication_deadline {
+            return;
+        }
+        if session.current_epoch() != observed_epoch {
+            return;
+        }
     }
-    let elapsed = now
-        .checked_duration_since(*last_publication)
-        .unwrap_or_default();
-    if !force && elapsed < LIVE_PUBLICATION_INTERVAL {
+    if analyzer.revision <= *published_revision {
         return;
     }
     if session.current_epoch() != observed_epoch {
@@ -1333,7 +1332,28 @@ fn publish_live_frame_if_due_at(
     }
     if shared.publish_live_frame(session, frame) {
         *published_revision = analyzer.revision;
-        *last_publication = now;
+        if !force {
+            advance_live_publication_deadline(next_publication_deadline, now);
+        }
+    }
+}
+
+/// Advance to the first cadence boundary strictly after `now`. Remainder
+/// arithmetic skips every elapsed slot in one step without retiming the phase.
+fn advance_live_publication_deadline(next_publication_deadline: &mut Instant, now: Instant) {
+    let elapsed = now.duration_since(*next_publication_deadline);
+    let interval_nanos = LIVE_PUBLICATION_INTERVAL.as_nanos();
+    let remainder_nanos = elapsed.as_nanos() % interval_nanos;
+    let advance_nanos = if remainder_nanos == 0 {
+        interval_nanos
+    } else {
+        interval_nanos - remainder_nanos
+    };
+    let advance = Duration::from_nanos(
+        u64::try_from(advance_nanos).expect("live publication interval fits in nanoseconds"),
+    );
+    if let Some(deadline) = now.checked_add(advance) {
+        *next_publication_deadline = deadline;
     }
 }
 
@@ -2436,6 +2456,17 @@ mod tests {
         row
     }
 
+    fn analyzer_with_one_frame() -> LiveAnalyzer {
+        let mut analyzer = LiveAnalyzer::new(48_000);
+        for index in 0..LIVE_SPECTRUM_FFT_SIZE {
+            assert_eq!(
+                analyzer.push((index as f32 * 0.01).sin()),
+                index + 1 == LIVE_SPECTRUM_FFT_SIZE
+            );
+        }
+        analyzer
+    }
+
     #[test]
     fn analysis_source_downmixes_complete_frames_without_output_gain() {
         let (shared, session) = active_test_session(3);
@@ -2974,7 +3005,7 @@ mod tests {
     }
 
     #[test]
-    fn live_publication_rejects_early_revisions_and_deduplicates_at_60_hz() {
+    fn live_publication_advances_next_deadline_on_time() {
         assert_eq!(
             LIVE_PUBLICATION_INTERVAL,
             Duration::from_nanos(1_000_000_000 / LIVE_PRESENTATION_FPS)
@@ -2982,64 +3013,273 @@ mod tests {
 
         let (shared, session) = active_test_session(7);
         let observed_epoch = session.current_epoch();
+        let analyzer = analyzer_with_one_frame();
+        let start = Instant::now();
+        let mut published_revision = 0;
+        let first_deadline = start + LIVE_PUBLICATION_INTERVAL;
+        let mut next_publication_deadline = first_deadline;
+        publish_live_frame_if_due_at(
+            &analyzer,
+            &session,
+            &shared,
+            observed_epoch,
+            &mut published_revision,
+            &mut next_publication_deadline,
+            first_deadline,
+            false,
+        );
+        assert!(shared.latest_live_frame().is_some());
+        assert_eq!(published_revision, analyzer.revision);
+        assert_eq!(
+            next_publication_deadline,
+            first_deadline + LIVE_PUBLICATION_INTERVAL
+        );
+        session.retire();
+    }
+
+    #[test]
+    fn live_publication_preserves_phase_when_late() {
+        let (shared, session) = active_test_session(7);
+        let observed_epoch = session.current_epoch();
+        let analyzer = analyzer_with_one_frame();
+        let start = Instant::now();
+        let first_deadline = start + LIVE_PUBLICATION_INTERVAL;
+        let late = first_deadline + Duration::from_millis(5);
+        let mut published_revision = 0;
+        let mut next_publication_deadline = first_deadline;
+        publish_live_frame_if_due_at(
+            &analyzer,
+            &session,
+            &shared,
+            observed_epoch,
+            &mut published_revision,
+            &mut next_publication_deadline,
+            late,
+            false,
+        );
+        assert_eq!(published_revision, analyzer.revision);
+        assert_eq!(
+            next_publication_deadline,
+            first_deadline + LIVE_PUBLICATION_INTERVAL
+        );
+        assert_ne!(
+            next_publication_deadline,
+            late + LIVE_PUBLICATION_INTERVAL,
+            "a late publication must not retime the cadence"
+        );
+        session.retire();
+    }
+
+    #[test]
+    fn live_publication_coalesces_multiple_late_intervals() {
+        let (shared, session) = active_test_session(7);
+        let observed_epoch = session.current_epoch();
+        let mut analyzer = analyzer_with_one_frame();
+        for index in 0..LIVE_SPECTRUM_HOP_SIZE {
+            assert_eq!(
+                analyzer.push((index as f32 * 0.02).cos()),
+                index + 1 == LIVE_SPECTRUM_HOP_SIZE
+            );
+        }
+        let start = Instant::now();
+        let first_deadline = start + LIVE_PUBLICATION_INTERVAL;
+        let late = first_deadline
+            + LIVE_PUBLICATION_INTERVAL
+                .checked_mul(3)
+                .expect("test interval multiplication should fit")
+            + Duration::from_millis(5);
+        let mut published_revision = 0;
+        let mut next_publication_deadline = first_deadline;
+        publish_live_frame_if_due_at(
+            &analyzer,
+            &session,
+            &shared,
+            observed_epoch,
+            &mut published_revision,
+            &mut next_publication_deadline,
+            late,
+            false,
+        );
+        assert_eq!(published_revision, analyzer.revision);
+        assert_eq!(
+            next_publication_deadline,
+            first_deadline
+                + LIVE_PUBLICATION_INTERVAL
+                    .checked_mul(4)
+                    .expect("test interval multiplication should fit")
+        );
+
+        let published_frame = shared
+            .latest_live_frame()
+            .expect("the newest frame should publish once after lateness");
+        publish_live_frame_if_due_at(
+            &analyzer,
+            &session,
+            &shared,
+            observed_epoch,
+            &mut published_revision,
+            &mut next_publication_deadline,
+            late,
+            false,
+        );
+        let still_published_frame = shared
+            .latest_live_frame()
+            .expect("lateness must not cause a catch-up publication burst");
+        assert!(Arc::ptr_eq(&still_published_frame, &published_frame));
+        session.retire();
+    }
+
+    #[test]
+    fn live_publication_ignores_early_and_duplicate_revisions() {
+        let (shared, session) = active_test_session(7);
+        let observed_epoch = session.current_epoch();
+        let analyzer = analyzer_with_one_frame();
+        let start = Instant::now();
+        let first_deadline = start + LIVE_PUBLICATION_INTERVAL;
+        let mut published_revision = 0;
+        let mut next_publication_deadline = first_deadline;
+        let early = first_deadline
+            .checked_sub(Duration::from_nanos(1))
+            .expect("test deadline should be representable");
+        publish_live_frame_if_due_at(
+            &analyzer,
+            &session,
+            &shared,
+            observed_epoch,
+            &mut published_revision,
+            &mut next_publication_deadline,
+            early,
+            false,
+        );
+        assert_eq!(published_revision, 0);
+        assert!(shared.latest_live_frame().is_none());
+        assert_eq!(next_publication_deadline, first_deadline);
+
+        publish_live_frame_if_due_at(
+            &analyzer,
+            &session,
+            &shared,
+            observed_epoch,
+            &mut published_revision,
+            &mut next_publication_deadline,
+            first_deadline,
+            false,
+        );
+        let first_frame = shared
+            .latest_live_frame()
+            .expect("the revision should publish at its deadline");
+        let duplicate_due = next_publication_deadline;
+        publish_live_frame_if_due_at(
+            &analyzer,
+            &session,
+            &shared,
+            observed_epoch,
+            &mut published_revision,
+            &mut next_publication_deadline,
+            duplicate_due,
+            false,
+        );
+        let duplicate_frame = shared
+            .latest_live_frame()
+            .expect("the duplicate should leave the latest frame unchanged");
+        assert!(Arc::ptr_eq(&duplicate_frame, &first_frame));
+        assert_eq!(published_revision, analyzer.revision);
+        assert_eq!(next_publication_deadline, duplicate_due);
+        session.retire();
+    }
+
+    #[test]
+    fn live_publication_keeps_empty_due_slot_open_for_newer_revision() {
+        let (shared, session) = active_test_session(7);
+        let observed_epoch = session.current_epoch();
         let mut analyzer = LiveAnalyzer::new(48_000);
+        let start = Instant::now();
+        let first_deadline = start + LIVE_PUBLICATION_INTERVAL;
+        let mut published_revision = 0;
+        let mut next_publication_deadline = first_deadline;
+        publish_live_frame_if_due_at(
+            &analyzer,
+            &session,
+            &shared,
+            observed_epoch,
+            &mut published_revision,
+            &mut next_publication_deadline,
+            first_deadline,
+            false,
+        );
+        assert_eq!(published_revision, 0);
+        assert!(shared.latest_live_frame().is_none());
+        assert_eq!(next_publication_deadline, first_deadline);
+
         for index in 0..LIVE_SPECTRUM_FFT_SIZE {
             assert_eq!(
                 analyzer.push((index as f32 * 0.01).sin()),
                 index + 1 == LIVE_SPECTRUM_FFT_SIZE
             );
         }
-
-        let start = Instant::now();
-        let mut published_revision = 0;
-        let mut last_publication = start;
-        let before_due = start + LIVE_PUBLICATION_INTERVAL - Duration::from_nanos(1);
+        let just_after_empty_slot = first_deadline + Duration::from_nanos(1);
         publish_live_frame_if_due_at(
             &analyzer,
             &session,
             &shared,
             observed_epoch,
             &mut published_revision,
-            &mut last_publication,
-            before_due,
+            &mut next_publication_deadline,
+            just_after_empty_slot,
             false,
         );
-        assert_eq!(published_revision, 0);
-        assert!(shared.latest_live_frame().is_none());
+        assert_eq!(published_revision, analyzer.revision);
+        assert!(shared.latest_live_frame().is_some());
+        assert_eq!(
+            next_publication_deadline,
+            first_deadline + LIVE_PUBLICATION_INTERVAL
+        );
+        assert!(next_publication_deadline > just_after_empty_slot);
+        session.retire();
+    }
 
-        let first_due = start + LIVE_PUBLICATION_INTERVAL;
+    #[test]
+    fn forced_terminal_publication_is_newer_only_and_does_not_retime_schedule() {
+        let (shared, session) = active_test_session(7);
+        let observed_epoch = session.current_epoch();
+        let mut analyzer = analyzer_with_one_frame();
+        let start = Instant::now();
+        let scheduled_deadline = start + LIVE_PUBLICATION_INTERVAL;
+        let mut published_revision = 0;
+        let mut next_publication_deadline = scheduled_deadline;
+        let final_now = start + Duration::from_millis(1);
         publish_live_frame_if_due_at(
             &analyzer,
             &session,
             &shared,
             observed_epoch,
             &mut published_revision,
-            &mut last_publication,
-            first_due,
-            false,
+            &mut next_publication_deadline,
+            final_now,
+            true,
         );
         let first_frame = shared
             .latest_live_frame()
-            .expect("a new revision should publish at the cadence boundary");
+            .expect("forced terminal publication should publish a newer frame");
         assert_eq!(published_revision, analyzer.revision);
-        assert_eq!(last_publication, first_due);
+        assert_eq!(next_publication_deadline, scheduled_deadline);
 
-        let duplicate_due = first_due + LIVE_PUBLICATION_INTERVAL;
         publish_live_frame_if_due_at(
             &analyzer,
             &session,
             &shared,
             observed_epoch,
             &mut published_revision,
-            &mut last_publication,
-            duplicate_due,
-            false,
+            &mut next_publication_deadline,
+            final_now,
+            true,
         );
         let duplicate_frame = shared
             .latest_live_frame()
-            .expect("the first frame should remain visible");
+            .expect("the forced terminal publication should remain visible");
         assert!(Arc::ptr_eq(&duplicate_frame, &first_frame));
-        assert_eq!(last_publication, first_due);
+        assert_eq!(published_revision, analyzer.revision);
+        assert_eq!(next_publication_deadline, scheduled_deadline);
 
         for index in 0..LIVE_SPECTRUM_HOP_SIZE {
             assert_eq!(
@@ -3053,34 +3293,15 @@ mod tests {
             &shared,
             observed_epoch,
             &mut published_revision,
-            &mut last_publication,
-            duplicate_due,
-            false,
+            &mut next_publication_deadline,
+            final_now,
+            true,
         );
-        let second_frame = shared
+        let newer_frame = shared
             .latest_live_frame()
-            .expect("a newer revision should publish after the interval");
+            .expect("a forced publication may replace the terminal frame once");
+        assert!(!Arc::ptr_eq(&newer_frame, &first_frame));
         assert_eq!(published_revision, analyzer.revision);
-        assert_eq!(second_frame.revision, first_frame.revision + 1);
-        assert!(!Arc::ptr_eq(&second_frame, &first_frame));
-        assert_eq!(last_publication, duplicate_due);
-
-        let final_due = duplicate_due + LIVE_PUBLICATION_INTERVAL;
-        publish_live_frame_if_due_at(
-            &analyzer,
-            &session,
-            &shared,
-            observed_epoch,
-            &mut published_revision,
-            &mut last_publication,
-            final_due,
-            false,
-        );
-        let final_frame = shared
-            .latest_live_frame()
-            .expect("the newer frame should remain visible");
-        assert!(Arc::ptr_eq(&final_frame, &second_frame));
-        assert_eq!(last_publication, duplicate_due);
         session.retire();
     }
 
@@ -3096,14 +3317,14 @@ mod tests {
 
         session.mark_discontinuity(&shared);
         let mut published_revision = 0;
-        let mut last_publication = Instant::now();
+        let mut next_publication_deadline = Instant::now();
         publish_live_frame_if_due(
             &analyzer,
             &session,
             &shared,
             observed_epoch,
             &mut published_revision,
-            &mut last_publication,
+            &mut next_publication_deadline,
             true,
         );
 
@@ -3123,14 +3344,14 @@ mod tests {
         }
 
         let mut published_revision = 0;
-        let mut last_publication = Instant::now();
+        let mut next_publication_deadline = Instant::now();
         publish_live_frame_if_due(
             &analyzer,
             &session,
             &shared,
             observed_epoch,
             &mut published_revision,
-            &mut last_publication,
+            &mut next_publication_deadline,
             true,
         );
         let displayed_frame = shared
@@ -3171,7 +3392,7 @@ mod tests {
             &mut analyzer,
             &mut observed_epoch,
             &mut published_revision,
-            &mut last_publication,
+            &mut next_publication_deadline,
         );
         assert!(consumed);
         assert!(frozen);
@@ -3187,9 +3408,9 @@ mod tests {
         assert_eq!(shared.live_frame_state().revision, displayed_state.revision);
 
         assert!(shared.set_live_analysis_frozen(&session, false));
-        last_publication = Instant::now()
-            .checked_sub(super::LIVE_PUBLICATION_INTERVAL)
-            .expect("the publication interval should be representable");
+        next_publication_deadline = Instant::now()
+            .checked_add(Duration::from_secs(1))
+            .expect("the test publication deadline should be representable");
         for index in 0..super::LIVE_SPECTRUM_HOP_SIZE {
             producer
                 .push(CaptureFrame {
@@ -3206,7 +3427,7 @@ mod tests {
             &mut analyzer,
             &mut observed_epoch,
             &mut published_revision,
-            &mut last_publication,
+            &mut next_publication_deadline,
         );
         assert!(consumed);
         assert!(!frozen);
@@ -3226,6 +3447,9 @@ mod tests {
                 .expect("the resumed capture ring should have room");
         }
         shared.mark_capture_pending();
+        next_publication_deadline = Instant::now()
+            .checked_sub(super::LIVE_PUBLICATION_INTERVAL)
+            .expect("the test publication deadline should be representable");
         let (consumed, frozen) = run_live_analyzer_iteration(
             &mut consumer,
             &session,
@@ -3233,7 +3457,7 @@ mod tests {
             &mut analyzer,
             &mut observed_epoch,
             &mut published_revision,
-            &mut last_publication,
+            &mut next_publication_deadline,
         );
         assert!(consumed);
         assert!(!frozen);
