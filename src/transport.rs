@@ -43,12 +43,13 @@ pub(crate) const LIVE_SPECTRUM_DISPLAY_TILT_REFERENCE_FREQUENCY: f32 = 1_000.0;
 const LIVE_SPECTRUM_ATTACK_TIME: Duration = Duration::from_millis(30);
 const LIVE_SPECTRUM_RELEASE_TIME: Duration = Duration::from_millis(160);
 // The analyzer still consumes every captured frame and emits FFT rows at the
-// configured hop. Live publication follows the existing 60 Hz presentation
-// cadence, while the latest-only gate below prevents duplicate or queued
-// frames from competing with the rest of the review surface.
-const LIVE_PRESENTATION_FPS: u64 = 60;
+// configured hop. Private live-graph publication is capped at 30 Hz,
+// independently of the app's 60 Hz frame clock, while the latest-only gate
+// below prevents duplicate or queued frames from competing with the rest of
+// the review surface.
+const LIVE_PUBLICATION_FPS: u64 = 30;
 const LIVE_PUBLICATION_INTERVAL: Duration =
-    Duration::from_nanos(1_000_000_000 / LIVE_PRESENTATION_FPS);
+    Duration::from_nanos(1_000_000_000 / LIVE_PUBLICATION_FPS);
 const LIVE_ANALYZER_POLL_INTERVAL: Duration = Duration::from_millis(2);
 static NEXT_LIVE_GPU_REVISION: AtomicU64 = AtomicU64::new(1);
 
@@ -2292,7 +2293,7 @@ pub fn normalize_output_gain(gain: f32) -> f32 {
 mod tests {
     use super::{
         AudioTransport, CONTROLS_BUSY_ERROR, CaptureFrame, Command, DEFAULT_VOLUME,
-        LIVE_PRESENTATION_FPS, LIVE_PUBLICATION_INTERVAL, LIVE_SPECTROGRAM_BAND_COUNT,
+        LIVE_PUBLICATION_FPS, LIVE_PUBLICATION_INTERVAL, LIVE_SPECTROGRAM_BAND_COUNT,
         LIVE_SPECTROGRAM_MAX_HISTORY, LIVE_SPECTRUM_DISPLAY_CEILING_DB,
         LIVE_SPECTRUM_DISPLAY_FLOOR_DB, LIVE_SPECTRUM_DISPLAY_MAX_FREQUENCY,
         LIVE_SPECTRUM_DISPLAY_MIN_FREQUENCY, LIVE_SPECTRUM_DISPLAY_TILT_DB_PER_OCTAVE,
@@ -2465,6 +2466,15 @@ mod tests {
             );
         }
         analyzer
+    }
+
+    fn push_analyzer_hop(analyzer: &mut LiveAnalyzer, offset: usize) {
+        for index in 0..LIVE_SPECTRUM_HOP_SIZE {
+            assert_eq!(
+                analyzer.push(((offset + index) as f32 * 0.02).cos()),
+                index + 1 == LIVE_SPECTRUM_HOP_SIZE
+            );
+        }
     }
 
     #[test]
@@ -3008,7 +3018,7 @@ mod tests {
     fn live_publication_advances_next_deadline_on_time() {
         assert_eq!(
             LIVE_PUBLICATION_INTERVAL,
-            Duration::from_nanos(1_000_000_000 / LIVE_PRESENTATION_FPS)
+            Duration::from_nanos(1_000_000_000 / LIVE_PUBLICATION_FPS)
         );
 
         let (shared, session) = active_test_session(7);
@@ -3126,6 +3136,151 @@ mod tests {
             .latest_live_frame()
             .expect("lateness must not cause a catch-up publication burst");
         assert!(Arc::ptr_eq(&still_published_frame, &published_frame));
+        session.retire();
+    }
+
+    #[test]
+    fn live_publication_caps_sustained_input_at_30_hz_without_bursting() {
+        assert_eq!(LIVE_PUBLICATION_FPS, 30);
+        assert_eq!(
+            LIVE_PUBLICATION_INTERVAL,
+            Duration::from_nanos(1_000_000_000 / LIVE_PUBLICATION_FPS)
+        );
+
+        let (shared, session) = active_test_session(7);
+        let observed_epoch = session.current_epoch();
+        let mut analyzer = analyzer_with_one_frame();
+        let start = Instant::now();
+        let first_deadline = start + LIVE_PUBLICATION_INTERVAL;
+        let mut published_revision = 0;
+        let mut next_publication_deadline = first_deadline;
+        let mut normal_publication_count = 0;
+
+        for slot in 0..4_u32 {
+            let deadline = first_deadline
+                + LIVE_PUBLICATION_INTERVAL
+                    .checked_mul(slot)
+                    .expect("test interval multiplication should fit");
+            for hop in 0..3 {
+                push_analyzer_hop(&mut analyzer, slot as usize * 3 + hop);
+                let early = deadline
+                    .checked_sub(Duration::from_nanos(1))
+                    .expect("test deadline should be representable");
+                let published_before = published_revision;
+                publish_live_frame_if_due_at(
+                    &analyzer,
+                    &session,
+                    &shared,
+                    observed_epoch,
+                    &mut published_revision,
+                    &mut next_publication_deadline,
+                    early,
+                    false,
+                );
+                assert_eq!(
+                    published_revision, published_before,
+                    "sustained input must not publish before its scheduled slot"
+                );
+            }
+
+            let published_before = published_revision;
+            publish_live_frame_if_due_at(
+                &analyzer,
+                &session,
+                &shared,
+                observed_epoch,
+                &mut published_revision,
+                &mut next_publication_deadline,
+                deadline,
+                false,
+            );
+            assert!(published_revision > published_before);
+            assert_eq!(published_revision, analyzer.revision);
+            normal_publication_count += 1;
+            assert_eq!(
+                next_publication_deadline,
+                first_deadline
+                    + LIVE_PUBLICATION_INTERVAL
+                        .checked_mul(slot + 1)
+                        .expect("test interval multiplication should fit"),
+                "publication deadlines must retain their original phase"
+            );
+        }
+
+        assert_eq!(
+            normal_publication_count, 4,
+            "three sustained analyzer revisions per slot must still publish once per 30 Hz slot"
+        );
+
+        for hop in 0..6 {
+            push_analyzer_hop(&mut analyzer, 12 + hop);
+        }
+        let missed_slots_now = first_deadline
+            + LIVE_PUBLICATION_INTERVAL
+                .checked_mul(7)
+                .expect("test interval multiplication should fit")
+            + Duration::from_nanos(1);
+        let missed_slots_deadline = first_deadline
+            + LIVE_PUBLICATION_INTERVAL
+                .checked_mul(8)
+                .expect("test interval multiplication should fit");
+        let published_before_missed_slots = published_revision;
+        publish_live_frame_if_due_at(
+            &analyzer,
+            &session,
+            &shared,
+            observed_epoch,
+            &mut published_revision,
+            &mut next_publication_deadline,
+            missed_slots_now,
+            false,
+        );
+        assert!(published_revision > published_before_missed_slots);
+        assert_eq!(published_revision, analyzer.revision);
+        assert_eq!(
+            next_publication_deadline, missed_slots_deadline,
+            "missed slots must advance to the next original phase boundary"
+        );
+        let published_frame = shared
+            .latest_live_frame()
+            .expect("the late sustained-input frame should be visible");
+        let published_after_missed_slots = published_revision;
+        publish_live_frame_if_due_at(
+            &analyzer,
+            &session,
+            &shared,
+            observed_epoch,
+            &mut published_revision,
+            &mut next_publication_deadline,
+            missed_slots_now,
+            false,
+        );
+        let still_published_frame = shared
+            .latest_live_frame()
+            .expect("a repeated late call should retain the newest frame");
+        assert_eq!(published_revision, published_after_missed_slots);
+        assert!(Arc::ptr_eq(&still_published_frame, &published_frame));
+        assert_eq!(next_publication_deadline, missed_slots_deadline);
+
+        push_analyzer_hop(&mut analyzer, 18);
+        publish_live_frame_if_due_at(
+            &analyzer,
+            &session,
+            &shared,
+            observed_epoch,
+            &mut published_revision,
+            &mut next_publication_deadline,
+            missed_slots_deadline,
+            false,
+        );
+        assert_eq!(published_revision, analyzer.revision);
+        assert_eq!(
+            next_publication_deadline,
+            first_deadline
+                + LIVE_PUBLICATION_INTERVAL
+                    .checked_mul(9)
+                    .expect("test interval multiplication should fit")
+        );
         session.retire();
     }
 
