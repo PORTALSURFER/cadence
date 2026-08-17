@@ -156,18 +156,12 @@ enum Message {
     WaveformLoopDragStarted {
         ratio: f32,
     },
-    WaveformLoopDragMoved {
-        ratio: f32,
-    },
     WaveformLoopDragEnded {
         start_ratio: f32,
         end_ratio: f32,
     },
     WaveformLoopDragCancelled,
     ReferenceLoopDragStarted {
-        ratio: f32,
-    },
-    ReferenceLoopDragMoved {
         ratio: f32,
     },
     ReferenceLoopDragEnded {
@@ -2642,12 +2636,6 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             state.status = String::from("Paint a loop across the main waveform…");
             context.request_repaint();
         }
-        Message::WaveformLoopDragMoved { .. } => {
-            if !state.busy && !state.waveform_busy && state.waveform.is_some() {
-                state.status = String::from("Selecting a main loop…");
-                context.request_repaint();
-            }
-        }
         Message::WaveformLoopDragEnded {
             start_ratio,
             end_ratio,
@@ -2669,16 +2657,6 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             state.loop_selections.clear(AuditionSource::Reference);
             state.status = String::from("Paint a loop across the reference waveform…");
             context.request_repaint();
-        }
-        Message::ReferenceLoopDragMoved { .. } => {
-            if !state.busy
-                && !state.waveform_busy
-                && !state.reference_waveform_busy
-                && selected_reference_details(state).is_some()
-            {
-                state.status = String::from("Selecting a reference loop…");
-                context.request_repaint();
-            }
         }
         Message::ReferenceLoopDragEnded {
             start_ratio,
@@ -8368,9 +8346,6 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
                 waveform::WaveformInteraction::LoopDragStarted { ratio } => {
                     Message::WaveformLoopDragStarted { ratio }
                 }
-                waveform::WaveformInteraction::LoopDragMoved { ratio } => {
-                    Message::WaveformLoopDragMoved { ratio }
-                }
                 waveform::WaveformInteraction::LoopDragEnded {
                     start_ratio,
                     end_ratio,
@@ -8755,9 +8730,6 @@ fn reference_waveform_section(state: &AppState, track: &storage::Track) -> ui::V
             |interaction| match interaction {
                 waveform::WaveformInteraction::LoopDragStarted { ratio } => {
                     Message::ReferenceLoopDragStarted { ratio }
-                }
-                waveform::WaveformInteraction::LoopDragMoved { ratio } => {
-                    Message::ReferenceLoopDragMoved { ratio }
                 }
                 waveform::WaveformInteraction::LoopDragEnded {
                     start_ratio,

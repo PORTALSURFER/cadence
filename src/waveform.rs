@@ -147,9 +147,6 @@ pub enum WaveformInteraction {
     LoopDragStarted {
         ratio: f32,
     },
-    LoopDragMoved {
-        ratio: f32,
-    },
     LoopDragEnded {
         start_ratio: f32,
         end_ratio: f32,
@@ -556,13 +553,6 @@ impl WaveformWidget {
         target.is_some_and(|target| (target - clamp_ratio(ratio)).abs() <= NOTE_RATIO_MATCH_EPSILON)
     }
 
-    fn active_loop_selection(&self) -> Option<(f32, f32)> {
-        self.loop_drag_start_ratio
-            .zip(self.loop_drag_current_ratio)
-            .map(normalize_range)
-            .or(self.loop_selection)
-    }
-
     fn display_bar_levels(&self, bar_count: usize) -> Arc<[f32]> {
         let bar_count = bar_count.max(1);
         let cached_levels = self
@@ -674,9 +664,7 @@ impl Widget for WaveformWidget {
                     self.hover_ratio = Some(ratio);
                     self.hover_lower = false;
                     self.hovered_note_ratio = None;
-                    Some(WidgetOutput::typed(WaveformInteraction::LoopDragMoved {
-                        ratio,
-                    }))
+                    None
                 } else if self.pending_upper_click
                     && self
                         .pointer_down_position
@@ -989,7 +977,7 @@ impl Widget for WaveformWidget {
             return;
         }
 
-        if let Some((start_ratio, end_ratio)) = self.active_loop_selection() {
+        if let Some((start_ratio, end_ratio)) = self.loop_selection {
             paint_loop_selection(
                 primitives,
                 self.common.id,
@@ -1091,6 +1079,19 @@ impl Widget for WaveformWidget {
         let plot_bounds = self.timeline.plot_bounds(bounds);
         let rail_y = comment_rail_y(bounds);
         let hovered_note_ratio = self.local_hovered_note_ratio();
+        if let Some((start_ratio, end_ratio)) =
+            self.loop_drag_start_ratio.zip(self.loop_drag_current_ratio)
+        {
+            paint_loop_selection(
+                primitives,
+                self.common.id,
+                plot_bounds,
+                Rect::from_min_max(plot_bounds.min, Point::new(plot_bounds.max.x, rail_y)),
+                start_ratio,
+                end_ratio,
+                colors,
+            );
+        }
         if let Some(ratio) = self.hover_ratio {
             let x = self.timeline.x_at(bounds, ratio);
             let line_bottom = rail_y - CURSOR_GAP_ABOVE_RAIL;
@@ -1652,6 +1653,16 @@ mod tests {
                 {
                     Some((fill.rect, fill.color))
                 }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn loop_selection_fill_rects(primitives: &[PaintPrimitive], color: Rgba8) -> Vec<Rect> {
+        primitives
+            .iter()
+            .filter_map(|primitive| match primitive {
+                PaintPrimitive::FillRect(fill) if fill.color == color => Some(fill.rect),
                 _ => None,
             })
             .collect()
@@ -2590,13 +2601,15 @@ mod tests {
             )),
             WaveformInteraction::LoopDragStarted { ratio: 0.2 }
         );
-        assert_eq!(
-            reference_interaction(current.handle_input(
-                bounds,
-                WidgetInput::pointer_move(Point::new(timeline_x(bounds, 0.9), 20.0)),
-            )),
-            WaveformInteraction::LoopDragMoved { ratio: 0.9 }
+        assert!(
+            current
+                .handle_input(
+                    bounds,
+                    WidgetInput::pointer_move(Point::new(timeline_x(bounds, 0.9), 20.0)),
+                )
+                .is_none()
         );
+        assert_eq!(current.loop_drag_current_ratio, Some(0.9));
         assert_eq!(
             reference_interaction(current.handle_input(
                 bounds,
@@ -3162,13 +3175,15 @@ mod tests {
             )),
             WaveformInteraction::LoopDragStarted { ratio: 0.8 }
         );
-        assert_eq!(
-            interaction(reverse_widget.handle_input(
-                bounds,
-                WidgetInput::pointer_move(Point::new(timeline_x(bounds, 0.1), upper_y)),
-            )),
-            WaveformInteraction::LoopDragMoved { ratio: 0.1 }
+        assert!(
+            reverse_widget
+                .handle_input(
+                    bounds,
+                    WidgetInput::pointer_move(Point::new(timeline_x(bounds, 0.1), upper_y)),
+                )
+                .is_none()
         );
+        assert_eq!(reverse_widget.loop_drag_current_ratio, Some(0.1));
         assert_eq!(
             interaction(reverse_widget.handle_input(
                 bounds,
@@ -3284,6 +3299,132 @@ mod tests {
     }
 
     #[test]
+    fn active_loop_pointer_moves_are_paint_only_and_retain_latest_ratio() {
+        let bounds = Rect::from_min_max(Point::new(10.0, 20.0), Point::new(110.0, 120.0));
+        let upper_y = bounds.min.y + 20.0;
+        let waveform = Arc::new(test_waveform());
+        let mut main = WaveformWidget::new_for_source(
+            WaveformSource::Main,
+            0,
+            Arc::clone(&waveform),
+            None,
+            Vec::new(),
+        );
+        let mut reference = WaveformWidget::new_for_source(
+            WaveformSource::Reference,
+            0,
+            waveform,
+            None,
+            Vec::new(),
+        );
+
+        for widget in [&mut main, &mut reference] {
+            assert!(
+                widget
+                    .handle_input(
+                        bounds,
+                        WidgetInput::primary_press(Point::new(timeline_x(bounds, 0.2), upper_y,)),
+                    )
+                    .is_none()
+            );
+            assert_eq!(
+                interaction(widget.handle_input(
+                    bounds,
+                    WidgetInput::pointer_move(Point::new(timeline_x(bounds, 0.8), upper_y)),
+                )),
+                WaveformInteraction::LoopDragStarted { ratio: 0.2 }
+            );
+
+            for index in 0..64 {
+                let ratio = 0.05 + index as f32 / 63.0 * 0.9;
+                let position = Point::new(timeline_x(bounds, ratio), upper_y);
+                let expected_ratio = widget.timeline.ratio_at(bounds, position);
+                assert!(
+                    widget
+                        .handle_input(bounds, WidgetInput::pointer_move(position))
+                        .is_none(),
+                    "steady loop move {index} should not emit a widget output"
+                );
+                assert_eq!(widget.loop_drag_current_ratio, Some(expected_ratio));
+                assert_eq!(widget.hover_ratio, Some(expected_ratio));
+            }
+        }
+    }
+
+    #[test]
+    fn active_loop_overlay_paints_latest_range_without_repainting_committed_selection() {
+        let bounds = Rect::from_min_max(Point::new(10.0, 20.0), Point::new(210.0, 140.0));
+        let upper_y = bounds.min.y + 20.0;
+        let palette = colors();
+        let rail_y = comment_rail_y(bounds);
+        let mut widget = WaveformWidget::new(Arc::new(test_waveform()), None, Vec::new())
+            .with_loop_selection(Some((0.1, 0.2)));
+
+        assert!(
+            widget
+                .handle_input(
+                    bounds,
+                    WidgetInput::primary_press(Point::new(timeline_x(bounds, 0.8), upper_y)),
+                )
+                .is_none()
+        );
+        assert_eq!(
+            interaction(widget.handle_input(
+                bounds,
+                WidgetInput::pointer_move(Point::new(timeline_x(bounds, 0.3), upper_y)),
+            )),
+            WaveformInteraction::LoopDragStarted { ratio: 0.8 }
+        );
+
+        let base = widget.paint_plan_with_defaults(bounds);
+        let base_selection =
+            loop_selection_fill_rects(&base.primitives, palette.reference_selection_fill);
+        assert_eq!(base_selection.len(), 1);
+        assert!((base_selection[0].min.x - timeline_x(bounds, 0.1)).abs() < f32::EPSILON);
+        assert!((base_selection[0].max.x - timeline_x(bounds, 0.2)).abs() < f32::EPSILON);
+
+        let mut overlay = Vec::new();
+        widget.append_runtime_overlay_paint(
+            &mut overlay,
+            bounds,
+            &Default::default(),
+            &Default::default(),
+        );
+        let active_selection =
+            loop_selection_fill_rects(&overlay, palette.reference_selection_fill);
+        assert_eq!(active_selection.len(), 1);
+        assert!((active_selection[0].min.x - timeline_x(bounds, 0.3)).abs() < f32::EPSILON);
+        assert!((active_selection[0].max.x - timeline_x(bounds, 0.8)).abs() < f32::EPSILON);
+        assert!(active_selection.iter().all(|fill| fill.max.y <= rail_y));
+        assert_eq!(
+            loop_selection_fill_rects(&overlay, palette.reference_selection_edge).len(),
+            2,
+            "the active range should paint its two edges exactly once"
+        );
+
+        assert!(
+            widget
+                .handle_input(
+                    bounds,
+                    WidgetInput::pointer_move(Point::new(timeline_x(bounds, 0.6), upper_y)),
+                )
+                .is_none()
+        );
+        overlay.clear();
+        widget.append_runtime_overlay_paint(
+            &mut overlay,
+            bounds,
+            &Default::default(),
+            &Default::default(),
+        );
+        let latest_selection =
+            loop_selection_fill_rects(&overlay, palette.reference_selection_fill);
+        assert_eq!(latest_selection.len(), 1);
+        assert!((latest_selection[0].min.x - timeline_x(bounds, 0.6)).abs() < f32::EPSILON);
+        assert!((latest_selection[0].max.x - timeline_x(bounds, 0.8)).abs() < f32::EPSILON);
+    }
+
+    #[test]
     fn main_loop_state_cancels_and_survives_retained_widget_synchronization() {
         let bounds = Rect::from_min_max(Point::new(10.0, 20.0), Point::new(110.0, 120.0));
         let upper_y = bounds.min.y + 20.0;
@@ -3304,13 +3445,15 @@ mod tests {
 
         let mut current = WaveformWidget::new(waveform, Some(0.95), Vec::new());
         current.synchronize_from_previous(&previous);
-        assert_eq!(
-            interaction(current.handle_input(
-                bounds,
-                WidgetInput::pointer_move(Point::new(timeline_x(bounds, 0.8), upper_y)),
-            )),
-            WaveformInteraction::LoopDragMoved { ratio: 0.8 }
+        assert!(
+            current
+                .handle_input(
+                    bounds,
+                    WidgetInput::pointer_move(Point::new(timeline_x(bounds, 0.8), upper_y)),
+                )
+                .is_none()
         );
+        assert_eq!(current.loop_drag_current_ratio, Some(0.8));
         assert_eq!(
             Widget::handle_pointer_capture_cancelled(&mut current, bounds)
                 .and_then(|output| output.typed_copied()),
