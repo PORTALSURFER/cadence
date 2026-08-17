@@ -1056,13 +1056,6 @@ fn retained_live_spectrogram_revision(state: &AppState) -> u64 {
     }
 }
 
-fn live_spectrogram_source_revision(state: &AppState, source: AuditionSource) -> u64 {
-    match source {
-        AuditionSource::Main => state.live_spectrogram_revision,
-        AuditionSource::Reference => state.reference_live_spectrogram_revision,
-    }
-}
-
 fn live_spectrogram_source_has_frame(state: &AppState, source: AuditionSource) -> bool {
     match source {
         AuditionSource::Main => state.live_spectrogram.is_some(),
@@ -1083,18 +1076,6 @@ fn live_spectrogram_presence_revision(state: &AppState) -> u64 {
             state.reference_live_spectrogram.is_some() as u64,
         ])
     }
-}
-
-fn active_live_spectrogram_projection_revision(state: &AppState) -> u64 {
-    if !(state.transport_playing || state.reference_transport_playing) {
-        return 0;
-    }
-
-    let source = review_spectrogram_source(state);
-    frame_revision_mix(&[
-        source as u64,
-        live_spectrogram_source_revision(state, source),
-    ])
 }
 
 fn frame_surface_revisions(state: &mut AppState) -> SurfaceRevisions {
@@ -1142,11 +1123,10 @@ fn frame_surface_revisions(state: &mut AppState) -> SurfaceRevisions {
         // The header follows the displayed source while active. Once playback
         // is stopped, preserve the existing all-source final-frame behavior.
         live_spectrogram_presence_revision(state),
-        // Active live Spectrum and Waterfall frames live in retained GPU
-        // surfaces, so only the displayed source's accepted revision
-        // reprojects. Once playback is stopped, accepted frame revisions must
-        // reproject the retained scene so the final analyzer rows are included.
-        active_live_spectrogram_projection_revision(state),
+        // Active live Spectrum and Waterfall frames are repainted by the
+        // transient overlay. Once playback is stopped, accepted frame
+        // revisions must reproject the retained scene so the final analyzer
+        // rows are included.
         retained_live_spectrogram_revision(state),
         state.live_spectrogram_mode as u64,
         spectrogram::clamp_history_scale(state.live_spectrogram_history_scale).to_bits() as u64,
@@ -1237,6 +1217,24 @@ fn paint_live_playback_overlay(
             bounds,
             waveform::WaveformSource::Reference,
             ratio,
+            &theme,
+        );
+    }
+
+    let frame = selected_track(state).and_then(|track| {
+        let source = review_spectrogram_source(state);
+        current_live_frame_for_source(state, &track.id, source)
+    });
+    let Some(bounds) = context.plan.first_widget_rect(LIVE_SPECTROGRAM_BODY_ID) else {
+        return;
+    };
+    if let Some(frame) = frame {
+        spectrogram::paint_overlay(
+            frame,
+            state.live_spectrogram_mode,
+            state.live_spectrogram_history_scale,
+            bounds,
+            primitives,
             &theme,
         );
     }
@@ -9533,14 +9531,15 @@ mod tests {
         enforce_loop, favorite_toggle, frame_surface_revisions, library_track_title_id,
         live_frame_matches_current_session, live_spectrogram_display_sample_rate, loop_bounds,
         main_output_gain, native_launch_options, note_editor, note_ratio_for_id,
-        planner_insertion_target_is_valid, playback_shortcut, project_surface,
-        rebuild_audition_queue, reconcile_audition_queue, reference_decode_result_is_current,
-        reference_output_gain, reference_settings_auxiliary_windows,
-        reference_settings_window_view, refresh_live_spectrogram, refresh_live_spectrograms,
-        review_spectrogram_source, review_status_filter_message, selected_reference_notes,
-        selected_track, stage_dropdown, stage_menu_anchor_from_pointer, stage_menu_popover,
-        status_dropdown_for_host, status_filter_dropdown, sync_audition_queue_after_status_change,
-        tracks_in_stage, tracks_with_status, transport_command_is_confirmed, update,
+        paint_live_playback_overlay, planner_insertion_target_is_valid, playback_shortcut,
+        project_surface, rebuild_audition_queue, reconcile_audition_queue,
+        reference_decode_result_is_current, reference_output_gain,
+        reference_settings_auxiliary_windows, reference_settings_window_view,
+        refresh_live_spectrogram, refresh_live_spectrograms, review_spectrogram_source,
+        review_status_filter_message, selected_reference_notes, selected_track, stage_dropdown,
+        stage_menu_anchor_from_pointer, stage_menu_popover, status_dropdown_for_host,
+        status_filter_dropdown, sync_audition_queue_after_status_change, tracks_in_stage,
+        tracks_with_status, transport_command_is_confirmed, update,
     };
     use crate::transport::{LiveFrameState, Snapshot};
     use crate::{
@@ -9555,7 +9554,7 @@ mod tests {
         runtime::{
             Command, DeclarativeOwnedCommandRuntimeBridge, DeclarativeOwnedRuntimeBridge, Event,
             FocusTraversal, PaintPrimitive, PaintTextAlign, PlatformRequest, PlatformResponse,
-            RepaintScope, SurfaceRuntime,
+            RepaintScope, SurfaceRuntime, TransientOverlayContext,
         },
         theme::ThemeTokens,
         widgets::{PointerModifiers, Widget, WidgetInput},
@@ -9760,7 +9759,7 @@ mod tests {
     }
 
     #[test]
-    fn active_live_spectrogram_reprojects_only_the_displayed_source_revision() {
+    fn active_live_spectrogram_revision_is_paint_only_for_both_modes() {
         for mode in [
             LiveSpectrogramMode::Waterfall,
             LiveSpectrogramMode::Spectrum,
@@ -9828,7 +9827,7 @@ mod tests {
             let displayed_revision = frame_surface_revisions(&mut state);
             assert_eq!(
                 displayed_revision.repaint_scope_since(hidden_revision),
-                RepaintScope::Projection
+                RepaintScope::PaintOnly
             );
             let repeated_revision = frame_surface_revisions(&mut state);
             assert_eq!(
@@ -9847,7 +9846,7 @@ mod tests {
     }
 
     #[test]
-    fn active_spectrum_revision_reprojects_retained_surface() {
+    fn active_spectrum_revision_is_paint_only() {
         let mut state = audition_state(&["main"]);
         state.live_spectrogram = Some(live_frame(0, 0, 1));
         state.live_spectrogram_revision = 1;
@@ -9871,7 +9870,208 @@ mod tests {
         });
         let after = frame_surface_revisions(&mut state);
 
-        assert_eq!(after.repaint_scope_since(before), RepaintScope::Projection);
+        assert_eq!(after.repaint_scope_since(before), RepaintScope::PaintOnly);
+    }
+
+    #[test]
+    fn live_spectrogram_overlay_uses_newest_validated_frame_and_exact_body_layers() {
+        for mode in [
+            LiveSpectrogramMode::Waterfall,
+            LiveSpectrogramMode::Spectrum,
+        ] {
+            let mut state = audition_state(&["main"]);
+            state.transport_playing = true;
+            state.transport_generation = 0;
+            state.live_spectrogram_mode = mode;
+            let newest = live_frame(0, 0, 2);
+            state.live_spectrogram = Some(Arc::clone(&newest));
+            state.live_spectrogram_revision = newest.revision;
+            state.transport.set_live_state_for_test(LiveFrameState {
+                generation: 0,
+                epoch: 0,
+                revision: newest.revision,
+                pending: false,
+            });
+            assert_eq!(state.waveform_track_id.as_deref(), Some("main"));
+            assert_eq!(state.transport_generation, 0);
+            assert_eq!(state.live_spectrogram_revision, 2);
+            assert_eq!(state.transport.live_frame_state().revision, 2);
+            assert!(newest.is_valid());
+
+            // Build the cached plan from the previous frame. The transient
+            // painter must replace its graph with the newest validated frame
+            // without needing a new declarative projection.
+            let mut cached_state = state.clone();
+            cached_state.transport = transport::AudioTransport::spawn();
+            cached_state.live_spectrogram = Some(live_frame(0, 0, 1));
+            cached_state.live_spectrogram_revision = 1;
+            cached_state
+                .transport
+                .set_live_state_for_test(LiveFrameState {
+                    generation: 0,
+                    epoch: 0,
+                    revision: 1,
+                    pending: false,
+                });
+            let cached_frame = project_surface(&cached_state)
+                .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1100.0));
+            let body_bounds = cached_frame
+                .paint_plan
+                .first_widget_rect(super::LIVE_SPECTROGRAM_BODY_ID)
+                .expect("cached live spectrogram body bounds");
+            let context = TransientOverlayContext::new(
+                &cached_frame.paint_plan,
+                Vector2::new(1180.0, 1100.0),
+                Duration::ZERO,
+            );
+            assert!(current_live_frame_for_source(&state, "main", AuditionSource::Main).is_some());
+            let mut primitives = Vec::new();
+            paint_live_playback_overlay(&mut state, context, &mut primitives);
+
+            let expected_plot = body_bounds.inset(1.0, 1.0, 1.0, 1.0);
+            assert!(primitives.iter().any(|primitive| {
+                matches!(
+                    primitive,
+                    PaintPrimitive::ClipStart(clip) if clip.rect == body_bounds
+                )
+            }));
+            assert!(primitives.iter().any(|primitive| {
+                matches!(
+                    primitive,
+                    PaintPrimitive::ClipEnd(clip)
+                        if clip.node_id == super::spectrogram::LIVE_SPECTROGRAM_OVERLAY_WIDGET_ID
+                )
+            }));
+            assert!(primitives.iter().any(|primitive| {
+                matches!(
+                    primitive,
+                    PaintPrimitive::FillRect(fill)
+                        if fill.rect == body_bounds
+                            && fill.widget_id
+                                == super::spectrogram::LIVE_SPECTROGRAM_OVERLAY_WIDGET_ID
+                )
+            }));
+            assert!(!primitives.iter().any(|primitive| {
+                matches!(
+                    primitive,
+                    PaintPrimitive::GpuSurface(_)
+                        | PaintPrimitive::Image(_)
+                        | PaintPrimitive::CustomSurface(_)
+                        | PaintPrimitive::StrokePolyline(_)
+                )
+            }));
+            match mode {
+                LiveSpectrogramMode::Waterfall => assert!(
+                    primitives
+                        .iter()
+                        .any(|primitive| matches!(primitive, PaintPrimitive::FillRectBatch(_)))
+                ),
+                LiveSpectrogramMode::Spectrum => {
+                    assert!(
+                        primitives
+                            .iter()
+                            .any(|primitive| matches!(primitive, PaintPrimitive::FillPolygon(_)))
+                    );
+                    assert!(
+                        primitives
+                            .iter()
+                            .any(|primitive| matches!(primitive, PaintPrimitive::StrokePolygon(_)))
+                    );
+                }
+            }
+
+            let body_clip_start = primitives
+                .iter()
+                .position(|primitive| {
+                    matches!(
+                        primitive,
+                        PaintPrimitive::ClipStart(clip) if clip.rect == body_bounds
+                    )
+                })
+                .expect("live spectrogram overlay clip start");
+            let body_clip_end = primitives
+                .iter()
+                .position(|primitive| {
+                    matches!(
+                        primitive,
+                        PaintPrimitive::ClipEnd(clip)
+                            if clip.node_id
+                                == super::spectrogram::LIVE_SPECTROGRAM_OVERLAY_WIDGET_ID
+                    )
+                })
+                .expect("live spectrogram overlay clip end");
+            let body_layers = &primitives[body_clip_start + 1..body_clip_end];
+            let body_fill = body_layers
+                .iter()
+                .position(|primitive| {
+                    matches!(
+                        primitive,
+                        PaintPrimitive::FillRect(fill) if fill.rect == body_bounds
+                    )
+                })
+                .expect("live spectrogram overlay background");
+            let plot_fill = body_layers
+                .iter()
+                .position(|primitive| {
+                    matches!(primitive, PaintPrimitive::FillRect(fill) if fill.rect == expected_plot)
+                })
+                .expect("live spectrogram overlay plot background");
+            let grid = body_layers
+                .iter()
+                .position(|primitive| {
+                    matches!(primitive, PaintPrimitive::FillRect(fill) if fill.rect != body_bounds && fill.rect != expected_plot)
+                })
+                .expect("live spectrogram overlay grid");
+            let border = body_layers
+                .iter()
+                .rposition(|primitive| {
+                    matches!(
+                        primitive,
+                        PaintPrimitive::StrokeRect(stroke) if stroke.rect == expected_plot
+                    )
+                })
+                .expect("live spectrogram overlay border");
+            assert!(body_fill < plot_fill && plot_fill < grid);
+            assert!(grid < border);
+            assert!(!body_layers.iter().any(|primitive| {
+                matches!(primitive, PaintPrimitive::Text(text) if text.text.starts_with("LIVE SPECTROGRAM"))
+            }));
+        }
+    }
+
+    #[test]
+    fn live_spectrogram_overlay_rejects_stale_generation_and_epoch_frames() {
+        for (generation, epoch) in [(1, 0), (0, 1)] {
+            let mut state = audition_state(&["main"]);
+            state.transport_playing = true;
+            state.live_spectrogram = Some(live_frame(generation, epoch, 2));
+            state.live_spectrogram_revision = 2;
+            state.transport.set_live_state_for_test(LiveFrameState {
+                generation: 0,
+                epoch: 0,
+                revision: 2,
+                pending: false,
+            });
+            let frame = project_surface(&state)
+                .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1100.0));
+            let context = TransientOverlayContext::new(
+                &frame.paint_plan,
+                Vector2::new(1180.0, 1100.0),
+                Duration::ZERO,
+            );
+            let mut primitives = Vec::new();
+            paint_live_playback_overlay(&mut state, context, &mut primitives);
+
+            assert!(
+                !primitives.iter().any(|primitive| {
+                    matches!(
+                        primitive,
+                        PaintPrimitive::FillRectBatch(_) | PaintPrimitive::FillPolygon(_)
+                    )
+                }),
+                "stale generation/epoch frame must not reach the overlay"
+            );
+        }
     }
 
     #[test]
@@ -9967,7 +10167,7 @@ mod tests {
             let active_after = frame_surface_revisions(&mut state);
             assert_eq!(
                 active_after.repaint_scope_since(active_before),
-                RepaintScope::Projection
+                RepaintScope::PaintOnly
             );
 
             apply_transport_snapshot(
