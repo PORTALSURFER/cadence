@@ -9973,7 +9973,7 @@ mod tests {
                             .any(|primitive| matches!(primitive, PaintPrimitive::FillPolygon(_)))
                     );
                     assert!(
-                        primitives
+                        !primitives
                             .iter()
                             .any(|primitive| matches!(primitive, PaintPrimitive::StrokePolygon(_)))
                     );
@@ -10033,6 +10033,24 @@ mod tests {
                 .expect("live spectrogram overlay border");
             assert!(body_fill < plot_fill && plot_fill < grid);
             assert!(grid < border);
+            if mode == LiveSpectrogramMode::Spectrum {
+                let fill_polygons = body_layers
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, primitive)| {
+                        matches!(primitive, PaintPrimitive::FillPolygon(_)).then_some(index)
+                    })
+                    .collect::<Vec<_>>();
+                let area = fill_polygons
+                    .first()
+                    .copied()
+                    .expect("overlay spectrum area");
+                let ribbon = fill_polygons
+                    .get(1)
+                    .copied()
+                    .expect("overlay spectrum ribbon");
+                assert!(area < grid && grid < ribbon && ribbon < border);
+            }
             assert!(!body_layers.iter().any(|primitive| {
                 matches!(primitive, PaintPrimitive::Text(text) if text.text.starts_with("LIVE SPECTROGRAM"))
             }));

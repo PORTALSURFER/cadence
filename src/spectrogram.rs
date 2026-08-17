@@ -15,9 +15,8 @@ use radiant::{
     runtime::{
         GpuShaderSurfaceDescriptor, GpuShaderSurfaceDescriptorParts, GpuSurfaceCapabilities,
         GpuSurfaceContent, PaintClipEnd, PaintClipStart, PaintFillPolygon, PaintFillRect,
-        PaintFillRectBatch, PaintGpuSurface, PaintPrimitive, PaintStrokePolygon,
-        PaintStrokePolyline, PaintStrokeRect, PaintTextAlign, PaintTextMetrics,
-        push_text_run_with_metrics,
+        PaintFillRectBatch, PaintGpuSurface, PaintPrimitive, PaintStrokePolyline, PaintStrokeRect,
+        PaintTextAlign, PaintTextMetrics, push_text_run_with_metrics,
     },
     theme::ThemeTokens,
     widgets::{FocusBehavior, PaintBounds, Widget, WidgetCommon, WidgetInput, WidgetOutput},
@@ -971,11 +970,10 @@ fn append_overlay_spectrum_ribbon(
             (point.y + half_width).clamp(plot.min.y, plot.max.y),
         )
     }));
-    primitives.push(PaintPrimitive::StrokePolygon(PaintStrokePolygon {
+    primitives.push(PaintPrimitive::FillPolygon(PaintFillPolygon {
         widget_id,
         points: Arc::from(ribbon.into_boxed_slice()),
         color: theme.highlight_orange,
-        width: SPECTRUM_RIBBON_WIDTH,
     }));
 }
 
@@ -1618,7 +1616,8 @@ mod tests {
                             .any(|primitive| matches!(primitive, PaintPrimitive::FillPolygon(_)))
                     );
                     assert!(
-                        body.iter()
+                        !body
+                            .iter()
                             .any(|primitive| matches!(primitive, PaintPrimitive::StrokePolygon(_)))
                     );
                 }
@@ -1627,12 +1626,15 @@ mod tests {
                 .iter()
                 .position(|primitive| matches!(primitive, PaintPrimitive::FillRect(fill) if fill.rect != bounds && fill.rect != plot))
                 .expect("overlay grid");
-            let area = body
+            let fill_polygons = body
                 .iter()
-                .position(|primitive| matches!(primitive, PaintPrimitive::FillPolygon(_)));
-            let ribbon = body
-                .iter()
-                .position(|primitive| matches!(primitive, PaintPrimitive::StrokePolygon(_)));
+                .enumerate()
+                .filter_map(|(index, primitive)| {
+                    matches!(primitive, PaintPrimitive::FillPolygon(_)).then_some(index)
+                })
+                .collect::<Vec<_>>();
+            let area = fill_polygons.first().copied();
+            let ribbon = fill_polygons.get(1).copied();
             let border = body
                 .iter()
                 .rposition(|primitive| {
@@ -1644,7 +1646,7 @@ mod tests {
                 let area = area.expect("overlay spectrum area");
                 let ribbon = ribbon.expect("overlay spectrum ribbon");
                 assert!(area < grid && grid < ribbon && ribbon < border);
-                let PaintPrimitive::StrokePolygon(ribbon) = &body[ribbon] else {
+                let PaintPrimitive::FillPolygon(ribbon) = &body[ribbon] else {
                     unreachable!();
                 };
                 assert_eq!(ribbon.points.len(), 2 * OVERLAY_MAX_SPECTRUM_POINTS);
@@ -1680,14 +1682,6 @@ mod tests {
                     }
                     PaintPrimitive::FillPolygon(fill) => {
                         assert!(fill.points.iter().all(|point| {
-                            point.x >= plot.min.x - f32::EPSILON
-                                && point.x <= plot.max.x + f32::EPSILON
-                                && point.y >= plot.min.y - f32::EPSILON
-                                && point.y <= plot.max.y + f32::EPSILON
-                        }));
-                    }
-                    PaintPrimitive::StrokePolygon(stroke) => {
-                        assert!(stroke.points.iter().all(|point| {
                             point.x >= plot.min.x - f32::EPSILON
                                 && point.x <= plot.max.x + f32::EPSILON
                                 && point.y >= plot.min.y - f32::EPSILON
