@@ -13,7 +13,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex, Weak,
-        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
     },
     thread,
@@ -1384,15 +1384,20 @@ enum Command {
         position_millis: u64,
         resume: bool,
     },
+    SeekBoundary {
+        token: u64,
+    },
 }
 
 impl Command {
     fn load_generation(&self) -> Option<u64> {
         match self {
             Self::Load { generation, .. } => Some(*generation),
-            Self::Unload { .. } | Self::Play { .. } | Self::Pause { .. } | Self::Seek { .. } => {
-                None
-            }
+            Self::Unload { .. }
+            | Self::Play { .. }
+            | Self::Pause { .. }
+            | Self::Seek { .. }
+            | Self::SeekBoundary { .. } => None,
         }
     }
 }
@@ -1462,12 +1467,183 @@ impl Drop for PendingLoad {
     }
 }
 
+const SEEK_BOUNDARY_NONE: u8 = 0;
+const SEEK_BOUNDARY_ADMITTING: u8 = 1;
+const SEEK_BOUNDARY_QUEUED: u8 = 2;
+const SEEK_DIRECT_PENDING: u8 = 3;
+
+/// Single-slot, latest-wins admission for seek commands. A seek boundary in
+/// the FIFO preserves ordering with unrelated controls; repeated seeks replace
+/// the command behind that same boundary without consuming more capacity.
+#[derive(Debug)]
+struct PendingSeek {
+    pointer: std::sync::atomic::AtomicPtr<Command>,
+    boundary_state: AtomicU8,
+    boundary_token: AtomicU64,
+}
+
+// SAFETY: Command is Send, and ownership of each boxed command moves through
+// the atomic pointer exactly once via swap before it is reclaimed.
+unsafe impl Send for PendingSeek {}
+unsafe impl Sync for PendingSeek {}
+
+impl PendingSeek {
+    fn new() -> Self {
+        Self {
+            pointer: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+            boundary_state: AtomicU8::new(SEEK_BOUNDARY_NONE),
+            boundary_token: AtomicU64::new(0),
+        }
+    }
+
+    fn replace(&self, command: Command) -> Option<Command> {
+        let replacement = Box::into_raw(Box::new(command));
+        let previous = self.pointer.swap(replacement, Ordering::AcqRel);
+        if previous.is_null() {
+            None
+        } else {
+            // SAFETY: the swap transfers exclusive ownership of the previous
+            // allocation to this thread.
+            Some(unsafe { *Box::from_raw(previous) })
+        }
+    }
+
+    fn take(&self) -> Option<Command> {
+        let pointer = self.pointer.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if pointer.is_null() {
+            None
+        } else {
+            // SAFETY: the swap transfers exclusive ownership of this
+            // allocation to this thread.
+            Some(unsafe { *Box::from_raw(pointer) })
+        }
+    }
+
+    fn begin_boundary(&self, token: u64) -> bool {
+        if self
+            .boundary_state
+            .compare_exchange(
+                SEEK_BOUNDARY_NONE,
+                SEEK_BOUNDARY_ADMITTING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        self.boundary_token.store(token, Ordering::Release);
+        true
+    }
+
+    fn mark_boundary_queued(&self, token: u64) {
+        if self.boundary_token.load(Ordering::Acquire) == token {
+            let _ = self.boundary_state.compare_exchange(
+                SEEK_BOUNDARY_ADMITTING,
+                SEEK_BOUNDARY_QUEUED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+    }
+
+    fn mark_direct_pending(&self, token: u64) {
+        if self.boundary_token.load(Ordering::Acquire) == token {
+            let _ = self.boundary_state.compare_exchange(
+                SEEK_BOUNDARY_ADMITTING,
+                SEEK_DIRECT_PENDING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+    }
+
+    fn cancel_boundary(&self, token: u64) -> Option<Command> {
+        if self.boundary_token.load(Ordering::Acquire) != token
+            || self
+                .boundary_state
+                .compare_exchange(
+                    SEEK_BOUNDARY_ADMITTING,
+                    SEEK_BOUNDARY_NONE,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+        {
+            return None;
+        }
+        self.take()
+    }
+
+    fn take_for_boundary(&self, token: u64) -> Option<Command> {
+        if self.boundary_token.load(Ordering::Acquire) != token {
+            return None;
+        }
+        let state = self.boundary_state.load(Ordering::Acquire);
+        if state != SEEK_BOUNDARY_ADMITTING && state != SEEK_BOUNDARY_QUEUED {
+            return None;
+        }
+        if self
+            .boundary_state
+            .compare_exchange(
+                state,
+                SEEK_BOUNDARY_NONE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return None;
+        }
+        self.take()
+    }
+
+    fn take_direct(&self) -> Option<Command> {
+        if self
+            .boundary_state
+            .compare_exchange(
+                SEEK_DIRECT_PENDING,
+                SEEK_BOUNDARY_NONE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return None;
+        }
+        self.take()
+    }
+
+    fn blocks_unrelated_commands(&self) -> bool {
+        matches!(
+            self.boundary_state.load(Ordering::Acquire),
+            SEEK_BOUNDARY_ADMITTING | SEEK_DIRECT_PENDING
+        )
+    }
+
+    #[cfg(test)]
+    fn is_pending(&self) -> bool {
+        !self.pointer.load(Ordering::Acquire).is_null()
+    }
+}
+
+impl Drop for PendingSeek {
+    fn drop(&mut self) {
+        let pointer = self.pointer.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if !pointer.is_null() {
+            // SAFETY: Drop has exclusive access to the slot.
+            unsafe { drop(Box::from_raw(pointer)) };
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct AudioTransport {
     commands: SyncSender<Command>,
     queued_commands: Arc<AtomicUsize>,
     shared: Arc<SharedSnapshot>,
     pending_load: Arc<PendingLoad>,
+    pending_seek: Arc<PendingSeek>,
     next_token: Arc<AtomicU64>,
 }
 
@@ -1477,9 +1653,11 @@ impl AudioTransport {
         let queued_commands = Arc::new(AtomicUsize::new(0));
         let shared = Arc::new(SharedSnapshot::new());
         let pending_load = Arc::new(PendingLoad::new());
+        let pending_seek = Arc::new(PendingSeek::new());
         let thread_queued_commands = Arc::clone(&queued_commands);
         let thread_shared = Arc::clone(&shared);
         let thread_pending_load = Arc::clone(&pending_load);
+        let thread_pending_seek = Arc::clone(&pending_seek);
         thread::Builder::new()
             .name(String::from("cadence-audio-transport"))
             .spawn(move || {
@@ -1488,6 +1666,7 @@ impl AudioTransport {
                     thread_queued_commands,
                     thread_shared,
                     thread_pending_load,
+                    thread_pending_seek,
                 )
             })
             .expect("Cadence audio transport thread should spawn");
@@ -1496,6 +1675,7 @@ impl AudioTransport {
             queued_commands,
             shared,
             pending_load,
+            pending_seek,
             next_token: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -1591,6 +1771,10 @@ impl AudioTransport {
         self.pending_load.is_pending()
     }
 
+    pub(crate) fn has_seek_capacity(&self) -> bool {
+        !self.has_pending_load()
+    }
+
     #[cfg(test)]
     pub(crate) fn force_command_queue_full_for_test(&self) {
         self.queued_commands
@@ -1603,6 +1787,10 @@ impl AudioTransport {
         path: PathBuf,
         duration_millis: u64,
     ) -> Result<u64, String> {
+        // Loading a new source is also the lifecycle invalidation boundary
+        // for any older pending seek. Publish the requested generation before
+        // admitting the load so a direct-pending seek can be rejected even if
+        // the bounded command queue is still full.
         self.shared
             .requested_generation
             .store(generation, Ordering::Release);
@@ -1638,6 +1826,9 @@ impl AudioTransport {
     }
 
     pub fn unload(&self, generation: u64) -> Result<u64, String> {
+        // Unload must always publish the new generation before any capacity
+        // failure. This invalidates a direct-pending seek during track/source
+        // replacement instead of allowing that old seek to execute later.
         self.shared
             .requested_generation
             .store(generation, Ordering::Release);
@@ -1647,7 +1838,7 @@ impl AudioTransport {
     }
 
     pub fn play(&self, generation: u64) -> Result<u64, String> {
-        if self.has_pending_load() {
+        if self.has_pending_load() || self.pending_seek.blocks_unrelated_commands() {
             return Err(String::from(CONTROLS_BUSY_ERROR));
         }
         let token = self.next_token();
@@ -1656,6 +1847,9 @@ impl AudioTransport {
     }
 
     pub fn pause(&self, generation: u64) -> Result<u64, String> {
+        if self.pending_seek.blocks_unrelated_commands() {
+            return Err(String::from(CONTROLS_BUSY_ERROR));
+        }
         let token = self.next_token();
         self.try_send(Command::Pause { token, generation })
             .map(|()| token)
@@ -1672,13 +1866,49 @@ impl AudioTransport {
             return Err(String::from(CONTROLS_BUSY_ERROR));
         }
         let token = self.next_token();
-        self.try_send(Command::Seek {
+        let command = Command::Seek {
             token,
             generation,
             position_millis: clamp_position(position_millis, duration_millis),
             resume,
-        })
-        .map(|()| token)
+        };
+        let starts_boundary = self.pending_seek.begin_boundary(token);
+        let replaced = self.pending_seek.replace(command);
+        self.acknowledge_superseded_seek(replaced);
+        if starts_boundary {
+            match self.try_send_seek_boundary(token) {
+                Ok(()) => self.pending_seek.mark_boundary_queued(token),
+                Err(TrySendError::Full(_)) => self.pending_seek.mark_direct_pending(token),
+                Err(TrySendError::Disconnected(_)) => {
+                    let cancelled = self.pending_seek.cancel_boundary(token);
+                    self.acknowledge_superseded_seek(cancelled);
+                    return Err(String::from("The audio transport is no longer available."));
+                }
+            }
+        }
+        Ok(token)
+    }
+
+    fn try_send_seek_boundary(&self, token: u64) -> Result<(), TrySendError<Command>> {
+        if !self.try_reserve_command_slot() {
+            return Err(TrySendError::Full(Command::SeekBoundary { token }));
+        }
+        match self.commands.try_send(Command::SeekBoundary { token }) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.release_command_slot();
+                Err(error)
+            }
+        }
+    }
+
+    fn acknowledge_superseded_seek(&self, command: Option<Command>) {
+        if let Some(Command::Seek { token, .. }) = command {
+            // A replaced seek is intentionally superseded. Acknowledging its
+            // token keeps any older UI waiter from remaining stuck while the
+            // newest slot value is admitted at the FIFO boundary.
+            self.shared.acknowledge(token);
+        }
     }
 
     fn try_send(&self, command: Command) -> Result<(), String> {
@@ -1775,6 +2005,7 @@ fn run_transport(
     queued_commands: Arc<AtomicUsize>,
     shared: Arc<SharedSnapshot>,
     pending_load: Arc<PendingLoad>,
+    pending_seek: Arc<PendingSeek>,
 ) {
     let output = match DeviceSinkBuilder::open_default_sink() {
         Ok(output) => {
@@ -1809,13 +2040,14 @@ fn run_transport(
         match receiver.recv_timeout(CONTROL_INTERVAL) {
             Ok(command) => {
                 release_command_slot(&queued_commands);
-                handle_command(
+                handle_transport_command(
                     command,
                     &shared,
                     output.as_ref(),
                     &mut player,
                     &mut loaded,
                     &mut live_session,
+                    &pending_seek,
                 )
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -1826,13 +2058,14 @@ fn run_transport(
             match receiver.try_recv() {
                 Ok(command) => {
                     release_command_slot(&queued_commands);
-                    handle_command(
+                    handle_transport_command(
                         command,
                         &shared,
                         output.as_ref(),
                         &mut player,
                         &mut loaded,
                         &mut live_session,
+                        &pending_seek,
                     )
                 }
                 Err(TryRecvError::Empty) => break,
@@ -1841,6 +2074,17 @@ fn run_transport(
                     return;
                 }
             }
+        }
+
+        if let Some(command) = pending_seek.take_direct() {
+            handle_command(
+                command,
+                &shared,
+                output.as_ref(),
+                &mut player,
+                &mut loaded,
+                &mut live_session,
+            );
         }
 
         reconcile_stale_track(&shared, &mut player, &mut loaded, &mut live_session);
@@ -1861,6 +2105,26 @@ fn release_command_slot(queued_commands: &AtomicUsize) {
 
 fn take_pending_load(pending_load: &PendingLoad) -> Option<Command> {
     pending_load.take()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_transport_command(
+    command: Command,
+    shared: &Arc<SharedSnapshot>,
+    output: Option<&rodio::MixerDeviceSink>,
+    player: &mut Option<Player>,
+    loaded: &mut Option<LoadedTrack>,
+    live_session: &mut Option<Arc<LiveCaptureSession>>,
+    pending_seek: &PendingSeek,
+) {
+    match command {
+        Command::SeekBoundary { token } => {
+            if let Some(command) = pending_seek.take_for_boundary(token) {
+                handle_command(command, shared, output, player, loaded, live_session);
+            }
+        }
+        command => handle_command(command, shared, output, player, loaded, live_session),
+    }
 }
 
 fn reconcile_stale_track(
@@ -2053,6 +2317,9 @@ fn handle_command(
                     }
                 }
             }
+        }
+        Command::SeekBoundary { .. } => {
+            unreachable!("seek boundaries are resolved before command handling")
         }
     };
     if acknowledged {
@@ -2299,9 +2566,9 @@ mod tests {
         LIVE_SPECTRUM_DISPLAY_MIN_FREQUENCY, LIVE_SPECTRUM_DISPLAY_TILT_DB_PER_OCTAVE,
         LIVE_SPECTRUM_DISPLAY_TILT_REFERENCE_FREQUENCY, LIVE_SPECTRUM_FFT_SIZE,
         LIVE_SPECTRUM_HOP_SIZE, LIVE_SPECTRUM_POINT_COUNT, LiveAnalysisSource, LiveAnalyzer,
-        LiveCaptureSession, LiveSpectrogramFrame, MAX_OUTPUT_GAIN, PendingLoad, SharedSnapshot,
-        clamp_position, display_tilt_db, finish_analyzer_fallback, handle_command, is_current,
-        live_band_ranges, live_display_frequency_bounds, live_spectrum_point_frequency,
+        LiveCaptureSession, LiveSpectrogramFrame, MAX_OUTPUT_GAIN, PendingLoad, PendingSeek,
+        SharedSnapshot, clamp_position, display_tilt_db, finish_analyzer_fallback, handle_command,
+        is_current, live_band_ranges, live_display_frequency_bounds, live_spectrum_point_frequency,
         live_spectrum_point_mappings, normalize_output_gain, normalize_volume,
         publish_live_frame_if_due, publish_live_frame_if_due_at, run_live_analyzer_iteration,
     };
@@ -2360,14 +2627,7 @@ mod tests {
 
     #[test]
     fn pending_load_blocks_dependent_controls_until_it_is_admitted() {
-        let (commands, _receiver) = mpsc::sync_channel(super::COMMAND_CAPACITY);
-        let transport = AudioTransport {
-            commands,
-            queued_commands: Arc::new(AtomicUsize::new(super::COMMAND_CAPACITY)),
-            shared: Arc::new(SharedSnapshot::new()),
-            pending_load: Arc::new(PendingLoad::new()),
-            next_token: Arc::new(AtomicU64::new(1)),
-        };
+        let (transport, _receiver) = test_transport(super::COMMAND_CAPACITY);
 
         transport
             .load(0, PathBuf::from("pending.wav"), 1_000)
@@ -2378,6 +2638,169 @@ mod tests {
             Err(String::from(CONTROLS_BUSY_ERROR))
         );
         assert_eq!(transport.play(0), Err(String::from(CONTROLS_BUSY_ERROR)));
+    }
+
+    #[test]
+    fn pending_seek_slot_is_latest_wins_under_full_queue_and_acknowledges_superseded_token() {
+        let (transport, receiver) = test_transport(super::COMMAND_CAPACITY);
+        let first_token = transport
+            .seek(4, 100, 1_000, false)
+            .expect("first seek should enter the bounded slot");
+        let latest_token = transport
+            .seek(4, 900, 1_000, true)
+            .expect("replacement seek should reuse the bounded slot");
+
+        assert!(latest_token > first_token);
+        assert!(transport.pending_seek.is_pending());
+        assert_eq!(transport.snapshot().acknowledged_token, first_token);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        match transport
+            .pending_seek
+            .take_direct()
+            .expect("full queue should use the direct pending path")
+        {
+            Command::Seek {
+                token,
+                generation,
+                position_millis,
+                resume,
+            } => {
+                assert_eq!(token, latest_token);
+                assert_eq!(generation, 4);
+                assert_eq!(position_millis, 900);
+                assert!(resume);
+            }
+            command => panic!("expected latest seek, got {command:?}"),
+        }
+        assert!(!transport.pending_seek.is_pending());
+        assert_eq!(transport.snapshot().acknowledged_token, first_token);
+    }
+
+    #[test]
+    fn lifecycle_invalidation_rejects_direct_pending_seek_before_capacity_failure() {
+        let (transport, _receiver) = test_transport(super::COMMAND_CAPACITY);
+        let seek_token = transport
+            .seek(4, 100, 1_000, true)
+            .expect("full queue should admit a direct-pending seek");
+
+        assert_eq!(transport.unload(5), Err(String::from(CONTROLS_BUSY_ERROR)));
+        assert_eq!(
+            transport
+                .shared
+                .requested_generation
+                .load(Ordering::Acquire),
+            5
+        );
+        transport
+            .load(5, PathBuf::from("replacement.wav"), 1_000)
+            .expect("replacement load should coalesce while the queue is full");
+        assert!(transport.has_pending_load());
+
+        let command = transport
+            .pending_seek
+            .take_direct()
+            .expect("the pending seek should still be drained explicitly");
+        let mut player = None;
+        let mut loaded: Option<super::LoadedTrack> = None;
+        let mut live_session: Option<Arc<LiveCaptureSession>> = None;
+        handle_command(
+            command,
+            &transport.shared,
+            None,
+            &mut player,
+            &mut loaded,
+            &mut live_session,
+        );
+
+        assert_eq!(transport.snapshot().position_millis, 0);
+        assert!(!transport.snapshot().playing);
+        assert_eq!(transport.snapshot().acknowledged_token, seek_token - 1);
+    }
+
+    #[test]
+    fn pending_seek_boundary_preserves_non_seek_command_order_and_capacity() {
+        let (transport, receiver) = test_transport(0);
+        let seek_token = transport
+            .seek(7, 321, 1_000, false)
+            .expect("seek boundary should reserve one queue slot");
+        let play_token = transport
+            .play(7)
+            .expect("unrelated controls should follow the seek boundary");
+
+        assert_eq!(transport.queued_commands.load(Ordering::Acquire), 2);
+        match receiver.try_recv().expect("seek boundary should be first") {
+            Command::SeekBoundary { token } => assert_eq!(token, seek_token),
+            command => panic!("expected seek boundary, got {command:?}"),
+        }
+        transport.release_command_slot();
+        match receiver
+            .try_recv()
+            .expect("play should follow the boundary")
+        {
+            Command::Play { token, generation } => {
+                assert_eq!(token, play_token);
+                assert_eq!(generation, 7);
+            }
+            command => panic!("expected play, got {command:?}"),
+        }
+        transport.release_command_slot();
+
+        match transport
+            .pending_seek
+            .take_for_boundary(seek_token)
+            .expect("boundary should admit the latest seek")
+        {
+            Command::Seek {
+                token,
+                generation,
+                position_millis,
+                resume,
+            } => {
+                assert_eq!(token, seek_token);
+                assert_eq!(generation, 7);
+                assert_eq!(position_millis, 321);
+                assert!(!resume);
+            }
+            command => panic!("expected seek, got {command:?}"),
+        }
+        assert_eq!(transport.queued_commands.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn pending_seek_keeps_generation_validation_at_consumption_boundary() {
+        let shared = Arc::new(SharedSnapshot::new());
+        shared.requested_generation.store(9, Ordering::Release);
+        let pending = PendingSeek::new();
+        assert!(pending.begin_boundary(12));
+        pending.replace(Command::Seek {
+            token: 12,
+            generation: 8,
+            position_millis: 600,
+            resume: true,
+        });
+        pending.mark_boundary_queued(12);
+
+        let command = pending
+            .take_for_boundary(12)
+            .expect("queued seek should be consumed at its boundary");
+        let mut player = None;
+        let mut loaded: Option<super::LoadedTrack> = None;
+        let mut live_session: Option<Arc<LiveCaptureSession>> = None;
+        handle_command(
+            command,
+            &shared,
+            None,
+            &mut player,
+            &mut loaded,
+            &mut live_session,
+        );
+
+        assert_eq!(shared.snapshot().acknowledged_token, 0);
+        assert_eq!(shared.snapshot().position_millis, 0);
     }
 
     #[test]
@@ -2430,6 +2853,21 @@ mod tests {
             pending.take().and_then(|command| command.load_generation()),
             Some(2)
         );
+    }
+
+    fn test_transport(queued_commands: usize) -> (AudioTransport, mpsc::Receiver<Command>) {
+        let (commands, receiver) = mpsc::sync_channel(super::COMMAND_CAPACITY);
+        (
+            AudioTransport {
+                commands,
+                queued_commands: Arc::new(AtomicUsize::new(queued_commands)),
+                shared: Arc::new(SharedSnapshot::new()),
+                pending_load: Arc::new(PendingLoad::new()),
+                pending_seek: Arc::new(PendingSeek::new()),
+                next_token: Arc::new(AtomicU64::new(1)),
+            },
+            receiver,
+        )
     }
 
     fn active_test_session(generation: u64) -> (Arc<SharedSnapshot>, Arc<LiveCaptureSession>) {

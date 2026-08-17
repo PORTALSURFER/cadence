@@ -182,17 +182,11 @@ enum Message {
     WaveformPlayheadDragStarted {
         ratio: f32,
     },
-    WaveformPlayheadDragMoved {
-        ratio: f32,
-    },
     WaveformPlayheadDragEnded {
         ratio: f32,
     },
     WaveformPlayheadDragCancelled,
     ReferencePlayheadDragStarted {
-        ratio: f32,
-    },
-    ReferencePlayheadDragMoved {
         ratio: f32,
     },
     ReferencePlayheadDragEnded {
@@ -2719,12 +2713,6 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             state.hovered_note_id = None;
             seek_review_position(state, context, ratio, false);
         }
-        Message::WaveformPlayheadDragMoved { ratio } => {
-            if !state.playhead_drag_active {
-                return;
-            }
-            seek_review_position(state, context, ratio, false);
-        }
         Message::WaveformPlayheadDragEnded { ratio } => {
             if !state.playhead_drag_active {
                 return;
@@ -2749,12 +2737,6 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             state.reference_playhead_drag_active = true;
             state.reference_draft_note = None;
             state.hovered_reference_note_id = None;
-            seek_reference_waveform_position(state, context, ratio, false);
-        }
-        Message::ReferencePlayheadDragMoved { ratio } => {
-            if !state.reference_playhead_drag_active {
-                return;
-            }
             seek_reference_waveform_position(state, context, ratio, false);
         }
         Message::ReferencePlayheadDragEnded { ratio } => {
@@ -3179,7 +3161,7 @@ fn seek_synchronized_positions(
         return Err(String::from("Audio analysis is still pending."));
     };
     let reference_details = selected_reference_details(state);
-    if !state.transport.has_command_capacity(1) {
+    if !state.transport.has_seek_capacity() {
         return Err(String::from(transport::CONTROLS_BUSY_ERROR));
     }
     let reference_was_loaded = state.reference_transport_loaded;
@@ -3193,8 +3175,11 @@ fn seek_synchronized_positions(
         if reference_transport.has_pending_load() {
             return Err(String::from(transport::CONTROLS_BUSY_ERROR));
         }
-        let required_slots = if reference_was_loaded { 1 } else { 2 };
-        if !reference_transport.has_command_capacity(required_slots) {
+        if if reference_was_loaded {
+            !reference_transport.has_seek_capacity()
+        } else {
+            !reference_transport.has_command_capacity(1)
+        } {
             return Err(String::from(transport::CONTROLS_BUSY_ERROR));
         }
     }
@@ -3376,7 +3361,7 @@ fn seek_loop_owner(
             if state.transport_polling
                 || state.transport_waiting_token.is_some()
                 || state.transport.has_pending_load()
-                || !state.transport.has_command_capacity(1)
+                || !state.transport.has_seek_capacity()
             {
                 return Err(String::from(transport::CONTROLS_BUSY_ERROR));
             }
@@ -3397,7 +3382,7 @@ fn seek_loop_owner(
                 || state.reference_transport_polling
                 || state.reference_transport_waiting_token.is_some()
                 || reference_transport.has_pending_load()
-                || !reference_transport.has_command_capacity(1)
+                || !reference_transport.has_seek_capacity()
             {
                 return Err(String::from(transport::CONTROLS_BUSY_ERROR));
             }
@@ -8362,9 +8347,6 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
                 waveform::WaveformInteraction::PlayheadDragStarted { ratio } => {
                     Message::WaveformPlayheadDragStarted { ratio }
                 }
-                waveform::WaveformInteraction::PlayheadDragMoved { ratio } => {
-                    Message::WaveformPlayheadDragMoved { ratio }
-                }
                 waveform::WaveformInteraction::PlayheadDragEnded { ratio } => {
                     Message::WaveformPlayheadDragEnded { ratio }
                 }
@@ -8750,9 +8732,6 @@ fn reference_waveform_section(state: &AppState, track: &storage::Track) -> ui::V
                 }
                 waveform::WaveformInteraction::PlayheadDragStarted { ratio } => {
                     Message::ReferencePlayheadDragStarted { ratio }
-                }
-                waveform::WaveformInteraction::PlayheadDragMoved { ratio } => {
-                    Message::ReferencePlayheadDragMoved { ratio }
                 }
                 waveform::WaveformInteraction::PlayheadDragEnded { ratio } => {
                     Message::ReferencePlayheadDragEnded { ratio }
@@ -11385,14 +11364,6 @@ mod tests {
 
         update(
             &mut state,
-            Message::WaveformPlayheadDragMoved { ratio: 0.75 },
-            &mut context,
-        );
-        assert_eq!(state.review_cursor_millis, 750);
-        assert_eq!(state.transport_position_millis, 750);
-
-        update(
-            &mut state,
             Message::WaveformPlayheadDragEnded { ratio: 0.5 },
             &mut context,
         );
@@ -12702,15 +12673,6 @@ mod tests {
         assert_eq!(state.review_cursor_millis, 600);
         assert_eq!(state.transport_position_millis, 600);
         assert_eq!(state.audition_source, AuditionSource::Reference);
-
-        update(
-            &mut state,
-            Message::ReferencePlayheadDragMoved { ratio: 0.75 },
-            &mut context,
-        );
-        assert_eq!(state.reference_transport_position_millis, 3_000);
-        assert_eq!(state.review_cursor_millis, 600);
-        assert_eq!(state.transport_position_millis, 600);
 
         update(
             &mut state,
