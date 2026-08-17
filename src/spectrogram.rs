@@ -58,6 +58,7 @@ const GRID_LINE_ALPHA: u8 = 82;
 const GRID_LABEL_ALPHA: u8 = 200;
 const GRID_LABEL_FONT_SIZE: f32 = 9.0;
 const WATERFALL_SURFACE_KEY: u64 = 0x4341_4445_4e43_4553;
+const WATERFALL_STORAGE_IDENTITY: u64 = 0x4341_4445_4e43_5756;
 const SPECTRUM_AREA_SURFACE_KEY: u64 = 0x4341_4445_4e43_5350;
 const SPECTRUM_RIBBON_SURFACE_KEY: u64 = 0x4341_4445_4e43_5352;
 const SPECTRUM_STORAGE_IDENTITY: u64 = 0x4341_4445_4e43_5356;
@@ -363,6 +364,13 @@ fn waterfall_uniform_bytes(
     bytes
 }
 
+fn waterfall_storage_identity(plot: Rect, history_scale: f32) -> u64 {
+    let identity = WATERFALL_STORAGE_IDENTITY
+        ^ u64::from(plot.height().to_bits()).rotate_left(17)
+        ^ u64::from(clamp_history_scale(history_scale).to_bits()).rotate_left(41);
+    if identity == 0 { 1 } else { identity }
+}
+
 fn waterfall_shader_descriptor(
     frame: &LiveSpectrogramFrame,
     plot: Rect,
@@ -380,8 +388,8 @@ fn waterfall_shader_descriptor(
             fragment_entry_point: Some(String::from("fragment_main")),
             uniform_bytes: Arc::<[u8]>::from(uniform_bytes.as_slice()),
             storage_bytes: Arc::clone(frame.packed_values()),
-            storage_identity: 0,
-            storage_revision: 0,
+            storage_identity: waterfall_storage_identity(plot, history_scale),
+            storage_revision: frame.gpu_revision(),
             presentation_uniform_bytes: None,
             presentation_uniform_revision: None,
             vertex_count: 6,
@@ -810,9 +818,10 @@ mod tests {
         DEFAULT_HISTORY_SCALE, SPECTRUM_AREA_ALPHA, SPECTRUM_AREA_RENDER_KIND,
         SPECTRUM_AREA_SURFACE_KEY, SPECTRUM_PLOT_BACKGROUND, SPECTRUM_RIBBON_RENDER_KIND,
         SPECTRUM_RIBBON_SURFACE_KEY, SPECTRUM_RIBBON_WIDTH, SPECTRUM_SHADER_KEY,
-        SPECTRUM_SHADER_WGSL, SpectrogramWidget, clamp_height, clamp_history_scale,
-        history_scale_from_normalized, history_scale_to_normalized, visible_waterfall_rows,
-        waterfall_row_rect, waterfall_row_y_interval,
+        SPECTRUM_SHADER_WGSL, SpectrogramWidget, WATERFALL_STORAGE_IDENTITY, clamp_height,
+        clamp_history_scale, history_scale_from_normalized, history_scale_to_normalized,
+        visible_waterfall_rows, waterfall_row_rect, waterfall_row_y_interval,
+        waterfall_shader_descriptor, waterfall_storage_identity,
     };
     use crate::LiveSpectrogramMode;
     use crate::transport::{
@@ -917,11 +926,16 @@ mod tests {
     fn retained_waterfall_stays_on_its_existing_gpu_contract() {
         let frame = test_frame();
         let primitives = paint(SpectrogramWidget::new(
-            frame,
+            Arc::clone(&frame),
             LiveSpectrogramMode::Waterfall,
         ));
         let surfaces = gpu_surfaces(&primitives);
         assert_eq!(surfaces.len(), 1);
+        assert_eq!(surfaces[0].key, super::WATERFALL_SURFACE_KEY);
+        assert_eq!(
+            surfaces[0].revision,
+            frame.gpu_revision() ^ u64::from(DEFAULT_HISTORY_SCALE.to_bits())
+        );
         assert_eq!(surfaces[0].rect, SpectrogramWidget::plot_rect(bounds()));
 
         let descriptor = custom_descriptor(surfaces[0]);
@@ -931,8 +945,16 @@ mod tests {
             descriptor.fragment_entry_point.as_deref(),
             Some("fragment_main")
         );
-        assert_eq!(descriptor.storage_identity, 0);
-        assert_eq!(descriptor.storage_revision, 0);
+        assert_eq!(
+            descriptor.storage_identity,
+            waterfall_storage_identity(surfaces[0].rect, DEFAULT_HISTORY_SCALE)
+        );
+        assert_ne!(descriptor.storage_identity, 0);
+        assert_eq!(descriptor.storage_revision, frame.gpu_revision());
+        assert!(Arc::ptr_eq(
+            &descriptor.storage_bytes,
+            frame.packed_values()
+        ));
         assert_eq!(descriptor.presentation_uniform_bytes, None);
         assert_eq!(descriptor.presentation_uniform_revision, None);
         assert_eq!(descriptor.vertex_count, 6);
@@ -972,6 +994,54 @@ mod tests {
             !primitives
                 .iter()
                 .any(|primitive| matches!(primitive, PaintPrimitive::FillRectBatch(_)))
+        );
+    }
+
+    #[test]
+    fn waterfall_storage_identity_is_nonzero_and_stable_for_same_frame_geometry() {
+        let frame = test_frame();
+        let plot = SpectrogramWidget::plot_rect(bounds());
+        let first = waterfall_shader_descriptor(frame.as_ref(), plot, 2.5);
+        let second = waterfall_shader_descriptor(frame.as_ref(), plot, 2.5);
+
+        assert_ne!(WATERFALL_STORAGE_IDENTITY, 0);
+        assert_ne!(first.storage_identity, 0);
+        assert_eq!(first.storage_identity, second.storage_identity);
+        assert_eq!(
+            first.storage_identity,
+            waterfall_storage_identity(plot, 2.5)
+        );
+        assert_eq!(first.storage_revision, frame.gpu_revision());
+        assert!(Arc::ptr_eq(&first.storage_bytes, &second.storage_bytes));
+    }
+
+    #[test]
+    fn waterfall_storage_revision_changes_for_new_frames_but_identity_stays_stable() {
+        let first_frame = test_frame();
+        let second_frame = test_frame();
+        let plot = SpectrogramWidget::plot_rect(bounds());
+        let first = waterfall_shader_descriptor(first_frame.as_ref(), plot, 2.5);
+        let second = waterfall_shader_descriptor(second_frame.as_ref(), plot, 2.5);
+
+        assert_ne!(first_frame.gpu_revision(), second_frame.gpu_revision());
+        assert_ne!(first.storage_revision, second.storage_revision);
+        assert_eq!(first.storage_revision, first_frame.gpu_revision());
+        assert_eq!(second.storage_revision, second_frame.gpu_revision());
+        assert_eq!(first.storage_identity, second.storage_identity);
+    }
+
+    #[test]
+    fn waterfall_storage_identity_changes_with_height_and_history_scale() {
+        let plot = Rect::from_min_size(Point::new(0.0, 0.0), Vector2::new(100.0, 72.0));
+        let taller_plot = Rect::from_min_size(Point::new(0.0, 0.0), Vector2::new(100.0, 73.0));
+        let base = waterfall_storage_identity(plot, 1.0);
+
+        assert_ne!(base, waterfall_storage_identity(taller_plot, 1.0));
+        assert_ne!(base, waterfall_storage_identity(plot, 2.0));
+        assert_eq!(base, waterfall_storage_identity(plot, 0.5));
+        assert_eq!(
+            waterfall_storage_identity(plot, 99.0),
+            waterfall_storage_identity(plot, super::MAX_HISTORY_SCALE)
         );
     }
 
