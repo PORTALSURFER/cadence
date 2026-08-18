@@ -182,17 +182,11 @@ enum Message {
     WaveformPlayheadDragStarted {
         ratio: f32,
     },
-    WaveformPlayheadDragMoved {
-        ratio: f32,
-    },
     WaveformPlayheadDragEnded {
         ratio: f32,
     },
     WaveformPlayheadDragCancelled,
     ReferencePlayheadDragStarted {
-        ratio: f32,
-    },
-    ReferencePlayheadDragMoved {
         ratio: f32,
     },
     ReferencePlayheadDragEnded {
@@ -203,9 +197,6 @@ enum Message {
         ratio: f32,
         note_index: Option<usize>,
     },
-    CommentDragMoved {
-        ratio: f32,
-    },
     CommentDragEnded {
         ratio: f32,
     },
@@ -213,9 +204,6 @@ enum Message {
     ReferenceCommentDragStarted {
         ratio: f32,
         note_index: Option<usize>,
-    },
-    ReferenceCommentDragMoved {
-        ratio: f32,
     },
     ReferenceCommentDragEnded {
         ratio: f32,
@@ -901,7 +889,6 @@ struct PersistedNoteDrag {
     track_id: String,
     note_id: String,
     original_time_millis: u64,
-    moved: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2722,12 +2709,6 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             state.hovered_note_id = None;
             seek_review_position(state, context, ratio, false);
         }
-        Message::WaveformPlayheadDragMoved { ratio } => {
-            if !state.playhead_drag_active {
-                return;
-            }
-            seek_review_position(state, context, ratio, false);
-        }
         Message::WaveformPlayheadDragEnded { ratio } => {
             if !state.playhead_drag_active {
                 return;
@@ -2754,12 +2735,6 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             state.hovered_reference_note_id = None;
             seek_reference_waveform_position(state, context, ratio, false);
         }
-        Message::ReferencePlayheadDragMoved { ratio } => {
-            if !state.reference_playhead_drag_active {
-                return;
-            }
-            seek_reference_waveform_position(state, context, ratio, false);
-        }
         Message::ReferencePlayheadDragEnded { ratio } => {
             if !state.reference_playhead_drag_active {
                 return;
@@ -2779,16 +2754,6 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 start_persisted_note_drag(state, context, note_index);
             } else {
                 rollback_persisted_note_drag(state);
-                move_draft_note(state, context, ratio);
-            }
-        }
-        Message::CommentDragMoved { ratio } => {
-            if state.busy || state.waveform_busy {
-                return;
-            }
-            if state.persisted_note_drag.is_some() {
-                move_persisted_note(state, context, ratio);
-            } else {
                 move_draft_note(state, context, ratio);
             }
         }
@@ -2819,16 +2784,6 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 start_reference_persisted_note_drag(state, context, note_index);
             } else {
                 rollback_reference_persisted_note_drag(state);
-                move_reference_draft_note(state, context, ratio);
-            }
-        }
-        Message::ReferenceCommentDragMoved { ratio } => {
-            if state.busy || state.waveform_busy || state.reference_waveform_busy {
-                return;
-            }
-            if state.reference_persisted_note_drag.is_some() {
-                move_reference_persisted_note(state, context, ratio);
-            } else {
                 move_reference_draft_note(state, context, ratio);
             }
         }
@@ -4409,61 +4364,12 @@ fn start_persisted_note_drag(
         track_id,
         note_id: note_id.clone(),
         original_time_millis: time_millis,
-        moved: false,
     });
     state.selected_note_id = Some(note_id);
     state.hovered_note_id = None;
     state.review_cursor_millis = time_millis;
     state.transport_position_millis = time_millis;
     state.status = format!("Dragging comment at {}…", format_timestamp(time_millis));
-    context.request_repaint();
-}
-
-fn move_persisted_note(
-    state: &mut AppState,
-    context: &mut ui::UiUpdateContext<Message>,
-    ratio: f32,
-) {
-    let Some(drag) = state.persisted_note_drag.clone() else {
-        return;
-    };
-    let Some(duration_millis) = state
-        .waveform
-        .as_ref()
-        .filter(|_| state.waveform_track_id.as_deref() == Some(drag.track_id.as_str()))
-        .map(|waveform| waveform.duration_millis)
-    else {
-        rollback_persisted_note_drag(state);
-        return;
-    };
-    let time_millis = waveform::millis_for_ratio(ratio, duration_millis);
-    let note_exists = state
-        .library
-        .tracks
-        .iter_mut()
-        .find(|track| track.id == drag.track_id)
-        .and_then(|track| track.notes.iter_mut().find(|note| note.id == drag.note_id))
-        .map(|note| note.time_millis = time_millis)
-        .is_some();
-    if !note_exists {
-        rollback_persisted_note_drag(state);
-        state.status = String::from("That comment no longer exists.");
-        context.request_repaint();
-        return;
-    }
-    if let Some(active_drag) = state.persisted_note_drag.as_mut() {
-        active_drag.moved |= time_millis != active_drag.original_time_millis;
-    }
-    if let Some(draft) = state
-        .draft_note
-        .as_mut()
-        .filter(|draft| draft.note_id.as_deref() == Some(drag.note_id.as_str()))
-    {
-        draft.time_millis = time_millis;
-    }
-    state.review_cursor_millis = time_millis;
-    state.transport_position_millis = time_millis;
-    state.status = format!("Comment at {}.", format_timestamp(time_millis));
     context.request_repaint();
 }
 
@@ -4499,7 +4405,7 @@ fn finish_persisted_note_drag(
         context.request_repaint();
         return;
     };
-    if drag.moved {
+    if time_millis != drag.original_time_millis {
         note.time_millis = time_millis;
     }
     let final_time_millis = note.time_millis;
@@ -4605,7 +4511,6 @@ fn start_reference_persisted_note_drag(
         track_id,
         note_id: note_id.clone(),
         original_time_millis: time_millis,
-        moved: false,
     });
     state.selected_reference_note_id = Some(note_id);
     state.hovered_reference_note_id = None;
@@ -4614,57 +4519,6 @@ fn start_reference_persisted_note_drag(
         "Dragging reference comment at {}…",
         format_timestamp(time_millis)
     );
-    context.request_repaint();
-}
-
-fn move_reference_persisted_note(
-    state: &mut AppState,
-    context: &mut ui::UiUpdateContext<Message>,
-    ratio: f32,
-) {
-    let Some(drag) = state.reference_persisted_note_drag.clone() else {
-        return;
-    };
-    let Some(duration_millis) = state
-        .reference_waveform
-        .as_ref()
-        .filter(|_| {
-            !state.reference_waveform_busy
-                && state.reference_waveform_track_id.as_deref() == Some(drag.track_id.as_str())
-        })
-        .map(|waveform| waveform.duration_millis)
-    else {
-        rollback_reference_persisted_note_drag(state);
-        return;
-    };
-    let time_millis = waveform::millis_for_ratio(ratio, duration_millis);
-    let note_exists = selected_reference_track_mut(state)
-        .and_then(|reference| {
-            reference
-                .notes
-                .iter_mut()
-                .find(|note| note.id == drag.note_id)
-        })
-        .map(|note| note.time_millis = time_millis)
-        .is_some();
-    if !note_exists {
-        rollback_reference_persisted_note_drag(state);
-        state.status = String::from("That reference comment no longer exists.");
-        context.request_repaint();
-        return;
-    }
-    if let Some(active_drag) = state.reference_persisted_note_drag.as_mut() {
-        active_drag.moved |= time_millis != active_drag.original_time_millis;
-    }
-    if let Some(draft) = state
-        .reference_draft_note
-        .as_mut()
-        .filter(|draft| draft.note_id.as_deref() == Some(drag.note_id.as_str()))
-    {
-        draft.time_millis = time_millis;
-    }
-    state.reference_transport_position_millis = time_millis;
-    state.status = format!("Reference comment at {}.", format_timestamp(time_millis));
     context.request_repaint();
 }
 
@@ -4702,7 +4556,7 @@ fn finish_reference_persisted_note_drag(
         context.request_repaint();
         return;
     };
-    if drag.moved {
+    if time_millis != drag.original_time_millis {
         note.time_millis = time_millis;
     }
     let final_time_millis = note.time_millis;
@@ -8400,9 +8254,6 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
                 waveform::WaveformInteraction::PlayheadDragStarted { ratio } => {
                     Message::WaveformPlayheadDragStarted { ratio }
                 }
-                waveform::WaveformInteraction::PlayheadDragMoved { ratio } => {
-                    Message::WaveformPlayheadDragMoved { ratio }
-                }
                 waveform::WaveformInteraction::PlayheadDragEnded { ratio } => {
                     Message::WaveformPlayheadDragEnded { ratio }
                 }
@@ -8411,9 +8262,6 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
                 }
                 waveform::WaveformInteraction::CommentDragStarted { ratio, note_index } => {
                     Message::CommentDragStarted { ratio, note_index }
-                }
-                waveform::WaveformInteraction::CommentDragMoved { ratio } => {
-                    Message::CommentDragMoved { ratio }
                 }
                 waveform::WaveformInteraction::CommentDragEnded { ratio } => {
                     Message::CommentDragEnded { ratio }
@@ -8789,9 +8637,6 @@ fn reference_waveform_section(state: &AppState, track: &storage::Track) -> ui::V
                 waveform::WaveformInteraction::PlayheadDragStarted { ratio } => {
                     Message::ReferencePlayheadDragStarted { ratio }
                 }
-                waveform::WaveformInteraction::PlayheadDragMoved { ratio } => {
-                    Message::ReferencePlayheadDragMoved { ratio }
-                }
                 waveform::WaveformInteraction::PlayheadDragEnded { ratio } => {
                     Message::ReferencePlayheadDragEnded { ratio }
                 }
@@ -8800,9 +8645,6 @@ fn reference_waveform_section(state: &AppState, track: &storage::Track) -> ui::V
                 }
                 waveform::WaveformInteraction::CommentDragStarted { ratio, note_index } => {
                     Message::ReferenceCommentDragStarted { ratio, note_index }
-                }
-                waveform::WaveformInteraction::CommentDragMoved { ratio } => {
-                    Message::ReferenceCommentDragMoved { ratio }
                 }
                 waveform::WaveformInteraction::CommentDragEnded { ratio } => {
                     Message::ReferenceCommentDragEnded { ratio }
@@ -11464,14 +11306,6 @@ mod tests {
 
         update(
             &mut state,
-            Message::WaveformPlayheadDragMoved { ratio: 0.75 },
-            &mut context,
-        );
-        assert_eq!(state.review_cursor_millis, 750);
-        assert_eq!(state.transport_position_millis, 750);
-
-        update(
-            &mut state,
             Message::WaveformPlayheadDragEnded { ratio: 0.5 },
             &mut context,
         );
@@ -11623,18 +11457,13 @@ mod tests {
         assert!(state.draft_note.is_none());
         assert!(state.persisted_note_drag.is_some());
 
-        update(
-            &mut state,
-            Message::CommentDragMoved { ratio: 0.75 },
-            &mut context,
-        );
-        assert_eq!(state.review_cursor_millis, 1_500);
-        assert_eq!(state.transport_position_millis, 1_500);
+        assert_eq!(state.review_cursor_millis, 500);
+        assert_eq!(state.transport_position_millis, 500);
         assert_eq!(
             selected_track(&state)
                 .and_then(|track| track.notes.iter().find(|note| note.id == note_id))
                 .map(|note| note.time_millis),
-            Some(1_500)
+            Some(500)
         );
 
         update(
@@ -11673,13 +11502,8 @@ mod tests {
             },
             &mut context,
         );
-        update(
-            &mut state,
-            Message::CommentDragMoved { ratio: 0.75 },
-            &mut context,
-        );
-        assert_eq!(state.review_cursor_millis, 1_500);
-        assert_eq!(state.transport_position_millis, 1_500);
+        assert_eq!(state.review_cursor_millis, 500);
+        assert_eq!(state.transport_position_millis, 500);
         assert_eq!(
             state
                 .library
@@ -11688,11 +11512,11 @@ mod tests {
                 .find(|track| track.id == track_id)
                 .and_then(|track| track.notes.iter().find(|note| note.id == note_id))
                 .map(|note| note.time_millis),
-            Some(1_500)
+            Some(500)
         );
         assert_eq!(
             state.draft_note.as_ref().map(|draft| draft.time_millis),
-            Some(1_500)
+            Some(500)
         );
 
         update(&mut state, Message::CommentDragCancelled, &mut context);
@@ -11711,11 +11535,6 @@ mod tests {
         assert!(state.persisted_note_drag.is_none());
         assert!(!state.save_in_flight);
 
-        update(
-            &mut state,
-            Message::CommentDragMoved { ratio: 0.25 },
-            &mut context,
-        );
         update(
             &mut state,
             Message::CommentDragEnded { ratio: 0.25 },
@@ -12784,15 +12603,6 @@ mod tests {
 
         update(
             &mut state,
-            Message::ReferencePlayheadDragMoved { ratio: 0.75 },
-            &mut context,
-        );
-        assert_eq!(state.reference_transport_position_millis, 3_000);
-        assert_eq!(state.review_cursor_millis, 600);
-        assert_eq!(state.transport_position_millis, 600);
-
-        update(
-            &mut state,
             Message::ReferencePlayheadDragEnded { ratio: 0.5 },
             &mut context,
         );
@@ -12831,19 +12641,14 @@ mod tests {
             },
             &mut context,
         );
-        update(
-            &mut state,
-            Message::ReferenceCommentDragMoved { ratio: 0.75 },
-            &mut context,
-        );
         assert_eq!(
             state
                 .reference_draft_note
                 .as_ref()
                 .map(|draft| draft.time_millis),
-            Some(3_000)
+            Some(1_000)
         );
-        assert_eq!(state.reference_transport_position_millis, 3_000);
+        assert_eq!(state.reference_transport_position_millis, 1_000);
         assert_eq!(state.review_cursor_millis, 0);
         assert_eq!(state.transport_position_millis, 0);
 
@@ -12882,19 +12687,14 @@ mod tests {
         assert!(state.reference_persisted_note_drag.is_some());
         assert_eq!(state.reference_transport_position_millis, 500);
 
-        update(
-            &mut state,
-            Message::ReferenceCommentDragMoved { ratio: 0.75 },
-            &mut context,
-        );
         assert_eq!(
             selected_reference_notes(&state)
                 .iter()
                 .find(|note| note.id == note_id)
                 .map(|note| note.time_millis),
-            Some(3_000)
+            Some(500)
         );
-        assert_eq!(state.reference_transport_position_millis, 3_000);
+        assert_eq!(state.reference_transport_position_millis, 500);
 
         update(
             &mut state,
@@ -12929,17 +12729,12 @@ mod tests {
             },
             &mut context,
         );
-        update(
-            &mut state,
-            Message::ReferenceCommentDragMoved { ratio: 0.75 },
-            &mut context,
-        );
         assert_eq!(
             selected_reference_notes(&state)
                 .iter()
                 .find(|note| note.id == note_id)
                 .map(|note| note.time_millis),
-            Some(3_000)
+            Some(500)
         );
 
         update(
@@ -13962,7 +13757,7 @@ mod tests {
 
         update(
             &mut state,
-            Message::CommentDragMoved { ratio: 0.75 },
+            Message::CommentDragEnded { ratio: 0.75 },
             &mut context,
         );
         assert_eq!(
@@ -13982,7 +13777,7 @@ mod tests {
             .note_id = Some(String::from("existing-note"));
         update(
             &mut state,
-            Message::CommentDragMoved { ratio: 0.25 },
+            Message::CommentDragEnded { ratio: 0.25 },
             &mut context,
         );
         assert_eq!(
