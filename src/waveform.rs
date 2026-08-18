@@ -155,9 +155,6 @@ pub enum WaveformInteraction {
     PlayheadDragStarted {
         ratio: f32,
     },
-    PlayheadDragMoved {
-        ratio: f32,
-    },
     PlayheadDragEnded {
         ratio: f32,
     },
@@ -378,6 +375,7 @@ struct WaveformWidget {
     hover_lower: bool,
     hovered_note_ratio: Option<f32>,
     playhead_dragging: bool,
+    playhead_preview_ratio: Option<f32>,
     pending_upper_click: bool,
     pointer_down_position: Option<Point>,
     pointer_down_ratio: Option<f32>,
@@ -429,6 +427,7 @@ impl WaveformWidget {
             hover_lower: false,
             hovered_note_ratio: None,
             playhead_dragging: false,
+            playhead_preview_ratio: None,
             pending_upper_click: false,
             pointer_down_position: None,
             pointer_down_ratio: None,
@@ -604,6 +603,7 @@ impl WaveformWidget {
 
     fn clear_pointer_state(&mut self) {
         self.playhead_dragging = false;
+        self.playhead_preview_ratio = None;
         self.pending_upper_click = false;
         self.pointer_down_position = None;
         self.pointer_down_ratio = None;
@@ -653,12 +653,11 @@ impl Widget for WaveformWidget {
                         ratio,
                     }))
                 } else if self.playhead_dragging {
+                    self.playhead_preview_ratio = Some(ratio);
                     self.hover_ratio = Some(ratio);
                     self.hover_lower = false;
                     self.hovered_note_ratio = None;
-                    Some(WidgetOutput::typed(
-                        WaveformInteraction::PlayheadDragMoved { ratio },
-                    ))
+                    None
                 } else if self.loop_drag_start_ratio.is_some() {
                     self.loop_drag_current_ratio = Some(ratio);
                     self.hover_ratio = Some(ratio);
@@ -731,6 +730,7 @@ impl Widget for WaveformWidget {
                     }))
                 } else if self.playhead_hit(bounds, position) {
                     self.playhead_dragging = true;
+                    self.playhead_preview_ratio = Some(ratio);
                     self.pending_upper_click = false;
                     self.pointer_down_position = None;
                     self.pointer_down_ratio = None;
@@ -787,6 +787,7 @@ impl Widget for WaveformWidget {
             } if self.playhead_dragging => {
                 let ratio = self.timeline.ratio_at(bounds, position);
                 self.playhead_dragging = false;
+                self.playhead_preview_ratio = None;
                 self.common.state.hovered = self.timeline.interactive_contains(bounds, position);
                 self.hover_ratio = self.common.state.hovered.then_some(ratio);
                 self.hover_lower = false;
@@ -895,6 +896,7 @@ impl Widget for WaveformWidget {
             })
         });
         self.playhead_dragging = previous.playhead_dragging;
+        self.playhead_preview_ratio = previous.playhead_preview_ratio;
         self.pending_upper_click = previous.pending_upper_click;
         self.pointer_down_position = previous.pointer_down_position;
         self.pointer_down_ratio = previous.pointer_down_ratio;
@@ -1092,7 +1094,7 @@ impl Widget for WaveformWidget {
                 colors,
             );
         }
-        if let Some(ratio) = self.hover_ratio {
+        if let Some(ratio) = self.playhead_preview_ratio.or(self.hover_ratio) {
             let x = self.timeline.x_at(bounds, ratio);
             let line_bottom = rail_y - CURSOR_GAP_ABOVE_RAIL;
             fill_rect(
@@ -3104,18 +3106,18 @@ mod tests {
             )),
             WaveformInteraction::PlayheadDragStarted { ratio: 0.25 }
         );
-        assert_eq!(
-            interaction(
-                widget.handle_input(bounds, WidgetInput::pointer_move(Point::new(-40.0, 40.0)),)
-            ),
-            WaveformInteraction::PlayheadDragMoved { ratio: 0.0 }
+        assert!(
+            widget
+                .handle_input(bounds, WidgetInput::pointer_move(Point::new(-40.0, 40.0)),)
+                .is_none()
         );
-        assert_eq!(
-            interaction(
-                widget.handle_input(bounds, WidgetInput::pointer_move(Point::new(180.0, 40.0)),)
-            ),
-            WaveformInteraction::PlayheadDragMoved { ratio: 1.0 }
+        assert_eq!(widget.playhead_preview_ratio, Some(0.0));
+        assert!(
+            widget
+                .handle_input(bounds, WidgetInput::pointer_move(Point::new(180.0, 40.0)),)
+                .is_none()
         );
+        assert_eq!(widget.playhead_preview_ratio, Some(1.0));
         assert_eq!(
             interaction(widget.handle_input(
                 bounds,
@@ -3124,6 +3126,77 @@ mod tests {
             WaveformInteraction::PlayheadDragEnded { ratio: 0.5 }
         );
         assert!(!widget.playhead_dragging);
+        assert_eq!(widget.playhead_preview_ratio, None);
+    }
+
+    #[test]
+    fn main_and_reference_playhead_moves_are_paint_only_and_release_once() {
+        let bounds = Rect::from_min_max(Point::new(10.0, 20.0), Point::new(110.0, 120.0));
+        let waveform = Arc::new(test_waveform());
+
+        for source in [WaveformSource::Main, WaveformSource::Reference] {
+            let mut widget = WaveformWidget::new_for_source(
+                source,
+                0,
+                Arc::clone(&waveform),
+                Some(0.2),
+                Vec::new(),
+            );
+            assert_eq!(
+                interaction(widget.handle_input(
+                    bounds,
+                    WidgetInput::primary_press(Point::new(timeline_x(bounds, 0.2), 40.0)),
+                )),
+                WaveformInteraction::PlayheadDragStarted { ratio: 0.2 }
+            );
+
+            for ratio in [0.05, 0.35, 0.65, 0.95, 0.4] {
+                assert!(
+                    widget
+                        .handle_input(
+                            bounds,
+                            WidgetInput::pointer_move(Point::new(timeline_x(bounds, ratio), 40.0)),
+                        )
+                        .is_none()
+                );
+                assert_eq!(widget.playhead_preview_ratio, Some(ratio));
+
+                let mut overlay = Vec::new();
+                widget.append_runtime_overlay_paint(
+                    &mut overlay,
+                    bounds,
+                    &Default::default(),
+                    &Default::default(),
+                );
+                let expected_x = timeline_x(bounds, ratio);
+                assert!(overlay.iter().any(|primitive| {
+                    matches!(
+                        primitive,
+                        PaintPrimitive::FillRect(fill)
+                            if fill.color == colors().cursor
+                                && ((fill.rect.min.x + fill.rect.max.x) * 0.5 - expected_x).abs()
+                                    < f32::EPSILON
+                    )
+                }));
+            }
+
+            assert_eq!(
+                interaction(widget.handle_input(
+                    bounds,
+                    WidgetInput::primary_release(Point::new(timeline_x(bounds, 0.4), 40.0)),
+                )),
+                WaveformInteraction::PlayheadDragEnded { ratio: 0.4 }
+            );
+            assert_eq!(widget.playhead_preview_ratio, None);
+            assert!(
+                widget
+                    .handle_input(
+                        bounds,
+                        WidgetInput::primary_release(Point::new(timeline_x(bounds, 0.4), 40.0)),
+                    )
+                    .is_none()
+            );
+        }
     }
 
     #[test]
@@ -3478,11 +3551,26 @@ mod tests {
         current.synchronize_from_previous(&previous);
 
         assert_eq!(
-            interaction(current.handle_input(
+            current.handle_input(
                 bounds,
                 WidgetInput::pointer_move(Point::new(timeline_x(bounds, 0.75), 40.0)),
-            )),
-            WaveformInteraction::PlayheadDragMoved { ratio: 0.75 }
+            ),
+            None
+        );
+        assert_eq!(current.playhead_preview_ratio, Some(0.75));
+        assert_eq!(
+            Widget::handle_pointer_capture_cancelled(&mut current, bounds)
+                .and_then(|output| output.typed_copied()),
+            Some(WaveformInteraction::PlayheadDragCancelled)
+        );
+        assert_eq!(current.playhead_preview_ratio, None);
+        assert!(
+            current
+                .handle_input(
+                    bounds,
+                    WidgetInput::primary_release(Point::new(timeline_x(bounds, 0.75), 40.0)),
+                )
+                .is_none()
         );
     }
 
