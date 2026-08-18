@@ -6254,7 +6254,7 @@ fn planner_drag_preview(
             PLANNER_DRAG_PREVIEW_CARD_HEIGHT,
         ),
         planner_card_with_key(
-            track.clone(),
+            track,
             selected_id,
             None,
             None,
@@ -6292,11 +6292,10 @@ fn project_surface(state: &AppState) -> ui::View<Message> {
                 .library
                 .tracks
                 .iter()
-                .find(|track| track.id == track_id)
-                .cloned()?;
+                .find(|track| track.id == track_id)?;
             let pointer = state.planner_drag_pointer?;
             Some(planner_drag_preview(
-                &track,
+                track,
                 state.library.selected_track_id.as_deref(),
                 pointer,
             ))
@@ -6868,7 +6867,7 @@ fn planner_panel(state: &AppState) -> ui::View<Message> {
     let columns = stages.into_iter().map(|stage| {
         planner_column(
             stage,
-            tracks_in_stage(&filtered_tracks, stage),
+            filtered_tracks.tracks_in_stage(stage),
             state.planner_status_filter,
             PlannerColumnContext {
                 selected_id: state.library.selected_track_id.as_deref(),
@@ -6932,7 +6931,7 @@ struct PlannerColumnContext<'a> {
 
 fn planner_column(
     stage: storage::TrackStage,
-    tracks: Vec<storage::Track>,
+    tracks: &[&storage::Track],
     status_filter: Option<storage::TrackStatus>,
     context: PlannerColumnContext<'_>,
     drag_active: bool,
@@ -7003,7 +7002,7 @@ fn planner_column(
         children.push(empty_content);
     } else {
         let mut rows = Vec::with_capacity(tracks.len() + usize::from(drag_active));
-        for (index, track) in tracks.into_iter().enumerate() {
+        for (index, track) in tracks.iter().copied().enumerate() {
             let card = planner_card(
                 track,
                 selected_id,
@@ -7248,7 +7247,7 @@ fn planner_stage_visual_color(stage: storage::TrackStage, theme: &ThemeTokens) -
 }
 
 fn planner_card(
-    track: storage::Track,
+    track: &storage::Track,
     selected_id: Option<&str>,
     stage_menu_track_id: Option<&str>,
     status_menu_track_id: Option<&str>,
@@ -7268,7 +7267,7 @@ fn planner_card(
 }
 
 fn planner_card_with_key(
-    track: storage::Track,
+    track: &storage::Track,
     selected_id: Option<&str>,
     stage_menu_track_id: Option<&str>,
     status_menu_track_id: Option<&str>,
@@ -7286,8 +7285,8 @@ fn planner_card_with_key(
     let review_track_id = track.id.clone();
     let remove_id = track.id.clone();
     let favorite_control =
-        favorite_toggle(&track, selected, format!("planner-favorite-{}", track.id));
-    let replace_control = replace_toggle(&track, format!("planner-replace-{}", track.id));
+        favorite_toggle(track, selected, format!("planner-favorite-{}", track.id));
+    let replace_control = replace_toggle(track, format!("planner-replace-{}", track.id));
     let review_control = ui::icon_button(planner_review_icon())
         .subtle()
         .message(Message::SelectTrack(review_track_id))
@@ -7375,8 +7374,8 @@ fn planner_card_with_key(
         .height(22.0)
         .fill_width()
         .subtle(),
-        stage_dropdown(&track, stage_menu_open, selected),
-        status_dropdown_for_host(&track, status_menu_open, selected, StatusMenuHost::Planner),
+        stage_dropdown(track, stage_menu_open, selected),
+        status_dropdown_for_host(track, status_menu_open, selected, StatusMenuHost::Planner),
     ])
     .padding(TRACK_CARD_CONTENT_INSET)
     .spacing(TRACK_CARD_CONTENT_SPACING)
@@ -7398,19 +7397,50 @@ fn tracks_with_status(
     favorites.into_iter().chain(non_favorites).collect()
 }
 
+struct PlannerTrackProjection<'a> {
+    ordered: Vec<&'a storage::Track>,
+    by_stage: [Vec<&'a storage::Track>; 4],
+}
+
+impl<'a> PlannerTrackProjection<'a> {
+    fn tracks_in_stage(&self, stage: storage::TrackStage) -> &[&'a storage::Track] {
+        &self.by_stage[planner_stage_index(stage)]
+    }
+
+    fn len(&self) -> usize {
+        self.ordered.len()
+    }
+}
+
+fn planner_stage_index(stage: storage::TrackStage) -> usize {
+    match stage {
+        storage::TrackStage::SoundDesign => 0,
+        storage::TrackStage::Production => 1,
+        storage::TrackStage::Mixdown => 2,
+        storage::TrackStage::Mastering => 3,
+    }
+}
+
 fn planner_tracks_with_status(
     library: &storage::Library,
     status: Option<storage::TrackStatus>,
-) -> Vec<storage::Track> {
-    storage::planner_order(library)
+) -> PlannerTrackProjection<'_> {
+    let ordered = storage::planner_tracks(library)
         .into_iter()
-        .filter_map(|id| library.tracks.iter().find(|track| track.id == id))
         .filter(|track| status.is_none_or(|status| track.status == status))
-        .cloned()
-        .collect()
+        .collect::<Vec<_>>();
+    let mut by_stage = std::array::from_fn(|_| Vec::new());
+    for track in &ordered {
+        by_stage[planner_stage_index(track.stage)].push(*track);
+    }
+    PlannerTrackProjection { ordered, by_stage }
 }
 
-fn tracks_in_stage(tracks: &[storage::Track], stage: storage::TrackStage) -> Vec<storage::Track> {
+#[cfg(test)]
+fn owned_tracks_in_stage(
+    tracks: &[storage::Track],
+    stage: storage::TrackStage,
+) -> Vec<storage::Track> {
     tracks
         .iter()
         .filter(|track| track.stage == stage)
@@ -7431,9 +7461,8 @@ fn planner_insertion_target_is_valid(
         return false;
     }
     let target_count = planner_tracks_with_status(library, status_filter)
-        .iter()
-        .filter(|track| track.stage == target.stage)
-        .count();
+        .tracks_in_stage(target.stage)
+        .len();
     target.slot <= target_count
 }
 
@@ -7442,10 +7471,8 @@ fn planner_insertion_status(
     target: &PlannerInsertionTarget,
     status_filter: Option<storage::TrackStatus>,
 ) -> String {
-    let tracks = planner_tracks_with_status(library, status_filter)
-        .into_iter()
-        .filter(|track| track.stage == target.stage)
-        .collect::<Vec<_>>();
+    let projection = planner_tracks_with_status(library, status_filter);
+    let tracks = projection.tracks_in_stage(target.stage);
     if let Some(track) = tracks.get(target.slot) {
         format!("Release above {}.", track.title)
     } else {
@@ -9514,15 +9541,15 @@ mod tests {
         enforce_loop, favorite_toggle, frame_surface_revisions, library_track_title_id,
         live_frame_matches_current_session, live_spectrogram_display_sample_rate, loop_bounds,
         main_output_gain, native_launch_options, note_editor, note_ratio_for_id,
-        paint_live_playback_overlay, planner_insertion_target_is_valid, playback_shortcut,
-        project_surface, rebuild_audition_queue, reconcile_audition_queue,
-        reference_decode_result_is_current, reference_output_gain,
+        owned_tracks_in_stage, paint_live_playback_overlay, planner_insertion_target_is_valid,
+        planner_tracks_with_status, playback_shortcut, project_surface, rebuild_audition_queue,
+        reconcile_audition_queue, reference_decode_result_is_current, reference_output_gain,
         reference_settings_auxiliary_windows, reference_settings_window_view,
         refresh_live_spectrogram, refresh_live_spectrograms, review_spectrogram_source,
         review_status_filter_message, selected_reference_notes, selected_track, stage_dropdown,
         stage_menu_anchor_from_pointer, stage_menu_popover, status_dropdown_for_host,
-        status_filter_dropdown, sync_audition_queue_after_status_change, tracks_in_stage,
-        tracks_with_status, transport_command_is_confirmed, update,
+        status_filter_dropdown, sync_audition_queue_after_status_change, tracks_with_status,
+        transport_command_is_confirmed, update,
     };
     use crate::transport::{LiveFrameState, Snapshot};
     use crate::{
@@ -15962,12 +15989,93 @@ mod tests {
             track("production", TrackStage::Production),
         ];
 
-        let production = tracks_in_stage(&tracks, TrackStage::Production);
-        let mastering = tracks_in_stage(&tracks, TrackStage::Mastering);
+        let production = owned_tracks_in_stage(&tracks, TrackStage::Production);
+        let mastering = owned_tracks_in_stage(&tracks, TrackStage::Mastering);
 
         assert_eq!(production.len(), 1);
         assert_eq!(production[0].id, "production");
         assert!(mastering.is_empty());
+    }
+
+    #[test]
+    fn planner_projection_filters_and_groups_borrowed_tracks_once() {
+        let track = |id: &str, status: TrackStatus, stage: TrackStage| Track {
+            id: String::from(id),
+            title: format!("{id} track"),
+            original_name: format!("{id}.wav"),
+            path: PathBuf::from(format!("/external/{id}.wav")),
+            reference_path: None,
+            size: 0,
+            favorite: false,
+            stage,
+            status,
+            notes: Vec::new(),
+        };
+        let library = Library {
+            tracks: vec![
+                track("sound", TrackStatus::Refine, TrackStage::SoundDesign),
+                track("production", TrackStatus::Inbox, TrackStage::Production),
+                track("mix", TrackStatus::Refine, TrackStage::Mixdown),
+                track("master", TrackStatus::Refine, TrackStage::Mastering),
+                track("tail", TrackStatus::Refine, TrackStage::Production),
+            ],
+            selected_track_id: None,
+            reference_tracks: Vec::new(),
+            planner_order: vec![
+                String::from("missing"),
+                String::from("mix"),
+                String::from("mix"),
+                String::from("sound"),
+            ],
+        };
+
+        let projection = planner_tracks_with_status(&library, Some(TrackStatus::Refine));
+        assert_eq!(
+            projection
+                .ordered
+                .iter()
+                .map(|track| track.id.as_str())
+                .collect::<Vec<_>>(),
+            ["mix", "sound", "master", "tail"]
+        );
+        assert!(std::ptr::eq(projection.ordered[0], &library.tracks[2]));
+        assert!(std::ptr::eq(projection.ordered[1], &library.tracks[0]));
+        assert!(std::ptr::eq(
+            projection.tracks_in_stage(TrackStage::Production)[0],
+            &library.tracks[4]
+        ));
+        assert_eq!(
+            projection
+                .tracks_in_stage(TrackStage::SoundDesign)
+                .iter()
+                .map(|track| track.id.as_str())
+                .collect::<Vec<_>>(),
+            ["sound"]
+        );
+        assert_eq!(
+            projection
+                .tracks_in_stage(TrackStage::Production)
+                .iter()
+                .map(|track| track.id.as_str())
+                .collect::<Vec<_>>(),
+            ["tail"]
+        );
+        assert_eq!(
+            projection
+                .tracks_in_stage(TrackStage::Mixdown)
+                .iter()
+                .map(|track| track.id.as_str())
+                .collect::<Vec<_>>(),
+            ["mix"]
+        );
+        assert_eq!(
+            projection
+                .tracks_in_stage(TrackStage::Mastering)
+                .iter()
+                .map(|track| track.id.as_str())
+                .collect::<Vec<_>>(),
+            ["master"]
+        );
     }
 
     fn planner_scroll_state(cards_per_stage: usize) -> AppState {
@@ -16352,7 +16460,7 @@ mod tests {
             ["refine"]
         );
         assert_eq!(
-            tracks_in_stage(&refined, TrackStage::Production)
+            owned_tracks_in_stage(&refined, TrackStage::Production)
                 .iter()
                 .map(|track| track.id.as_str())
                 .collect::<Vec<_>>(),
