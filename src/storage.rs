@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env, fs,
     io::{ErrorKind, Write},
     path::{Path, PathBuf},
@@ -463,10 +463,68 @@ pub fn normalize_planner_order(library: &mut Library) {
 }
 
 /// Return the effective Planner order without mutating the library.
+#[allow(dead_code)]
 pub fn planner_order(library: &Library) -> Vec<String> {
-    let mut normalized = library.clone();
-    normalize_planner_order(&mut normalized);
-    normalized.planner_order
+    planner_tracks(library)
+        .into_iter()
+        .map(|track| track.id.clone())
+        .collect()
+}
+
+/// Return the effective Planner order as borrowed tracks without mutating the
+/// library.
+///
+/// The first track for a duplicate ID wins, matching the historical
+/// `planner_order` projection. Empty persisted orders retain the legacy
+/// favorite-first ordering, including its one-entry-per-track behavior for
+/// duplicate IDs. Explicit orders discard stale and duplicate IDs, then append
+/// missing track IDs in library order.
+pub fn planner_tracks<'a>(library: &'a Library) -> Vec<&'a Track> {
+    let first_track_by_id = library.tracks.iter().fold(
+        HashMap::<&str, &'a Track>::with_capacity(library.tracks.len()),
+        |mut tracks, track| {
+            tracks.entry(track.id.as_str()).or_insert(track);
+            tracks
+        },
+    );
+    let mut ordered = Vec::with_capacity(library.tracks.len());
+
+    if library.planner_order.is_empty() {
+        for track in library.tracks.iter().filter(|track| track.favorite) {
+            ordered.push(
+                *first_track_by_id
+                    .get(track.id.as_str())
+                    .expect("every library track must be indexed by its ID"),
+            );
+        }
+        for track in library.tracks.iter().filter(|track| !track.favorite) {
+            ordered.push(
+                *first_track_by_id
+                    .get(track.id.as_str())
+                    .expect("every library track must be indexed by its ID"),
+            );
+        }
+    } else {
+        let mut seen = HashSet::with_capacity(library.planner_order.len() + library.tracks.len());
+        for id in &library.planner_order {
+            if seen.insert(id.as_str())
+                && let Some(track) = first_track_by_id.get(id.as_str())
+            {
+                ordered.push(*track);
+            }
+        }
+        for track in &library.tracks {
+            if seen.insert(track.id.as_str()) {
+                ordered.push(
+                    *first_track_by_id
+                        .get(track.id.as_str())
+                        .expect("every library track must be indexed by its ID"),
+                );
+            }
+        }
+    }
+
+    ordered
 }
 
 /// Move one track to a visible Planner insertion slot.
@@ -883,6 +941,80 @@ mod tests {
         ];
         normalize_planner_order(&mut legacy);
         assert_eq!(legacy.planner_order, ["plain", "starred"]);
+    }
+
+    #[test]
+    fn planner_tracks_preserve_order_semantics_and_first_match_identity() {
+        let mut first_duplicate = planner_test_track(
+            "duplicate",
+            TrackStage::Production,
+            TrackStatus::Inbox,
+            false,
+        );
+        first_duplicate.title = String::from("first duplicate");
+        let mut later_duplicate =
+            planner_test_track("duplicate", TrackStage::Mixdown, TrackStatus::Refine, true);
+        later_duplicate.title = String::from("later duplicate");
+        let explicit = Library {
+            tracks: vec![
+                planner_test_track("tail", TrackStage::Mastering, TrackStatus::Release, false),
+                first_duplicate.clone(),
+                later_duplicate.clone(),
+                planner_test_track(
+                    "appended",
+                    TrackStage::SoundDesign,
+                    TrackStatus::Inbox,
+                    false,
+                ),
+            ],
+            selected_track_id: None,
+            reference_tracks: Vec::new(),
+            planner_order: vec![
+                String::from("missing"),
+                String::from("duplicate"),
+                String::from("duplicate"),
+                String::from("tail"),
+            ],
+        };
+        let projected = planner_tracks(&explicit);
+
+        assert_eq!(
+            projected
+                .iter()
+                .map(|track| track.id.as_str())
+                .collect::<Vec<_>>(),
+            ["duplicate", "tail", "appended"]
+        );
+        assert_eq!(planner_order(&explicit), ["duplicate", "tail", "appended"]);
+        assert_eq!(projected[0].title, "first duplicate");
+        assert!(std::ptr::eq(projected[0], &explicit.tracks[1]));
+        assert!(std::ptr::eq(projected[1], &explicit.tracks[0]));
+
+        let legacy = Library {
+            tracks: vec![
+                planner_test_track("plain", TrackStage::Production, TrackStatus::Inbox, false),
+                planner_test_track("favorite", TrackStage::Production, TrackStatus::Inbox, true),
+                first_duplicate,
+                later_duplicate,
+            ],
+            selected_track_id: None,
+            reference_tracks: Vec::new(),
+            planner_order: Vec::new(),
+        };
+        let legacy_projected = planner_tracks(&legacy);
+        assert_eq!(
+            legacy_projected
+                .iter()
+                .map(|track| track.id.as_str())
+                .collect::<Vec<_>>(),
+            ["favorite", "duplicate", "plain", "duplicate"]
+        );
+        assert_eq!(
+            planner_order(&legacy),
+            ["favorite", "duplicate", "plain", "duplicate"]
+        );
+        assert!(std::ptr::eq(legacy_projected[1], &legacy.tracks[2]));
+        assert!(std::ptr::eq(legacy_projected[3], &legacy.tracks[2]));
     }
 
     #[test]
