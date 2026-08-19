@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+caller_cwd="$PWD"
+project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 output_dir="$project_dir/release-output"
 version="${CADENCE_RELEASE_VERSION:-}"
 channel="${CADENCE_RELEASE_CHANNEL:-stable}"
@@ -13,10 +14,112 @@ usage() {
 Usage: build_macos_release.sh --version VERSION [--channel stable|rc|nightly] [--output-dir DIR] [--build-id ID]
 
 Builds, signs, notarizes, staples, and describes the Cadence arm64 macOS release.
+--output-dir DIR is resolved relative to the caller's current working directory.
+Its parent must already exist, and DIR must be absent or an existing empty
+directory. Symlinks, files, special nodes, nonempty directories, ambiguous or
+root paths, and the repository root are rejected; caller-controlled directories
+are never recursively removed.
 Production signing requires the Apple certificate and notary API-key environment
 variables documented in README.md. The manifest Team ID is derived from the
 selected Developer ID Application identity.
 EOF
+}
+
+validate_release_output_dir_path() {
+    local requested="${1:-}"
+    local caller_directory="${2:-$PWD}"
+    local parent_directory
+    local output_name
+
+    if [[ -z "$requested" ]]; then
+        echo "invalid release output directory: path must not be empty" >&2
+        return 1
+    fi
+
+    while [[ "$requested" == */ && "$requested" != "/" ]]; do
+        requested="${requested%/}"
+    done
+    case "$requested" in
+        .|..|/)
+            echo "invalid release output directory: ambiguous or root path: $requested" >&2
+            return 1
+            ;;
+    esac
+
+    if [[ "$requested" != /* ]]; then
+        requested="$caller_directory/$requested"
+    fi
+
+    parent_directory="$(dirname "$requested")"
+    output_name="$(basename "$requested")"
+    case "$output_name" in
+        ""|.|..)
+            echo "invalid release output directory: ambiguous or root path: $requested" >&2
+            return 1
+            ;;
+    esac
+
+    if [[ ! -d "$parent_directory" ]]; then
+        echo "invalid release output directory: parent does not already exist: $parent_directory" >&2
+        return 1
+    fi
+    if ! parent_directory="$(cd "$parent_directory" && pwd -P)"; then
+        echo "invalid release output directory: could not resolve parent: $parent_directory" >&2
+        return 1
+    fi
+    printf '%s/%s\n' "$parent_directory" "$output_name"
+}
+
+validate_release_output_dir() {
+    local requested="${1:-}"
+    local caller_directory="${2:-$PWD}"
+    local candidate
+    local child
+
+    candidate="$(validate_release_output_dir_path "$requested" "$caller_directory")" || return 1
+    if [[ "$candidate" == "$project_dir" ]]; then
+        echo "invalid release output directory: repository root is not allowed: $candidate" >&2
+        return 1
+    fi
+    if [[ -L "$candidate" ]]; then
+        echo "invalid release output directory: symlinks are not allowed: $candidate" >&2
+        return 1
+    fi
+    if [[ ! -e "$candidate" ]]; then
+        printf '%s\n' "$candidate"
+        return 0
+    fi
+    if [[ ! -d "$candidate" ]]; then
+        echo "invalid release output directory: target must be a directory: $candidate" >&2
+        return 1
+    fi
+    if [[ ! -r "$candidate" || ! -x "$candidate" ]]; then
+        echo "invalid release output directory: target cannot be inspected: $candidate" >&2
+        return 1
+    fi
+    for child in "$candidate"/* "$candidate"/.[!.]* "$candidate"/..?*; do
+        if [[ -e "$child" || -L "$child" ]]; then
+            echo "invalid release output directory: target must be empty: $candidate" >&2
+            return 1
+        fi
+    done
+    printf '%s\n' "$candidate"
+}
+
+prepare_release_output_dir() {
+    local requested="${1:-}"
+    local caller_directory="${2:-$PWD}"
+    local candidate
+
+    candidate="$(validate_release_output_dir "$requested" "$caller_directory")" || return 1
+    if [[ ! -e "$candidate" && ! -L "$candidate" ]]; then
+        if ! mkdir "$candidate"; then
+            echo "could not create release output directory: $candidate" >&2
+            return 1
+        fi
+    fi
+    validate_release_output_dir "$candidate" "$caller_directory" >/dev/null || return 1
+    printf '%s\n' "$candidate"
 }
 
 team_id_from_codesign_identity() {
@@ -67,6 +170,10 @@ while (($# > 0)); do
             ;;
     esac
 done
+
+if ! output_dir="$(validate_release_output_dir "$output_dir" "$caller_cwd")"; then
+    exit 2
+fi
 
 case "$channel" in
     stable|rc|nightly)
@@ -137,7 +244,6 @@ require_env APPLE_NOTARY_KEY_BASE64
 require_env APPLE_NOTARY_KEY_ID
 require_env APPLE_NOTARY_ISSUER_ID
 
-output_dir="$(cd -- "$(dirname -- "$output_dir")" && pwd)/$(basename -- "$output_dir")"
 work_dir="$(mktemp -d -t cadence-release.XXXXXX)"
 keychain_path="$work_dir/cadence-release-signing.keychain-db"
 keychain_password="$(/usr/bin/uuidgen | tr -d '-')"
@@ -251,8 +357,9 @@ xcrun stapler staple "$app_path"
 xcrun stapler validate "$app_path"
 spctl --assess --type execute --verbose=2 "$app_path"
 
-rm -rf "$output_dir"
-mkdir -p "$output_dir"
+if ! output_dir="$(prepare_release_output_dir "$output_dir" "$caller_cwd")"; then
+    exit 1
+fi
 artifact_name="cadence-v${version}-macos-arm64.zip"
 ditto -c -k --sequesterRsrc --keepParent "$app_path" "$output_dir/$artifact_name"
 cp "$project_dir/reference/cadence-ui-repainted.png" "$output_dir/cadence-default-ui-1594x987.png"

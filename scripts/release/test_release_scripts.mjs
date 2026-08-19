@@ -64,6 +64,36 @@ function parseTeamId(identity) {
   ]);
 }
 
+function validateOutputDirectory(requested, callerDirectory) {
+  return execFileAsync("bash", [
+    "-c",
+    'source "$1"; validate_release_output_dir "$2" "$3"',
+    "cadence-output-dir-validation-test",
+    buildScript,
+    requested,
+    callerDirectory,
+  ]);
+}
+
+function prepareOutputDirectory(requested, callerDirectory) {
+  return execFileAsync("bash", [
+    "-c",
+    'source "$1"; prepare_release_output_dir "$2" "$3"',
+    "cadence-output-dir-preparation-test",
+    buildScript,
+    requested,
+    callerDirectory,
+  ]);
+}
+
+async function assertRejectedOutputDirectory(label, requested, callerDirectory) {
+  await assert.rejects(
+    validateOutputDirectory(requested, callerDirectory),
+    (error) => error.code === 1 && error.stderr.includes("invalid release output directory"),
+    `${label} must be rejected`,
+  );
+}
+
 test("Team ID parser accepts a valid identity suffix and rejects malformed identities", async () => {
   const { stdout } = await parseTeamId("Developer ID Application: Cadence Release (ABCDE12345)");
   assert.equal(stdout.trim(), "ABCDE12345");
@@ -78,6 +108,88 @@ test("Team ID parser accepts a valid identity suffix and rejects malformed ident
       (error) => error.code === 1 && error.stderr.includes("valid ten-character Team ID"),
     );
   }
+});
+
+test("release output directory helpers enforce safe, caller-relative targets", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cadence-output-dir-test-"));
+  try {
+    const realRoot = await fs.realpath(root);
+    const emptyDirectory = path.join(realRoot, "empty");
+    const visibleNonemptyDirectory = path.join(realRoot, "visible-nonempty");
+    const hiddenNonemptyDirectory = path.join(realRoot, "hidden-nonempty");
+    const file = path.join(realRoot, "release-file");
+    const symlink = path.join(realRoot, "release-symlink");
+    const fifo = path.join(realRoot, "release-fifo");
+    const spacedParent = path.join(realRoot, "parent with spaces");
+    const missingDirectory = path.join(realRoot, "missing");
+    const createdDirectory = path.join(realRoot, "created");
+    const repositoryRoot = path.resolve(releaseDirectory, "../..");
+
+    await fs.mkdir(emptyDirectory);
+    await fs.mkdir(visibleNonemptyDirectory);
+    await fs.writeFile(path.join(visibleNonemptyDirectory, "sentinel.txt"), "preserve me\n");
+    await fs.mkdir(hiddenNonemptyDirectory);
+    const hiddenSentinel = path.join(hiddenNonemptyDirectory, ".sentinel");
+    await fs.writeFile(hiddenSentinel, "preserve hidden me\n");
+    await fs.writeFile(file, "not a directory\n");
+    await fs.symlink(emptyDirectory, symlink, "dir");
+    await execFileAsync("mkfifo", [fifo]);
+    await fs.mkdir(spacedParent);
+
+    for (const [label, requested, expected] of [
+      ["missing target", "missing", missingDirectory],
+      ["empty target", "empty", emptyDirectory],
+      [
+        "spaces in a caller-relative path",
+        "parent with spaces/release output",
+        path.join(spacedParent, "release output"),
+      ],
+    ]) {
+      const { stdout } = await validateOutputDirectory(requested, root);
+      assert.equal(stdout.trim(), expected, `${label} should resolve from the caller cwd`);
+    }
+    await assert.rejects(fs.lstat(missingDirectory), { code: "ENOENT" });
+
+    const { stdout: createdOutput } = await prepareOutputDirectory("created", root);
+    assert.equal(createdOutput.trim(), createdDirectory);
+    assert.deepEqual((await fs.readdir(createdDirectory)), []);
+
+    for (const [label, requested] of [
+      ["visible nonempty target", "visible-nonempty"],
+      ["hidden nonempty target", "hidden-nonempty"],
+      ["regular file target", "release-file"],
+      ["symlink target", "release-symlink"],
+      ["special node target", "release-fifo"],
+      ["ambiguous dot target", "."],
+      ["ambiguous parent target", ".."],
+      ["root target", "/"],
+      ["repository root target", repositoryRoot],
+      ["repository root equivalent target", `${repositoryRoot}/scripts/../../${path.basename(repositoryRoot)}`],
+      ["missing parent", "missing-parent/release output"],
+    ]) {
+      await assertRejectedOutputDirectory(label, requested, root);
+    }
+    await assert.rejects(
+      execFileAsync(buildScript, ["--version", "0.1.0", "--output-dir", visibleNonemptyDirectory]),
+      (error) => error.code === 2
+        && error.stderr.includes("target must be empty")
+        && !error.stderr.includes("missing required production signing secret"),
+    );
+    assert.equal(await fs.readFile(path.join(visibleNonemptyDirectory, "sentinel.txt"), "utf8"), "preserve me\n");
+    assert.equal(await fs.readFile(hiddenSentinel, "utf8"), "preserve hidden me\n");
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("release output cleanup keeps temporary cleanup but never removes caller output", async () => {
+  const script = await fs.readFile(buildScript, "utf8");
+  assert.doesNotMatch(script, /rm -rf "\$output_dir"/);
+  assert.match(script, /rm -rf "\$work_dir"/);
+  assert.ok(
+    script.indexOf('validate_release_output_dir "$output_dir" "$caller_cwd"')
+      < script.indexOf("require_env APPLE_DEVELOPER_ID_APPLICATION_CERT_BASE64"),
+  );
 });
 
 test("manifest preserves the stable default and emits supported channels", async (t) => {
