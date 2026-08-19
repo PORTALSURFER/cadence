@@ -46,6 +46,8 @@ GitHub Actions uses its built-in `GITHUB_TOKEN` for the GitHub release, so no se
 
 Optionally set the repository variable `PORTALSURFER_RELEASE_ENDPOINT`; it defaults to `https://portalsurfer.org`. The publisher accepts only that production origin or an explicit HTTP loopback URL for local testing. It checks the server capability before staging the app zip, screenshot, and `CHANGELOG.md`, then commits their hashes in the manifest.
 
+The release builder accepts `--output-dir DIR` for a caller-selected artifact directory. Relative paths resolve from the caller's current working directory, and the parent directory must already exist. The target may be absent or an existing empty directory; symlinks, files, special nodes, nonempty directories (including hidden entries), `.`, `..`, `/`, and paths resolving to the repository root are rejected. The builder validates this before reading signing credentials and again immediately before output creation, and never recursively removes a caller-controlled output directory.
+
 The local scripts are intentionally production-gated. Check their syntax without contacting Apple or PortalSurfer:
 
 ```sh
@@ -59,7 +61,7 @@ bash scripts/release/test_macos_architecture.sh
 ./scripts/release/build_macos_release.sh --help
 ```
 
-A real release requires macOS, the protected `cadence-production` environment with the five Apple signing/notary secrets and the PortalSurfer upload token, and a clean checkout; the release tests exercise Team ID derivation with synthetic identities without Apple credentials. No ad-hoc signature is accepted by the production release script. Direct callers may pass `--channel stable`, `--channel rc`, or `--channel nightly`; omitting it preserves the stable default.
+A real release requires macOS, the protected `cadence-production` environment with the five Apple signing/notary secrets and the PortalSurfer upload token, and a clean checkout; the release tests exercise Team ID derivation and output-directory safety with synthetic identities and temporary directories without Apple credentials. No ad-hoc signature is accepted by the production release script. Direct callers may pass `--channel stable`, `--channel rc`, or `--channel nightly`; omitting it preserves the stable default.
 
 To capture the current native window for visual refinement, run the macOS screenshot harness:
 
