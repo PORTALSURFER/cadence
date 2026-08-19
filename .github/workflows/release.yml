@@ -41,6 +41,23 @@ jobs:
       artifact_upload_name: ${{ steps.release.outputs.artifact_upload_name }}
       source_sha: ${{ steps.release.outputs.source_sha }}
     steps:
+      - name: Validate manual stable source
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          INPUT_CHANNEL: ${{ inputs.channel || '' }}
+          INPUT_VERSION: ${{ inputs.version || '' }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" && "$INPUT_CHANNEL" == "stable" ]]; then
+            [[ "$REF" == "refs/heads/main" || "$REF" == "refs/tags/v${INPUT_VERSION}" ]] || {
+              echo "manual stable releases must run from refs/heads/main or the matching v<version> tag" >&2
+              exit 1
+            }
+          fi
+
       - name: Check out source
         uses: actions/checkout@v4
         with:
@@ -319,6 +336,7 @@ jobs:
     name: Build and sign release
     needs: prepare
     runs-on: macos-14
+    environment: cadence-production
     permissions:
       contents: read
       actions: read
@@ -333,11 +351,11 @@ jobs:
       source_sha: ${{ needs.prepare.outputs.source_sha }}
     env:
       CARGO_TERM_COLOR: always
-      APPLE_DEVELOPER_ID_APPLICATION_CERT_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_CERT_BASE64 }}
-      APPLE_DEVELOPER_ID_APPLICATION_CERT_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_CERT_PASSWORD }}
-      APPLE_NOTARY_KEY_BASE64: ${{ secrets.APPLE_NOTARY_KEY_BASE64 }}
-      APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
-      APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+      APPLE_DEVELOPER_ID_APPLICATION_CERT_BASE64: ${{ secrets.CADENCE_PRODUCTION_APPLE_DEVELOPER_ID_APPLICATION_CERT_BASE64 }}
+      APPLE_DEVELOPER_ID_APPLICATION_CERT_PASSWORD: ${{ secrets.CADENCE_PRODUCTION_APPLE_DEVELOPER_ID_APPLICATION_CERT_PASSWORD }}
+      APPLE_NOTARY_KEY_BASE64: ${{ secrets.CADENCE_PRODUCTION_APPLE_NOTARY_KEY_BASE64 }}
+      APPLE_NOTARY_KEY_ID: ${{ secrets.CADENCE_PRODUCTION_APPLE_NOTARY_KEY_ID }}
+      APPLE_NOTARY_ISSUER_ID: ${{ secrets.CADENCE_PRODUCTION_APPLE_NOTARY_ISSUER_ID }}
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -402,11 +420,12 @@ jobs:
     name: Publish release
     needs: build
     runs-on: ubuntu-latest
+    environment: cadence-production
     permissions:
       contents: write
       actions: read
     env:
-      CADENCE_RELEASE_UPLOAD_TOKEN: ${{ secrets.CADENCE_RELEASE_UPLOAD_TOKEN }}
+      CADENCE_RELEASE_UPLOAD_TOKEN: ${{ secrets.CADENCE_PRODUCTION_PORTALSURFER_RELEASE_TOKEN }}
       PORTALSURFER_RELEASE_ENDPOINT: ${{ vars.PORTALSURFER_RELEASE_ENDPOINT || 'https://portalsurfer.org' }}
       RELEASE_CHANNEL: ${{ needs.build.outputs.channel }}
       RELEASE_VERSION: ${{ needs.build.outputs.version }}
