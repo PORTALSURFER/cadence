@@ -1013,14 +1013,13 @@ impl Default for AppState {
 }
 
 fn playback_shortcut(state: &AppState, press: ui::KeyPress) -> ui::ShortcutResolution<Message> {
+    let comment_draft_active = state.draft_note.is_some() || state.reference_draft_note.is_some();
+
     if press == ui::KeyPress::new(ui::KeyCode::Escape) {
         ui::ShortcutResolution::action(Message::StopPlayback)
-    } else if state.draft_note.is_none()
-        && state.reference_draft_note.is_none()
-        && press == ui::KeyPress::new(ui::KeyCode::N)
-    {
+    } else if !comment_draft_active && press == ui::KeyPress::new(ui::KeyCode::N) {
         ui::ShortcutResolution::action(Message::NewNoteAtCurrentTime)
-    } else if state.draft_note.is_none() && press == ui::KeyPress::new(ui::KeyCode::Space) {
+    } else if !comment_draft_active && press == ui::KeyPress::new(ui::KeyCode::Space) {
         ui::ShortcutResolution::action(Message::TogglePlayback)
     } else {
         ui::ShortcutResolution::unhandled()
@@ -12021,6 +12020,29 @@ mod tests {
             playback_shortcut(&state, ui::KeyPress::new(ui::KeyCode::N)),
             ui::ShortcutResolution::unhandled()
         );
+        assert_eq!(
+            playback_shortcut(&state, ui::KeyPress::new(ui::KeyCode::Escape)),
+            ui::ShortcutResolution::action(Message::StopPlayback)
+        );
+    }
+
+    #[test]
+    fn reference_draft_note_shortcuts_are_unhandled() {
+        let state = AppState {
+            reference_draft_note: Some(NoteDraft {
+                note_id: None,
+                time_millis: 0,
+                body: String::new(),
+            }),
+            ..AppState::default()
+        };
+
+        for key in [ui::KeyCode::Space, ui::KeyCode::N] {
+            assert_eq!(
+                playback_shortcut(&state, ui::KeyPress::new(key)),
+                ui::ShortcutResolution::unhandled()
+            );
+        }
         assert_eq!(
             playback_shortcut(&state, ui::KeyPress::new(ui::KeyCode::Escape)),
             ui::ShortcutResolution::action(Message::StopPlayback)
