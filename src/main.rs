@@ -795,6 +795,8 @@ enum PairedPlaybackGuard {
         main_pause_token: Option<u64>,
         main_pause_acknowledged: bool,
         reference_unload_pending: bool,
+        pending_reset_main: bool,
+        pending_reset_reference: bool,
     },
 }
 
@@ -1372,7 +1374,9 @@ fn schedule_waveform_decode(
     state.waveform_track_id = None;
     state.waveform_progress = None;
     state.loop_selections.clear(AuditionSource::Main);
-    state.status = format!("Preparing MAIN waveform and loudness · {}…", path.display());
+    if !paired_playback_cleanup_active(state) {
+        state.status = format!("Preparing MAIN waveform and loudness · {}…", path.display());
+    }
     let cache_path = storage::waveform_cache_path(&path);
     let progress_track_id = track_id.clone();
     let completion_track_id = track_id;
@@ -3259,6 +3263,8 @@ fn cleanup_reference_transport_failure(state: &mut AppState, error: String) -> S
         main_pause_token: None,
         main_pause_acknowledged: false,
         reference_unload_pending,
+        pending_reset_main: false,
+        pending_reset_reference: false,
     };
     progress_paired_playback_cleanup(state);
     state.status = error.clone();
@@ -3272,6 +3278,8 @@ fn progress_paired_playback_cleanup(state: &mut AppState) {
         mut main_pause_token,
         mut main_pause_acknowledged,
         mut reference_unload_pending,
+        pending_reset_main,
+        pending_reset_reference,
     } = guard
     else {
         state.paired_playback_guard = guard;
@@ -3326,12 +3334,20 @@ fn progress_paired_playback_cleanup(state: &mut AppState) {
 
     if main_pause_acknowledged && !reference_unload_pending {
         state.paired_playback_guard = PairedPlaybackGuard::Idle;
+        if pending_reset_main {
+            reset_transport(state);
+        }
+        if pending_reset_reference {
+            reset_reference_transport(state);
+        }
     } else {
         state.paired_playback_guard = PairedPlaybackGuard::StoppingMain {
             root_error: root_error.clone(),
             main_pause_token,
             main_pause_acknowledged,
             reference_unload_pending,
+            pending_reset_main,
+            pending_reset_reference,
         };
     }
     state.status = root_error;
@@ -3639,12 +3655,16 @@ fn seek_loop_owner(
             {
                 return Err(String::from(transport::CONTROLS_BUSY_ERROR));
             }
-            let token = reference_transport.seek(
+            let seek_result = reference_transport.seek(
                 state.reference_transport_generation,
                 position_millis,
                 duration_millis,
                 true,
-            )?;
+            );
+            let token = match seek_result {
+                Ok(token) => token,
+                Err(error) => return Err(cleanup_reference_transport_failure(state, error)),
+            };
             set_source_position(state, source, position_millis);
             state.reference_transport_waiting_token = Some(token);
             state.reference_transport_polling = true;
@@ -5339,6 +5359,13 @@ fn schedule_library_save(state: &mut AppState, context: &mut ui::UiUpdateContext
 }
 
 fn reset_transport(state: &mut AppState) {
+    if let PairedPlaybackGuard::StoppingMain {
+        pending_reset_main, ..
+    } = &mut state.paired_playback_guard
+    {
+        *pending_reset_main = true;
+        return;
+    }
     clear_paired_playback_guard(state);
     clear_live_spectrogram(state, AuditionSource::Main);
     state.transport_generation = state.transport_generation.wrapping_add(1);
@@ -5354,6 +5381,14 @@ fn reset_transport(state: &mut AppState) {
 }
 
 fn reset_reference_transport(state: &mut AppState) {
+    if let PairedPlaybackGuard::StoppingMain {
+        pending_reset_reference,
+        ..
+    } = &mut state.paired_playback_guard
+    {
+        *pending_reset_reference = true;
+        return;
+    }
     clear_paired_playback_guard(state);
     clear_live_spectrogram(state, AuditionSource::Reference);
     state.reference_transport_generation = state.reference_transport_generation.wrapping_add(1);
@@ -13864,6 +13899,106 @@ mod tests {
     }
 
     #[test]
+    fn paired_reference_loop_seek_failure_cleans_up_through_enforce_loop() {
+        let mut state = shared_reference_playback_state();
+        let error = String::from("paired reference loop seek failed");
+        let reference_generation = state.reference_transport_generation;
+        state.paired_playback_guard = PairedPlaybackGuard::Active;
+        state.transport_playing = true;
+        state.transport_position_millis = 750;
+        state.review_cursor_millis = 750;
+        state.reference_transport_playing = true;
+        state.reference_transport_position_millis = 3_200;
+        state.loop_selections = LoopSelections {
+            main: None,
+            reference: Some(LoopSelection {
+                start_ratio: 0.25,
+                end_ratio: 0.75,
+            }),
+        };
+        let loops = state.loop_selections;
+        state
+            .reference_transport
+            .as_ref()
+            .expect("paired playback should have a reference transport")
+            .fail_next_command_for_test(error.clone());
+
+        enforce_loop(&mut state, true, true);
+
+        assert_eq!(state.status, error);
+        assert_eq!(state.loop_selections, loops);
+        assert_eq!(state.transport_position_millis, 750);
+        assert_eq!(state.review_cursor_millis, 750);
+        assert_eq!(state.reference_transport_position_millis, 3_200);
+        assert_eq!(
+            state.reference_transport_generation,
+            reference_generation.wrapping_add(1)
+        );
+        assert!(!state.transport_playing);
+        assert!(!state.reference_transport_playing);
+        assert!(!state.reference_transport_loaded);
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::StoppingMain { .. }
+        ));
+        assert_eq!(state.transport.requested_output_gain_for_test(), 0.0);
+    }
+
+    #[test]
+    fn reference_only_loop_seek_failure_preserves_main_through_enforce_loop() {
+        let mut state = shared_reference_playback_state();
+        let error = String::from("reference-only loop seek failed");
+        let main_generation = state.transport_generation;
+        let reference_generation = state.reference_transport_generation;
+        state.audition_source = AuditionSource::Reference;
+        state.reference_only_playback = true;
+        state.transport_playing = true;
+        state.transport_position_millis = 510;
+        state.review_cursor_millis = 510;
+        state.transport.set_output_gain(0.37);
+        state.reference_transport_playing = true;
+        state.reference_transport_position_millis = 3_200;
+        state.loop_selections = LoopSelections {
+            main: Some(LoopSelection {
+                start_ratio: 0.1,
+                end_ratio: 0.2,
+            }),
+            reference: Some(LoopSelection {
+                start_ratio: 0.25,
+                end_ratio: 0.75,
+            }),
+        };
+        let loops = state.loop_selections;
+        state
+            .reference_transport
+            .as_ref()
+            .expect("reference-only playback should have a reference transport")
+            .fail_next_command_for_test(error.clone());
+
+        enforce_loop(&mut state, false, true);
+
+        assert_eq!(state.status, error);
+        assert_eq!(state.loop_selections, loops);
+        assert_eq!(state.transport_generation, main_generation);
+        assert!(state.transport_playing);
+        assert_eq!(state.transport_position_millis, 510);
+        assert_eq!(state.review_cursor_millis, 510);
+        assert_eq!(
+            state.reference_transport_generation,
+            reference_generation.wrapping_add(1)
+        );
+        assert_eq!(state.reference_transport_position_millis, 3_200);
+        assert!(!state.reference_transport_playing);
+        assert!(!state.reference_transport_loaded);
+        assert!(!state.reference_only_playback);
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::Idle
+        ));
+        assert_eq!(state.transport.requested_output_gain_for_test(), 0.37);
+    }
+
+    #[test]
     fn global_play_resumes_each_source_from_its_own_loop_or_stored_position() {
         let mut state = shared_reference_playback_state();
         state.loop_selections = LoopSelections {
@@ -14132,6 +14267,81 @@ mod tests {
             state.paired_playback_guard,
             PairedPlaybackGuard::Idle
         ));
+        assert_eq!(
+            state.transport.requested_output_gain_for_test(),
+            state.audition_volume
+        );
+    }
+
+    #[test]
+    fn select_track_defers_resets_until_paired_cleanup_is_acknowledged() {
+        let mut state = shared_reference_playback_state();
+        let root_error = String::from("reference cleanup root error");
+        let main_generation = state.transport_generation;
+        state.transport_position_millis = 640;
+        state.review_cursor_millis = 640;
+        state.reference_transport_position_millis = 2_400;
+        state.paired_playback_guard = PairedPlaybackGuard::Active;
+
+        cleanup_reference_transport_failure(&mut state, root_error.clone());
+
+        let pause_token = state
+            .transport_waiting_token
+            .expect("cleanup should have a pending main pause");
+        let reference_generation = state.reference_transport_generation;
+        let track_id = state
+            .library
+            .tracks
+            .first()
+            .expect("the synthetic state should have a track")
+            .id
+            .clone();
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut state, Message::SelectTrack(track_id), &mut context);
+
+        assert_eq!(state.status, root_error);
+        assert_eq!(state.transport_generation, main_generation);
+        assert_eq!(state.reference_transport_generation, reference_generation);
+        assert_eq!(state.transport_position_millis, 640);
+        assert_eq!(state.reference_transport_position_millis, 2_400);
+        assert_eq!(state.transport.requested_output_gain_for_test(), 0.0);
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::StoppingMain {
+                main_pause_token: Some(token),
+                main_pause_acknowledged: false,
+                pending_reset_main: true,
+                pending_reset_reference: true,
+                ..
+            } if token == pause_token
+        ));
+
+        state.transport.set_snapshot_for_test(Snapshot {
+            generation: main_generation,
+            acknowledged_token: pause_token,
+            position_millis: 640,
+            playing: false,
+            ready: true,
+        });
+        update(&mut state, Message::Frame, &mut context);
+
+        assert_eq!(state.status, root_error);
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::Idle
+        ));
+        assert_eq!(state.transport_generation, main_generation.wrapping_add(1));
+        assert_eq!(
+            state.reference_transport_generation,
+            reference_generation.wrapping_add(1)
+        );
+        assert_eq!(state.transport_position_millis, 0);
+        assert_eq!(state.review_cursor_millis, 0);
+        assert_eq!(state.reference_transport_position_millis, 0);
+        assert!(!state.reference_transport_loaded);
+        assert!(!state.transport_polling);
+        assert!(state.transport_waiting_token.is_none());
         assert_eq!(
             state.transport.requested_output_gain_for_test(),
             state.audition_volume
