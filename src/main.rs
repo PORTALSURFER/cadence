@@ -785,6 +785,19 @@ struct ImportBatchProgress {
     failed: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PairedPlaybackGuard {
+    Idle,
+    ReferenceRequired,
+    Active,
+    StoppingMain {
+        root_error: String,
+        main_pause_token: Option<u64>,
+        main_pause_acknowledged: bool,
+        reference_unload_pending: bool,
+    },
+}
+
 #[derive(Clone, Debug)]
 struct AppState {
     library: storage::Library,
@@ -833,6 +846,7 @@ struct AppState {
     reference_transport_waiting_token: Option<u64>,
     reference_transport_loaded: bool,
     reference_only_playback: bool,
+    paired_playback_guard: PairedPlaybackGuard,
     reference_match_enabled: bool,
     comment_source: CommentSource,
     comment_source_explicit: bool,
@@ -948,6 +962,7 @@ impl Default for AppState {
             reference_transport_waiting_token: None,
             reference_transport_loaded: false,
             reference_only_playback: false,
+            paired_playback_guard: PairedPlaybackGuard::Idle,
             reference_match_enabled: false,
             comment_source: CommentSource::Main,
             comment_source_explicit: false,
@@ -1023,6 +1038,7 @@ fn animation_requested(state: &AppState) -> bool {
         || state.pending_comment_playback.is_some()
         || state.playhead_drag_active
         || state.reference_playhead_drag_active
+        || !matches!(state.paired_playback_guard, PairedPlaybackGuard::Idle)
 }
 
 fn live_animation_requested(transport: &transport::AudioTransport, visible_revision: u64) -> bool {
@@ -1551,7 +1567,20 @@ fn reference_output_gain_for_source(state: &AppState, source: AuditionSource) ->
 }
 
 fn main_output_gain(state: &AppState) -> f32 {
-    if state.audition_source == AuditionSource::Main {
+    let cleanup_has_paused_main = matches!(
+        state.paired_playback_guard,
+        PairedPlaybackGuard::StoppingMain {
+            main_pause_acknowledged: true,
+            ..
+        }
+    );
+    if (cleanup_has_paused_main
+        || !matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::StoppingMain { .. }
+        ))
+        && state.audition_source == AuditionSource::Main
+    {
         state.audition_volume
     } else {
         0.0
@@ -2061,7 +2090,12 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 && state.transport_playing;
             let was_main_playing = !state.reference_only_playback && state.transport_playing;
             let was_reference_playing = state.reference_transport_playing;
+            let cleanup_was_active = paired_playback_cleanup_active(state);
             update_reference_transport(state);
+            let cleanup_was_active = cleanup_was_active || paired_playback_cleanup_active(state);
+            if paired_playback_cleanup_active(state) {
+                progress_paired_playback_cleanup(state);
+            }
             let snapshot = state.transport.snapshot();
             let audition_play_acknowledged = state.workspace_mode == WorkspaceMode::Audition
                 && state.audition_auto_advance
@@ -2071,10 +2105,12 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             let pending_audition = state.workspace_mode == WorkspaceMode::Audition
                 && state.audition_pending_play_track_id.is_some();
             let mut main_snapshot_applied = false;
+            let block_main_snapshot = cleanup_was_active || paired_playback_cleanup_active(state);
             if snapshot.generation == state.transport_generation {
                 if let Some(warning) = state
                     .transport
                     .take_analysis_warning(state.transport_generation)
+                    && !block_main_snapshot
                 {
                     state.status = format!("Live spectrogram unavailable: {warning}");
                 }
@@ -2086,18 +2122,26 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     state.audition_auto_advance = false;
                     state.audition_play_token = None;
                     state.audition_pending_play_track_id = None;
-                    state.status = error;
-                    if pending_audition {
+                    if !block_main_snapshot {
+                        state.status = error;
+                    }
+                    if !block_main_snapshot && pending_audition {
                         advance_audition(state, context);
                     }
-                } else if state
-                    .transport_waiting_token
-                    .is_none_or(|token| transport_command_is_confirmed(snapshot, token))
+                } else if !block_main_snapshot
+                    && state
+                        .transport_waiting_token
+                        .is_none_or(|token| transport_command_is_confirmed(snapshot, token))
                 {
                     state.transport_waiting_token = None;
                     apply_transport_snapshot(state, snapshot);
                     main_snapshot_applied = true;
                 }
+            }
+            if block_main_snapshot {
+                progress_paired_playback_cleanup(state);
+                refresh_live_spectrograms(state);
+                return;
             }
             let natural_audition_completion = main_snapshot_applied
                 && (was_audition_playing || audition_play_acknowledged)
@@ -2119,6 +2163,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
             enforce_loop(state, was_main_playing, was_reference_playing);
             maybe_start_pending_comment_playback(state, context);
+            maybe_clear_paired_playback_guard_after_idle(state);
             refresh_live_spectrograms(state);
         }
         Message::ToggleLiveSpectrogramMode => {
@@ -3124,12 +3169,203 @@ fn loop_bounds_meet_minimum(bounds: LoopBounds) -> bool {
     bounds.end_millis.saturating_sub(bounds.start_millis) >= MIN_LOOP_MILLIS
 }
 
+fn paired_playback_cleanup_error(state: &AppState) -> Option<&str> {
+    match &state.paired_playback_guard {
+        PairedPlaybackGuard::StoppingMain { root_error, .. } => Some(root_error),
+        _ => None,
+    }
+}
+
+fn paired_playback_cleanup_active(state: &AppState) -> bool {
+    paired_playback_cleanup_error(state).is_some()
+}
+
+fn arm_paired_playback_guard(state: &mut AppState) {
+    if matches!(state.paired_playback_guard, PairedPlaybackGuard::Idle) {
+        state.paired_playback_guard = PairedPlaybackGuard::ReferenceRequired;
+    }
+}
+
+fn paired_playback_commands_admitted(state: &mut AppState) {
+    if matches!(
+        state.paired_playback_guard,
+        PairedPlaybackGuard::ReferenceRequired
+    ) {
+        state.paired_playback_guard = PairedPlaybackGuard::Active;
+    }
+}
+
+fn clear_paired_playback_guard(state: &mut AppState) {
+    state.paired_playback_guard = PairedPlaybackGuard::Idle;
+}
+
+fn clear_uncommitted_paired_playback_guard(state: &mut AppState) {
+    if matches!(
+        state.paired_playback_guard,
+        PairedPlaybackGuard::ReferenceRequired
+    ) {
+        clear_paired_playback_guard(state);
+    }
+}
+
+fn invalidate_reference_transport_after_failure(state: &mut AppState) -> bool {
+    state.reference_transport_generation = state.reference_transport_generation.wrapping_add(1);
+    clear_live_spectrogram(state, AuditionSource::Reference);
+    state.reference_transport_playing = false;
+    state.reference_transport_polling = false;
+    state.reference_transport_waiting_token = None;
+    state.reference_transport_loaded = false;
+    state.reference_only_playback = false;
+    state.reference_playhead_drag_active = false;
+    rollback_reference_persisted_note_drag(state);
+
+    let Some(reference_transport) = state.reference_transport.as_ref() else {
+        return false;
+    };
+    match reference_transport.unload(state.reference_transport_generation) {
+        Ok(_) => false,
+        Err(error) if error == transport::CONTROLS_BUSY_ERROR => true,
+        Err(_) => false,
+    }
+}
+
+fn cleanup_reference_transport_failure(state: &mut AppState, error: String) -> String {
+    if let Some(root_error) = paired_playback_cleanup_error(state) {
+        let root_error = root_error.to_owned();
+        state.status = root_error.clone();
+        return root_error;
+    }
+
+    let paired = matches!(
+        state.paired_playback_guard,
+        PairedPlaybackGuard::ReferenceRequired | PairedPlaybackGuard::Active
+    );
+    let reference_unload_pending = invalidate_reference_transport_after_failure(state);
+    if !paired {
+        state.paired_playback_guard = PairedPlaybackGuard::Idle;
+        state.status = error.clone();
+        return error;
+    }
+
+    state.audition_auto_advance = false;
+    state.audition_play_token = None;
+    state.audition_pending_play_track_id = None;
+    state.transport_playing = false;
+    state.transport_polling = false;
+    state.transport_waiting_token = None;
+    state.transport.set_output_gain(0.0);
+    state.paired_playback_guard = PairedPlaybackGuard::StoppingMain {
+        root_error: error.clone(),
+        main_pause_token: None,
+        main_pause_acknowledged: false,
+        reference_unload_pending,
+    };
+    progress_paired_playback_cleanup(state);
+    state.status = error.clone();
+    error
+}
+
+fn progress_paired_playback_cleanup(state: &mut AppState) {
+    let guard = std::mem::replace(&mut state.paired_playback_guard, PairedPlaybackGuard::Idle);
+    let PairedPlaybackGuard::StoppingMain {
+        root_error,
+        mut main_pause_token,
+        mut main_pause_acknowledged,
+        mut reference_unload_pending,
+    } = guard
+    else {
+        state.paired_playback_guard = guard;
+        return;
+    };
+
+    if !main_pause_acknowledged {
+        if let Some(token) = main_pause_token
+            && state.transport.snapshot().generation == state.transport_generation
+            && transport_command_is_confirmed(state.transport.snapshot(), token)
+        {
+            main_pause_token = None;
+            main_pause_acknowledged = true;
+            state.transport_playing = false;
+            state.transport_polling = false;
+            state.transport_waiting_token = None;
+        }
+        if !main_pause_acknowledged
+            && main_pause_token.is_none()
+            && let Ok(token) = state.transport.pause(state.transport_generation)
+        {
+            main_pause_token = Some(token);
+            begin_transport_polling(state, token);
+        }
+    }
+
+    if reference_unload_pending {
+        reference_unload_pending =
+            state
+                .reference_transport
+                .as_ref()
+                .is_some_and(|reference_transport| {
+                    match reference_transport.unload(state.reference_transport_generation) {
+                        Ok(_) => false,
+                        Err(error) if error == transport::CONTROLS_BUSY_ERROR => true,
+                        Err(_) => false,
+                    }
+                });
+    }
+
+    if main_pause_acknowledged {
+        let normal_main_gain = if state.audition_source == AuditionSource::Main {
+            state.audition_volume
+        } else {
+            0.0
+        };
+        state.transport.set_output_gain(normal_main_gain);
+        if let Some(reference_transport) = state.reference_transport.as_ref() {
+            reference_transport.set_output_gain(reference_output_gain(state));
+        }
+    }
+
+    if main_pause_acknowledged && !reference_unload_pending {
+        state.paired_playback_guard = PairedPlaybackGuard::Idle;
+    } else {
+        state.paired_playback_guard = PairedPlaybackGuard::StoppingMain {
+            root_error: root_error.clone(),
+            main_pause_token,
+            main_pause_acknowledged,
+            reference_unload_pending,
+        };
+    }
+    state.status = root_error;
+}
+
+fn maybe_clear_paired_playback_guard_after_idle(state: &mut AppState) {
+    if !matches!(
+        state.paired_playback_guard,
+        PairedPlaybackGuard::ReferenceRequired | PairedPlaybackGuard::Active
+    ) {
+        return;
+    }
+    let reference_pending = state
+        .reference_transport
+        .as_ref()
+        .is_some_and(transport::AudioTransport::has_pending_load);
+    if !source_transport_is_active(state, AuditionSource::Main)
+        && !source_transport_is_active(state, AuditionSource::Reference)
+        && !state.transport.has_pending_load()
+        && !reference_pending
+    {
+        clear_paired_playback_guard(state);
+    }
+}
+
 fn seek_synchronized_positions(
     state: &mut AppState,
     main_position_millis: u64,
     reference_position_millis: u64,
     resume: bool,
 ) -> Result<(), String> {
+    if let Some(error) = paired_playback_cleanup_error(state) {
+        return Err(error.to_owned());
+    }
     if state.waveform_busy || state.reference_waveform_busy {
         return Err(String::from("Audio analysis is still building."));
     }
@@ -3150,7 +3386,9 @@ fn seek_synchronized_positions(
     let reference_was_loaded = state.reference_transport_loaded;
     if reference_details.is_some() {
         if !reference_was_loaded {
-            clear_live_spectrogram(state, AuditionSource::Reference);
+            state
+                .reference_transport
+                .get_or_insert_with(transport::AudioTransport::spawn);
         }
         let reference_transport = state
             .reference_transport
@@ -3162,13 +3400,23 @@ fn seek_synchronized_positions(
         if !reference_transport.has_command_capacity(required_slots) {
             return Err(String::from(transport::CONTROLS_BUSY_ERROR));
         }
+        arm_paired_playback_guard(state);
+        if !reference_was_loaded {
+            clear_live_spectrogram(state, AuditionSource::Reference);
+        }
     }
-    let main_token = state.transport.seek(
+    let main_token = match state.transport.seek(
         state.transport_generation,
         main_position_millis,
         main_duration_millis,
         resume,
-    )?;
+    ) {
+        Ok(token) => token,
+        Err(error) => {
+            clear_uncommitted_paired_playback_guard(state);
+            return Err(error);
+        }
+    };
     begin_transport_polling(state, main_token);
     if let Some((reference_path, reference_duration_millis)) = reference_details {
         let reference_gain = reference_output_gain(state);
@@ -3177,24 +3425,36 @@ fn seek_synchronized_positions(
             .get_or_insert_with(transport::AudioTransport::spawn);
         reference_transport.set_output_gain(reference_gain);
         if !reference_was_loaded {
-            reference_transport.load(
+            match reference_transport.load(
                 state.reference_transport_generation,
                 reference_path,
                 reference_duration_millis,
-            )?;
+            ) {
+                Ok(_) => {}
+                Err(error) => {
+                    return Err(cleanup_reference_transport_failure(state, error));
+                }
+            }
             if reference_transport.has_pending_load() {
-                return Err(String::from(transport::CONTROLS_BUSY_ERROR));
+                return Err(cleanup_reference_transport_failure(
+                    state,
+                    String::from(transport::CONTROLS_BUSY_ERROR),
+                ));
             }
             state.reference_transport_loaded = true;
         }
-        let reference_token = reference_transport.seek(
+        let reference_token = match reference_transport.seek(
             state.reference_transport_generation,
             reference_position_millis,
             reference_duration_millis,
             resume,
-        )?;
+        ) {
+            Ok(token) => token,
+            Err(error) => return Err(cleanup_reference_transport_failure(state, error)),
+        };
         state.reference_transport_waiting_token = Some(reference_token);
         state.reference_transport_polling = true;
+        paired_playback_commands_admitted(state);
     }
     state.reference_only_playback = false;
     state.transport_position_millis = main_position_millis;
@@ -3223,6 +3483,11 @@ fn seek_reference_waveform_position(
     ratio: f32,
     resume: bool,
 ) {
+    if let Some(error) = paired_playback_cleanup_error(state) {
+        state.status = error.to_owned();
+        context.request_repaint();
+        return;
+    }
     if state.busy || state.waveform_busy || state.reference_waveform_busy {
         return;
     }
@@ -3269,12 +3534,15 @@ fn seek_reference_waveform_position(
             path,
             reference_duration_millis,
         ) {
-            state.status = error;
+            cleanup_reference_transport_failure(state, error);
             context.request_repaint();
             return;
         }
         if reference_transport.has_pending_load() {
-            state.status = String::from(transport::CONTROLS_BUSY_ERROR);
+            cleanup_reference_transport_failure(
+                state,
+                String::from(transport::CONTROLS_BUSY_ERROR),
+            );
             context.request_repaint();
             return;
         }
@@ -3296,7 +3564,9 @@ fn seek_reference_waveform_position(
                 format_timestamp(reference_position_millis)
             );
         }
-        Err(error) => state.status = error,
+        Err(error) => {
+            cleanup_reference_transport_failure(state, error);
+        }
     }
     context.request_repaint();
 }
@@ -3333,6 +3603,9 @@ fn seek_loop_owner(
     source: AuditionSource,
     bounds: LoopBounds,
 ) -> Result<(), String> {
+    if let Some(error) = paired_playback_cleanup_error(state) {
+        return Err(error.to_owned());
+    }
     let duration_millis = selected_duration_for_source(state, source)
         .ok_or_else(|| String::from("Audio analysis is still pending."))?;
     let position_millis = bounds.start_millis.min(duration_millis);
@@ -3387,6 +3660,11 @@ fn finish_loop_selection(
     start_ratio: f32,
     end_ratio: f32,
 ) {
+    if let Some(error) = paired_playback_cleanup_error(state) {
+        state.status = error.to_owned();
+        context.request_repaint();
+        return;
+    }
     if state.busy
         || state.waveform_busy
         || (owner == AuditionSource::Reference && state.reference_waveform_busy)
@@ -3449,6 +3727,11 @@ fn select_audition_source(
     context: &mut ui::UiUpdateContext<Message>,
     source: AuditionSource,
 ) {
+    if let Some(error) = paired_playback_cleanup_error(state) {
+        state.status = error.to_owned();
+        context.request_repaint();
+        return;
+    }
     if state.busy {
         return;
     }
@@ -3479,6 +3762,11 @@ fn activate_audition_source(
     context: &mut ui::UiUpdateContext<Message>,
     source: AuditionSource,
 ) {
+    if let Some(error) = paired_playback_cleanup_error(state) {
+        state.status = error.to_owned();
+        context.request_repaint();
+        return;
+    }
     if state.busy {
         return;
     }
@@ -3528,6 +3816,9 @@ fn start_source_alongside_active(
     state: &mut AppState,
     source: AuditionSource,
 ) -> Result<(), String> {
+    if let Some(error) = paired_playback_cleanup_error(state) {
+        return Err(error.to_owned());
+    }
     match source {
         AuditionSource::Main => {
             let duration_millis = selected_main_duration(state)
@@ -3576,9 +3867,6 @@ fn start_source_alongside_active(
                 loop_bounds,
             );
             let reference_gain = reference_output_gain_for_source(state, AuditionSource::Reference);
-            if !reference_was_loaded {
-                clear_live_spectrogram(state, AuditionSource::Reference);
-            }
             let reference_transport = state
                 .reference_transport
                 .get_or_insert_with(transport::AudioTransport::spawn);
@@ -3587,6 +3875,11 @@ fn start_source_alongside_active(
             }
             if !reference_transport.has_command_capacity(required_slots) {
                 return Err(String::from(transport::CONTROLS_BUSY_ERROR));
+            }
+            let reference_transport = reference_transport.clone();
+            arm_paired_playback_guard(state);
+            if !reference_was_loaded {
+                clear_live_spectrogram(state, AuditionSource::Reference);
             }
             let mut loaded = reference_was_loaded;
             let result = {
@@ -3628,11 +3921,12 @@ fn start_source_alongside_active(
                     set_source_position(state, AuditionSource::Reference, position_millis);
                     state.reference_transport_waiting_token = Some(token);
                     state.reference_transport_polling = true;
+                    paired_playback_commands_admitted(state);
                     Ok(())
                 }
                 Err(error) => {
                     sync_audition_output_gains(state);
-                    Err(error)
+                    Err(cleanup_reference_transport_failure(state, error))
                 }
             }
         }
@@ -3649,6 +3943,11 @@ fn set_audition_source(state: &mut AppState, source: AuditionSource) {
 }
 
 fn play_audition(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
+    if let Some(error) = paired_playback_cleanup_error(state) {
+        state.status = error.to_owned();
+        context.request_repaint();
+        return;
+    }
     if state.busy || state.workspace_mode != WorkspaceMode::Audition {
         return;
     }
@@ -3753,6 +4052,11 @@ fn move_audition(
     context: &mut ui::UiUpdateContext<Message>,
     direction: AuditionMove,
 ) {
+    if let Some(error) = paired_playback_cleanup_error(state) {
+        state.status = error.to_owned();
+        context.request_repaint();
+        return;
+    }
     if state.busy || state.workspace_mode != WorkspaceMode::Audition {
         return;
     }
@@ -3826,6 +4130,11 @@ fn move_audition(
 }
 
 fn stop_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
+    if let Some(error) = paired_playback_cleanup_error(state) {
+        state.status = error.to_owned();
+        context.request_repaint();
+        return;
+    }
     state.audition_auto_advance = false;
     state.audition_play_token = None;
     state.audition_pending_play_track_id = None;
@@ -3839,6 +4148,7 @@ fn stop_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Message
             || state.reference_transport_waiting_token.is_some()
     });
     if !main_active && !reference_active {
+        clear_paired_playback_guard(state);
         return;
     }
 
@@ -3893,11 +4203,17 @@ fn stop_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Message
         state.reference_transport_polling = true;
     }
     state.reference_only_playback = false;
+    clear_paired_playback_guard(state);
     state.status = String::from("Stopping playback…");
     context.request_repaint();
 }
 
 fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
+    if let Some(error) = paired_playback_cleanup_error(state) {
+        state.status = error.to_owned();
+        context.request_repaint();
+        return;
+    }
     if state.busy || state.waveform_busy || state.reference_waveform_busy {
         if state.waveform_busy || state.reference_waveform_busy {
             state.status = String::from("Audio analysis is still building.");
@@ -4026,6 +4342,7 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
                 context.request_repaint();
                 return;
             }
+            arm_paired_playback_guard(state);
         }
         state.reference_only_playback = false;
 
@@ -4051,6 +4368,7 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
                     state.audition_auto_advance = false;
                     state.audition_play_token = None;
                 }
+                clear_uncommitted_paired_playback_guard(state);
                 state.status = error;
                 context.request_repaint();
                 return;
@@ -4078,12 +4396,15 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
                     path,
                     reference_duration_millis,
                 ) {
-                    state.status = error;
+                    cleanup_reference_transport_failure(state, error);
                     context.request_repaint();
                     return;
                 }
                 if reference_transport.has_pending_load() {
-                    state.status = String::from(transport::CONTROLS_BUSY_ERROR);
+                    cleanup_reference_transport_failure(
+                        state,
+                        String::from(transport::CONTROLS_BUSY_ERROR),
+                    );
                     context.request_repaint();
                     return;
                 }
@@ -4097,7 +4418,7 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
                     false,
                 );
                 if let Err(error) = seek_result {
-                    state.status = error;
+                    cleanup_reference_transport_failure(state, error);
                     context.request_repaint();
                     return;
                 }
@@ -4110,7 +4431,7 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
             {
                 Ok(token) => token,
                 Err(error) => {
-                    state.status = error;
+                    cleanup_reference_transport_failure(state, error);
                     context.request_repaint();
                     return;
                 }
@@ -4118,6 +4439,7 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
             set_source_position(state, AuditionSource::Reference, reference_position_millis);
             state.reference_transport_waiting_token = Some(reference_token);
             state.reference_transport_polling = true;
+            paired_playback_commands_admitted(state);
             state.status = if state.audition_source == AuditionSource::Reference {
                 String::from("Playing reference and imported track…")
             } else {
@@ -5017,6 +5339,7 @@ fn schedule_library_save(state: &mut AppState, context: &mut ui::UiUpdateContext
 }
 
 fn reset_transport(state: &mut AppState) {
+    clear_paired_playback_guard(state);
     clear_live_spectrogram(state, AuditionSource::Main);
     state.transport_generation = state.transport_generation.wrapping_add(1);
     state.audition_play_token = None;
@@ -5031,6 +5354,7 @@ fn reset_transport(state: &mut AppState) {
 }
 
 fn reset_reference_transport(state: &mut AppState) {
+    clear_paired_playback_guard(state);
     clear_live_spectrogram(state, AuditionSource::Reference);
     state.reference_transport_generation = state.reference_transport_generation.wrapping_add(1);
     state.reference_playhead_drag_active = false;
@@ -5095,17 +5419,13 @@ fn update_reference_transport(state: &mut AppState) {
             reference_transport.take_error(state.reference_transport_generation)
         })
     {
-        state.reference_transport_playing = false;
-        state.reference_transport_polling = false;
-        state.reference_transport_waiting_token = None;
-        state.reference_transport_loaded = false;
-        state.reference_only_playback = false;
-        state.reference_playhead_drag_active = false;
-        rollback_reference_persisted_note_drag(state);
-        state.status = error;
-    } else if state
-        .reference_transport_waiting_token
-        .is_none_or(|token| transport_command_is_confirmed(snapshot, token))
+        cleanup_reference_transport_failure(state, error);
+        return;
+    }
+    if !paired_playback_cleanup_active(state)
+        && state
+            .reference_transport_waiting_token
+            .is_none_or(|token| transport_command_is_confirmed(snapshot, token))
     {
         state.reference_transport_waiting_token = None;
         apply_reference_transport_snapshot(state, snapshot);
@@ -5272,6 +5592,11 @@ fn seek_review_position(
     ratio: f32,
     resume: bool,
 ) {
+    if let Some(error) = paired_playback_cleanup_error(state) {
+        state.status = error.to_owned();
+        context.request_repaint();
+        return;
+    }
     if state.waveform_busy || state.reference_waveform_busy {
         return;
     }
@@ -5285,8 +5610,6 @@ fn seek_review_position(
     disarm_audition_auto_advance(state);
     let time_millis = waveform::millis_for_ratio(ratio, duration_millis);
     state.reference_only_playback = false;
-    state.review_cursor_millis = time_millis;
-    state.transport_position_millis = time_millis;
     if resume {
         match resume_main_at_position_with_reference(state, time_millis) {
             Ok(()) => {
@@ -5295,6 +5618,8 @@ fn seek_review_position(
             Err(error) => state.status = error,
         }
     } else {
+        state.review_cursor_millis = time_millis;
+        state.transport_position_millis = time_millis;
         state.status = format!("Scrubbing at {}.", format_timestamp(time_millis));
     }
     context.request_repaint();
@@ -5367,6 +5692,11 @@ fn maybe_start_pending_comment_playback(
     state: &mut AppState,
     context: &mut ui::UiUpdateContext<Message>,
 ) {
+    if let Some(error) = paired_playback_cleanup_error(state) {
+        state.status = error.to_owned();
+        context.request_repaint();
+        return;
+    }
     let Some(pending) = state.pending_comment_playback.clone() else {
         return;
     };
@@ -5628,6 +5958,11 @@ fn rebuild_audition_queue(state: &mut AppState) {
 }
 
 fn shuffle_audition(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
+    if let Some(error) = paired_playback_cleanup_error(state) {
+        state.status = error.to_owned();
+        context.request_repaint();
+        return;
+    }
     if state.busy || state.workspace_mode != WorkspaceMode::Audition {
         return;
     }
@@ -5871,6 +6206,11 @@ fn advance_audition(state: &mut AppState, context: &mut ui::UiUpdateContext<Mess
 }
 
 fn maybe_start_pending_audition(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
+    if let Some(error) = paired_playback_cleanup_error(state) {
+        state.status = error.to_owned();
+        context.request_repaint();
+        return;
+    }
     let Some(track_id) = state.audition_pending_play_track_id.clone() else {
         return;
     };
@@ -9379,12 +9719,13 @@ mod tests {
     use super::{
         APP_VERSION_LABEL, AppState, AuditionSource, DEFAULT_LIVE_SPECTROGRAM_DISPLAY_SAMPLE_RATE,
         FavoriteMarkerWidget, ImportBatchProgress, LiveSpectrogramMode, LoopBounds, LoopSelection,
-        LoopSelections, Message, NoteDraft, PlannerInsertionTarget, REFERENCE_MENU_WIDTH,
-        SETTINGS_REFERENCE_ROW_METADATA_HEIGHT, SETTINGS_REFERENCE_ROW_TEXT_HEIGHT,
-        SETTINGS_REFERENCE_ROW_TEXT_SPACING, SETTINGS_REFERENCE_ROW_TITLE_HEIGHT,
-        STATUS_BAR_VERSION_WIDTH, StatusMenuHost, TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER,
-        TRACK_CARD_SELECTED_CORAL, WAVEFORM_HEIGHT, WorkspaceMode, animation_requested,
-        apply_transport_snapshot, audition_panel, audition_shuffle_seed, audition_statuses,
+        LoopSelections, Message, NoteDraft, PairedPlaybackGuard, PlannerInsertionTarget,
+        REFERENCE_MENU_WIDTH, SETTINGS_REFERENCE_ROW_METADATA_HEIGHT,
+        SETTINGS_REFERENCE_ROW_TEXT_HEIGHT, SETTINGS_REFERENCE_ROW_TEXT_SPACING,
+        SETTINGS_REFERENCE_ROW_TITLE_HEIGHT, STATUS_BAR_VERSION_WIDTH, StatusMenuHost,
+        TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER, TRACK_CARD_SELECTED_CORAL, WAVEFORM_HEIGHT,
+        WorkspaceMode, animation_requested, apply_transport_snapshot, audition_panel,
+        audition_shuffle_seed, audition_statuses, cleanup_reference_transport_failure,
         current_live_frame_for_source, current_loudness_match_gain_db, current_lufs_meter_value,
         current_reference_lufs_meter_value, decode_result_is_current, deterministic_shuffle,
         enforce_loop, favorite_toggle, frame_surface_revisions, library_track_title_id,
@@ -9395,10 +9736,10 @@ mod tests {
         reconcile_audition_queue, reference_decode_result_is_current, reference_output_gain,
         reference_settings_auxiliary_windows, reference_settings_window_view,
         refresh_live_spectrogram, refresh_live_spectrograms, review_spectrogram_source,
-        review_status_filter_message, selected_reference_notes, selected_track, stage_dropdown,
-        stage_menu_anchor_from_pointer, stage_menu_popover, status_dropdown_for_host,
-        status_filter_dropdown, sync_audition_queue_after_status_change, tracks_with_status,
-        transport_command_is_confirmed, update,
+        review_status_filter_message, seek_synchronized_positions, selected_reference_notes,
+        selected_track, stage_dropdown, stage_menu_anchor_from_pointer, stage_menu_popover,
+        status_dropdown_for_host, status_filter_dropdown, sync_audition_queue_after_status_change,
+        tracks_with_status, transport_command_is_confirmed, update,
     };
     use crate::transport::{LiveFrameState, Snapshot};
     use crate::{
@@ -13549,6 +13890,324 @@ mod tests {
         assert!(state.reference_transport_polling);
         assert!(state.transport_waiting_token.is_some());
         assert!(state.reference_transport_waiting_token.is_some());
+    }
+
+    #[test]
+    fn paired_toggle_reference_failure_cleans_up_main_and_preserves_retry_state() {
+        let mut state = shared_reference_playback_state();
+        let error = String::from("reference play failed immediately");
+        let reference_generation = state.reference_transport_generation;
+        let reference_transport = state
+            .reference_transport
+            .as_ref()
+            .expect("paired playback should have a reference transport")
+            .clone();
+        reference_transport.fail_next_command_for_test(error.clone());
+        state.transport_position_millis = 650;
+        state.review_cursor_millis = 650;
+        state.reference_transport_position_millis = 1_800;
+        state.loop_selections = LoopSelections {
+            main: Some(LoopSelection {
+                start_ratio: 0.2,
+                end_ratio: 0.6,
+            }),
+            reference: Some(LoopSelection {
+                start_ratio: 0.3,
+                end_ratio: 0.7,
+            }),
+        };
+        let loops = state.loop_selections;
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut state, Message::TogglePlayback, &mut context);
+
+        assert_eq!(state.status, error);
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::StoppingMain { .. }
+        ));
+        assert!(!state.transport_playing);
+        assert!(state.transport_polling);
+        assert_eq!(state.transport_position_millis, 650);
+        assert_eq!(state.review_cursor_millis, 650);
+        assert_eq!(state.reference_transport_position_millis, 1_800);
+        assert_eq!(state.loop_selections, loops);
+        assert_eq!(
+            state.reference_transport_generation,
+            reference_generation.wrapping_add(1)
+        );
+        assert!(!state.reference_transport_playing);
+        assert!(!state.reference_transport_polling);
+        assert!(state.reference_transport_waiting_token.is_none());
+        assert!(!state.reference_transport_loaded);
+        assert!(!state.reference_only_playback);
+        assert_eq!(state.transport.requested_output_gain_for_test(), 0.0);
+
+        update(&mut state, Message::TogglePlayback, &mut context);
+        assert_eq!(state.status, error);
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::StoppingMain { .. }
+        ));
+    }
+
+    #[test]
+    fn paired_synchronized_seek_reference_failure_cleans_up_main_atomically() {
+        let mut state = shared_reference_playback_state();
+        let error = String::from("reference seek failed immediately");
+        state
+            .reference_transport
+            .as_ref()
+            .expect("paired playback should have a reference transport")
+            .fail_next_command_for_test(error.clone());
+        state.transport_position_millis = 400;
+        state.review_cursor_millis = 400;
+        state.reference_transport_position_millis = 2_200;
+        state.loop_selections = LoopSelections {
+            main: Some(LoopSelection {
+                start_ratio: 0.1,
+                end_ratio: 0.5,
+            }),
+            reference: Some(LoopSelection {
+                start_ratio: 0.4,
+                end_ratio: 0.8,
+            }),
+        };
+        let loops = state.loop_selections;
+
+        let result = seek_synchronized_positions(&mut state, 900, 2_900, true);
+
+        assert_eq!(result, Err(error.clone()));
+        assert_eq!(state.status, error);
+        assert!(!state.transport_playing);
+        assert_eq!(state.transport_position_millis, 400);
+        assert_eq!(state.review_cursor_millis, 400);
+        assert_eq!(state.reference_transport_position_millis, 2_200);
+        assert_eq!(state.loop_selections, loops);
+        assert!(!state.reference_transport_loaded);
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::StoppingMain { .. }
+        ));
+    }
+
+    #[test]
+    fn async_paired_reference_failure_stops_main_and_preserves_root_error() {
+        let mut state = shared_reference_playback_state();
+        state.paired_playback_guard = PairedPlaybackGuard::Active;
+        state.transport_playing = true;
+        state.transport_polling = true;
+        state.transport_waiting_token = Some(7);
+        state.reference_transport_playing = true;
+        state.reference_transport_polling = true;
+        state.reference_transport_waiting_token = Some(11);
+        state.transport_position_millis = 720;
+        state.review_cursor_millis = 720;
+        state.reference_transport_position_millis = 2_640;
+        state.loop_selections.reference = Some(LoopSelection {
+            start_ratio: 0.2,
+            end_ratio: 0.7,
+        });
+        let reference_generation = state.reference_transport_generation;
+        let reference_transport = state
+            .reference_transport
+            .as_ref()
+            .expect("paired playback should have a reference transport")
+            .clone();
+        state.transport.set_snapshot_for_test(Snapshot {
+            generation: state.transport_generation,
+            acknowledged_token: 0,
+            position_millis: 720,
+            playing: true,
+            ready: true,
+        });
+        reference_transport.set_snapshot_for_test(Snapshot {
+            generation: reference_generation,
+            acknowledged_token: 11,
+            position_millis: 2_640,
+            playing: true,
+            ready: true,
+        });
+        reference_transport.set_error_for_test(
+            reference_generation,
+            String::from("async reference failure"),
+        );
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut state, Message::Frame, &mut context);
+
+        assert_eq!(state.status, "async reference failure");
+        assert!(!state.transport_playing);
+        assert_eq!(state.transport_position_millis, 720);
+        assert_eq!(state.review_cursor_millis, 720);
+        assert_eq!(state.reference_transport_position_millis, 2_640);
+        assert_eq!(
+            state.reference_transport_generation,
+            reference_generation.wrapping_add(1)
+        );
+        assert!(!state.reference_transport_playing);
+        assert!(!state.reference_transport_polling);
+        assert!(state.reference_transport_waiting_token.is_none());
+        assert!(!state.reference_transport_loaded);
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::StoppingMain { .. }
+        ));
+        assert_eq!(state.transport.requested_output_gain_for_test(), 0.0);
+
+        update(&mut state, Message::TogglePlayback, &mut context);
+        assert_eq!(state.status, "async reference failure");
+    }
+
+    #[test]
+    fn starting_reference_alongside_main_failure_stops_main_atomically() {
+        let mut state = shared_reference_playback_state();
+        state.transport_playing = true;
+        state.transport_position_millis = 300;
+        state.reference_transport_position_millis = 1_200;
+        let error = String::from("reference start failed immediately");
+        state
+            .reference_transport
+            .as_ref()
+            .expect("paired playback should have a reference transport")
+            .fail_next_command_for_test(error.clone());
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::ActivateAuditionSource(AuditionSource::Reference),
+            &mut context,
+        );
+
+        assert_eq!(state.status, error);
+        assert!(!state.transport_playing);
+        assert!(!state.reference_transport_playing);
+        assert!(!state.reference_transport_loaded);
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::StoppingMain { .. }
+        ));
+    }
+
+    #[test]
+    fn paired_cleanup_retries_full_main_queue_without_replacing_root_error() {
+        let mut state = shared_reference_playback_state();
+        let root_error = String::from("reference cleanup root error");
+        state.paired_playback_guard = PairedPlaybackGuard::Active;
+        state.transport.set_command_queue_size_for_test(32);
+
+        cleanup_reference_transport_failure(&mut state, root_error.clone());
+
+        assert_eq!(state.status, root_error);
+        assert!(!state.transport_playing);
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::StoppingMain {
+                main_pause_token: None,
+                ..
+            }
+        ));
+        assert_eq!(state.transport.requested_output_gain_for_test(), 0.0);
+
+        state.transport.set_command_queue_size_for_test(31);
+        let mut context = ui::UiUpdateContext::default();
+        update(&mut state, Message::Frame, &mut context);
+        assert_eq!(state.status, root_error);
+        let pause_token = state
+            .transport_waiting_token
+            .expect("cleanup should retry the main pause");
+        assert!(!state.transport_playing);
+
+        state.transport.set_snapshot_for_test(Snapshot {
+            generation: state.transport_generation,
+            acknowledged_token: pause_token,
+            position_millis: state.transport_position_millis,
+            playing: false,
+            ready: true,
+        });
+        update(&mut state, Message::Frame, &mut context);
+
+        assert_eq!(state.status, root_error);
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::Idle
+        ));
+        assert_eq!(
+            state.transport.requested_output_gain_for_test(),
+            state.audition_volume
+        );
+    }
+
+    #[test]
+    fn reference_only_failure_does_not_touch_main_transport_state() {
+        let mut state = shared_reference_playback_state();
+        state.reference_only_playback = true;
+        state.transport_playing = true;
+        state.transport_position_millis = 510;
+        state.review_cursor_millis = 510;
+        state.transport.set_output_gain(0.37);
+        let main_generation = state.transport_generation;
+        let reference_generation = state.reference_transport_generation;
+        state.transport.set_snapshot_for_test(Snapshot {
+            generation: main_generation,
+            acknowledged_token: 0,
+            position_millis: 510,
+            playing: true,
+            ready: true,
+        });
+        let reference_transport = state
+            .reference_transport
+            .as_ref()
+            .expect("reference-only playback should have a reference transport")
+            .clone();
+        reference_transport.set_snapshot_for_test(Snapshot {
+            generation: reference_generation,
+            acknowledged_token: 3,
+            position_millis: 1_400,
+            playing: true,
+            ready: true,
+        });
+        reference_transport
+            .set_error_for_test(reference_generation, String::from("reference-only failure"));
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut state, Message::Frame, &mut context);
+
+        assert_eq!(state.status, "reference-only failure");
+        assert!(state.transport_playing);
+        assert_eq!(state.transport_position_millis, 510);
+        assert_eq!(state.review_cursor_millis, 510);
+        assert_eq!(state.transport_generation, main_generation);
+        assert_eq!(state.transport.requested_output_gain_for_test(), 0.37);
+        assert!(!state.reference_transport_playing);
+        assert!(!state.reference_transport_polling);
+        assert!(state.reference_transport_waiting_token.is_none());
+        assert!(!state.reference_transport_loaded);
+        assert!(!state.reference_only_playback);
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::Idle
+        ));
+    }
+
+    #[test]
+    fn main_only_playback_failure_remains_unguarded() {
+        let mut state = main_only_loop_state();
+        let error = String::from("main-only play failed immediately");
+        state.transport.fail_next_command_for_test(error.clone());
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut state, Message::TogglePlayback, &mut context);
+
+        assert_eq!(state.status, error);
+        assert!(!state.transport_playing);
+        assert!(!state.transport_polling);
+        assert!(state.transport_waiting_token.is_none());
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::Idle
+        ));
+        assert!(state.reference_transport.is_none());
     }
 
     #[test]

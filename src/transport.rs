@@ -1469,6 +1469,8 @@ pub struct AudioTransport {
     shared: Arc<SharedSnapshot>,
     pending_load: Arc<PendingLoad>,
     next_token: Arc<AtomicU64>,
+    #[cfg(test)]
+    test_next_command_error: Arc<Mutex<Option<String>>>,
 }
 
 impl AudioTransport {
@@ -1497,6 +1499,8 @@ impl AudioTransport {
             shared,
             pending_load,
             next_token: Arc::new(AtomicU64::new(1)),
+            #[cfg(test)]
+            test_next_command_error: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1597,12 +1601,33 @@ impl AudioTransport {
             .store(COMMAND_CAPACITY, Ordering::Release);
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_command_queue_size_for_test(&self, queued: usize) {
+        self.queued_commands
+            .store(queued.min(COMMAND_CAPACITY), Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_command_for_test(&self, error: String) {
+        if let Ok(mut next_error) = self.test_next_command_error.lock() {
+            *next_error = Some(error);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn requested_output_gain_for_test(&self) -> f32 {
+        self.shared.requested_volume()
+    }
+
     pub fn load(
         &self,
         generation: u64,
         path: PathBuf,
         duration_millis: u64,
     ) -> Result<u64, String> {
+        if let Some(error) = self.take_test_command_error() {
+            return Err(error);
+        }
         self.shared
             .requested_generation
             .store(generation, Ordering::Release);
@@ -1638,6 +1663,9 @@ impl AudioTransport {
     }
 
     pub fn unload(&self, generation: u64) -> Result<u64, String> {
+        if let Some(error) = self.take_test_command_error() {
+            return Err(error);
+        }
         self.shared
             .requested_generation
             .store(generation, Ordering::Release);
@@ -1647,6 +1675,9 @@ impl AudioTransport {
     }
 
     pub fn play(&self, generation: u64) -> Result<u64, String> {
+        if let Some(error) = self.take_test_command_error() {
+            return Err(error);
+        }
         if self.has_pending_load() {
             return Err(String::from(CONTROLS_BUSY_ERROR));
         }
@@ -1656,6 +1687,9 @@ impl AudioTransport {
     }
 
     pub fn pause(&self, generation: u64) -> Result<u64, String> {
+        if let Some(error) = self.take_test_command_error() {
+            return Err(error);
+        }
         let token = self.next_token();
         self.try_send(Command::Pause { token, generation })
             .map(|()| token)
@@ -1668,6 +1702,9 @@ impl AudioTransport {
         duration_millis: u64,
         resume: bool,
     ) -> Result<u64, String> {
+        if let Some(error) = self.take_test_command_error() {
+            return Err(error);
+        }
         if self.has_pending_load() {
             return Err(String::from(CONTROLS_BUSY_ERROR));
         }
@@ -1700,6 +1737,16 @@ impl AudioTransport {
 
     fn next_token(&self) -> u64 {
         self.next_token.fetch_add(1, Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn take_test_command_error(&self) -> Option<String> {
+        self.test_next_command_error.lock().ok()?.take()
+    }
+
+    #[cfg(not(test))]
+    fn take_test_command_error(&self) -> Option<String> {
+        None
     }
 
     fn try_reserve_command_slot(&self) -> bool {
@@ -2308,7 +2355,7 @@ mod tests {
     use rodio::{Player, Source, buffer::SamplesBuffer, source::SeekError};
     use std::path::PathBuf;
     use std::sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, AtomicUsize, Ordering},
         mpsc,
     };
@@ -2367,6 +2414,7 @@ mod tests {
             shared: Arc::new(SharedSnapshot::new()),
             pending_load: Arc::new(PendingLoad::new()),
             next_token: Arc::new(AtomicU64::new(1)),
+            test_next_command_error: Arc::new(Mutex::new(None)),
         };
 
         transport
