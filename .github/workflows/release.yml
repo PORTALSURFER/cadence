@@ -41,6 +41,23 @@ jobs:
       artifact_upload_name: ${{ steps.release.outputs.artifact_upload_name }}
       source_sha: ${{ steps.release.outputs.source_sha }}
     steps:
+      - name: Validate manual stable source
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          INPUT_CHANNEL: ${{ inputs.channel || '' }}
+          INPUT_VERSION: ${{ inputs.version || '' }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" && "$INPUT_CHANNEL" == "stable" ]]; then
+            [[ "$REF" == "refs/heads/main" || "$REF" == "refs/tags/v${INPUT_VERSION}" ]] || {
+              echo "manual stable releases must run from refs/heads/main or the matching v<version> tag" >&2
+              exit 1
+            }
+          fi
+
       - name: Check out source
         uses: actions/checkout@v4
         with:

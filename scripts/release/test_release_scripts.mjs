@@ -168,6 +168,51 @@ test("nightly allocator fails closed for history drift, gaps, and malformed name
   }
 });
 
+function workflowRunBlock(workflow, stepName) {
+  const stepMarker = `      - name: ${stepName}\n`;
+  const stepStart = workflow.indexOf(stepMarker);
+  assert.ok(stepStart >= 0, `workflow must define the ${stepName} step`);
+
+  const runMarker = "        run: |\n";
+  const runStart = workflow.indexOf(runMarker, stepStart);
+  assert.ok(runStart >= 0, `${stepName} must define a shell run block`);
+
+  const bodyStart = runStart + runMarker.length;
+  const nextStep = workflow.indexOf("\n      - name: ", bodyStart);
+  const body = workflow.slice(bodyStart, nextStep >= 0 ? nextStep : workflow.length);
+  return body
+    .split("\n")
+    .map((line) => (line.startsWith("          ") ? line.slice(10) : line))
+    .join("\n")
+    .trim();
+}
+
+test("release workflow rejects untrusted manual stable sources", async () => {
+  const workflow = await fs.readFile(workflowPath, "utf8");
+  const stableSourceCheck = workflowRunBlock(workflow, "Validate manual stable source");
+  const runSourceCheck = (ref, version = "0.1.0") => execFileAsync(
+    "bash",
+    ["-c", stableSourceCheck],
+    {
+      env: {
+        ...process.env,
+        EVENT_NAME: "workflow_dispatch",
+        REF: ref,
+        INPUT_CHANNEL: "stable",
+        INPUT_VERSION: version,
+      },
+    },
+  );
+
+  await assert.rejects(
+    runSourceCheck("refs/heads/feature/release-test"),
+    (error) => error.code === 1 && error.stderr.includes("manual stable releases must run from"),
+  );
+  await assert.doesNotReject(runSourceCheck("refs/heads/main"));
+  await assert.doesNotReject(runSourceCheck("refs/tags/v0.1.0"));
+  await assert.rejects(runSourceCheck("refs/tags/v0.1.1"), (error) => error.code === 1);
+});
+
 test("release workflow reserves nightly versions before immutable builds", async () => {
   const workflow = await fs.readFile(workflowPath, "utf8");
   const prepareMatch = workflow.match(/\n  prepare:\n([\s\S]*?)\n  build:\n/);
