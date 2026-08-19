@@ -50,7 +50,7 @@ if [[ "$output_path" != /* ]]; then
 fi
 mkdir -p "$(dirname -- "$output_path")"
 
-window_id() {
+window_records() {
     swift -e '
 import CoreGraphics
 
@@ -60,19 +60,31 @@ let windows = CGWindowListCopyWindowInfo(
 ) as? [[String: Any]] ?? []
 
 for window in windows {
+    let id = window[kCGWindowNumber as String] as? Int ?? 0
+    let ownerPID = window[kCGWindowOwnerPID as String] as? Int ?? 0
     let owner = window[kCGWindowOwnerName as String] as? String ?? ""
     let name = window[kCGWindowName as String] as? String ?? ""
-    let id = window[kCGWindowNumber as String] as? Int ?? 0
-    if owner == "cadence-native" && name == "Cadence — local track review" {
-        print(id)
-        break
-    }
+    print("\(id)\t\(ownerPID)\t\(owner)\t\(name)")
 }
-' 2>/dev/null | head -n 1
+' 2>/dev/null
+}
+
+window_record() {
+    window_records | awk -F '\t' '
+        $1 ~ /^[1-9][0-9]*$/ &&
+        $2 ~ /^[1-9][0-9]*$/ &&
+        ($3 == "Cadence" || $3 == "cadence-native") &&
+        $4 == "Cadence — local track review" &&
+        !found {
+            print $1 "\t" $2
+            found = 1
+        }
+    '
 }
 
 log_path="$(mktemp -t cadence-native-screenshot.XXXXXX)"
 app_pid=""
+app_owner_pid=""
 
 cleanup() {
     if [[ -n "$app_pid" ]] && kill -0 "$app_pid" 2>/dev/null; then
@@ -83,8 +95,8 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-native_window_id="$(window_id)"
-if [[ -z "$native_window_id" ]]; then
+native_window_record="$(window_record)"
+if [[ -z "$native_window_record" ]]; then
     (
         cd "$project_dir"
         cargo build --quiet --locked
@@ -94,18 +106,19 @@ if [[ -z "$native_window_id" ]]; then
 
     for _ in {1..60}; do
         sleep 0.5
-        native_window_id="$(window_id)"
-        [[ -n "$native_window_id" ]] && break
+        native_window_record="$(window_record)"
+        [[ -n "$native_window_record" ]] && break
     done
 fi
 
-if [[ -z "$native_window_id" ]]; then
+if [[ -z "$native_window_record" ]]; then
     printf '%s\n' "Cadence native window did not appear." >&2
     tail -n 40 "$log_path" >&2
     exit 1
 fi
 
-osascript -e 'tell application "System Events" to set frontmost of process "cadence-native" to true' 2>/dev/null || true
+IFS=$'\t' read -r native_window_id app_owner_pid <<< "$native_window_record"
+osascript -e "tell application \"System Events\" to set frontmost of (first process whose unix id is $app_owner_pid) to true" 2>/dev/null || true
 
 if [[ -n "$hover_x" ]]; then
     swift -e '
