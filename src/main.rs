@@ -20,7 +20,8 @@ use radiant::{
     },
     theme::ThemeTokens,
     widgets::{
-        DragHandleWidget, InteractiveRowWidget, Widget, WidgetCommon, WidgetInput, WidgetOutput,
+        DragHandleWidget, InteractiveRowWidget, SliderEditBatch, Widget, WidgetCommon, WidgetInput,
+        WidgetOutput,
     },
 };
 use std::{
@@ -151,7 +152,7 @@ enum Message {
     SelectCommentSource(CommentSource),
     ToggleReviewFilterMenu,
     ToggleReferenceMatch,
-    AuditionVolumeChanged(f32),
+    AuditionVolumeChanged(SliderEditBatch),
     Frame,
     WaveformLoopDragStarted {
         ratio: f32,
@@ -2608,13 +2609,19 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
             context.request_repaint();
         }
-        Message::AuditionVolumeChanged(volume) => {
-            let volume = transport::normalize_volume(volume);
-            state.audition_volume = volume;
-            // This gain is applied only by Rodio's output player. The
-            // decoder's integrated LUFS value is computed from raw samples.
-            sync_audition_output_gains(state);
-            context.request_repaint();
+        Message::AuditionVolumeChanged(edit) => {
+            if let Some(volume) = edit.value_change() {
+                let volume = transport::normalize_volume(volume);
+                state.audition_volume = volume;
+                // This gain is applied only by Rodio's output player. The
+                // decoder's integrated LUFS value is computed from raw samples.
+                sync_audition_output_gains(state);
+            }
+            if edit.events().iter().any(|event| event.phase.is_terminal()) {
+                context.repaint(ui::RepaintScope::Projection);
+            } else {
+                context.request_paint_only();
+            }
         }
         Message::WaveformLoopDragStarted { .. } => {
             if state.busy || state.waveform_busy || state.waveform.is_none() {
@@ -8491,7 +8498,7 @@ fn review_global_controls(state: &AppState, track: &storage::Track) -> ui::View<
             .compact()
             .track_height(5.0)
             .track_border()
-            .message(Message::AuditionVolumeChanged)
+            .on_edit(Message::AuditionVolumeChanged)
             .key("native-audition-volume")
             .height(26.0)
             .width(180.0),
@@ -9409,7 +9416,10 @@ mod tests {
             RepaintScope, SurfaceRuntime, TransientOverlayContext,
         },
         theme::ThemeTokens,
-        widgets::{PointerModifiers, Widget, WidgetInput},
+        widgets::{
+            EditEvent, EditPhase, InteractionProvenance, PointerModifiers, SliderEditBatch, Widget,
+            WidgetInput,
+        },
     };
     use std::{path::PathBuf, sync::Arc, time::Duration};
 
@@ -9560,6 +9570,38 @@ mod tests {
                     1,
                 ),
             ),
+        }
+    }
+
+    fn audition_volume_edit(
+        start: f32,
+        value: f32,
+        terminal: Option<EditPhase>,
+    ) -> SliderEditBatch {
+        let provenance = InteractionProvenance::Programmatic;
+        let begin = EditEvent::begin(start, provenance);
+        let update = begin
+            .update(value, provenance)
+            .expect("volume edit update should follow begin");
+        match terminal {
+            None => SliderEditBatch::from_events(&[begin, update]).expect("volume edit batch"),
+            Some(EditPhase::Commit) => {
+                let commit = update
+                    .commit(value, provenance)
+                    .expect("volume edit commit should follow update");
+                SliderEditBatch::from_events(&[begin, update, commit])
+                    .expect("volume edit commit batch")
+            }
+            Some(EditPhase::Cancel) => {
+                let cancel = update
+                    .cancel(provenance)
+                    .expect("volume edit cancel should follow update");
+                SliderEditBatch::from_events(&[begin, update, cancel])
+                    .expect("volume edit cancel batch")
+            }
+            Some(EditPhase::Begin | EditPhase::Update) => {
+                panic!("volume edit helper only accepts terminal phases")
+            }
         }
     }
 
@@ -11688,17 +11730,71 @@ mod tests {
 
         update(
             &mut state,
-            Message::AuditionVolumeChanged(0.25),
+            Message::AuditionVolumeChanged(audition_volume_edit(
+                transport::DEFAULT_VOLUME,
+                0.25,
+                None,
+            )),
             &mut context,
         );
 
         assert_eq!(state.audition_volume, 0.25);
+        assert_eq!(main_output_gain(&state), 0.25);
+        assert_eq!(
+            context.into_command().repaint_scope(),
+            Some(RepaintScope::PaintOnly)
+        );
         assert_eq!(
             state
                 .waveform
                 .as_ref()
                 .and_then(|waveform| waveform.integrated_lufs),
             Some(-7.0)
+        );
+    }
+
+    #[test]
+    fn audition_volume_terminal_edit_reprojects_and_cancel_restores() {
+        let mut state = AppState {
+            busy: false,
+            audition_volume: 0.8,
+            ..AppState::default()
+        };
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::AuditionVolumeChanged(audition_volume_edit(
+                0.8,
+                0.25,
+                Some(EditPhase::Commit),
+            )),
+            &mut context,
+        );
+
+        assert_eq!(state.audition_volume, 0.25);
+        assert_eq!(main_output_gain(&state), 0.25);
+        assert_eq!(
+            context.into_command().repaint_scope(),
+            Some(RepaintScope::Projection)
+        );
+
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::AuditionVolumeChanged(audition_volume_edit(
+                0.25,
+                0.75,
+                Some(EditPhase::Cancel),
+            )),
+            &mut context,
+        );
+
+        assert_eq!(state.audition_volume, 0.25);
+        assert_eq!(main_output_gain(&state), 0.25);
+        assert_eq!(
+            context.into_command().repaint_scope(),
+            Some(RepaintScope::Projection)
         );
     }
 
