@@ -245,6 +245,7 @@ test("release workflow reserves nightly versions before immutable builds", async
   }
   assert.match(buildJob, /needs: prepare/);
   assert.match(buildJob, /runs-on: macos-14/);
+  assert.match(buildJob, /environment: cadence-production/);
   assert.match(buildJob, /\n    permissions:\n      contents: read\n      actions: read\n/);
   assert.match(buildJob, /- name: Check out source\n        uses: actions\/checkout@v4\n        with:\n          ref: \$\{\{ needs\.prepare\.outputs\.source_sha \}\}\n          persist-credentials: false/);
   assert.doesNotMatch(buildJob, /Select release metadata|github\.event_name|steps\.release/);
@@ -253,13 +254,13 @@ test("release workflow reserves nightly versions before immutable builds", async
   assert.match(buildJob, /actions\/upload-artifact@v4/);
   assert.match(buildJob, /path: release-output\//);
   for (const secret of [
-    "APPLE_DEVELOPER_ID_APPLICATION_CERT_BASE64",
-    "APPLE_DEVELOPER_ID_APPLICATION_CERT_PASSWORD",
-    "APPLE_NOTARY_KEY_BASE64",
-    "APPLE_NOTARY_KEY_ID",
-    "APPLE_NOTARY_ISSUER_ID",
+    "CADENCE_PRODUCTION_APPLE_DEVELOPER_ID_APPLICATION_CERT_BASE64",
+    "CADENCE_PRODUCTION_APPLE_DEVELOPER_ID_APPLICATION_CERT_PASSWORD",
+    "CADENCE_PRODUCTION_APPLE_NOTARY_KEY_BASE64",
+    "CADENCE_PRODUCTION_APPLE_NOTARY_KEY_ID",
+    "CADENCE_PRODUCTION_APPLE_NOTARY_ISSUER_ID",
   ]) {
-    assert.match(buildJob, new RegExp(secret));
+    assert.match(buildJob, new RegExp(`\\$\\{\\{ secrets\\.${secret} \\}\\}`));
   }
   assert.doesNotMatch(buildJob, /CADENCE_RELEASE_UPLOAD_TOKEN|PORTALSURFER_RELEASE_ENDPOINT|publish_release\.mjs|gh release/);
 
@@ -284,6 +285,7 @@ test("release workflow reserves nightly versions before immutable builds", async
   assert.match(buildJob.slice(uploadIndex), /overwrite: false/);
 
   assert.match(publishJob, /needs: build/);
+  assert.match(publishJob, /environment: cadence-production/);
   assert.match(publishJob, /\n    permissions:\n      contents: write\n      actions: read\n/);
   assert.match(publishJob, /- name: Check out source for release publisher\n        uses: actions\/checkout@v4\n        with:\n          ref: \$\{\{ needs\.build\.outputs\.source_sha \}\}\n          persist-credentials: false/);
   assert.match(publishJob, /actions\/download-artifact@v4/);
@@ -292,7 +294,10 @@ test("release workflow reserves nightly versions before immutable builds", async
   assert.match(publishJob, /run-id: \$\{\{ github\.run_id \}\}/);
   assert.match(publishJob, /\.source\.git_sha == \$git_sha/);
   assert.doesNotMatch(publishJob, /and \.git_sha == \$git_sha/);
-  assert.match(publishJob, /CADENCE_RELEASE_UPLOAD_TOKEN/);
+  assert.match(
+    publishJob,
+    /\$\{\{ secrets\.CADENCE_PRODUCTION_PORTALSURFER_RELEASE_TOKEN \}\}/,
+  );
   assert.match(publishJob, /gh release view/);
   assert.match(publishJob, /gh release create/);
   assert.match(publishJob, /git\/ref\/tags\/\$RELEASE_TAG/);
@@ -308,4 +313,20 @@ test("release workflow reserves nightly versions before immutable builds", async
     /- name: Publish exact release to PortalSurfer\n        run: \|\n          node scripts\/release\/publish_release\.mjs \\\n            --manifest release-output\/cadence-release-manifest\.json \\\n            --root release-output/,
     "publisher arguments must remain separate shell arguments after YAML parsing",
   );
+
+  const releaseJobs = `${buildJob}\n${publishJob}`;
+  for (const legacySecret of [
+    "APPLE_DEVELOPER_ID_APPLICATION_CERT_BASE64",
+    "APPLE_DEVELOPER_ID_APPLICATION_CERT_PASSWORD",
+    "APPLE_NOTARY_KEY_BASE64",
+    "APPLE_NOTARY_KEY_ID",
+    "APPLE_NOTARY_ISSUER_ID",
+    "CADENCE_RELEASE_UPLOAD_TOKEN",
+  ]) {
+    assert.doesNotMatch(
+      releaseJobs,
+      new RegExp(`\\$\\{\\{ secrets\\.${legacySecret} \\}\\}`),
+      `release jobs must not use the legacy repository secret ${legacySecret}`,
+    );
+  }
 });

@@ -29,16 +29,20 @@ The same workflow runs nightly at `02:17 UTC` and can be started manually. Manua
 
 Release versions are channel-specific: stable is `X.Y.Z`, RC is `X.Y.Z-rc.N`, and nightly is `X.Y.Z-nightly.N`. Automatic nightlies use one globally increasing numeric patch stream across all three channels; existing nightlies are never renumbered. The full semantic version remains in the artifact name and manifest. Apple bundle metadata is separate: `CFBundleShortVersionString` is the numeric base `X.Y.Z`, while `CFBundleVersion` is the numeric build value (`X.Y.Z` for stable and `N` for RC/nightly). A failed or canceled run before the reservation consumes no patch; once the reservation commit and tag are pushed, later retries reuse that patch.
 
-The GitHub repository needs these Actions secrets:
+Both the build and publish jobs require the fixed `cadence-production` GitHub Actions environment. Configure that environment externally before a production release: allow only protected `main` and matching release tags, and require the reviewers selected in the environment protection rules. The existing manual stable-source guard remains defense in depth; it still accepts only `main` or the matching `vX.Y.Z` tag. Nightly and push-tag triggers retain their existing behavior.
 
-- `APPLE_DEVELOPER_ID_APPLICATION_CERT_BASE64`: a base64-encoded Developer ID Application `.p12` export.
-- `APPLE_DEVELOPER_ID_APPLICATION_CERT_PASSWORD`: the `.p12` password.
-- `APPLE_NOTARY_KEY_BASE64`, `APPLE_NOTARY_KEY_ID`, and `APPLE_NOTARY_ISSUER_ID`: an App Store Connect API key and its identifiers.
-- `CADENCE_RELEASE_UPLOAD_TOKEN`: the product-specific PortalSurfer release token.
+The `cadence-production` environment needs these Actions secrets:
+
+- `CADENCE_PRODUCTION_APPLE_DEVELOPER_ID_APPLICATION_CERT_BASE64`: a base64-encoded Developer ID Application `.p12` export.
+- `CADENCE_PRODUCTION_APPLE_DEVELOPER_ID_APPLICATION_CERT_PASSWORD`: the `.p12` password.
+- `CADENCE_PRODUCTION_APPLE_NOTARY_KEY_BASE64`, `CADENCE_PRODUCTION_APPLE_NOTARY_KEY_ID`, and `CADENCE_PRODUCTION_APPLE_NOTARY_ISSUER_ID`: an App Store Connect API key and its identifiers.
+- `CADENCE_PRODUCTION_PORTALSURFER_RELEASE_TOKEN`: the product-specific PortalSurfer release token.
+
+For an existing setup, copy each value from the old repository-level secret to its corresponding `cadence-production` environment secret: `APPLE_DEVELOPER_ID_APPLICATION_CERT_BASE64` to `CADENCE_PRODUCTION_APPLE_DEVELOPER_ID_APPLICATION_CERT_BASE64`, `APPLE_DEVELOPER_ID_APPLICATION_CERT_PASSWORD` to `CADENCE_PRODUCTION_APPLE_DEVELOPER_ID_APPLICATION_CERT_PASSWORD`, `APPLE_NOTARY_KEY_BASE64` to `CADENCE_PRODUCTION_APPLE_NOTARY_KEY_BASE64`, `APPLE_NOTARY_KEY_ID` to `CADENCE_PRODUCTION_APPLE_NOTARY_KEY_ID`, `APPLE_NOTARY_ISSUER_ID` to `CADENCE_PRODUCTION_APPLE_NOTARY_ISSUER_ID`, and `CADENCE_RELEASE_UPLOAD_TOKEN` to `CADENCE_PRODUCTION_PORTALSURFER_RELEASE_TOKEN`. After migration is verified, remove all of those old repository-level secrets. Do not expose secret values in repository files, logs, or documentation.
 
 The release build derives the ten-character Team ID from the trailing `(TEAMID)` in the selected imported Developer ID Application identity; configure no separate Team ID secret. It fails closed if the identity does not contain a valid suffix.
 
-GitHub Actions uses its built-in `GITHUB_TOKEN` for the GitHub release, so no separate GitHub release PAT is needed inside Actions. `CADENCE_RELEASE_UPLOAD_TOKEN` is still required for publishing the manifest and artifacts to PortalSurfer.
+GitHub Actions uses its built-in `GITHUB_TOKEN` for the GitHub release, so no separate GitHub release PAT is needed inside Actions. `CADENCE_PRODUCTION_PORTALSURFER_RELEASE_TOKEN` is still required for publishing the manifest and artifacts to PortalSurfer.
 
 Optionally set the repository variable `PORTALSURFER_RELEASE_ENDPOINT`; it defaults to `https://portalsurfer.org`. The publisher accepts only that production origin or an explicit HTTP loopback URL for local testing. It checks the server capability before staging the app zip, screenshot, and `CHANGELOG.md`, then commits their hashes in the manifest.
 
@@ -55,7 +59,7 @@ bash scripts/release/test_macos_architecture.sh
 ./scripts/release/build_macos_release.sh --help
 ```
 
-A real release requires macOS, the five Apple signing/notary secrets, a clean checkout, and the PortalSurfer upload token; the release tests exercise Team ID derivation with synthetic identities without Apple credentials. No ad-hoc signature is accepted by the production release script. Direct callers may pass `--channel stable`, `--channel rc`, or `--channel nightly`; omitting it preserves the stable default.
+A real release requires macOS, the protected `cadence-production` environment with the five Apple signing/notary secrets and the PortalSurfer upload token, and a clean checkout; the release tests exercise Team ID derivation with synthetic identities without Apple credentials. No ad-hoc signature is accepted by the production release script. Direct callers may pass `--channel stable`, `--channel rc`, or `--channel nightly`; omitting it preserves the stable default.
 
 To capture the current native window for visual refinement, run the macOS screenshot harness:
 
