@@ -4,6 +4,7 @@ use std::{
     env, fs,
     io::{ErrorKind, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -11,6 +12,9 @@ use std::{
 use std::os::fd::AsRawFd;
 
 const AUDIO_EXTENSIONS: &[&str] = &["aac", "aiff", "flac", "m4a", "mp3", "ogg", "opus", "wav"];
+const MAX_TEMP_FILE_ALLOCATION_ATTEMPTS: usize = 128;
+
+static NEXT_TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Library {
@@ -674,25 +678,100 @@ pub fn selection_after_removal(library: &Library, removed_index: usize) -> Optio
 
 pub fn persist_library(library: &Library) -> Result<(), String> {
     let path = library_path();
+    persist_library_at(library, &path)
+}
+
+fn persist_library_at(library: &Library, path: &Path) -> Result<(), String> {
+    let encoded = serde_json::to_vec_pretty(library)
+        .map_err(|error| format!("Could not encode library: {error}"))?;
     let directory = path
         .parent()
         .ok_or_else(|| format!("No parent directory for {}", path.display()))?;
     fs::create_dir_all(directory)
         .map_err(|error| format!("Could not create {}: {error}", directory.display()))?;
+
+    let (temporary_path, mut file) = create_unique_temp_file(path)?;
+    if let Err(error) = file.write_all(&encoded) {
+        drop(file);
+        return Err(with_temp_cleanup(
+            format!("Could not write {}: {error}", temporary_path.display()),
+            &temporary_path,
+        ));
+    }
+    if let Err(error) = file.sync_all() {
+        drop(file);
+        return Err(with_temp_cleanup(
+            format!("Could not sync {}: {error}", temporary_path.display()),
+            &temporary_path,
+        ));
+    }
+    drop(file);
+
+    if let Err(error) = fs::rename(&temporary_path, path) {
+        return Err(with_temp_cleanup(
+            format!("Could not replace {}: {error}", path.display()),
+            &temporary_path,
+        ));
+    }
+
+    #[cfg(unix)]
+    if let Err(error) = sync_parent_directory(directory) {
+        return Err(format!(
+            "Could not sync containing directory {} after replacing {}; durability is uncertain: {error}",
+            directory.display(),
+            path.display()
+        ));
+    }
+
+    Ok(())
+}
+
+fn create_unique_temp_file(path: &Path) -> Result<(PathBuf, fs::File), String> {
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("library.json");
-    let temporary_path = path.with_file_name(format!(".{file_name}.tmp-{}", std::process::id()));
-    let encoded = serde_json::to_vec_pretty(library)
-        .map_err(|error| format!("Could not encode library: {error}"))?;
-    fs::write(&temporary_path, encoded)
-        .map_err(|error| format!("Could not write {}: {error}", temporary_path.display()))?;
-    if let Err(error) = fs::rename(&temporary_path, &path) {
-        let _ = fs::remove_file(&temporary_path);
-        return Err(format!("Could not replace {}: {error}", path.display()));
+    let process_id = std::process::id();
+
+    for _ in 0..MAX_TEMP_FILE_ALLOCATION_ATTEMPTS {
+        let nonce = NEXT_TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
+        let temporary_path = path.with_file_name(format!(".{file_name}.tmp-{process_id}-{nonce}"));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)
+        {
+            Ok(file) => return Ok((temporary_path, file)),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "Could not create {}: {error}",
+                    temporary_path.display()
+                ));
+            }
+        }
     }
-    Ok(())
+
+    Err(format!(
+        "Could not create a unique temporary file for {} after {MAX_TEMP_FILE_ALLOCATION_ATTEMPTS} attempts",
+        path.display()
+    ))
+}
+
+fn with_temp_cleanup(primary_error: String, temporary_path: &Path) -> String {
+    match fs::remove_file(temporary_path) {
+        Ok(()) => primary_error,
+        Err(cleanup_error) => format!(
+            "{primary_error}; additionally, could not remove temporary file {}: {cleanup_error}",
+            temporary_path.display()
+        ),
+    }
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(directory: &Path) -> std::io::Result<()> {
+    let file = fs::File::open(directory)?;
+    file.sync_all()
 }
 
 pub fn library_path() -> PathBuf {
@@ -753,6 +832,158 @@ fn unique_id() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST_DIRECTORY_NONCE: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDirectory {
+        path: PathBuf,
+    }
+
+    impl TestDirectory {
+        fn new() -> Self {
+            for _ in 0..MAX_TEMP_FILE_ALLOCATION_ATTEMPTS {
+                let nonce = NEXT_TEST_DIRECTORY_NONCE.fetch_add(1, Ordering::Relaxed);
+                let path = std::env::temp_dir().join(format!(
+                    "cadence-storage-test-{}-{nonce}",
+                    std::process::id()
+                ));
+                match fs::create_dir(&path) {
+                    Ok(()) => return Self { path },
+                    Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+                    Err(error) => {
+                        panic!(
+                            "could not create isolated test directory {}: {error}",
+                            path.display()
+                        )
+                    }
+                }
+            }
+            panic!("could not allocate an isolated test directory")
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn temporary_paths(directory: &Path) -> Vec<PathBuf> {
+        fs::read_dir(directory)
+            .expect("test directory should be readable")
+            .map(|entry| {
+                entry
+                    .expect("test directory entry should be readable")
+                    .path()
+            })
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(".library.json.tmp-"))
+            })
+            .collect()
+    }
+
+    fn persistence_fixture() -> Library {
+        let reference_path = PathBuf::from("/external/reference.wav");
+        Library {
+            tracks: vec![Track {
+                id: String::from("track-1"),
+                title: String::from("Night Drive"),
+                original_name: String::from("night-drive.wav"),
+                path: PathBuf::from("/external/night-drive.wav"),
+                reference_path: Some(reference_path.clone()),
+                size: 42,
+                favorite: true,
+                stage: TrackStage::Mixdown,
+                status: TrackStatus::Release,
+                notes: vec![Note {
+                    id: String::from("note-1"),
+                    time_millis: 900,
+                    body: String::from("Compare the low-end tail."),
+                    done: false,
+                }],
+            }],
+            selected_track_id: Some(String::from("track-1")),
+            reference_tracks: vec![ReferenceTrack {
+                path: reference_path,
+                notes: vec![Note {
+                    id: String::from("reference-note-1"),
+                    time_millis: 1_100,
+                    body: String::from("Check the reference vocal."),
+                    done: true,
+                }],
+            }],
+            planner_order: vec![String::from("track-1")],
+        }
+    }
+
+    #[test]
+    fn persist_library_replaces_and_round_trips_a_complete_snapshot() {
+        let directory = TestDirectory::new();
+        let path = directory.path.join("library.json");
+        let library = persistence_fixture();
+        let expected = serde_json::to_vec_pretty(&library).expect("fixture should encode");
+        fs::write(&path, br#"{"stale":true}"#).expect("stale destination should be writable");
+
+        persist_library_at(&library, &path).expect("library should persist");
+
+        assert_eq!(
+            fs::read(&path).expect("destination should be readable"),
+            expected
+        );
+        let read_back: Library =
+            serde_json::from_slice(&fs::read(&path).expect("destination should be readable"))
+                .expect("persisted snapshot should parse");
+        assert_eq!(read_back, library);
+        assert!(temporary_paths(&directory.path).is_empty());
+    }
+
+    #[test]
+    fn temp_file_allocation_uses_distinct_create_new_paths() {
+        let directory = TestDirectory::new();
+        let path = directory.path.join("library.json");
+        let (first_path, first_file) =
+            create_unique_temp_file(&path).expect("first temporary file should be created");
+        let (second_path, second_file) =
+            create_unique_temp_file(&path).expect("second temporary file should be created");
+        let expected_prefix = format!(".library.json.tmp-{}-", std::process::id());
+
+        assert_ne!(first_path, second_path);
+        assert!(
+            first_path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(&expected_prefix))
+        );
+        assert!(
+            second_path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(&expected_prefix))
+        );
+
+        drop(first_file);
+        drop(second_file);
+        fs::remove_file(first_path).expect("first temporary file should be removable");
+        fs::remove_file(second_path).expect("second temporary file should be removable");
+    }
+
+    #[test]
+    fn persist_library_cleans_up_when_destination_cannot_be_replaced() {
+        let directory = TestDirectory::new();
+        let path = directory.path.join("library.json");
+        let library = persistence_fixture();
+        fs::create_dir(&path).expect("destination directory should be creatable");
+
+        let error =
+            persist_library_at(&library, &path).expect_err("directory replacement must fail");
+
+        assert!(error.contains("Could not replace"));
+        assert!(
+            path.is_dir(),
+            "the failed replace must not delete the destination"
+        );
+        assert!(temporary_paths(&directory.path).is_empty());
+    }
 
     #[test]
     fn stage_labels_are_product_neutral_storage_values() {
