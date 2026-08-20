@@ -198,8 +198,10 @@ pub fn load_library_at(path: &Path) -> Result<Library, String> {
 /// Preserve an unreadable library before replacing it with a fresh snapshot.
 ///
 /// The original bytes are copied to a unique same-directory backup using
-/// `create_new`, flushed, and synced before the active library is replaced.
-/// Backups are intentionally never removed by this helper.
+/// `create_new`, flushed, synced, and closed; its directory entry is then
+/// synced so the backup contents and directory entry are durable before the
+/// active library is replaced. Backups are intentionally never removed by
+/// this helper.
 pub fn preserve_unreadable_library_and_start_fresh() -> Result<PathBuf, String> {
     preserve_unreadable_library_and_start_fresh_at(&library_path())
 }
@@ -224,6 +226,14 @@ pub fn preserve_unreadable_library_and_start_fresh_at(path: &Path) -> Result<Pat
         .sync_all()
         .map_err(|error| format!("Could not sync {}: {error}", backup_path.display()))?;
     drop(backup_file);
+
+    #[cfg(unix)]
+    if let Err(error) = sync_parent_directory(directory) {
+        return Err(format!(
+            "Could not sync recovery backup directory {} before replacing the active library; active library was not replaced: {error}",
+            directory.display()
+        ));
+    }
 
     persist_library_at(&Library::default(), path)?;
     Ok(backup_path)
