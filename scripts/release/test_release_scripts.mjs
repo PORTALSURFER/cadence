@@ -522,3 +522,39 @@ test("release workflow reserves nightly versions before immutable builds", async
     );
   }
 });
+
+test("automatic nightly IDs use final source while reservation tags retain original source", async () => {
+  const workflow = await fs.readFile(workflowPath, "utf8");
+  const prepareRun = workflowRunBlock(workflow, "Select and reserve release metadata");
+  const newReservationSourceAssignment = 'source_sha="$(git rev-parse HEAD)"';
+  const buildIdDerivation = 'short_sha="${source_sha:0:12}"';
+  const sourceAssignmentIndex = prepareRun.indexOf(newReservationSourceAssignment);
+  const buildIdIndex = prepareRun.indexOf(buildIdDerivation);
+  assert.ok(sourceAssignmentIndex >= 0, "new nightly reservations must assign the final source SHA");
+  assert.ok(buildIdIndex > sourceAssignmentIndex, "final source SHA must be assigned before build ID derivation");
+
+  const buildIdBlockEnd = prepareRun.indexOf("\n\n", buildIdIndex);
+  assert.ok(buildIdBlockEnd > buildIdIndex, "workflow must contain a bounded build ID derivation block");
+  const buildIdBlock = prepareRun.slice(buildIdIndex, buildIdBlockEnd);
+  const originalSourceSha = "a".repeat(40);
+  const finalSourceSha = "b".repeat(40);
+  const runNumber = "42";
+  const buildScript = [
+    "set -euo pipefail",
+    `original_source_sha='${originalSourceSha}'`,
+    `source_sha='${finalSourceSha}'`,
+    "channel=nightly",
+    `RUN_NUMBER='${runNumber}'`,
+    "version=0.1.1-nightly.42",
+    "tag_release=true",
+    `reservation_tag="cadence-nightly-${runNumber}-${originalSourceSha.slice(0, 12)}"`,
+    "release_tag=\"$reservation_tag\"",
+    buildIdBlock,
+    "printf '%s\\t%s\\n' \"$build_id\" \"$release_tag\"",
+  ].join("\n");
+  const { stdout } = await execFileAsync("bash", ["-c", buildScript]);
+  assert.equal(
+    stdout.trim(),
+    `cadence-nightly-${runNumber}-${finalSourceSha.slice(0, 12)}\tcadence-nightly-${runNumber}-${originalSourceSha.slice(0, 12)}`,
+  );
+});

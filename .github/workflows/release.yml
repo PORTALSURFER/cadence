@@ -304,7 +304,7 @@ jobs:
             [[ "$version_base" == "$original_cargo_base_version" ]] || { echo "Cargo.toml base version $original_cargo_base_version does not match release version $version" >&2; exit 1; }
           fi
 
-          short_sha="${original_source_sha:0:12}"
+          short_sha="${source_sha:0:12}"
           if [[ "$channel" == stable ]]; then
             build_id="cadence-v${version}-${RUN_NUMBER}"
           else
