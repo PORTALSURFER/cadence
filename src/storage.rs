@@ -298,26 +298,32 @@ fn import_into_library_at(
 /// Replace the source file for one existing track while preserving its stable
 /// identity, favorite state, and workflow stage. A replacement is a new audio
 /// version, so timestamped comments are intentionally cleared.
-pub fn replace_track(library: Library, track_id: &str, path: PathBuf) -> Result<Library, String> {
-    replace_track_at(library, track_id, path, &library_path())
+pub fn replace_track(
+    library: Library,
+    track_id: &str,
+    decoded: crate::audio::DecodedAudioFile,
+) -> Result<Library, String> {
+    replace_track_at(library, track_id, decoded, &library_path())
 }
 
 fn replace_track_at(
     mut library: Library,
     track_id: &str,
-    path: PathBuf,
+    decoded: crate::audio::DecodedAudioFile,
     library_path: &Path,
 ) -> Result<Library, String> {
+    let path = decoded.path().to_path_buf();
     validate_audio_path(&path)?;
+    ensure_decoded_audio_unchanged(&decoded)?;
     let metadata = fs::metadata(&path)
         .map_err(|error| format!("Could not inspect {}: {error}", path.display()))?;
     if !metadata.is_file() {
         return Err(format!("{} is not a file", path.display()));
     }
 
-    crate::audio::decode_waveform(&path)
-        .map_err(|error| format!("Could not decode replacement {}: {error}", path.display()))?;
+    ensure_decoded_audio_unchanged(&decoded)?;
     replace_track_metadata(&mut library, track_id, path, metadata.len())?;
+    ensure_decoded_audio_unchanged(&decoded)?;
     persist_library_at(&library, library_path)?;
     Ok(library)
 }
@@ -1637,10 +1643,10 @@ mod tests {
             .expect("corrupt replacement should be writable");
 
         let before = library.clone();
-        let error = replace_track_at(library.clone(), "track-1", replacement_path, &library_path)
-            .expect_err("corrupt replacement should fail decoding");
+        let error = crate::audio::decode_audio_file(&replacement_path)
+            .expect_err("corrupt replacement should fail preflight");
 
-        assert!(error.contains("Could not decode replacement"));
+        assert!(error.contains("Could not identify") || error.contains("Could not read"));
         assert_eq!(library, before);
         assert_eq!(
             fs::read(&library_path).expect("persisted library should remain readable"),
@@ -1649,6 +1655,61 @@ mod tests {
         assert_eq!(
             load_library_at(&library_path).expect("original library should still reload"),
             before
+        );
+    }
+
+    #[test]
+    fn stale_replacement_proof_leaves_library_notes_and_persisted_snapshot_unchanged() {
+        let directory = TestDirectory::new();
+        let library_path = directory.path.join("library.json");
+        let (source, decoded) = decoded_audio_fixture(&directory.path);
+        let library = persistence_fixture();
+        persist_library_at(&library, &library_path).expect("original library should persist");
+        let original_bytes = fs::read(&library_path).expect("persisted library should be readable");
+        fs::write(&source, b"replacement changed after preflight")
+            .expect("stale replacement should be writable");
+
+        let before = library.clone();
+        let error = replace_track_at(library.clone(), "track-1", decoded, &library_path)
+            .expect_err("stale replacement proof must be rejected");
+
+        assert!(error.contains("changed after preflight"));
+        assert_eq!(library, before);
+        assert_eq!(library.tracks[0].notes, before.tracks[0].notes);
+        assert_eq!(
+            fs::read(&library_path).expect("library should remain readable"),
+            original_bytes
+        );
+        assert_eq!(
+            load_library_at(&library_path).expect("library should still reload"),
+            before
+        );
+    }
+
+    #[test]
+    fn replacement_with_proof_preserves_workflow_semantics_and_persists() {
+        let directory = TestDirectory::new();
+        let library_path = directory.path.join("library.json");
+        let (source, decoded) = decoded_audio_fixture(&directory.path);
+        let library = persistence_fixture();
+        persist_library_at(&library, &library_path).expect("original library should persist");
+
+        let replaced = replace_track_at(library.clone(), "track-1", decoded, &library_path)
+            .expect("replacement with a current proof should succeed");
+        let track = &replaced.tracks[0];
+        assert_eq!(track.id, "track-1");
+        assert_eq!(track.title, "source");
+        assert_eq!(track.original_name, "source.wav");
+        assert_eq!(track.path, source);
+        assert_eq!(track.size, tiny_pcm_wav().len() as u64);
+        assert!(track.notes.is_empty());
+        assert!(track.favorite);
+        assert_eq!(track.stage, TrackStage::Mixdown);
+        assert_eq!(track.status, TrackStatus::Release);
+        assert_eq!(replaced.selected_track_id, Some(String::from("track-1")));
+        assert_eq!(
+            load_library_at(&library_path).expect("replaced library should reload"),
+            replaced
         );
     }
 
