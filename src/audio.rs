@@ -551,8 +551,17 @@ fn frames_for_millis(sample_rate: u32, millis: u64) -> usize {
 }
 
 fn preview_progress(decoded_frames: usize, expected_frames: Option<u64>) -> Option<f32> {
-    let expected_frames = expected_frames?;
-    Some((decoded_frames as f64 / expected_frames.max(1) as f64).clamp(0.0, 1.0) as f32)
+    let expected_frames = expected_frames.filter(|frames| *frames > 0)?;
+    Some((decoded_frames as f64 / expected_frames as f64).clamp(0.0, 1.0) as f32)
+}
+
+fn progressive_preview<T>(
+    decoded_frames: usize,
+    expected_frames: Option<u64>,
+    build: impl FnOnce(f32) -> Option<T>,
+) -> Option<T> {
+    let progress = preview_progress(decoded_frames, expected_frames)?;
+    build(progress)
 }
 
 fn loudness_channel_map(channel_layout: Channels, channel_count: usize) -> Vec<LoudnessChannel> {
@@ -965,8 +974,8 @@ pub fn decode_waveform_with_progress_and_cancellation(
         .ok_or_else(|| format!("No decodable audio track found in {}", path.display()))?;
     let track_id = track.id;
     let codec_params = track.codec_params.clone();
-    let expected_windows = codec_params
-        .n_frames
+    let expected_frames = codec_params.n_frames.filter(|frames| *frames > 0);
+    let expected_windows = expected_frames
         .and_then(|frames| usize::try_from(frames.div_ceil(PEAK_WINDOW_FRAMES as u64)).ok());
     let mut decoder = symphonia::default::get_codecs()
         .make(&codec_params, &DecoderOptions::default())
@@ -979,7 +988,6 @@ pub fn decode_waveform_with_progress_and_cancellation(
     let mut sample_rate = None;
     let mut channels = None;
     let mut channel_layout = None;
-    let expected_frames = codec_params.n_frames;
     let mut next_preview_frame = None;
 
     loop {
@@ -1070,21 +1078,22 @@ pub fn decode_waveform_with_progress_and_cancellation(
             return Err(String::from("cancelled"));
         }
         if decoded_frames >= *next_preview_frame {
-            let peaks = reducer.snapshot_with_partial(window.snapshot());
-            if let (true, Some(progress)) = (
-                !peaks.is_empty(),
-                preview_progress(decoded_frames, expected_frames),
-            ) {
-                on_progress(WaveformProgress {
-                    waveform: preview_waveform(
-                        peaks,
-                        decoded_sample_rate,
-                        decoded_channels,
-                        decoded_frames,
-                        expected_frames,
-                    ),
-                    progress: Some(progress),
-                });
+            if let Some(progress) =
+                progressive_preview(decoded_frames, expected_frames, |progress| {
+                    let peaks = reducer.snapshot_with_partial(window.snapshot());
+                    (!peaks.is_empty()).then(|| WaveformProgress {
+                        waveform: preview_waveform(
+                            peaks,
+                            decoded_sample_rate,
+                            decoded_channels,
+                            decoded_frames,
+                            expected_frames,
+                        ),
+                        progress: Some(progress),
+                    })
+                })
+            {
+                on_progress(progress);
             }
             *next_preview_frame = decoded_frames.saturating_add(preview_interval);
         }
@@ -1129,7 +1138,9 @@ fn preview_waveform(
     decoded_frames: usize,
     expected_frames: Option<u64>,
 ) -> WaveformData {
-    let duration_frames = expected_frames.unwrap_or(decoded_frames as u64);
+    let duration_frames = expected_frames
+        .filter(|frames| *frames > 0)
+        .unwrap_or(decoded_frames as u64);
     let duration_millis = ((duration_frames as u128 * 1_000) / sample_rate.max(1) as u128) as u64;
     let render_frames = peaks.len();
     WaveformData {
@@ -1213,7 +1224,7 @@ mod tests {
         PeakMeasurement, PeakReducer, PeakWindow, WaveformData,
         decode_waveform_with_progress_and_cancellation, linear_gain_for_db, load_waveform_cache,
         loudness_at_position, loudness_channel_map, loudness_match_gain_db, preview_progress,
-        preview_waveform, summary_from_peaks, waveform_cache_fingerprint,
+        preview_waveform, progressive_preview, summary_from_peaks, waveform_cache_fingerprint,
         write_waveform_cache_if_unchanged,
     };
     use radiant::runtime::GpuSignalSummary;
@@ -1482,8 +1493,36 @@ mod tests {
     #[test]
     fn unknown_duration_does_not_publish_a_stretched_preview_extent() {
         assert_eq!(preview_progress(1_024, None), None);
+        assert_eq!(preview_progress(1_024, Some(0)), None);
         assert_eq!(preview_progress(4_800, Some(9_600)), Some(0.5));
         assert_eq!(preview_progress(12_000, Some(9_600)), Some(1.0));
+    }
+
+    #[test]
+    fn progressive_preview_only_builds_for_known_positive_duration() {
+        let mut calls = 0;
+        assert_eq!(
+            progressive_preview(1_024, None, |_| {
+                calls += 1;
+                Some(())
+            }),
+            None
+        );
+        assert_eq!(
+            progressive_preview(1_024, Some(0), |_| {
+                calls += 1;
+                Some(())
+            }),
+            None
+        );
+        assert_eq!(
+            progressive_preview(4_800, Some(9_600), |progress| {
+                calls += 1;
+                Some(progress)
+            }),
+            Some(0.5)
+        );
+        assert_eq!(calls, 1);
     }
 
     #[test]

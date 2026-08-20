@@ -178,8 +178,11 @@ pub fn acquire_instance_lock() -> Result<InstanceLock, String> {
 }
 
 pub fn load_library() -> Result<Library, String> {
-    let path = library_path();
-    match fs::read_to_string(&path) {
+    load_library_at(&library_path())
+}
+
+pub fn load_library_at(path: &Path) -> Result<Library, String> {
+    match fs::read_to_string(path) {
         Ok(contents) => {
             let mut library: Library = serde_json::from_str(&contents)
                 .map_err(|error| format!("Could not parse {}: {error}", path.display()))?;
@@ -190,6 +193,50 @@ pub fn load_library() -> Result<Library, String> {
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(Library::default()),
         Err(error) => Err(format!("Could not read {}: {error}", path.display())),
     }
+}
+
+/// Preserve an unreadable library before replacing it with a fresh snapshot.
+///
+/// The original bytes are copied to a unique same-directory backup using
+/// `create_new`, flushed, synced, and closed; its directory entry is then
+/// synced so the backup contents and directory entry are durable before the
+/// active library is replaced. Backups are intentionally never removed by
+/// this helper.
+pub fn preserve_unreadable_library_and_start_fresh() -> Result<PathBuf, String> {
+    preserve_unreadable_library_and_start_fresh_at(&library_path())
+}
+
+pub fn preserve_unreadable_library_and_start_fresh_at(path: &Path) -> Result<PathBuf, String> {
+    let bytes = fs::read(path)
+        .map_err(|error| format!("Could not preserve {}: {error}", path.display()))?;
+    let directory = path
+        .parent()
+        .ok_or_else(|| format!("No parent directory for {}", path.display()))?;
+    fs::create_dir_all(directory)
+        .map_err(|error| format!("Could not create {}: {error}", directory.display()))?;
+
+    let (backup_path, mut backup_file) = create_unique_recovery_backup(path)?;
+    backup_file
+        .write_all(&bytes)
+        .map_err(|error| format!("Could not write {}: {error}", backup_path.display()))?;
+    backup_file
+        .flush()
+        .map_err(|error| format!("Could not flush {}: {error}", backup_path.display()))?;
+    backup_file
+        .sync_all()
+        .map_err(|error| format!("Could not sync {}: {error}", backup_path.display()))?;
+    drop(backup_file);
+
+    #[cfg(unix)]
+    if let Err(error) = sync_parent_directory(directory) {
+        return Err(format!(
+            "Could not sync recovery backup directory {} before replacing the active library; active library was not replaced: {error}",
+            directory.display()
+        ));
+    }
+
+    persist_library_at(&Library::default(), path)?;
+    Ok(backup_path)
 }
 
 pub fn import_into_library(mut library: Library, path: PathBuf) -> Result<Library, String> {
@@ -758,6 +805,39 @@ fn create_unique_temp_file(path: &Path) -> Result<(PathBuf, fs::File), String> {
     ))
 }
 
+fn create_unique_recovery_backup(path: &Path) -> Result<(PathBuf, fs::File), String> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("library.json");
+    let process_id = std::process::id();
+
+    for _ in 0..MAX_TEMP_FILE_ALLOCATION_ATTEMPTS {
+        let nonce = NEXT_TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
+        let backup_path =
+            path.with_file_name(format!("{file_name}.recovery-backup-{process_id}-{nonce}"));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&backup_path)
+        {
+            Ok(file) => return Ok((backup_path, file)),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "Could not create {}: {error}",
+                    backup_path.display()
+                ));
+            }
+        }
+    }
+
+    Err(format!(
+        "Could not create a unique recovery backup for {} after {MAX_TEMP_FILE_ALLOCATION_ATTEMPTS} attempts",
+        path.display()
+    ))
+}
+
 fn with_temp_cleanup(primary_error: String, temporary_path: &Path) -> String {
     match fs::remove_file(temporary_path) {
         Ok(()) => primary_error,
@@ -937,6 +1017,48 @@ mod tests {
                 .expect("persisted snapshot should parse");
         assert_eq!(read_back, library);
         assert!(temporary_paths(&directory.path).is_empty());
+    }
+
+    #[test]
+    fn malformed_library_load_leaves_active_bytes_unchanged() {
+        let directory = TestDirectory::new();
+        let path = directory.path.join("library.json");
+        let malformed = b"{\"tracks\": [not valid json".to_vec();
+        fs::write(&path, &malformed).expect("malformed library should be writable");
+
+        let error = load_library_at(&path).expect_err("malformed library should fail to load");
+
+        assert!(error.contains("Could not parse"));
+        assert_eq!(
+            fs::read(&path).expect("active library should remain readable"),
+            malformed
+        );
+    }
+
+    #[test]
+    fn recovery_backup_is_exact_and_active_library_becomes_default() {
+        let directory = TestDirectory::new();
+        let path = directory.path.join("library.json");
+        let malformed = b"not-json\0with-original-bytes".to_vec();
+        fs::write(&path, &malformed).expect("malformed library should be writable");
+
+        let backup_path = preserve_unreadable_library_and_start_fresh_at(&path)
+            .expect("recovery should preserve and reset the library");
+
+        assert_ne!(backup_path, path);
+        assert_eq!(backup_path.parent(), path.parent());
+        assert_eq!(
+            fs::read(&backup_path).expect("backup should be readable"),
+            malformed
+        );
+        assert_eq!(
+            serde_json::from_slice::<Library>(
+                &fs::read(&path).expect("fresh library should exist")
+            )
+            .expect("fresh library should parse"),
+            Library::default()
+        );
+        assert!(backup_path.exists(), "recovery backup must not be deleted");
     }
 
     #[test]
