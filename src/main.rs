@@ -788,6 +788,13 @@ struct ImportBatchProgress {
     failed: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WaveformDecodeRequest {
+    track_id: String,
+    path: PathBuf,
+    generation: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LibraryLoadState {
     Loading,
@@ -823,6 +830,8 @@ struct AppState {
     waveform_track_id: Option<String>,
     waveform_busy: bool,
     waveform_generation: u64,
+    waveform_in_flight: Option<WaveformDecodeRequest>,
+    waveform_pending: Option<WaveformDecodeRequest>,
     waveform_cancellation: Option<ui::CancellationToken>,
     waveform_progress: Option<f32>,
     live_spectrogram: Option<Arc<transport::LiveSpectrogramFrame>>,
@@ -835,6 +844,8 @@ struct AppState {
     reference_waveform_track_id: Option<String>,
     reference_waveform_busy: bool,
     reference_waveform_generation: u64,
+    reference_waveform_in_flight: Option<WaveformDecodeRequest>,
+    reference_waveform_pending: Option<WaveformDecodeRequest>,
     reference_waveform_cancellation: Option<ui::CancellationToken>,
     reference_waveform_progress: Option<f32>,
     reference_live_spectrogram: Option<Arc<transport::LiveSpectrogramFrame>>,
@@ -940,6 +951,8 @@ impl Default for AppState {
             waveform_track_id: None,
             waveform_busy: false,
             waveform_generation: 0,
+            waveform_in_flight: None,
+            waveform_pending: None,
             waveform_cancellation: None,
             waveform_progress: None,
             live_spectrogram: None,
@@ -952,6 +965,8 @@ impl Default for AppState {
             reference_waveform_track_id: None,
             reference_waveform_busy: false,
             reference_waveform_generation: 0,
+            reference_waveform_in_flight: None,
+            reference_waveform_pending: None,
             reference_waveform_cancellation: None,
             reference_waveform_progress: None,
             reference_live_spectrogram: None,
@@ -1401,8 +1416,7 @@ fn activate_loaded_library(
     }
     schedule_selected_waveform_decode(state, context);
     schedule_selected_reference_decode(state, context);
-    schedule_next_pending_import(state, context);
-    schedule_next_pending_reference_import(state, context);
+    schedule_next_pending_library_operation(state, context);
 }
 
 fn retry_library_load(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
@@ -1476,21 +1490,19 @@ fn decode_or_load_cached_waveform(
     result
 }
 
-fn schedule_waveform_decode(
+fn start_waveform_decode(
     state: &mut AppState,
     context: &mut ui::UiUpdateContext<Message>,
-    track_id: String,
-    path: PathBuf,
+    request: WaveformDecodeRequest,
 ) {
-    if let Some(cancellation) = state.waveform_cancellation.take() {
-        cancellation.cancel();
-    }
+    debug_assert!(state.waveform_in_flight.is_none());
+    let WaveformDecodeRequest {
+        track_id,
+        path,
+        generation,
+    } = request.clone();
+    state.waveform_in_flight = Some(request);
     state.waveform_busy = true;
-    state.waveform_generation = state.waveform_generation.wrapping_add(1);
-    let generation = state.waveform_generation;
-    state.waveform = None;
-    state.waveform_track_id = None;
-    state.waveform_progress = None;
     state.loop_selections.clear(AuditionSource::Main);
     if !paired_playback_cleanup_active(state) {
         state.status = format!("Preparing MAIN waveform and loudness · {}…", path.display());
@@ -1498,16 +1510,18 @@ fn schedule_waveform_decode(
     let cache_path = storage::waveform_cache_path(&path);
     let progress_track_id = track_id.clone();
     let completion_track_id = track_id;
-    let cancellation = context
+    let cancellation = ui::CancellationToken::new();
+    state.waveform_cancellation = Some(cancellation.clone());
+    let worker_cancellation = cancellation.clone();
+    context
         .business()
-        .blocking_io("cadence-decode-waveform")
-        .cancellable()
+        .background("cadence-decode-waveform")
         .stream_latest(
-            move |work, sink| {
+            move |_work, sink| {
                 decode_or_load_cached_waveform(
                     &path,
                     &cache_path,
-                    || work.is_cancelled(),
+                    || worker_cancellation.is_cancelled(),
                     |progress| {
                         let _ = sink.emit(progress);
                     },
@@ -1524,8 +1538,57 @@ fn schedule_waveform_decode(
                 result,
             },
         );
-    state.waveform_cancellation = Some(cancellation);
     context.request_repaint();
+}
+
+fn schedule_waveform_decode(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    track_id: String,
+    path: PathBuf,
+) {
+    state.waveform_generation = state.waveform_generation.wrapping_add(1);
+    let request = WaveformDecodeRequest {
+        track_id,
+        path,
+        generation: state.waveform_generation,
+    };
+    state.waveform_busy = true;
+    state.waveform = None;
+    state.waveform_track_id = None;
+    state.waveform_progress = None;
+    state.loop_selections.clear(AuditionSource::Main);
+    if state.waveform_in_flight.is_some() {
+        state.waveform_pending = Some(request);
+        if let Some(cancellation) = state.waveform_cancellation.as_ref() {
+            cancellation.cancel();
+        }
+        if !paired_playback_cleanup_active(state)
+            && let Some(pending) = state.waveform_pending.as_ref()
+        {
+            state.status = format!(
+                "Preparing MAIN waveform and loudness · {}…",
+                pending.path.display()
+            );
+        }
+        context.request_repaint();
+        return;
+    }
+    state.waveform_pending = None;
+    start_waveform_decode(state, context, request);
+}
+
+fn reset_waveform_decode(state: &mut AppState) {
+    state.waveform_generation = state.waveform_generation.wrapping_add(1);
+    state.waveform_pending = None;
+    if let Some(cancellation) = state.waveform_cancellation.as_ref() {
+        cancellation.cancel();
+    }
+    state.waveform_busy = false;
+    state.waveform = None;
+    state.waveform_track_id = None;
+    state.waveform_progress = None;
+    state.loop_selections.clear(AuditionSource::Main);
 }
 
 fn schedule_selected_waveform_decode(
@@ -1541,48 +1604,40 @@ fn schedule_selected_waveform_decode(
     if let Some((track_id, path)) = selected {
         schedule_waveform_decode(state, context, track_id, path);
     } else {
-        if let Some(cancellation) = state.waveform_cancellation.take() {
-            cancellation.cancel();
-        }
-        state.waveform_generation = state.waveform_generation.wrapping_add(1);
-        state.waveform_busy = false;
-        state.waveform = None;
-        state.waveform_track_id = None;
-        state.waveform_progress = None;
-        state.loop_selections.clear(AuditionSource::Main);
+        reset_waveform_decode(state);
         context.request_repaint();
     }
 }
 
-fn schedule_reference_waveform_decode(
+fn start_reference_waveform_decode(
     state: &mut AppState,
     context: &mut ui::UiUpdateContext<Message>,
-    track_id: String,
-    path: PathBuf,
+    request: WaveformDecodeRequest,
 ) {
-    if let Some(cancellation) = state.reference_waveform_cancellation.take() {
-        cancellation.cancel();
-    }
+    debug_assert!(state.reference_waveform_in_flight.is_none());
+    let WaveformDecodeRequest {
+        track_id,
+        path,
+        generation,
+    } = request.clone();
+    state.reference_waveform_in_flight = Some(request);
     state.reference_waveform_busy = true;
-    state.reference_waveform_generation = state.reference_waveform_generation.wrapping_add(1);
-    let generation = state.reference_waveform_generation;
-    state.reference_waveform = None;
-    state.reference_waveform_track_id = None;
-    state.reference_waveform_progress = None;
     state.loop_selections.clear(AuditionSource::Reference);
     let cache_path = storage::waveform_cache_path(&path);
     let progress_track_id = track_id.clone();
     let completion_track_id = track_id;
-    let cancellation = context
+    let cancellation = ui::CancellationToken::new();
+    state.reference_waveform_cancellation = Some(cancellation.clone());
+    let worker_cancellation = cancellation.clone();
+    context
         .business()
-        .blocking_io("cadence-decode-reference-waveform")
-        .cancellable()
+        .background("cadence-decode-reference-waveform")
         .stream_latest(
-            move |work, sink| {
+            move |_work, sink| {
                 decode_or_load_cached_waveform(
                     &path,
                     &cache_path,
-                    || work.is_cancelled(),
+                    || worker_cancellation.is_cancelled(),
                     |progress| {
                         let _ = sink.emit(progress);
                     },
@@ -1599,8 +1654,49 @@ fn schedule_reference_waveform_decode(
                 result,
             },
         );
-    state.reference_waveform_cancellation = Some(cancellation);
     context.request_repaint();
+}
+
+fn schedule_reference_waveform_decode(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    track_id: String,
+    path: PathBuf,
+) {
+    state.reference_waveform_generation = state.reference_waveform_generation.wrapping_add(1);
+    let request = WaveformDecodeRequest {
+        track_id,
+        path,
+        generation: state.reference_waveform_generation,
+    };
+    state.reference_waveform_busy = true;
+    state.reference_waveform = None;
+    state.reference_waveform_track_id = None;
+    state.reference_waveform_progress = None;
+    state.loop_selections.clear(AuditionSource::Reference);
+    if state.reference_waveform_in_flight.is_some() {
+        state.reference_waveform_pending = Some(request);
+        if let Some(cancellation) = state.reference_waveform_cancellation.as_ref() {
+            cancellation.cancel();
+        }
+        context.request_repaint();
+        return;
+    }
+    state.reference_waveform_pending = None;
+    start_reference_waveform_decode(state, context, request);
+}
+
+fn reset_reference_waveform_decode(state: &mut AppState) {
+    state.reference_waveform_generation = state.reference_waveform_generation.wrapping_add(1);
+    state.reference_waveform_pending = None;
+    if let Some(cancellation) = state.reference_waveform_cancellation.as_ref() {
+        cancellation.cancel();
+    }
+    state.reference_waveform_busy = false;
+    state.reference_waveform = None;
+    state.reference_waveform_track_id = None;
+    state.reference_waveform_progress = None;
+    state.loop_selections.clear(AuditionSource::Reference);
 }
 
 fn schedule_selected_reference_decode(
@@ -1621,15 +1717,7 @@ fn schedule_selected_reference_decode(
     if let Some((track_id, path)) = selected {
         schedule_reference_waveform_decode(state, context, track_id, path);
     } else {
-        if let Some(cancellation) = state.reference_waveform_cancellation.take() {
-            cancellation.cancel();
-        }
-        state.reference_waveform_generation = state.reference_waveform_generation.wrapping_add(1);
-        state.reference_waveform_busy = false;
-        state.reference_waveform = None;
-        state.reference_waveform_track_id = None;
-        state.reference_waveform_progress = None;
-        state.loop_selections.clear(AuditionSource::Reference);
+        reset_reference_waveform_decode(state);
         context.request_repaint();
     }
 }
@@ -1723,14 +1811,17 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             Ok(PlatformResponse::Path(path)) => schedule_import(state, context, path),
             Ok(PlatformResponse::Canceled) => {
                 state.status = String::from("Import canceled.");
+                schedule_next_pending_library_operation(state, context);
                 context.request_repaint();
             }
             Ok(response) => {
                 state.status = format!("Unexpected file-picker response: {response:?}");
+                schedule_next_pending_library_operation(state, context);
                 context.request_repaint();
             }
             Err(error) => {
                 state.status = format!("Could not open the file picker: {error}");
+                schedule_next_pending_library_operation(state, context);
                 context.request_repaint();
             }
         },
@@ -1739,14 +1830,17 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             Ok(PlatformResponse::Path(path)) => schedule_replace(state, context, track_id, path),
             Ok(PlatformResponse::Canceled) => {
                 state.status = String::from("Replace canceled.");
+                schedule_next_pending_library_operation(state, context);
                 context.request_repaint();
             }
             Ok(response) => {
                 state.status = format!("Unexpected file-picker response: {response:?}");
+                schedule_next_pending_library_operation(state, context);
                 context.request_repaint();
             }
             Err(error) => {
                 state.status = format!("Could not open the file picker: {error}");
+                schedule_next_pending_library_operation(state, context);
                 context.request_repaint();
             }
         },
@@ -1755,6 +1849,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             state.busy = false;
             if paths.is_empty() {
                 state.status = String::from("Reference import canceled.");
+                schedule_next_pending_library_operation(state, context);
             } else {
                 schedule_reference_import(state, context, track_id, paths);
             }
@@ -1765,6 +1860,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             state.busy = false;
             if paths.is_empty() {
                 state.status = String::from("Reference catalog import canceled.");
+                schedule_next_pending_library_operation(state, context);
             } else {
                 schedule_reference_catalog_import(state, context, paths);
             }
@@ -1811,6 +1907,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 state.reference_catalog_import_total = 0;
                 state.reference_catalog_import_completed = 0;
                 state.reference_catalog_import_failed = 0;
+                schedule_next_pending_library_operation(state, context);
             } else {
                 schedule_next_reference_catalog_import(state, context);
             }
@@ -1902,7 +1999,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 }
             }
             finish_import_batch(state);
-            schedule_next_pending_import(state, context);
+            schedule_next_pending_library_operation(state, context);
             context.request_repaint();
         }
         Message::ReplaceCompleted { track_id, result } => {
@@ -1949,7 +2046,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 }
                 Err(error) => state.status = error,
             }
-            schedule_next_pending_import(state, context);
+            schedule_next_pending_library_operation(state, context);
             context.request_repaint();
         }
         Message::ReferenceImportCompleted {
@@ -2005,7 +2102,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     state.reference_match_enabled = false;
                     schedule_selected_reference_decode(state, context);
                 }
-                schedule_next_pending_import(state, context);
+                schedule_next_pending_library_operation(state, context);
             }
             close_reference_menu(state);
             context.request_repaint();
@@ -2063,7 +2160,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             generation,
             progress,
         } => {
-            if !decode_result_is_current(state, &track_id, generation) {
+            if !decode_progress_is_current(state, &track_id, generation) {
                 return;
             }
             state.waveform_track_id = Some(track_id);
@@ -2076,10 +2173,19 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             generation,
             result,
         } => {
+            let Some(_retired_request) =
+                take_matching_waveform_in_flight(state, &track_id, generation)
+            else {
+                return;
+            };
+            state.waveform_cancellation = None;
+            if let Some(pending) = state.waveform_pending.take() {
+                start_waveform_decode(state, context, pending);
+                return;
+            }
             if !decode_result_is_current(state, &track_id, generation) {
                 return;
             }
-            state.waveform_cancellation = None;
             state.waveform_progress = None;
             state.waveform_busy = false;
             let pending_audition = state.workspace_mode == WorkspaceMode::Audition
@@ -2152,7 +2258,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             generation,
             progress,
         } => {
-            if !reference_decode_result_is_current(state, &track_id, generation) {
+            if !reference_decode_progress_is_current(state, &track_id, generation) {
                 return;
             }
             state.reference_waveform_track_id = Some(track_id);
@@ -2165,10 +2271,19 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             generation,
             result,
         } => {
+            let Some(_retired_request) =
+                take_matching_reference_waveform_in_flight(state, &track_id, generation)
+            else {
+                return;
+            };
+            state.reference_waveform_cancellation = None;
+            if let Some(pending) = state.reference_waveform_pending.take() {
+                start_reference_waveform_decode(state, context, pending);
+                return;
+            }
             if !reference_decode_result_is_current(state, &track_id, generation) {
                 return;
             }
-            state.reference_waveform_cancellation = None;
             state.reference_waveform_progress = None;
             state.reference_waveform_busy = false;
             match result {
@@ -2307,8 +2422,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             if save_again {
                 schedule_library_save(state, context);
             } else {
-                schedule_next_pending_import(state, context);
-                schedule_next_pending_reference_import(state, context);
+                schedule_next_pending_library_operation(state, context);
             }
             context.request_repaint();
         }
@@ -2728,20 +2842,8 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 state.hovered_note_id = None;
                 state.library.selected_track_id =
                     storage::selection_after_removal(&state.library, removed.0);
-                if let Some(cancellation) = state.waveform_cancellation.take() {
-                    cancellation.cancel();
-                }
-                if let Some(cancellation) = state.reference_waveform_cancellation.take() {
-                    cancellation.cancel();
-                }
-                state.waveform = None;
-                state.waveform_track_id = None;
-                state.waveform_busy = false;
-                state.waveform_progress = None;
-                state.reference_waveform = None;
-                state.reference_waveform_track_id = None;
-                state.reference_waveform_busy = false;
-                state.reference_waveform_progress = None;
+                reset_waveform_decode(state);
+                reset_reference_waveform_decode(state);
                 reset_transport(state);
                 reset_reference_transport(state);
                 state.reference_match_enabled = false;
@@ -5407,16 +5509,31 @@ fn schedule_import(
     start_import(state, context, path);
 }
 
-fn schedule_next_pending_import(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
+fn schedule_next_pending_library_operation(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+) {
     if !library_is_ready(state) || state.busy || state.save_in_flight {
         return;
     }
-    let Some(path) =
+    if let Some(path) =
         (!state.pending_import_paths.is_empty()).then(|| state.pending_import_paths.remove(0))
-    else {
+    {
+        start_import(state, context, path);
         return;
-    };
-    start_import(state, context, path);
+    }
+    if let Some(track_id) = state.pending_reference_track_id.clone()
+        && let Some(path) = (!state.pending_reference_paths.is_empty())
+            .then(|| state.pending_reference_paths.remove(0))
+    {
+        schedule_reference(state, context, track_id, path);
+        return;
+    }
+    if let Some(path) = (!state.pending_reference_catalog_paths.is_empty())
+        .then(|| state.pending_reference_catalog_paths.remove(0))
+    {
+        start_reference_catalog_import(state, context, path);
+    }
 }
 
 fn schedule_reference_import(
@@ -6192,19 +6309,17 @@ fn select_track_internal(
     close_reference_menu(state);
     state.remove_confirmation_track_id = None;
     clear_planner_drag(state);
-    if let Some(cancellation) = state.waveform_cancellation.take() {
+    if let Some(cancellation) = state.waveform_cancellation.as_ref() {
         cancellation.cancel();
     }
-    if let Some(cancellation) = state.reference_waveform_cancellation.take() {
+    if let Some(cancellation) = state.reference_waveform_cancellation.as_ref() {
         cancellation.cancel();
     }
     state.waveform = None;
     state.waveform_track_id = None;
-    state.waveform_busy = false;
     state.waveform_progress = None;
     state.reference_waveform = None;
     state.reference_waveform_track_id = None;
-    state.reference_waveform_busy = false;
     state.reference_waveform_progress = None;
     state.review_cursor_millis = 0;
     state.draft_note = None;
@@ -10047,9 +10162,51 @@ fn decode_result_is_current(state: &AppState, track_id: &str, generation: u64) -
         && state.waveform_generation == generation
 }
 
+fn decode_progress_is_current(state: &AppState, track_id: &str, generation: u64) -> bool {
+    decode_result_is_current(state, track_id, generation)
+        && state
+            .waveform_in_flight
+            .as_ref()
+            .is_some_and(|request| request.track_id == track_id && request.generation == generation)
+}
+
+fn take_matching_waveform_in_flight(
+    state: &mut AppState,
+    track_id: &str,
+    generation: u64,
+) -> Option<WaveformDecodeRequest> {
+    let matches = state
+        .waveform_in_flight
+        .as_ref()
+        .is_some_and(|request| request.track_id == track_id && request.generation == generation);
+    matches.then(|| state.waveform_in_flight.take()).flatten()
+}
+
 fn reference_decode_result_is_current(state: &AppState, track_id: &str, generation: u64) -> bool {
     state.library.selected_track_id.as_deref() == Some(track_id)
         && state.reference_waveform_generation == generation
+}
+
+fn reference_decode_progress_is_current(state: &AppState, track_id: &str, generation: u64) -> bool {
+    reference_decode_result_is_current(state, track_id, generation)
+        && state
+            .reference_waveform_in_flight
+            .as_ref()
+            .is_some_and(|request| request.track_id == track_id && request.generation == generation)
+}
+
+fn take_matching_reference_waveform_in_flight(
+    state: &mut AppState,
+    track_id: &str,
+    generation: u64,
+) -> Option<WaveformDecodeRequest> {
+    let matches = state
+        .reference_waveform_in_flight
+        .as_ref()
+        .is_some_and(|request| request.track_id == track_id && request.generation == generation);
+    matches
+        .then(|| state.reference_waveform_in_flight.take())
+        .flatten()
 }
 
 fn transport_command_is_confirmed(snapshot: transport::Snapshot, token: u64) -> bool {
@@ -10082,9 +10239,10 @@ mod tests {
         SETTINGS_REFERENCE_ROW_TEXT_HEIGHT, SETTINGS_REFERENCE_ROW_TEXT_SPACING,
         SETTINGS_REFERENCE_ROW_TITLE_HEIGHT, STATUS_BAR_VERSION_WIDTH, StatusMenuHost,
         TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER, TRACK_CARD_SELECTED_CORAL, WAVEFORM_HEIGHT,
-        WorkspaceMode, animation_requested, apply_transport_snapshot, audition_panel,
-        audition_shuffle_seed, audition_statuses, cleanup_reference_transport_failure,
-        current_live_frame_for_source, current_loudness_match_gain_db, current_lufs_meter_value,
+        WaveformDecodeRequest, WorkspaceMode, animation_requested, apply_transport_snapshot,
+        audition_panel, audition_shuffle_seed, audition_statuses,
+        cleanup_reference_transport_failure, current_live_frame_for_source,
+        current_loudness_match_gain_db, current_lufs_meter_value,
         current_reference_lufs_meter_value, decode_result_is_current, deterministic_shuffle,
         enforce_loop, favorite_toggle, frame_surface_revisions, library_track_title_id,
         live_frame_matches_current_session, live_spectrogram_display_sample_rate, loop_bounds,
@@ -10094,11 +10252,11 @@ mod tests {
         reconcile_audition_queue, reference_decode_result_is_current, reference_output_gain,
         reference_settings_auxiliary_windows, reference_settings_window_view,
         refresh_live_spectrogram, refresh_live_spectrograms, review_spectrogram_source,
-        review_status_filter_message, schedule_library_save, seek_synchronized_positions,
-        selected_reference_notes, selected_track, stage_dropdown, stage_menu_anchor_from_pointer,
-        stage_menu_popover, status_dropdown_for_host, status_filter_dropdown,
-        sync_audition_queue_after_status_change, tracks_with_status,
-        transport_command_is_confirmed, update,
+        review_status_filter_message, schedule_library_save, schedule_reference_waveform_decode,
+        schedule_waveform_decode, seek_synchronized_positions, selected_reference_notes,
+        selected_track, stage_dropdown, stage_menu_anchor_from_pointer, stage_menu_popover,
+        status_dropdown_for_host, status_filter_dropdown, sync_audition_queue_after_status_change,
+        tracks_with_status, transport_command_is_confirmed, update,
     };
     use crate::transport::{LiveFrameState, Snapshot};
     use crate::{
@@ -10113,7 +10271,8 @@ mod tests {
         runtime::{
             Command, DeclarativeOwnedCommandRuntimeBridge, DeclarativeOwnedRuntimeBridge, Event,
             FocusTraversal, PaintPrimitive, PaintTextAlign, PlatformRequest, PlatformResponse,
-            RepaintScope, SurfaceRuntime, TransientOverlayContext,
+            RepaintScope, RuntimeBridge, RuntimeHostCapabilities, RuntimeTaskHost, SurfaceRuntime,
+            TaskPriority, TransientOverlayContext, UiSurface,
         },
         theme::ThemeTokens,
         widgets::{
@@ -10121,7 +10280,81 @@ mod tests {
             WidgetInput,
         },
     };
-    use std::{path::PathBuf, sync::Arc, time::Duration};
+    use std::{
+        path::PathBuf,
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+
+    struct RuntimeTaskBridge<Bridge>(Bridge);
+
+    impl<Bridge, Message> RuntimeBridge<Message> for RuntimeTaskBridge<Bridge>
+    where
+        Bridge: RuntimeBridge<Message>,
+    {
+        fn project_surface(&mut self) -> Arc<UiSurface<Message>> {
+            self.0.project_surface()
+        }
+
+        fn pull_surface(&mut self) -> UiSurface<Message> {
+            self.0.pull_surface()
+        }
+
+        fn reduce_message(&mut self, message: Message) {
+            self.0.reduce_message(message);
+        }
+
+        fn update(&mut self, message: Message) -> Command<Message> {
+            self.0.update(message)
+        }
+
+        fn host_capabilities(&self) -> RuntimeHostCapabilities<Self, Message> {
+            RuntimeHostCapabilities::new().with_tasks()
+        }
+    }
+
+    impl<Bridge, Message> RuntimeTaskHost<Message> for RuntimeTaskBridge<Bridge> {
+        fn spawn_worker_task(
+            &mut self,
+            _name: &'static str,
+            _priority: TaskPriority,
+            _is_cancelled: Option<Box<dyn Fn() -> bool + Send + Sync + 'static>>,
+            work: Box<dyn FnOnce() + Send + 'static>,
+        ) -> bool {
+            std::thread::spawn(work);
+            true
+        }
+    }
+
+    fn drain_decode_runtime_until<Project, Update, Predicate>(
+        runtime: &mut SurfaceRuntime<
+            RuntimeTaskBridge<
+                DeclarativeOwnedCommandRuntimeBridge<AppState, Message, Project, Update>,
+            >,
+            Message,
+        >,
+        mut predicate: Predicate,
+    ) -> usize
+    where
+        Project: FnMut(&mut AppState) -> UiSurface<Message>,
+        Update: FnMut(&mut AppState, Message) -> Command<Message>,
+        Predicate: FnMut(&AppState) -> bool,
+    {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut messages_dispatched = 0;
+        loop {
+            let outcome = runtime.drain_runtime_messages();
+            messages_dispatched += outcome.messages_dispatched;
+            if predicate(runtime.bridge().0.state()) {
+                return messages_dispatched;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "runtime decode did not reach the expected lifecycle state"
+            );
+            std::thread::yield_now();
+        }
+    }
 
     fn planner_drag_state(pointer: Point) -> AppState {
         let mut state = AppState {
@@ -17022,6 +17255,11 @@ mod tests {
             busy: false,
             waveform_busy: true,
             waveform_generation: 7,
+            waveform_in_flight: Some(WaveformDecodeRequest {
+                track_id: String::from("track-a"),
+                path: PathBuf::from("/external/track-a.wav"),
+                generation: 7,
+            }),
             ..AppState::default()
         };
         state.library.selected_track_id = Some(String::from("track-a"));
@@ -17060,6 +17298,444 @@ mod tests {
         );
         assert_eq!(state.waveform_track_id.as_deref(), Some("track-a"));
         assert_eq!(state.waveform_progress, Some(0.4));
+    }
+
+    #[test]
+    fn rapid_main_waveform_targets_keep_one_job_and_start_only_the_newest_pending_target() {
+        let mut state = AppState::default();
+        let first_id = String::from("main-target-0");
+        state.library.selected_track_id = Some(first_id.clone());
+        let mut first_context = ui::UiUpdateContext::default();
+        schedule_waveform_decode(
+            &mut state,
+            &mut first_context,
+            first_id.clone(),
+            PathBuf::from("/external/main-target-0.wav"),
+        );
+        assert_eq!(
+            first_context
+                .into_command()
+                .business_task_priority("cadence-decode-waveform"),
+            Some(TaskPriority::Background)
+        );
+        let first_request = state
+            .waveform_in_flight
+            .clone()
+            .expect("the first target should be admitted");
+
+        for index in 1..=128 {
+            let track_id = format!("main-target-{index}");
+            state.library.selected_track_id = Some(track_id.clone());
+            let mut context = ui::UiUpdateContext::default();
+            schedule_waveform_decode(
+                &mut state,
+                &mut context,
+                track_id.clone(),
+                PathBuf::from(format!("/external/{track_id}.wav")),
+            );
+            assert_eq!(
+                context
+                    .into_command()
+                    .business_task_priority("cadence-decode-waveform"),
+                None,
+                "a superseded target must not admit another main decode"
+            );
+            assert_eq!(
+                state.waveform_in_flight.as_ref(),
+                Some(&first_request),
+                "the original main decode remains the only admitted job"
+            );
+            assert_eq!(
+                state
+                    .waveform_pending
+                    .as_ref()
+                    .map(|request| request.track_id.as_str()),
+                Some(track_id.as_str())
+            );
+        }
+
+        let newest_request = state
+            .waveform_pending
+            .clone()
+            .expect("the newest main target should remain pending");
+        let mut stale_context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::DecodeCompleted {
+                track_id: first_request.track_id.clone(),
+                generation: first_request.generation,
+                result: Ok(audition_waveform()),
+            },
+            &mut stale_context,
+        );
+        assert_eq!(
+            stale_context
+                .into_command()
+                .business_task_priority("cadence-decode-waveform"),
+            Some(TaskPriority::Background),
+            "retiring the stale main result should admit exactly the newest target"
+        );
+        assert_eq!(state.waveform_in_flight.as_ref(), Some(&newest_request));
+        assert!(state.waveform_pending.is_none());
+        assert!(state.waveform_busy);
+        assert!(state.waveform.is_none());
+
+        let mut newest_context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::DecodeCompleted {
+                track_id: newest_request.track_id.clone(),
+                generation: newest_request.generation,
+                result: Ok(audition_waveform()),
+            },
+            &mut newest_context,
+        );
+        assert_eq!(
+            newest_context
+                .into_command()
+                .business_task_priority("cadence-decode-waveform"),
+            None
+        );
+        assert!(state.waveform_in_flight.is_none());
+        assert!(state.waveform_pending.is_none());
+        assert!(!state.waveform_busy);
+        assert_eq!(
+            state.waveform_track_id.as_deref(),
+            Some(newest_request.track_id.as_str())
+        );
+    }
+
+    #[test]
+    fn rapid_reference_waveform_targets_keep_one_job_and_start_only_the_newest_pending_target() {
+        let mut state = AppState::default();
+        let first_id = String::from("reference-target-0");
+        state.library.selected_track_id = Some(first_id.clone());
+        let mut first_context = ui::UiUpdateContext::default();
+        schedule_reference_waveform_decode(
+            &mut state,
+            &mut first_context,
+            first_id.clone(),
+            PathBuf::from("/external/reference-target-0.wav"),
+        );
+        assert_eq!(
+            first_context
+                .into_command()
+                .business_task_priority("cadence-decode-reference-waveform"),
+            Some(TaskPriority::Background)
+        );
+        let first_request = state
+            .reference_waveform_in_flight
+            .clone()
+            .expect("the first reference target should be admitted");
+
+        for index in 1..=128 {
+            let track_id = format!("reference-target-{index}");
+            state.library.selected_track_id = Some(track_id.clone());
+            let mut context = ui::UiUpdateContext::default();
+            schedule_reference_waveform_decode(
+                &mut state,
+                &mut context,
+                track_id.clone(),
+                PathBuf::from(format!("/external/{track_id}.wav")),
+            );
+            assert_eq!(
+                context
+                    .into_command()
+                    .business_task_priority("cadence-decode-reference-waveform"),
+                None,
+                "a superseded target must not admit another reference decode"
+            );
+            assert_eq!(
+                state.reference_waveform_in_flight.as_ref(),
+                Some(&first_request),
+                "the original reference decode remains the only admitted job"
+            );
+            assert_eq!(
+                state
+                    .reference_waveform_pending
+                    .as_ref()
+                    .map(|request| request.track_id.as_str()),
+                Some(track_id.as_str())
+            );
+        }
+
+        let newest_request = state
+            .reference_waveform_pending
+            .clone()
+            .expect("the newest reference target should remain pending");
+        let mut stale_context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::ReferenceDecodeCompleted {
+                track_id: first_request.track_id.clone(),
+                generation: first_request.generation,
+                result: Ok(audition_waveform()),
+            },
+            &mut stale_context,
+        );
+        assert_eq!(
+            stale_context
+                .into_command()
+                .business_task_priority("cadence-decode-reference-waveform"),
+            Some(TaskPriority::Background),
+            "retiring the stale reference result should admit exactly the newest target"
+        );
+        assert_eq!(
+            state.reference_waveform_in_flight.as_ref(),
+            Some(&newest_request)
+        );
+        assert!(state.reference_waveform_pending.is_none());
+        assert!(state.reference_waveform_busy);
+        assert!(state.reference_waveform.is_none());
+
+        let mut newest_context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::ReferenceDecodeCompleted {
+                track_id: newest_request.track_id.clone(),
+                generation: newest_request.generation,
+                result: Ok(audition_waveform()),
+            },
+            &mut newest_context,
+        );
+        assert_eq!(
+            newest_context
+                .into_command()
+                .business_task_priority("cadence-decode-reference-waveform"),
+            None
+        );
+        assert!(state.reference_waveform_in_flight.is_none());
+        assert!(state.reference_waveform_pending.is_none());
+        assert!(!state.reference_waveform_busy);
+        assert_eq!(
+            state.reference_waveform_track_id.as_deref(),
+            Some(newest_request.track_id.as_str())
+        );
+    }
+
+    #[test]
+    fn main_waveform_runtime_retires_cancelled_first_decode_before_latest_error() {
+        let first_id = String::from("runtime-main-first");
+        let second_id = String::from("runtime-main-second");
+        let first_path = PathBuf::from("/definitely/missing/runtime-main-first.wav");
+        let second_path = PathBuf::from("/definitely/missing/runtime-main-second.wav");
+        assert!(!first_path.exists());
+        assert!(!second_path.exists());
+        let mut first_track = audition_track(&first_id);
+        first_track.path = first_path.clone();
+        first_track.reference_path = None;
+        let mut second_track = audition_track(&second_id);
+        second_track.path = second_path.clone();
+        second_track.reference_path = None;
+        let state = AppState {
+            busy: false,
+            save_in_flight: true,
+            library_load_state: LibraryLoadState::Ready,
+            library: Library {
+                tracks: vec![first_track, second_track],
+                selected_track_id: Some(first_id.clone()),
+                ..Library::default()
+            },
+            ..AppState::default()
+        };
+        let bridge = RuntimeTaskBridge(DeclarativeOwnedCommandRuntimeBridge::new(
+            state,
+            |state| project_surface(state).into_surface(),
+            |state, message| {
+                let mut context = ui::UiUpdateContext::default();
+                update(state, message, &mut context);
+                context.into_command()
+            },
+        ));
+        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1_180.0, 720.0));
+
+        runtime.dispatch_message(Message::SelectTrack(first_id.clone()));
+        let first_request = runtime
+            .bridge()
+            .0
+            .state()
+            .waveform_in_flight
+            .clone()
+            .expect("the first main decode should be admitted");
+        let first_cancellation = runtime
+            .bridge()
+            .0
+            .state()
+            .waveform_cancellation
+            .clone()
+            .expect("the first main decode should retain its Cadence token");
+
+        runtime.dispatch_message(Message::SelectTrack(second_id.clone()));
+        let second_request = runtime
+            .bridge()
+            .0
+            .state()
+            .waveform_pending
+            .clone()
+            .expect("the second main decode should remain pending");
+        assert_eq!(
+            runtime.bridge().0.state().waveform_in_flight,
+            Some(first_request.clone())
+        );
+        assert_eq!(second_request.track_id, second_id);
+        assert_eq!(second_request.path, second_path);
+        assert!(
+            first_cancellation.is_cancelled(),
+            "superseding the first main decode should cancel its Cadence token"
+        );
+
+        let first_messages = drain_decode_runtime_until(&mut runtime, |state| {
+            state.waveform_in_flight.as_ref() == Some(&second_request)
+                && state.waveform_pending.is_none()
+        });
+        assert!(
+            first_messages > 0,
+            "the first terminal completion should be delivered through SurfaceRuntime"
+        );
+        assert!(
+            runtime
+                .bridge()
+                .0
+                .state()
+                .waveform_cancellation
+                .as_ref()
+                .is_some_and(|token| !token.is_cancelled())
+        );
+
+        let latest_messages = drain_decode_runtime_until(&mut runtime, |state| {
+            state.waveform_in_flight.is_none()
+                && state.waveform_pending.is_none()
+                && !state.waveform_busy
+        });
+        assert!(
+            latest_messages > 0,
+            "the newest terminal completion should be delivered through SurfaceRuntime"
+        );
+        let final_state = runtime.bridge().0.state();
+        assert!(final_state.waveform_cancellation.is_none());
+        assert!(!final_state.waveform_busy);
+        assert!(final_state.status.contains("Waveform unavailable"));
+        assert!(
+            final_state
+                .status
+                .contains(second_path.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn reference_waveform_runtime_retires_cancelled_first_decode_before_latest_error() {
+        let first_id = String::from("runtime-reference-first");
+        let second_id = String::from("runtime-reference-second");
+        let first_path = PathBuf::from("/definitely/missing/runtime-reference-first.wav");
+        let second_path = PathBuf::from("/definitely/missing/runtime-reference-second.wav");
+        assert!(!first_path.exists());
+        assert!(!second_path.exists());
+        let first_track = audition_track(&first_id);
+        let second_track = audition_track(&second_id);
+        let state = AppState {
+            busy: false,
+            save_in_flight: true,
+            library_load_state: LibraryLoadState::Ready,
+            library: Library {
+                tracks: vec![first_track, second_track],
+                selected_track_id: Some(first_id.clone()),
+                ..Library::default()
+            },
+            ..AppState::default()
+        };
+        let bridge = RuntimeTaskBridge(DeclarativeOwnedCommandRuntimeBridge::new(
+            state,
+            |state| project_surface(state).into_surface(),
+            |state, message| {
+                let mut context = ui::UiUpdateContext::default();
+                update(state, message, &mut context);
+                context.into_command()
+            },
+        ));
+        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1_180.0, 720.0));
+
+        runtime.dispatch_message(Message::SetReferenceTrack {
+            track_id: first_id.clone(),
+            path: first_path.clone(),
+        });
+        let first_request = runtime
+            .bridge()
+            .0
+            .state()
+            .reference_waveform_in_flight
+            .clone()
+            .expect("the first reference decode should be admitted");
+        let first_cancellation = runtime
+            .bridge()
+            .0
+            .state()
+            .reference_waveform_cancellation
+            .clone()
+            .expect("the first reference decode should retain its Cadence token");
+
+        runtime.bridge_mut().0.state_mut().library.selected_track_id = Some(second_id.clone());
+        runtime.dispatch_message(Message::SetReferenceTrack {
+            track_id: second_id.clone(),
+            path: second_path.clone(),
+        });
+        let second_request = runtime
+            .bridge()
+            .0
+            .state()
+            .reference_waveform_pending
+            .clone()
+            .expect("the second reference decode should remain pending");
+        assert_eq!(
+            runtime.bridge().0.state().reference_waveform_in_flight,
+            Some(first_request.clone())
+        );
+        assert_eq!(second_request.track_id, second_id);
+        assert_eq!(second_request.path, second_path);
+        assert!(
+            first_cancellation.is_cancelled(),
+            "superseding the first reference decode should cancel its Cadence token"
+        );
+
+        let first_messages = drain_decode_runtime_until(&mut runtime, |state| {
+            state.reference_waveform_in_flight.as_ref() == Some(&second_request)
+                && state.reference_waveform_pending.is_none()
+        });
+        assert!(
+            first_messages > 0,
+            "the first reference terminal completion should be delivered through SurfaceRuntime"
+        );
+        assert!(
+            runtime
+                .bridge()
+                .0
+                .state()
+                .reference_waveform_cancellation
+                .as_ref()
+                .is_some_and(|token| !token.is_cancelled())
+        );
+
+        let latest_messages = drain_decode_runtime_until(&mut runtime, |state| {
+            state.reference_waveform_in_flight.is_none()
+                && state.reference_waveform_pending.is_none()
+                && !state.reference_waveform_busy
+        });
+        assert!(
+            latest_messages > 0,
+            "the newest reference terminal completion should be delivered through SurfaceRuntime"
+        );
+        let final_state = runtime.bridge().0.state();
+        assert!(final_state.reference_waveform_cancellation.is_none());
+        assert!(!final_state.reference_waveform_busy);
+        assert!(
+            final_state
+                .status
+                .contains("Reference waveform unavailable")
+        );
+        assert!(
+            final_state
+                .status
+                .contains(second_path.to_string_lossy().as_ref())
+        );
     }
 
     #[test]
@@ -22475,6 +23151,93 @@ mod tests {
         assert!(state.pending_import_paths.is_empty());
         assert!(state.pending_reference_paths.is_empty());
         assert_eq!(state.status, "Imported 1 of 3 files; 2 failed.");
+    }
+
+    #[test]
+    fn catalog_sequence_continues_then_dispatches_queued_main_import_once() {
+        let mut state = AppState {
+            busy: true,
+            ..AppState::default()
+        };
+        state.library.tracks.push(audition_track("catalog-owner"));
+        let mut context = ui::UiUpdateContext::default();
+        let main_path = PathBuf::from("/external/queued-main.wav");
+        let first_catalog = PathBuf::from("/external/catalog-a.wav");
+        let second_catalog = PathBuf::from("/external/catalog-b.wav");
+
+        update(
+            &mut state,
+            Message::FileDropped(ui::NativeFileDrop::dropped(main_path.clone(), None, None)),
+            &mut context,
+        );
+        update(
+            &mut state,
+            Message::ReferenceCatalogFilesPicked(vec![first_catalog.clone(), second_catalog]),
+            &mut context,
+        );
+
+        assert_eq!(state.pending_import_paths, vec![main_path.clone()]);
+        assert_eq!(state.pending_reference_catalog_paths.len(), 1);
+        assert_eq!(state.reference_catalog_import_total, 2);
+        assert_eq!(state.reference_catalog_import_completed, 0);
+        assert!(state.busy, "the first catalog import should be active");
+
+        let first_library = state.library.clone();
+        update(
+            &mut state,
+            Message::ReferenceCatalogImportCompleted {
+                path: first_catalog,
+                result: Ok(first_library.clone()),
+            },
+            &mut context,
+        );
+
+        assert!(
+            state.busy,
+            "the second catalog import should continue directly"
+        );
+        assert_eq!(state.reference_catalog_import_completed, 1);
+        assert_eq!(state.pending_reference_catalog_paths.len(), 0);
+
+        update(
+            &mut state,
+            Message::ReferenceCatalogImportCompleted {
+                path: PathBuf::from("/external/catalog-b.wav"),
+                result: Err(String::from("catalog failed")),
+            },
+            &mut context,
+        );
+
+        assert!(
+            state.busy,
+            "the queued main import should start at catalog terminal"
+        );
+        assert!(state.pending_import_paths.is_empty());
+        assert_eq!(state.reference_catalog_import_total, 0);
+        assert_eq!(state.reference_catalog_import_completed, 0);
+        assert_eq!(state.reference_catalog_import_failed, 0);
+        assert_eq!(
+            state.import_batch,
+            Some(ImportBatchProgress {
+                total: 1,
+                completed: 0,
+                failed: 0,
+            })
+        );
+
+        update(
+            &mut state,
+            Message::ImportCompleted(Err(String::from("main failed"))),
+            &mut context,
+        );
+
+        assert!(!state.busy);
+        assert!(state.import_batch.is_none());
+        assert!(state.pending_import_paths.is_empty());
+        assert!(state.pending_reference_catalog_paths.is_empty());
+        assert_eq!(state.reference_catalog_import_total, 0);
+        assert_eq!(state.reference_catalog_import_completed, 0);
+        assert_eq!(state.reference_catalog_import_failed, 0);
     }
 
     #[test]
