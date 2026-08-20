@@ -2297,7 +2297,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                         .as_ref()
                         .is_some_and(|pending| pending.track_id == track_id)
                     {
-                        state.pending_comment_playback = None;
+                        cancel_pending_comment_playback(state);
                     }
                 }
                 Err(error) => {
@@ -2309,7 +2309,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                         .as_ref()
                         .is_some_and(|pending| pending.track_id == track_id)
                     {
-                        state.pending_comment_playback = None;
+                        cancel_pending_comment_playback(state);
                     }
                     if pending_audition {
                         state.audition_auto_advance = false;
@@ -2367,7 +2367,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                         .as_ref()
                         .is_some_and(|pending| pending.track_id == track_id)
                     {
-                        state.pending_comment_playback = None;
+                        cancel_pending_comment_playback(state);
                     }
                 }
                 Err(error) => {
@@ -2379,7 +2379,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                         .as_ref()
                         .is_some_and(|pending| pending.track_id == track_id)
                     {
-                        state.pending_comment_playback = None;
+                        cancel_pending_comment_playback(state);
                     }
                 }
             }
@@ -2531,7 +2531,6 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 && !state.busy
                 && state.library.tracks.iter().any(|track| track.id == id)
             {
-                state.pending_comment_playback = None;
                 if state.workspace_mode == WorkspaceMode::Audition {
                     state.audition_heard.retain(|heard_id| heard_id != &id);
                 }
@@ -3271,9 +3270,9 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 .cloned();
             if let Some(note) = note {
                 state.selected_note_id = Some(note.id);
+                set_pending_seek_intent(state, AuditionSource::Main, note.time_millis);
                 state.review_cursor_millis = note.time_millis;
                 state.transport_position_millis = note.time_millis;
-                set_pending_seek_intent(state, AuditionSource::Main, note.time_millis);
                 state.draft_note = None;
                 state.status = format!(
                     "Selected comment at {}.",
@@ -3338,9 +3337,9 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 .cloned();
             if let Some(note) = note {
                 let editor_id = main_inline_comment_editor_id(&note.id);
+                set_pending_seek_intent(state, AuditionSource::Main, note.time_millis);
                 state.review_cursor_millis = note.time_millis;
                 state.transport_position_millis = note.time_millis;
-                set_pending_seek_intent(state, AuditionSource::Main, note.time_millis);
                 state.selected_note_id = Some(note.id.clone());
                 state.draft_note = Some(NoteDraft {
                     note_id: Some(note.id),
@@ -3423,8 +3422,8 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 .cloned();
             if let Some(note) = note {
                 state.selected_reference_note_id = Some(note.id);
-                state.reference_transport_position_millis = note.time_millis;
                 set_pending_seek_intent(state, AuditionSource::Reference, note.time_millis);
+                state.reference_transport_position_millis = note.time_millis;
                 state.reference_draft_note = None;
                 state.status = format!(
                     "Selected reference comment at {}.",
@@ -3445,9 +3444,9 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 .cloned();
             if let Some(note) = note {
                 let editor_id = reference_inline_comment_editor_id(&note.id);
+                set_pending_seek_intent(state, AuditionSource::Reference, note.time_millis);
                 state.selected_reference_note_id = Some(note.id.clone());
                 state.reference_transport_position_millis = note.time_millis;
-                set_pending_seek_intent(state, AuditionSource::Reference, note.time_millis);
                 state.reference_draft_note = Some(NoteDraft {
                     note_id: Some(note.id),
                     time_millis: note.time_millis,
@@ -4042,11 +4041,11 @@ fn seek_reference_waveform_position(
     }
     let ratio = waveform::clamp_ratio(ratio);
     let reference_position_millis = waveform::millis_for_ratio(ratio, reference_duration_millis);
+    set_pending_seek_intent(state, AuditionSource::Reference, reference_position_millis);
     state.draft_note = None;
     rollback_persisted_note_drag(state);
     state.selected_note_id = None;
     if !resume {
-        clear_pending_seek_intent(state, AuditionSource::Reference);
         state.reference_transport_position_millis = reference_position_millis;
         state.reference_only_playback = false;
         state.status = format!(
@@ -4617,6 +4616,7 @@ fn pending_seek_intent(state: &AppState, source: AuditionSource) -> Option<u64> 
 }
 
 fn set_pending_seek_intent(state: &mut AppState, source: AuditionSource, position_millis: u64) {
+    cancel_pending_comment_playback(state);
     match source {
         AuditionSource::Main => state.pending_main_seek_intent = Some(position_millis),
         AuditionSource::Reference => state.pending_reference_seek_intent = Some(position_millis),
@@ -4638,6 +4638,14 @@ fn clear_pending_seek_intent_if_admitted(
     // Compare the admitted intent identity, not the transport's normalized position.
     if pending_seek_intent(state, source) == Some(admitted_intent_millis) {
         clear_pending_seek_intent(state, source);
+    }
+}
+
+fn normalize_position_for_duration(position_millis: u64, duration_millis: u64) -> u64 {
+    if position_millis >= duration_millis {
+        0
+    } else {
+        position_millis
     }
 }
 
@@ -4670,11 +4678,7 @@ fn playback_start_position(
     loop_bounds: Option<LoopBounds>,
 ) -> u64 {
     if let Some(intent_millis) = pending_seek_intent(state, source) {
-        return if intent_millis >= duration_millis {
-            0
-        } else {
-            intent_millis
-        };
+        return normalize_position_for_duration(intent_millis, duration_millis);
     }
     let stored_position_millis = source_position(state, source);
     if let Some(bounds) = loop_bounds {
@@ -4686,11 +4690,7 @@ fn playback_start_position(
             bounds.start_millis.min(duration_millis)
         }
     } else {
-        if stored_position_millis >= duration_millis {
-            0
-        } else {
-            stored_position_millis
-        }
+        normalize_position_for_duration(stored_position_millis, duration_millis)
     }
 }
 
@@ -4875,7 +4875,7 @@ fn stop_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Message
     state.audition_auto_advance = false;
     state.audition_play_token = None;
     state.audition_pending_play_track_id = None;
-    state.pending_comment_playback = None;
+    cancel_pending_comment_playback(state);
     match admit_pause_for_active_transports(state) {
         Ok(true) => state.status = String::from("Stopping playback…"),
         Ok(false) => {
@@ -6623,6 +6623,7 @@ fn seek_review_position(
     };
     disarm_audition_auto_advance(state);
     let time_millis = waveform::millis_for_ratio(ratio, duration_millis);
+    set_pending_seek_intent(state, AuditionSource::Main, time_millis);
     state.reference_only_playback = false;
     if resume {
         match resume_main_at_position_with_reference(state, time_millis) {
@@ -6632,7 +6633,6 @@ fn seek_review_position(
             Err(error) => state.status = error,
         }
     } else {
-        clear_pending_seek_intent(state, AuditionSource::Main);
         state.review_cursor_millis = time_millis;
         state.transport_position_millis = time_millis;
         state.status = format!("Scrubbing at {}.", format_timestamp(time_millis));
@@ -6710,21 +6710,25 @@ fn maybe_start_pending_comment_playback(
     if !library_is_ready(state) {
         return;
     }
+    let Some(pending) = state.pending_comment_playback.clone() else {
+        return;
+    };
+    if state.library.selected_track_id.as_deref() != Some(pending.track_id.as_str()) {
+        cancel_pending_comment_playback(state);
+        return;
+    }
     if let Some(error) = paired_playback_cleanup_error(state) {
         state.status = error.to_owned();
         context.request_repaint();
         return;
     }
-    let Some(pending) = state.pending_comment_playback.clone() else {
-        return;
-    };
-    if state.busy || state.library.selected_track_id.as_deref() != Some(pending.track_id.as_str()) {
+    if state.busy {
         return;
     }
     let Some(time_millis) =
         comment_time_for_track(state, &pending.track_id, pending.source, &pending.note_id)
     else {
-        state.pending_comment_playback = None;
+        cancel_pending_comment_playback(state);
         state.status = String::from("That comment no longer exists.");
         context.request_repaint();
         return;
@@ -6758,14 +6762,37 @@ fn maybe_start_pending_comment_playback(
         return;
     }
 
+    let Some(main_duration_millis) = selected_main_duration(state) else {
+        return;
+    };
+    let reference_duration_millis =
+        selected_reference_details(state).map(|(_, duration_millis)| duration_millis);
+    let main_position_millis = normalize_position_for_duration(
+        match pending.source {
+            CommentSource::Main => time_millis,
+            CommentSource::Reference => state.transport_position_millis,
+        },
+        main_duration_millis,
+    );
+    let reference_position_millis = reference_duration_millis.map_or(
+        state.reference_transport_position_millis,
+        |duration_millis| {
+            normalize_position_for_duration(
+                match pending.source {
+                    CommentSource::Main => state.reference_transport_position_millis,
+                    CommentSource::Reference => time_millis,
+                },
+                duration_millis,
+            )
+        },
+    );
+
     match pending.source {
         CommentSource::Main => {
             state.comment_source = CommentSource::Main;
             state.comment_source_explicit = true;
             state.selected_note_id = Some(pending.note_id);
             state.draft_note = None;
-            state.review_cursor_millis = time_millis;
-            state.transport_position_millis = time_millis;
             set_audition_source(state, AuditionSource::Main);
         }
         CommentSource::Reference => {
@@ -6773,31 +6800,35 @@ fn maybe_start_pending_comment_playback(
             state.comment_source_explicit = true;
             state.selected_reference_note_id = Some(pending.note_id);
             state.reference_draft_note = None;
-            state.reference_transport_position_millis = time_millis;
             set_audition_source(state, AuditionSource::Reference);
         }
     }
 
-    let main_position_millis = state.transport_position_millis;
-    let reference_position_millis = state.reference_transport_position_millis;
+    state.review_cursor_millis = main_position_millis;
+    state.transport_position_millis = main_position_millis;
+    state.reference_transport_position_millis = reference_position_millis;
+    let start_position_millis = match pending.source {
+        CommentSource::Main => main_position_millis,
+        CommentSource::Reference => reference_position_millis,
+    };
     match seek_synchronized_positions(state, main_position_millis, reference_position_millis, true)
     {
         Ok(()) => {
-            state.pending_comment_playback = None;
+            cancel_pending_comment_playback(state);
             let source_label = match pending.source {
                 CommentSource::Main => "comment",
                 CommentSource::Reference => "reference comment",
             };
             state.status = format!(
                 "Playing {source_label} from {}.",
-                format_timestamp(time_millis)
+                format_timestamp(start_position_millis)
             );
         }
         Err(error) if comment_playback_should_wait(&error) => {
             state.status = String::from("Preparing comment playback…");
         }
         Err(error) => {
-            state.pending_comment_playback = None;
+            cancel_pending_comment_playback(state);
             state.status = error;
         }
     }
@@ -6808,6 +6839,10 @@ fn comment_playback_should_wait(error: &str) -> bool {
     error == transport::CONTROLS_BUSY_ERROR
         || error == "Audio analysis is still building."
         || error == "Audio analysis is still pending."
+}
+
+fn cancel_pending_comment_playback(state: &mut AppState) {
+    state.pending_comment_playback = None;
 }
 
 fn close_stage_menu(state: &mut AppState) {
@@ -6861,6 +6896,7 @@ fn select_track_internal(
         remove_audition_queue_entry_if_outside_filter(state, previous_id);
     }
     state.library.selected_track_id = Some(id.clone());
+    cancel_pending_comment_playback(state);
     state.loop_selections.clear_all();
     if in_audition {
         if let Some(index) = state
@@ -18072,7 +18108,7 @@ mod tests {
             runtime.bridge().state().selected_note_id.as_deref(),
             Some("comment-row-play-note")
         );
-        assert_eq!(runtime.bridge().state().transport_position_millis, 1_250);
+        assert_eq!(runtime.bridge().state().transport_position_millis, 0);
         assert!(runtime.bridge().state().transport_polling);
     }
 
@@ -18153,7 +18189,7 @@ mod tests {
         };
         state.library.selected_track_id = Some(track_id.clone());
         state.library.tracks.push(Track {
-            id: track_id,
+            id: track_id.clone(),
             title: String::from("Comment playback track"),
             original_name: String::from("comment-playback-track.wav"),
             path: PathBuf::from("/external/comment-playback-track.wav"),
@@ -18171,6 +18207,12 @@ mod tests {
         });
         let mut context = ui::UiUpdateContext::default();
 
+        state.pending_comment_playback = Some(super::PendingCommentPlayback {
+            track_id: track_id.clone(),
+            source: super::CommentSource::Main,
+            note_id: String::from("deferred-comment"),
+        });
+
         update(
             &mut state,
             Message::SelectNote(String::from("play-from-main-comment")),
@@ -18179,6 +18221,7 @@ mod tests {
         assert_eq!(state.review_cursor_millis, 750);
         assert_eq!(state.transport_position_millis, 750);
         assert_eq!(state.pending_main_seek_intent, Some(750));
+        assert!(state.pending_comment_playback.is_none());
         assert_eq!(
             resume_transport_command(&state, AuditionSource::Main, 750, None),
             ResumeTransportCommand::Seek
@@ -18210,6 +18253,16 @@ mod tests {
         state.reference_transport_position_millis = 500;
         let mut context = ui::UiUpdateContext::default();
 
+        state.pending_comment_playback = Some(super::PendingCommentPlayback {
+            track_id: state
+                .library
+                .selected_track_id
+                .clone()
+                .expect("the shared state should have a selected track"),
+            source: super::CommentSource::Reference,
+            note_id: String::from("deferred-reference-comment"),
+        });
+
         update(
             &mut state,
             Message::SelectReferenceNote(String::from("play-from-reference-comment")),
@@ -18217,6 +18270,7 @@ mod tests {
         );
         assert_eq!(state.reference_transport_position_millis, 2_500);
         assert_eq!(state.pending_reference_seek_intent, Some(2_500));
+        assert!(state.pending_comment_playback.is_none());
         assert_eq!(
             resume_transport_command(&state, AuditionSource::Reference, 2_500, None),
             ResumeTransportCommand::Seek
@@ -18269,6 +18323,15 @@ mod tests {
     #[test]
     fn paused_scrub_supersedes_pending_main_comment_seek() {
         let mut state = main_only_loop_state();
+        state.pending_comment_playback = Some(super::PendingCommentPlayback {
+            track_id: state
+                .library
+                .selected_track_id
+                .clone()
+                .expect("the main-only state should have a selected track"),
+            source: super::CommentSource::Main,
+            note_id: String::from("deferred-comment"),
+        });
         state.pending_main_seek_intent = Some(750);
         let mut context = ui::UiUpdateContext::default();
 
@@ -18279,7 +18342,140 @@ mod tests {
         );
 
         assert_eq!(state.transport_position_millis, 500);
-        assert_eq!(state.pending_main_seek_intent, None);
+        assert!(state.pending_comment_playback.is_none());
+        assert_eq!(state.pending_main_seek_intent, Some(500));
+    }
+
+    #[test]
+    fn mismatched_pending_comment_is_cleared_on_frame_and_stops_animation() {
+        let mut state = main_only_loop_state();
+        state.pending_comment_playback = Some(super::PendingCommentPlayback {
+            track_id: String::from("another-track"),
+            source: super::CommentSource::Main,
+            note_id: String::from("deferred-comment"),
+        });
+        assert!(animation_requested(&state));
+
+        update(
+            &mut state,
+            Message::Frame,
+            &mut ui::UiUpdateContext::default(),
+        );
+
+        assert!(state.pending_comment_playback.is_none());
+        assert!(!animation_requested(&state));
+    }
+
+    #[test]
+    fn audition_navigation_cancels_deferred_comment_playback() {
+        let mut state = audition_state(&["a", "b"]);
+        state.pending_comment_playback = Some(super::PendingCommentPlayback {
+            track_id: String::from("a"),
+            source: super::CommentSource::Main,
+            note_id: String::from("deferred-comment"),
+        });
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut state, Message::AuditionNext, &mut context);
+
+        assert_eq!(state.library.selected_track_id.as_deref(), Some("b"));
+        assert!(state.pending_comment_playback.is_none());
+    }
+
+    #[test]
+    fn audition_filter_reselection_cancels_deferred_comment_playback() {
+        let mut state = audition_state(&["inbox", "refine"]);
+        state.library.tracks[1].status = TrackStatus::Refine;
+        state.pending_comment_playback = Some(super::PendingCommentPlayback {
+            track_id: String::from("inbox"),
+            source: super::CommentSource::Main,
+            note_id: String::from("deferred-comment"),
+        });
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::SetAuditionFilter(TrackStatus::Refine),
+            &mut context,
+        );
+
+        assert_eq!(state.library.selected_track_id.as_deref(), Some("refine"));
+        assert!(state.pending_comment_playback.is_none());
+    }
+
+    #[test]
+    fn waveform_seek_and_scrub_supersede_deferred_comment_playback() {
+        let mut main_state = main_only_loop_state();
+        main_state.pending_comment_playback = Some(super::PendingCommentPlayback {
+            track_id: main_state
+                .library
+                .selected_track_id
+                .clone()
+                .expect("the main-only state should have a selected track"),
+            source: super::CommentSource::Main,
+            note_id: String::from("deferred-main-comment"),
+        });
+        main_state.transport.force_command_queue_full_for_test();
+
+        update(
+            &mut main_state,
+            Message::WaveformClicked {
+                ratio: 0.25,
+                lower: false,
+            },
+            &mut ui::UiUpdateContext::default(),
+        );
+
+        assert!(main_state.pending_comment_playback.is_none());
+        assert_eq!(main_state.pending_main_seek_intent, Some(500));
+
+        let mut reference_state = shared_reference_playback_state();
+        reference_state.pending_comment_playback = Some(super::PendingCommentPlayback {
+            track_id: reference_state
+                .library
+                .selected_track_id
+                .clone()
+                .expect("the shared state should have a selected track"),
+            source: super::CommentSource::Reference,
+            note_id: String::from("deferred-reference-comment"),
+        });
+
+        update(
+            &mut reference_state,
+            Message::ReferencePlayheadDragStarted { ratio: 0.5 },
+            &mut ui::UiUpdateContext::default(),
+        );
+
+        assert!(reference_state.pending_comment_playback.is_none());
+        assert_eq!(reference_state.pending_reference_seek_intent, Some(2_000));
+
+        let mut reference_click_state = shared_reference_playback_state();
+        reference_click_state.pending_comment_playback = Some(super::PendingCommentPlayback {
+            track_id: reference_click_state
+                .library
+                .selected_track_id
+                .clone()
+                .expect("the shared state should have a selected track"),
+            source: super::CommentSource::Reference,
+            note_id: String::from("deferred-reference-comment"),
+        });
+
+        update(
+            &mut reference_click_state,
+            Message::ReferenceWaveformClicked { ratio: 0.5 },
+            &mut ui::UiUpdateContext::default(),
+        );
+
+        assert!(reference_click_state.pending_comment_playback.is_none());
+        assert_eq!(
+            reference_click_state.reference_transport_position_millis,
+            2_000
+        );
+        assert!(
+            reference_click_state
+                .pending_reference_seek_intent
+                .is_none()
+        );
     }
 
     fn assert_normalized_pending_comment_intents_clear_after_admission(
@@ -18483,7 +18679,11 @@ mod tests {
         let note_id = String::from("play-main-comment");
         let mut state = AppState {
             busy: false,
-            waveform: Some(audition_waveform()),
+            waveform: Some(WaveformData {
+                duration_millis: 2_000,
+                render_frames: 96_000,
+                ..audition_waveform()
+            }),
             waveform_track_id: Some(track_id.clone()),
             ..AppState::default()
         };
@@ -18500,7 +18700,7 @@ mod tests {
             status: TrackStatus::Inbox,
             notes: vec![Note {
                 id: note_id.clone(),
-                time_millis: 750,
+                time_millis: 1_250,
                 body: String::from("play this"),
                 done: false,
             }],
@@ -18519,8 +18719,9 @@ mod tests {
 
         assert_eq!(state.comment_source, super::CommentSource::Main);
         assert_eq!(state.selected_note_id.as_deref(), Some("play-main-comment"));
-        assert_eq!(state.review_cursor_millis, 750);
-        assert_eq!(state.transport_position_millis, 750);
+        assert_eq!(state.review_cursor_millis, 1_250);
+        assert_eq!(state.transport_position_millis, 1_250);
+        assert_eq!(state.status, "Playing comment from 00:01.");
         assert!(state.transport_polling);
         assert!(state.pending_comment_playback.is_none());
     }
@@ -18649,7 +18850,113 @@ mod tests {
         assert!(state.transport_polling);
         assert!(state.reference_transport_polling);
         assert!(state.pending_comment_playback.is_none());
+        assert_eq!(state.status, "Playing reference comment from 00:02.");
         assert_ne!(state.status, "Pausing playback…");
+    }
+
+    #[test]
+    fn direct_comment_playback_normalizes_each_paired_source_at_or_beyond_eof() {
+        for (source, time_millis) in [
+            (super::CommentSource::Main, 2_000),
+            (super::CommentSource::Main, 2_500),
+            (super::CommentSource::Reference, 4_000),
+            (super::CommentSource::Reference, 4_500),
+        ] {
+            let mut state = shared_reference_playback_state();
+            state.transport_position_millis = 2_000;
+            state.review_cursor_millis = 2_000;
+            state.reference_transport_position_millis = 4_000;
+            let track_id = state
+                .library
+                .selected_track_id
+                .clone()
+                .expect("the paired state should have a selected track");
+            let note_id = format!("eof-comment-{time_millis}");
+            if source == super::CommentSource::Main {
+                state.library.tracks[0].notes.push(Note {
+                    id: note_id.clone(),
+                    time_millis,
+                    body: String::from("play at eof"),
+                    done: false,
+                });
+            } else {
+                let reference_path = state.library.tracks[0]
+                    .reference_path
+                    .clone()
+                    .expect("the paired state should have a reference path");
+                state.library.reference_tracks.push(ReferenceTrack {
+                    path: reference_path,
+                    notes: vec![Note {
+                        id: note_id.clone(),
+                        time_millis,
+                        body: String::from("play reference at eof"),
+                        done: false,
+                    }],
+                });
+            }
+
+            update(
+                &mut state,
+                Message::PlayComment {
+                    track_id,
+                    source,
+                    note_id: note_id.clone(),
+                },
+                &mut ui::UiUpdateContext::default(),
+            );
+
+            assert_eq!(state.transport_position_millis, 0);
+            assert_eq!(state.review_cursor_millis, 0);
+            assert_eq!(state.reference_transport_position_millis, 0);
+            assert!(state.transport_polling);
+            assert!(state.reference_transport_polling);
+            match source {
+                super::CommentSource::Main => {
+                    assert_eq!(state.selected_note_id.as_deref(), Some(note_id.as_str()));
+                    assert_eq!(state.status, "Playing comment from 00:00.");
+                }
+                super::CommentSource::Reference => {
+                    assert_eq!(
+                        state.selected_reference_note_id.as_deref(),
+                        Some(note_id.as_str())
+                    );
+                    assert_eq!(state.status, "Playing reference comment from 00:00.");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn busy_admission_retains_the_current_pending_comment_playback() {
+        let mut state = main_only_loop_state();
+        let track_id = state
+            .library
+            .selected_track_id
+            .clone()
+            .expect("the main-only state should have a selected track");
+        let note_id = String::from("busy-comment");
+        state.library.tracks[0].notes.push(Note {
+            id: note_id.clone(),
+            time_millis: 500,
+            body: String::from("wait for controls"),
+            done: false,
+        });
+        state.pending_comment_playback = Some(super::PendingCommentPlayback {
+            track_id,
+            source: super::CommentSource::Main,
+            note_id,
+        });
+        state.transport.force_command_queue_full_for_test();
+
+        update(
+            &mut state,
+            Message::Frame,
+            &mut ui::UiUpdateContext::default(),
+        );
+
+        assert!(state.pending_comment_playback.is_some());
+        assert_eq!(state.status, "Preparing comment playback…");
+        assert!(animation_requested(&state));
     }
 
     #[test]
