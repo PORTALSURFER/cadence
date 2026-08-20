@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+project_manifest_path="$project_dir/Cargo.toml"
 bundle_path="$project_dir/dist/Cadence.app"
 executable_path=""
 output_was_set=false
 bundle_version=""
+version_was_supplied=false
 bundle_short_version=""
+bundle_short_version_was_supplied=false
 bundle_build_number=""
+bundle_build_number_was_supplied=false
 signing_identity="-"
 production_signing=false
 
@@ -36,6 +40,7 @@ while (($# > 0)); do
                 exit 2
             fi
             bundle_version="$2"
+            version_was_supplied=true
             shift 2
             ;;
         --bundle-short-version)
@@ -44,6 +49,7 @@ while (($# > 0)); do
                 exit 2
             fi
             bundle_short_version="$2"
+            bundle_short_version_was_supplied=true
             shift 2
             ;;
         --bundle-build-number)
@@ -52,6 +58,7 @@ while (($# > 0)); do
                 exit 2
             fi
             bundle_build_number="$2"
+            bundle_build_number_was_supplied=true
             shift 2
             ;;
         --signing-identity)
@@ -103,34 +110,120 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
     exit 1
 fi
 
-if [[ -n "$bundle_version" ]]; then
-    release_version_re='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(rc|nightly)\.[1-9][0-9]*)?$'
-    if [[ ! "$bundle_version" =~ $release_version_re ]]; then
-        printf '%s\n' "Version must use stable, rc, or nightly semantic version syntax: $bundle_version" >&2
-        exit 2
+if [[ "$version_was_supplied" == false && ( "$bundle_short_version_was_supplied" == true || "$bundle_build_number_was_supplied" == true ) ]]; then
+    printf '%s\n' "--bundle-short-version and --bundle-build-number require --version." >&2
+    exit 2
+fi
+
+metadata_path=""
+cleanup_metadata() {
+    if [[ -n "$metadata_path" ]]; then
+        rm -f -- "$metadata_path"
+    fi
+}
+trap cleanup_metadata EXIT
+
+if [[ "$version_was_supplied" == false ]]; then
+    metadata_path="$(mktemp -t cadence-native-metadata.XXXXXX)"
+    if ! cargo metadata \
+        --locked \
+        --no-deps \
+        --format-version 1 \
+        --manifest-path "$project_manifest_path" \
+        >"$metadata_path"; then
+        printf '%s\n' "Could not read the Cadence package version from cargo metadata." >&2
+        exit 1
     fi
 
-    derived_short_version="${bundle_version%%-*}"
-    if [[ -z "$bundle_short_version" ]]; then
-        bundle_short_version="$derived_short_version"
+    if ! bundle_version="$(/usr/bin/xcrun swift - "$metadata_path" "$project_manifest_path" <<'SWIFT'
+import Darwin
+import Foundation
+
+struct Metadata: Decodable {
+    let packages: [Package]
+}
+
+struct Package: Decodable {
+    let name: String
+    let version: String
+    let manifestPath: String
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case version
+        case manifestPath = "manifest_path"
+    }
+}
+
+func fail(_ message: String) -> Never {
+    fputs("\(message)\n", stderr)
+    exit(1)
+}
+
+guard CommandLine.arguments.count == 3 else {
+    fail("cargo metadata version resolver received invalid arguments")
+}
+
+let metadataPath = CommandLine.arguments[1]
+let rootManifestPath = URL(fileURLWithPath: CommandLine.arguments[2])
+    .standardizedFileURL
+    .resolvingSymlinksInPath()
+    .path
+
+do {
+    let metadataData = try Data(contentsOf: URL(fileURLWithPath: metadataPath))
+    let metadata = try JSONDecoder().decode(Metadata.self, from: metadataData)
+    let matches = metadata.packages.filter { package in
+        guard package.name == "cadence-native" else {
+            return false
+        }
+        let packageManifestPath = URL(fileURLWithPath: package.manifestPath)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+            .path
+        return packageManifestPath == rootManifestPath
+    }
+
+    guard matches.count == 1 else {
+        fail("cargo metadata must contain exactly one root cadence-native package; found \(matches.count)")
+    }
+    guard !matches[0].version.isEmpty else {
+        fail("root cadence-native package has an empty version")
+    }
+    print(matches[0].version, terminator: "")
+} catch {
+    fail("could not parse cargo metadata: \(error)")
+}
+SWIFT
+)"; then
+        printf '%s\n' "Could not select the root Cadence package version from cargo metadata." >&2
+        exit 1
     fi
-    if [[ "$bundle_short_version" != "$derived_short_version" || ! "$bundle_short_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-        printf '%s\n' "Bundle short version must be the numeric base version $derived_short_version." >&2
-        exit 2
+fi
+
+release_version_re='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(rc|nightly)\.[1-9][0-9]*)?$'
+if [[ ! "$bundle_version" =~ $release_version_re ]]; then
+    printf '%s\n' "Version must use stable, rc, or nightly semantic version syntax: $bundle_version" >&2
+    exit 2
+fi
+
+derived_short_version="${bundle_version%%-*}"
+if [[ -z "$bundle_short_version" ]]; then
+    bundle_short_version="$derived_short_version"
+fi
+if [[ "$bundle_short_version" != "$derived_short_version" || ! "$bundle_short_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+    printf '%s\n' "Bundle short version must be the numeric base version $derived_short_version." >&2
+    exit 2
+fi
+if [[ -z "$bundle_build_number" ]]; then
+    if [[ "$bundle_version" == *-* ]]; then
+        bundle_build_number="${bundle_version##*.}"
+    else
+        bundle_build_number="$bundle_short_version"
     fi
-    if [[ -z "$bundle_build_number" ]]; then
-        if [[ "$bundle_version" == *-* ]]; then
-            bundle_build_number="${bundle_version##*.}"
-        else
-            bundle_build_number="$bundle_short_version"
-        fi
-    fi
-    if [[ ! "$bundle_build_number" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]]; then
-        printf '%s\n' "Bundle build number must contain only numeric components: $bundle_build_number" >&2
-        exit 2
-    fi
-elif [[ -n "$bundle_short_version" || -n "$bundle_build_number" ]]; then
-    printf '%s\n' "--bundle-short-version and --bundle-build-number require --version." >&2
+fi
+if [[ ! "$bundle_build_number" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]]; then
+    printf '%s\n' "Bundle build number must contain only numeric components: $bundle_build_number" >&2
     exit 2
 fi
 
@@ -153,10 +246,8 @@ cp "$project_dir/macos/Cadence/Info.plist" "$bundle_path/Contents/Info.plist"
 printf 'APPL????' > "$bundle_path/Contents/PkgInfo"
 chmod +x "$bundle_path/Contents/MacOS/Cadence"
 
-if [[ -n "$bundle_version" ]]; then
-    /usr/bin/plutil -replace CFBundleShortVersionString -string "$bundle_short_version" "$bundle_path/Contents/Info.plist"
-    /usr/bin/plutil -replace CFBundleVersion -string "$bundle_build_number" "$bundle_path/Contents/Info.plist"
-fi
+/usr/bin/plutil -replace CFBundleShortVersionString -string "$bundle_short_version" "$bundle_path/Contents/Info.plist"
+/usr/bin/plutil -replace CFBundleVersion -string "$bundle_build_number" "$bundle_path/Contents/Info.plist"
 
 /usr/bin/plutil -lint "$bundle_path/Contents/Info.plist" >/dev/null
 codesign_args=(--force --deep --sign "$signing_identity")
