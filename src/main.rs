@@ -830,6 +830,13 @@ enum LibraryLoadState {
     RecoveryRequired,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReferenceUnloadState {
+    Complete,
+    PendingAdmission,
+    AwaitingAcknowledgement(u64),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum PairedPlaybackGuard {
     Idle,
@@ -839,7 +846,13 @@ enum PairedPlaybackGuard {
         root_error: String,
         main_pause_token: Option<u64>,
         main_pause_acknowledged: bool,
-        reference_unload_pending: bool,
+        reference_unload: ReferenceUnloadState,
+        pending_reset_main: bool,
+        pending_reset_reference: bool,
+    },
+    StoppingReference {
+        root_error: String,
+        reference_unload: ReferenceUnloadState,
         pending_reset_main: bool,
         pending_reset_reference: bool,
     },
@@ -904,6 +917,8 @@ struct AppState {
     reference_match_enabled: bool,
     comment_source: CommentSource,
     comment_source_explicit: bool,
+    pending_main_seek_intent: Option<u64>,
+    pending_reference_seek_intent: Option<u64>,
     pending_comment_playback: Option<PendingCommentPlayback>,
     draft_note: Option<NoteDraft>,
     reference_draft_note: Option<NoteDraft>,
@@ -1027,6 +1042,8 @@ impl Default for AppState {
             reference_match_enabled: false,
             comment_source: CommentSource::Main,
             comment_source_explicit: false,
+            pending_main_seek_intent: None,
+            pending_reference_seek_intent: None,
             pending_comment_playback: None,
             draft_note: None,
             reference_draft_note: None,
@@ -1799,6 +1816,9 @@ fn reference_output_gain(state: &AppState) -> f32 {
 }
 
 fn reference_output_gain_for_source(state: &AppState, source: AuditionSource) -> f32 {
+    if cleanup_any_active(state) {
+        return 0.0;
+    }
     let match_gain = state
         .reference_match_enabled
         .then(|| current_loudness_match_gain_db(state))
@@ -1833,9 +1853,15 @@ fn main_output_gain(state: &AppState) -> f32 {
 }
 
 fn sync_audition_output_gains(state: &AppState) {
-    state.transport.set_output_gain(main_output_gain(state));
+    if !cleanup_any_active(state) || cleanup_owns_main(state) {
+        state.transport.set_output_gain(main_output_gain(state));
+    }
     if let Some(reference_transport) = state.reference_transport.as_ref() {
-        reference_transport.set_output_gain(reference_output_gain(state));
+        reference_transport.set_output_gain(if cleanup_any_active(state) {
+            0.0
+        } else {
+            reference_output_gain(state)
+        });
     }
 }
 
@@ -2365,10 +2391,18 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 && state.transport_playing;
             let was_main_playing = !state.reference_only_playback && state.transport_playing;
             let was_reference_playing = state.reference_transport_playing;
-            let cleanup_was_active = paired_playback_cleanup_active(state);
+            let mut cleanup_was_reference_only = matches!(
+                state.paired_playback_guard,
+                PairedPlaybackGuard::StoppingReference { .. }
+            );
+            let cleanup_was_owning_main = cleanup_owns_main(state);
             update_reference_transport(state);
-            let cleanup_was_active = cleanup_was_active || paired_playback_cleanup_active(state);
-            if paired_playback_cleanup_active(state) {
+            cleanup_was_reference_only |= matches!(
+                state.paired_playback_guard,
+                PairedPlaybackGuard::StoppingReference { .. }
+            );
+            let cleanup_was_owning_main = cleanup_was_owning_main || cleanup_owns_main(state);
+            if cleanup_any_active(state) {
                 progress_paired_playback_cleanup(state);
             }
             let snapshot = state.transport.snapshot();
@@ -2380,7 +2414,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             let pending_audition = state.workspace_mode == WorkspaceMode::Audition
                 && state.audition_pending_play_track_id.is_some();
             let mut main_snapshot_applied = false;
-            let block_main_snapshot = cleanup_was_active || paired_playback_cleanup_active(state);
+            let mut block_main_snapshot = cleanup_was_owning_main || cleanup_owns_main(state);
             if snapshot.generation == state.transport_generation {
                 if let Some(warning) = state
                     .transport
@@ -2390,17 +2424,30 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     state.status = format!("Live spectrogram unavailable: {warning}");
                 }
                 if let Some(error) = state.transport.take_error(state.transport_generation) {
-                    state.playhead_drag_active = false;
-                    state.transport_playing = false;
-                    state.transport_polling = false;
-                    state.transport_waiting_token = None;
-                    state.audition_auto_advance = false;
-                    state.audition_play_token = None;
-                    state.audition_pending_play_track_id = None;
-                    if !block_main_snapshot {
+                    if paired_playback_intended(state) {
+                        state.playhead_drag_active = false;
+                        state.transport_playing = false;
+                        state.transport_polling = false;
+                        state.transport_waiting_token = None;
+                        state.audition_auto_advance = false;
+                        state.audition_play_token = None;
+                        state.audition_pending_play_track_id = None;
+                        cleanup_transport_failure(state, error, None);
+                        block_main_snapshot = true;
+                    } else if cleanup_any_active(state) {
+                        // A reference-only cleanup owns no main state. Keep
+                        // its first error while allowing main snapshots.
+                    } else if !block_main_snapshot {
+                        state.playhead_drag_active = false;
+                        state.transport_playing = false;
+                        state.transport_polling = false;
+                        state.transport_waiting_token = None;
+                        state.audition_auto_advance = false;
+                        state.audition_play_token = None;
+                        state.audition_pending_play_track_id = None;
                         state.status = error;
                     }
-                    if !block_main_snapshot && pending_audition {
+                    if !block_main_snapshot && !cleanup_any_active(state) && pending_audition {
                         advance_audition(state, context);
                     }
                 } else if !block_main_snapshot
@@ -2415,6 +2462,10 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
             if block_main_snapshot {
                 progress_paired_playback_cleanup(state);
+                refresh_live_spectrograms(state);
+                return;
+            }
+            if cleanup_was_reference_only {
                 refresh_live_spectrograms(state);
                 return;
             }
@@ -3145,6 +3196,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             } else {
                 state.draft_note = None;
             }
+            clear_pending_seek_intent(state, AuditionSource::Main);
             state.status = String::from("Comment canceled.");
             context.request_repaint();
         }
@@ -3186,6 +3238,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             } else {
                 state.reference_draft_note = None;
             }
+            clear_pending_seek_intent(state, AuditionSource::Reference);
             state.status = String::from("Reference comment canceled.");
             context.request_repaint();
         }
@@ -3202,6 +3255,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
             state.draft_note = None;
             rollback_persisted_note_drag(state);
+            clear_pending_seek_intent(state, AuditionSource::Main);
             state.status = String::from("Comment canceled.");
             context.request_repaint();
         }
@@ -3219,6 +3273,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 state.selected_note_id = Some(note.id);
                 state.review_cursor_millis = note.time_millis;
                 state.transport_position_millis = note.time_millis;
+                set_pending_seek_intent(state, AuditionSource::Main, note.time_millis);
                 state.draft_note = None;
                 state.status = format!(
                     "Selected comment at {}.",
@@ -3285,6 +3340,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 let editor_id = main_inline_comment_editor_id(&note.id);
                 state.review_cursor_millis = note.time_millis;
                 state.transport_position_millis = note.time_millis;
+                set_pending_seek_intent(state, AuditionSource::Main, note.time_millis);
                 state.selected_note_id = Some(note.id.clone());
                 state.draft_note = Some(NoteDraft {
                     note_id: Some(note.id),
@@ -3323,6 +3379,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     .is_some_and(|selected_id| selected_id == &id)
                 {
                     state.selected_note_id = None;
+                    clear_pending_seek_intent(state, AuditionSource::Main);
                 }
                 if state
                     .draft_note
@@ -3350,6 +3407,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 return;
             }
             state.reference_draft_note = None;
+            clear_pending_seek_intent(state, AuditionSource::Reference);
             state.status = String::from("Reference comment canceled.");
             context.request_repaint();
         }
@@ -3366,6 +3424,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             if let Some(note) = note {
                 state.selected_reference_note_id = Some(note.id);
                 state.reference_transport_position_millis = note.time_millis;
+                set_pending_seek_intent(state, AuditionSource::Reference, note.time_millis);
                 state.reference_draft_note = None;
                 state.status = format!(
                     "Selected reference comment at {}.",
@@ -3388,6 +3447,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 let editor_id = reference_inline_comment_editor_id(&note.id);
                 state.selected_reference_note_id = Some(note.id.clone());
                 state.reference_transport_position_millis = note.time_millis;
+                set_pending_seek_intent(state, AuditionSource::Reference, note.time_millis);
                 state.reference_draft_note = Some(NoteDraft {
                     note_id: Some(note.id),
                     time_millis: note.time_millis,
@@ -3419,6 +3479,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             if removed.is_some() {
                 if state.selected_reference_note_id.as_deref() == Some(id.as_str()) {
                     state.selected_reference_note_id = None;
+                    clear_pending_seek_intent(state, AuditionSource::Reference);
                 }
                 if state.hovered_reference_note_id.as_deref() == Some(id.as_str()) {
                     state.hovered_reference_note_id = None;
@@ -3506,15 +3567,38 @@ fn loop_bounds_meet_minimum(bounds: LoopBounds) -> bool {
     bounds.end_millis.saturating_sub(bounds.start_millis) >= MIN_LOOP_MILLIS
 }
 
-fn paired_playback_cleanup_error(state: &AppState) -> Option<&str> {
+fn cleanup_any_error(state: &AppState) -> Option<&str> {
     match &state.paired_playback_guard {
-        PairedPlaybackGuard::StoppingMain { root_error, .. } => Some(root_error),
+        PairedPlaybackGuard::StoppingMain { root_error, .. }
+        | PairedPlaybackGuard::StoppingReference { root_error, .. } => Some(root_error),
         _ => None,
     }
 }
 
+fn cleanup_any_active(state: &AppState) -> bool {
+    cleanup_any_error(state).is_some()
+}
+
+fn cleanup_owns_main(state: &AppState) -> bool {
+    matches!(
+        state.paired_playback_guard,
+        PairedPlaybackGuard::StoppingMain { .. }
+    )
+}
+
+fn paired_playback_cleanup_error(state: &AppState) -> Option<&str> {
+    cleanup_any_error(state)
+}
+
 fn paired_playback_cleanup_active(state: &AppState) -> bool {
-    paired_playback_cleanup_error(state).is_some()
+    cleanup_any_active(state)
+}
+
+fn paired_playback_intended(state: &AppState) -> bool {
+    matches!(
+        state.paired_playback_guard,
+        PairedPlaybackGuard::ReferenceRequired | PairedPlaybackGuard::Active
+    )
 }
 
 fn arm_paired_playback_guard(state: &mut AppState) {
@@ -3545,7 +3629,10 @@ fn clear_uncommitted_paired_playback_guard(state: &mut AppState) {
     }
 }
 
-fn invalidate_reference_transport_after_failure(state: &mut AppState) -> bool {
+fn invalidate_reference_transport_after_failure(state: &mut AppState) -> ReferenceUnloadState {
+    if let Some(reference_transport) = state.reference_transport.as_ref() {
+        reference_transport.set_output_gain(0.0);
+    }
     state.reference_transport_generation = state.reference_transport_generation.wrapping_add(1);
     clear_live_spectrogram(state, AuditionSource::Reference);
     state.reference_transport_playing = false;
@@ -3557,29 +3644,39 @@ fn invalidate_reference_transport_after_failure(state: &mut AppState) -> bool {
     rollback_reference_persisted_note_drag(state);
 
     let Some(reference_transport) = state.reference_transport.as_ref() else {
-        return false;
+        return ReferenceUnloadState::Complete;
     };
     match reference_transport.unload(state.reference_transport_generation) {
-        Ok(_) => false,
-        Err(error) if error == transport::CONTROLS_BUSY_ERROR => true,
-        Err(_) => false,
+        Ok(token) => ReferenceUnloadState::AwaitingAcknowledgement(token),
+        Err(_) => ReferenceUnloadState::PendingAdmission,
     }
 }
 
 fn cleanup_reference_transport_failure(state: &mut AppState, error: String) -> String {
-    if let Some(root_error) = paired_playback_cleanup_error(state) {
+    cleanup_transport_failure(state, error, None)
+}
+
+fn cleanup_transport_failure(
+    state: &mut AppState,
+    error: String,
+    accepted_main_pause_token: Option<u64>,
+) -> String {
+    if let Some(root_error) = cleanup_any_error(state) {
         let root_error = root_error.to_owned();
         state.status = root_error.clone();
         return root_error;
     }
 
-    let paired = matches!(
-        state.paired_playback_guard,
-        PairedPlaybackGuard::ReferenceRequired | PairedPlaybackGuard::Active
-    );
-    let reference_unload_pending = invalidate_reference_transport_after_failure(state);
+    let paired = paired_playback_intended(state);
+    let reference_unload = invalidate_reference_transport_after_failure(state);
     if !paired {
-        state.paired_playback_guard = PairedPlaybackGuard::Idle;
+        state.paired_playback_guard = PairedPlaybackGuard::StoppingReference {
+            root_error: error.clone(),
+            reference_unload,
+            pending_reset_main: false,
+            pending_reset_reference: false,
+        };
+        progress_paired_playback_cleanup_initial(state);
         state.status = error.clone();
         return error;
     }
@@ -3589,101 +3686,177 @@ fn cleanup_reference_transport_failure(state: &mut AppState, error: String) -> S
     state.audition_pending_play_track_id = None;
     state.transport_playing = false;
     state.transport_polling = false;
-    state.transport_waiting_token = None;
     state.transport.set_output_gain(0.0);
+    let (main_pause_token, main_pause_acknowledged) = if let Some(token) = accepted_main_pause_token
+    {
+        state.transport_waiting_token = Some(token);
+        state.transport_polling = true;
+        let snapshot = state.transport.snapshot();
+        let acknowledged = snapshot.generation == state.transport_generation
+            && transport_command_is_confirmed(snapshot, token);
+        if acknowledged {
+            state.transport_waiting_token = None;
+            state.transport_polling = false;
+            (None, true)
+        } else {
+            (Some(token), false)
+        }
+    } else {
+        state.transport_waiting_token = None;
+        (None, false)
+    };
     state.paired_playback_guard = PairedPlaybackGuard::StoppingMain {
         root_error: error.clone(),
-        main_pause_token: None,
-        main_pause_acknowledged: false,
-        reference_unload_pending,
+        main_pause_token,
+        main_pause_acknowledged,
+        reference_unload,
         pending_reset_main: false,
         pending_reset_reference: false,
     };
-    progress_paired_playback_cleanup(state);
+    progress_paired_playback_cleanup_initial(state);
     state.status = error.clone();
     error
 }
 
 fn progress_paired_playback_cleanup(state: &mut AppState) {
+    progress_paired_playback_cleanup_with_reference_retry(state, true);
+}
+
+fn progress_paired_playback_cleanup_initial(state: &mut AppState) {
+    progress_paired_playback_cleanup_with_reference_retry(state, false);
+}
+
+fn progress_paired_playback_cleanup_with_reference_retry(
+    state: &mut AppState,
+    retry_reference_admission: bool,
+) {
     let guard = std::mem::replace(&mut state.paired_playback_guard, PairedPlaybackGuard::Idle);
-    let PairedPlaybackGuard::StoppingMain {
-        root_error,
-        mut main_pause_token,
-        mut main_pause_acknowledged,
-        mut reference_unload_pending,
-        pending_reset_main,
-        pending_reset_reference,
-    } = guard
-    else {
-        state.paired_playback_guard = guard;
-        return;
-    };
-
-    if !main_pause_acknowledged {
-        if let Some(token) = main_pause_token
-            && state.transport.snapshot().generation == state.transport_generation
-            && transport_command_is_confirmed(state.transport.snapshot(), token)
-        {
-            main_pause_token = None;
-            main_pause_acknowledged = true;
-            state.transport_playing = false;
-            state.transport_polling = false;
-            state.transport_waiting_token = None;
-        }
-        if !main_pause_acknowledged
-            && main_pause_token.is_none()
-            && let Ok(token) = state.transport.pause(state.transport_generation)
-        {
-            main_pause_token = Some(token);
-            begin_transport_polling(state, token);
-        }
-    }
-
-    if reference_unload_pending {
-        reference_unload_pending =
-            state
-                .reference_transport
-                .as_ref()
-                .is_some_and(|reference_transport| {
-                    match reference_transport.unload(state.reference_transport_generation) {
-                        Ok(_) => false,
-                        Err(error) if error == transport::CONTROLS_BUSY_ERROR => true,
-                        Err(_) => false,
-                    }
-                });
-    }
-
-    if main_pause_acknowledged {
-        let normal_main_gain = if state.audition_source == AuditionSource::Main {
-            state.audition_volume
-        } else {
-            0.0
-        };
-        state.transport.set_output_gain(normal_main_gain);
-        if let Some(reference_transport) = state.reference_transport.as_ref() {
-            reference_transport.set_output_gain(reference_output_gain(state));
-        }
-    }
-
-    if main_pause_acknowledged && !reference_unload_pending {
-        state.paired_playback_guard = PairedPlaybackGuard::Idle;
-        if pending_reset_main {
-            reset_transport(state);
-        }
-        if pending_reset_reference {
-            reset_reference_transport(state);
-        }
-    } else {
-        state.paired_playback_guard = PairedPlaybackGuard::StoppingMain {
-            root_error: root_error.clone(),
-            main_pause_token,
-            main_pause_acknowledged,
-            reference_unload_pending,
+    match guard {
+        PairedPlaybackGuard::StoppingMain {
+            root_error,
+            mut main_pause_token,
+            mut main_pause_acknowledged,
+            mut reference_unload,
             pending_reset_main,
             pending_reset_reference,
-        };
+        } => {
+            if !main_pause_acknowledged {
+                if let Some(token) = main_pause_token {
+                    let snapshot = state.transport.snapshot();
+                    if snapshot.generation == state.transport_generation
+                        && transport_command_is_confirmed(snapshot, token)
+                    {
+                        main_pause_token = None;
+                        main_pause_acknowledged = true;
+                        state.transport_playing = false;
+                        state.transport_polling = false;
+                        state.transport_waiting_token = None;
+                    }
+                }
+                if !main_pause_acknowledged
+                    && main_pause_token.is_none()
+                    && let Ok(token) = state.transport.pause(state.transport_generation)
+                {
+                    main_pause_token = Some(token);
+                    begin_transport_polling(state, token);
+                }
+            }
+
+            reference_unload =
+                progress_reference_unload(state, reference_unload, retry_reference_admission);
+            if main_pause_acknowledged {
+                state.transport.set_output_gain(main_output_gain(state));
+            }
+
+            if main_pause_acknowledged && matches!(reference_unload, ReferenceUnloadState::Complete)
+            {
+                state.paired_playback_guard = PairedPlaybackGuard::Idle;
+                if pending_reset_main {
+                    reset_transport(state);
+                }
+                if pending_reset_reference {
+                    reset_reference_transport(state);
+                }
+                sync_audition_output_gains(state);
+            } else {
+                state.paired_playback_guard = PairedPlaybackGuard::StoppingMain {
+                    root_error: root_error.clone(),
+                    main_pause_token,
+                    main_pause_acknowledged,
+                    reference_unload,
+                    pending_reset_main,
+                    pending_reset_reference,
+                };
+            }
+            state.status = root_error;
+        }
+        PairedPlaybackGuard::StoppingReference {
+            root_error,
+            reference_unload,
+            pending_reset_main,
+            pending_reset_reference,
+        } => {
+            let reference_unload =
+                progress_reference_unload(state, reference_unload, retry_reference_admission);
+            if matches!(reference_unload, ReferenceUnloadState::Complete) {
+                state.paired_playback_guard = PairedPlaybackGuard::Idle;
+                if pending_reset_main {
+                    reset_transport(state);
+                }
+                if pending_reset_reference {
+                    reset_reference_transport(state);
+                }
+                restore_reference_output_gain(state);
+            } else {
+                state.paired_playback_guard = PairedPlaybackGuard::StoppingReference {
+                    root_error: root_error.clone(),
+                    reference_unload,
+                    pending_reset_main,
+                    pending_reset_reference,
+                };
+            }
+            state.status = root_error;
+        }
+        guard => state.paired_playback_guard = guard,
     }
-    state.status = root_error;
+}
+
+fn progress_reference_unload(
+    state: &AppState,
+    unload: ReferenceUnloadState,
+    retry_admission: bool,
+) -> ReferenceUnloadState {
+    let Some(reference_transport) = state.reference_transport.as_ref() else {
+        return ReferenceUnloadState::Complete;
+    };
+    match unload {
+        ReferenceUnloadState::Complete => ReferenceUnloadState::Complete,
+        ReferenceUnloadState::PendingAdmission => {
+            if !retry_admission {
+                return ReferenceUnloadState::PendingAdmission;
+            }
+            match reference_transport.unload(state.reference_transport_generation) {
+                Ok(token) => ReferenceUnloadState::AwaitingAcknowledgement(token),
+                Err(_) => ReferenceUnloadState::PendingAdmission,
+            }
+        }
+        ReferenceUnloadState::AwaitingAcknowledgement(token) => {
+            let snapshot = reference_transport.snapshot();
+            if snapshot.generation == state.reference_transport_generation
+                && transport_command_is_confirmed(snapshot, token)
+            {
+                ReferenceUnloadState::Complete
+            } else {
+                ReferenceUnloadState::AwaitingAcknowledgement(token)
+            }
+        }
+    }
+}
+
+fn restore_reference_output_gain(state: &AppState) {
+    if let Some(reference_transport) = state.reference_transport.as_ref() {
+        reference_transport.set_output_gain(reference_output_gain(state));
+    }
 }
 
 fn maybe_clear_paired_playback_guard_after_idle(state: &mut AppState) {
@@ -3762,10 +3935,15 @@ fn seek_synchronized_positions(
     ) {
         Ok(token) => token,
         Err(error) => {
-            clear_uncommitted_paired_playback_guard(state);
-            return Err(error);
+            return Err(if reference_details.is_some() {
+                cleanup_reference_transport_failure(state, error)
+            } else {
+                clear_uncommitted_paired_playback_guard(state);
+                error
+            });
         }
     };
+    clear_pending_seek_intent_if_admitted(state, AuditionSource::Main, main_position_millis);
     begin_transport_polling(state, main_token);
     if let Some((reference_path, reference_duration_millis)) = reference_details {
         let reference_gain = reference_output_gain(state);
@@ -3801,6 +3979,11 @@ fn seek_synchronized_positions(
             Ok(token) => token,
             Err(error) => return Err(cleanup_reference_transport_failure(state, error)),
         };
+        clear_pending_seek_intent_if_admitted(
+            state,
+            AuditionSource::Reference,
+            reference_position_millis,
+        );
         state.reference_transport_waiting_token = Some(reference_token);
         state.reference_transport_polling = true;
         paired_playback_commands_admitted(state);
@@ -3863,6 +4046,7 @@ fn seek_reference_waveform_position(
     rollback_persisted_note_drag(state);
     state.selected_note_id = None;
     if !resume {
+        clear_pending_seek_intent(state, AuditionSource::Reference);
         state.reference_transport_position_millis = reference_position_millis;
         state.reference_only_playback = false;
         state.status = format!(
@@ -3907,6 +4091,11 @@ fn seek_reference_waveform_position(
         true,
     ) {
         Ok(token) => {
+            clear_pending_seek_intent_if_admitted(
+                state,
+                AuditionSource::Reference,
+                reference_position_millis,
+            );
             state.reference_transport_position_millis = reference_position_millis;
             state.reference_transport_waiting_token = Some(token);
             state.reference_transport_polling = true;
@@ -3970,12 +4159,19 @@ fn seek_loop_owner(
             {
                 return Err(String::from(transport::CONTROLS_BUSY_ERROR));
             }
-            let token = state.transport.seek(
+            let token = match state.transport.seek(
                 state.transport_generation,
                 position_millis,
                 duration_millis,
                 true,
-            )?;
+            ) {
+                Ok(token) => token,
+                Err(error) if paired_playback_intended(state) => {
+                    return Err(cleanup_transport_failure(state, error, None));
+                }
+                Err(error) => return Err(error),
+            };
+            clear_pending_seek_intent(state, AuditionSource::Main);
             set_source_position(state, source, position_millis);
             begin_transport_polling(state, token);
         }
@@ -4001,6 +4197,7 @@ fn seek_loop_owner(
                 Ok(token) => token,
                 Err(error) => return Err(cleanup_reference_transport_failure(state, error)),
             };
+            clear_pending_seek_intent(state, AuditionSource::Reference);
             set_source_position(state, source, position_millis);
             state.reference_transport_waiting_token = Some(token);
             state.reference_transport_polling = true;
@@ -4188,11 +4385,15 @@ fn start_source_alongside_active(
             if !state.transport.has_command_capacity(1) {
                 return Err(String::from(transport::CONTROLS_BUSY_ERROR));
             }
+            arm_paired_playback_guard(state);
             let loop_bounds = loop_bounds_for_source(state, AuditionSource::Main);
+            let pending_intent_millis = pending_seek_intent(state, AuditionSource::Main);
             let position_millis =
                 playback_start_position(state, AuditionSource::Main, duration_millis, loop_bounds);
-            let starts_new_segment =
-                loop_bounds.is_some() || position_millis != state.transport_position_millis;
+            let starts_new_segment = matches!(
+                resume_transport_command(state, AuditionSource::Main, position_millis, loop_bounds,),
+                ResumeTransportCommand::Seek
+            );
             state.transport.set_output_gain(state.audition_volume);
             let result = if starts_new_segment {
                 state.transport.seek(
@@ -4206,13 +4407,25 @@ fn start_source_alongside_active(
             };
             match result {
                 Ok(token) => {
+                    if starts_new_segment && let Some(intent_millis) = pending_intent_millis {
+                        clear_pending_seek_intent_if_admitted(
+                            state,
+                            AuditionSource::Main,
+                            intent_millis,
+                        );
+                    }
                     set_source_position(state, AuditionSource::Main, position_millis);
                     begin_transport_polling(state, token);
+                    paired_playback_commands_admitted(state);
                     Ok(())
                 }
                 Err(error) => {
                     sync_audition_output_gains(state);
-                    Err(error)
+                    Err(if paired_playback_intended(state) {
+                        cleanup_transport_failure(state, error, None)
+                    } else {
+                        error
+                    })
                 }
             }
         }
@@ -4220,7 +4433,15 @@ fn start_source_alongside_active(
             let (path, duration_millis) = selected_reference_details(state)
                 .ok_or_else(|| String::from("Import and analyze a reference track first."))?;
             let reference_was_loaded = state.reference_transport_loaded;
-            let required_slots = if reference_was_loaded { 2 } else { 3 };
+            let pending_intent_millis = pending_seek_intent(state, AuditionSource::Reference);
+            let reference_uses_resume_seek = pending_intent_millis.is_some();
+            let required_slots = if reference_was_loaded {
+                if reference_uses_resume_seek { 1 } else { 2 }
+            } else if reference_uses_resume_seek {
+                2
+            } else {
+                3
+            };
             let loop_bounds = loop_bounds_for_source(state, AuditionSource::Reference);
             let position_millis = playback_start_position(
                 state,
@@ -4263,16 +4484,28 @@ fn start_source_alongside_active(
                     Ok(())
                 };
                 load_result.and_then(|()| {
-                    reference_transport
-                        .seek(
-                            state.reference_transport_generation,
-                            position_millis,
-                            duration_millis,
-                            false,
-                        )
-                        .and_then(|_| {
+                    let seek_result = reference_transport.seek(
+                        state.reference_transport_generation,
+                        position_millis,
+                        duration_millis,
+                        reference_uses_resume_seek,
+                    );
+                    if seek_result.is_ok()
+                        && let Some(intent_millis) = pending_intent_millis
+                    {
+                        clear_pending_seek_intent_if_admitted(
+                            state,
+                            AuditionSource::Reference,
+                            intent_millis,
+                        );
+                    }
+                    seek_result.and_then(|token| {
+                        if reference_uses_resume_seek {
+                            Ok(token)
+                        } else {
                             reference_transport.play(state.reference_transport_generation)
-                        })
+                        }
+                    })
                 })
             };
             if loaded {
@@ -4376,12 +4609,73 @@ fn source_position(state: &AppState, source: AuditionSource) -> u64 {
     }
 }
 
+fn pending_seek_intent(state: &AppState, source: AuditionSource) -> Option<u64> {
+    match source {
+        AuditionSource::Main => state.pending_main_seek_intent,
+        AuditionSource::Reference => state.pending_reference_seek_intent,
+    }
+}
+
+fn set_pending_seek_intent(state: &mut AppState, source: AuditionSource, position_millis: u64) {
+    match source {
+        AuditionSource::Main => state.pending_main_seek_intent = Some(position_millis),
+        AuditionSource::Reference => state.pending_reference_seek_intent = Some(position_millis),
+    }
+}
+
+fn clear_pending_seek_intent(state: &mut AppState, source: AuditionSource) {
+    match source {
+        AuditionSource::Main => state.pending_main_seek_intent = None,
+        AuditionSource::Reference => state.pending_reference_seek_intent = None,
+    }
+}
+
+fn clear_pending_seek_intent_if_admitted(
+    state: &mut AppState,
+    source: AuditionSource,
+    admitted_intent_millis: u64,
+) {
+    // Compare the admitted intent identity, not the transport's normalized position.
+    if pending_seek_intent(state, source) == Some(admitted_intent_millis) {
+        clear_pending_seek_intent(state, source);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResumeTransportCommand {
+    Play,
+    Seek,
+}
+
+fn resume_transport_command(
+    state: &AppState,
+    source: AuditionSource,
+    position_millis: u64,
+    loop_bounds: Option<LoopBounds>,
+) -> ResumeTransportCommand {
+    if pending_seek_intent(state, source).is_some()
+        || loop_bounds.is_some()
+        || position_millis != source_position(state, source)
+    {
+        ResumeTransportCommand::Seek
+    } else {
+        ResumeTransportCommand::Play
+    }
+}
+
 fn playback_start_position(
     state: &AppState,
     source: AuditionSource,
     duration_millis: u64,
     loop_bounds: Option<LoopBounds>,
 ) -> u64 {
+    if let Some(intent_millis) = pending_seek_intent(state, source) {
+        return if intent_millis >= duration_millis {
+            0
+        } else {
+            intent_millis
+        };
+    }
     let stored_position_millis = source_position(state, source);
     if let Some(bounds) = loop_bounds {
         if stored_position_millis >= bounds.start_millis
@@ -4391,10 +4685,12 @@ fn playback_start_position(
         } else {
             bounds.start_millis.min(duration_millis)
         }
-    } else if stored_position_millis >= duration_millis {
-        0
     } else {
-        stored_position_millis
+        if stored_position_millis >= duration_millis {
+            0
+        } else {
+            stored_position_millis
+        }
     }
 }
 
@@ -4497,66 +4793,62 @@ fn move_audition(
     context.request_repaint();
 }
 
-fn stop_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
-    if let Some(error) = paired_playback_cleanup_error(state) {
-        state.status = error.to_owned();
-        context.request_repaint();
-        return;
-    }
-    state.audition_auto_advance = false;
-    state.audition_play_token = None;
-    state.audition_pending_play_track_id = None;
-    state.pending_comment_playback = None;
-    let main_active = state.transport_playing
-        || state.transport_polling
-        || state.transport_waiting_token.is_some();
-    let reference_active = state.reference_transport.as_ref().is_some_and(|_| {
-        state.reference_transport_playing
-            || state.reference_transport_polling
-            || state.reference_transport_waiting_token.is_some()
-    });
+fn admit_pause_for_active_transports(state: &mut AppState) -> Result<bool, String> {
+    let main_active =
+        !state.reference_only_playback && source_transport_is_active(state, AuditionSource::Main);
+    let reference_active = source_transport_is_active(state, AuditionSource::Reference);
     if !main_active && !reference_active {
-        clear_paired_playback_guard(state);
-        return;
+        return Ok(false);
     }
 
-    let reference_capacity_available = !reference_active
-        || state.reference_transport.as_ref().is_some_and(|transport| {
-            !transport.has_pending_load() && transport.has_command_capacity(1)
-        });
-    if (main_active && !state.transport.has_command_capacity(1)) || !reference_capacity_available {
-        state.status = String::from(transport::CONTROLS_BUSY_ERROR);
-        context.request_repaint();
-        return;
+    let paired = paired_playback_intended(state)
+        || (!state.reference_only_playback && main_active && reference_active);
+    if main_active && !state.transport.has_command_capacity(1) {
+        return Err(String::from(transport::CONTROLS_BUSY_ERROR));
+    }
+    if reference_active {
+        let Some(reference_transport) = state.reference_transport.as_ref() else {
+            return Err(String::from(transport::CONTROLS_BUSY_ERROR));
+        };
+        if reference_transport.has_pending_load() || !reference_transport.has_command_capacity(1) {
+            return Err(String::from(transport::CONTROLS_BUSY_ERROR));
+        }
+    }
+    if paired && !paired_playback_intended(state) {
+        arm_paired_playback_guard(state);
     }
 
     let main_token = if main_active {
         match state.transport.pause(state.transport_generation) {
             Ok(token) => Some(token),
-            Err(error) => {
-                state.status = error;
-                context.request_repaint();
-                return;
+            Err(error) if paired => {
+                return Err(cleanup_transport_failure(state, error, None));
             }
+            Err(error) => return Err(error),
         }
     } else {
         None
     };
+
     let reference_token = if reference_active {
         let Some(reference_transport) = state.reference_transport.as_ref() else {
-            state.status = String::from(transport::CONTROLS_BUSY_ERROR);
-            context.request_repaint();
-            return;
+            return Err(if paired {
+                cleanup_transport_failure(
+                    state,
+                    String::from(transport::CONTROLS_BUSY_ERROR),
+                    main_token,
+                )
+            } else {
+                String::from(transport::CONTROLS_BUSY_ERROR)
+            });
         };
         match reference_transport.pause(state.reference_transport_generation) {
             Ok(token) => Some(token),
+            Err(error) if paired => {
+                return Err(cleanup_transport_failure(state, error, main_token));
+            }
             Err(error) => {
-                if let Some(token) = main_token {
-                    begin_transport_polling(state, token);
-                }
-                state.status = error;
-                context.request_repaint();
-                return;
+                return Err(cleanup_reference_transport_failure(state, error));
             }
         }
     } else {
@@ -4571,8 +4863,27 @@ fn stop_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Message
         state.reference_transport_polling = true;
     }
     state.reference_only_playback = false;
-    clear_paired_playback_guard(state);
-    state.status = String::from("Stopping playback…");
+    Ok(true)
+}
+
+fn stop_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
+    if let Some(error) = paired_playback_cleanup_error(state) {
+        state.status = error.to_owned();
+        context.request_repaint();
+        return;
+    }
+    state.audition_auto_advance = false;
+    state.audition_play_token = None;
+    state.audition_pending_play_track_id = None;
+    state.pending_comment_playback = None;
+    match admit_pause_for_active_transports(state) {
+        Ok(true) => state.status = String::from("Stopping playback…"),
+        Ok(false) => {
+            clear_paired_playback_guard(state);
+            return;
+        }
+        Err(error) => state.status = error,
+    }
     context.request_repaint();
 }
 
@@ -4629,49 +4940,20 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
             state.audition_auto_advance = false;
             state.audition_play_token = None;
         }
-        let reference_will_pause =
-            state.reference_transport_loaded && state.reference_transport.is_some();
-        let reference_capacity_available =
-            state
-                .reference_transport
-                .as_ref()
-                .is_none_or(|reference_transport| {
-                    !reference_will_pause
-                        || (!reference_transport.has_pending_load()
-                            && reference_transport.has_command_capacity(1))
-                });
-        if !state.transport.has_command_capacity(1) || !reference_capacity_available {
-            state.status = String::from(transport::CONTROLS_BUSY_ERROR);
-            context.request_repaint();
-            return;
-        }
-        let main_result = state.transport.pause(state.transport_generation);
-        let reference_result = state
-            .reference_transport
-            .as_ref()
-            .filter(|_| state.reference_transport_loaded)
-            .map(|reference_transport| {
-                reference_transport.pause(state.reference_transport_generation)
-            });
-        match main_result {
-            Ok(token) => begin_transport_polling(state, token),
+        match admit_pause_for_active_transports(state) {
+            Ok(true) => state.status = String::from("Pausing playback…"),
+            Ok(false) => {
+                clear_paired_playback_guard(state);
+                return;
+            }
             Err(error) => state.status = error,
         }
-        if let Some(result) = reference_result {
-            match result {
-                Ok(token) => {
-                    state.reference_transport_waiting_token = Some(token);
-                    state.reference_transport_polling = true;
-                }
-                Err(error) => state.status = error,
-            }
-        }
-        state.status = String::from("Pausing playback…");
-        state.reference_only_playback = false;
     } else {
         let duration_millis = waveform.duration_millis;
         let main_loop_bounds = loop_bounds_for_source(state, AuditionSource::Main);
         let reference_loop_bounds = loop_bounds_for_source(state, AuditionSource::Reference);
+        let pending_main_intent_millis = pending_seek_intent(state, AuditionSource::Main);
+        let pending_reference_intent_millis = pending_seek_intent(state, AuditionSource::Reference);
         let main_position_millis = playback_start_position(
             state,
             AuditionSource::Main,
@@ -4695,6 +4977,7 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
             return;
         }
         if reference_details.is_some() {
+            let reference_uses_resume_seek = pending_reference_intent_millis.is_some();
             let reference_transport = state
                 .reference_transport
                 .get_or_insert_with(transport::AudioTransport::spawn);
@@ -4704,9 +4987,9 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
                 return;
             }
             let required_reference_slots = if state.reference_transport_loaded {
-                2
+                if reference_uses_resume_seek { 1 } else { 2 }
             } else {
-                3
+                if reference_uses_resume_seek { 2 } else { 3 }
             };
             if !reference_transport.has_command_capacity(required_reference_slots) {
                 state.status = String::from(transport::CONTROLS_BUSY_ERROR);
@@ -4717,11 +5000,25 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
         }
         state.reference_only_playback = false;
 
-        let main_starts_new_segment =
-            main_loop_bounds.is_some() || main_position_millis != state.transport_position_millis;
+        let main_starts_new_segment = matches!(
+            resume_transport_command(
+                state,
+                AuditionSource::Main,
+                main_position_millis,
+                main_loop_bounds,
+            ),
+            ResumeTransportCommand::Seek
+        );
         let reference_starts_new_segment = !state.reference_transport_loaded
-            || reference_loop_bounds.is_some()
-            || reference_position_millis != state.reference_transport_position_millis;
+            || matches!(
+                resume_transport_command(
+                    state,
+                    AuditionSource::Reference,
+                    reference_position_millis,
+                    reference_loop_bounds,
+                ),
+                ResumeTransportCommand::Seek
+            );
         let main_result = if main_starts_new_segment {
             state.transport.seek(
                 state.transport_generation,
@@ -4739,12 +5036,19 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
                     state.audition_auto_advance = false;
                     state.audition_play_token = None;
                 }
-                clear_uncommitted_paired_playback_guard(state);
-                state.status = error;
+                state.status = if reference_details.is_some() {
+                    cleanup_reference_transport_failure(state, error)
+                } else {
+                    clear_uncommitted_paired_playback_guard(state);
+                    error
+                };
                 context.request_repaint();
                 return;
             }
         };
+        if main_starts_new_segment && let Some(intent_millis) = pending_main_intent_millis {
+            clear_pending_seek_intent_if_admitted(state, AuditionSource::Main, intent_millis);
+        }
         set_source_position(state, AuditionSource::Main, main_position_millis);
         if state.workspace_mode == WorkspaceMode::Audition {
             state.audition_auto_advance = true;
@@ -4753,6 +5057,7 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
         begin_transport_polling(state, main_token);
 
         if let Some((path, reference_duration_millis)) = reference_details {
+            let reference_uses_resume_seek = pending_reference_intent_millis.is_some();
             let reference_gain = reference_output_gain(state);
             if !state.reference_transport_loaded {
                 clear_live_spectrogram(state, AuditionSource::Reference);
@@ -4781,30 +5086,48 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
                 }
                 state.reference_transport_loaded = true;
             }
-            if reference_starts_new_segment {
-                let seek_result = reference_transport.seek(
+            let reference_seek_token = if reference_starts_new_segment {
+                let seek_token = match reference_transport.seek(
                     state.reference_transport_generation,
                     reference_position_millis,
                     reference_duration_millis,
-                    false,
-                );
-                if let Err(error) = seek_result {
-                    cleanup_reference_transport_failure(state, error);
-                    context.request_repaint();
-                    return;
+                    reference_uses_resume_seek,
+                ) {
+                    Ok(token) => token,
+                    Err(error) => {
+                        cleanup_reference_transport_failure(state, error);
+                        context.request_repaint();
+                        return;
+                    }
+                };
+                if let Some(intent_millis) = pending_reference_intent_millis {
+                    clear_pending_seek_intent_if_admitted(
+                        state,
+                        AuditionSource::Reference,
+                        intent_millis,
+                    );
                 }
-            }
-            let reference_token = match state
-                .reference_transport
-                .as_ref()
-                .expect("reference transport remains loaded")
-                .play(state.reference_transport_generation)
-            {
-                Ok(token) => token,
-                Err(error) => {
-                    cleanup_reference_transport_failure(state, error);
-                    context.request_repaint();
-                    return;
+                Some((seek_token, reference_uses_resume_seek))
+            } else {
+                None
+            };
+            let reference_token = if reference_seek_token.is_some_and(|(_, resume)| resume) {
+                reference_seek_token
+                    .expect("a resumed reference seek should have a token")
+                    .0
+            } else {
+                match state
+                    .reference_transport
+                    .as_ref()
+                    .expect("reference transport remains loaded")
+                    .play(state.reference_transport_generation)
+                {
+                    Ok(token) => token,
+                    Err(error) => {
+                        cleanup_reference_transport_failure(state, error);
+                        context.request_repaint();
+                        return;
+                    }
                 }
             };
             set_source_position(state, AuditionSource::Reference, reference_position_millis);
@@ -4856,6 +5179,7 @@ fn start_main_note_draft(
     state.comment_source_explicit = true;
     set_audition_source(state, AuditionSource::Main);
     state.review_cursor_millis = time_millis;
+    set_pending_seek_intent(state, AuditionSource::Main, time_millis);
     state.draft_note = Some(NoteDraft {
         note_id: None,
         time_millis,
@@ -4940,6 +5264,7 @@ fn start_reference_comment_draft(
         return;
     }
     let time_millis = waveform::millis_for_ratio(ratio, waveform.duration_millis);
+    set_pending_seek_intent(state, AuditionSource::Reference, time_millis);
     state.reference_draft_note = Some(NoteDraft {
         note_id: None,
         time_millis,
@@ -5021,6 +5346,7 @@ fn move_draft_note(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
     let time_millis = waveform::millis_for_ratio(ratio, duration_millis);
     draft.time_millis = time_millis;
     state.review_cursor_millis = time_millis;
+    set_pending_seek_intent(state, AuditionSource::Main, time_millis);
     state.status = format!("Comment at {}.", format_timestamp(time_millis));
     context.request_repaint();
 }
@@ -5082,6 +5408,7 @@ fn start_persisted_note_drag(
     state.hovered_note_id = None;
     state.review_cursor_millis = time_millis;
     state.transport_position_millis = time_millis;
+    set_pending_seek_intent(state, AuditionSource::Main, time_millis);
     state.status = format!("Dragging comment at {}…", format_timestamp(time_millis));
     context.request_repaint();
 }
@@ -5136,6 +5463,7 @@ fn finish_persisted_note_drag(
     }
     state.review_cursor_millis = final_time_millis;
     state.transport_position_millis = final_time_millis;
+    set_pending_seek_intent(state, AuditionSource::Main, final_time_millis);
     state.status = if changed {
         format!(
             "Comment moved to {} and saved locally.",
@@ -5176,6 +5504,7 @@ fn move_reference_draft_note(
     let time_millis = waveform::millis_for_ratio(ratio, duration_millis);
     draft.time_millis = time_millis;
     state.reference_transport_position_millis = time_millis;
+    set_pending_seek_intent(state, AuditionSource::Reference, time_millis);
     state.status = format!("Reference comment at {}.", format_timestamp(time_millis));
     context.request_repaint();
 }
@@ -5234,6 +5563,7 @@ fn start_reference_persisted_note_drag(
     state.selected_reference_note_id = Some(note_id);
     state.hovered_reference_note_id = None;
     state.reference_transport_position_millis = time_millis;
+    set_pending_seek_intent(state, AuditionSource::Reference, time_millis);
     state.status = format!(
         "Dragging reference comment at {}…",
         format_timestamp(time_millis)
@@ -5292,6 +5622,7 @@ fn finish_reference_persisted_note_drag(
         draft.time_millis = final_time_millis;
     }
     state.reference_transport_position_millis = final_time_millis;
+    set_pending_seek_intent(state, AuditionSource::Reference, final_time_millis);
     state.status = if changed {
         format!(
             "Reference comment moved to {} and saved locally.",
@@ -5991,12 +6322,18 @@ fn mark_library_snapshot_persisted(state: &mut AppState) {
 }
 
 fn reset_transport(state: &mut AppState) {
-    if let PairedPlaybackGuard::StoppingMain {
-        pending_reset_main, ..
-    } = &mut state.paired_playback_guard
-    {
-        *pending_reset_main = true;
-        return;
+    clear_pending_seek_intent(state, AuditionSource::Main);
+    match &mut state.paired_playback_guard {
+        PairedPlaybackGuard::StoppingMain {
+            pending_reset_main, ..
+        }
+        | PairedPlaybackGuard::StoppingReference {
+            pending_reset_main, ..
+        } => {
+            *pending_reset_main = true;
+            return;
+        }
+        _ => {}
     }
     clear_paired_playback_guard(state);
     clear_live_spectrogram(state, AuditionSource::Main);
@@ -6013,13 +6350,20 @@ fn reset_transport(state: &mut AppState) {
 }
 
 fn reset_reference_transport(state: &mut AppState) {
-    if let PairedPlaybackGuard::StoppingMain {
-        pending_reset_reference,
-        ..
-    } = &mut state.paired_playback_guard
-    {
-        *pending_reset_reference = true;
-        return;
+    clear_pending_seek_intent(state, AuditionSource::Reference);
+    match &mut state.paired_playback_guard {
+        PairedPlaybackGuard::StoppingMain {
+            pending_reset_reference,
+            ..
+        }
+        | PairedPlaybackGuard::StoppingReference {
+            pending_reset_reference,
+            ..
+        } => {
+            *pending_reset_reference = true;
+            return;
+        }
+        _ => {}
     }
     clear_paired_playback_guard(state);
     clear_live_spectrogram(state, AuditionSource::Reference);
@@ -6288,6 +6632,7 @@ fn seek_review_position(
             Err(error) => state.status = error,
         }
     } else {
+        clear_pending_seek_intent(state, AuditionSource::Main);
         state.review_cursor_millis = time_millis;
         state.transport_position_millis = time_millis;
         state.status = format!("Scrubbing at {}.", format_timestamp(time_millis));
@@ -10485,13 +10830,13 @@ mod tests {
         DEFAULT_LIVE_SPECTROGRAM_DISPLAY_SAMPLE_RATE, FavoriteMarkerWidget, ImportBatchProgress,
         LibraryLoadState, LibrarySaveAttempt, LiveSpectrogramMode, LoopBounds, LoopSelection,
         LoopSelections, Message, NoteDraft, PairedPlaybackGuard, PlannerInsertionTarget,
-        REFERENCE_MENU_WIDTH, SETTINGS_REFERENCE_ROW_METADATA_HEIGHT,
-        SETTINGS_REFERENCE_ROW_TEXT_HEIGHT, SETTINGS_REFERENCE_ROW_TEXT_SPACING,
-        SETTINGS_REFERENCE_ROW_TITLE_HEIGHT, STATUS_BAR_VERSION_WIDTH, StatusMenuHost,
-        TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER, TRACK_CARD_SELECTED_CORAL, WAVEFORM_HEIGHT,
-        WaveformDecodeRequest, WorkspaceMode, animation_requested, apply_transport_snapshot,
-        audition_panel, audition_shuffle_seed, audition_statuses,
-        cleanup_reference_transport_failure, current_live_frame_for_source,
+        REFERENCE_MENU_WIDTH, ReferenceUnloadState, ResumeTransportCommand,
+        SETTINGS_REFERENCE_ROW_METADATA_HEIGHT, SETTINGS_REFERENCE_ROW_TEXT_HEIGHT,
+        SETTINGS_REFERENCE_ROW_TEXT_SPACING, SETTINGS_REFERENCE_ROW_TITLE_HEIGHT,
+        STATUS_BAR_VERSION_WIDTH, StatusMenuHost, TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER,
+        TRACK_CARD_SELECTED_CORAL, WAVEFORM_HEIGHT, WaveformDecodeRequest, WorkspaceMode,
+        animation_requested, apply_transport_snapshot, audition_panel, audition_shuffle_seed,
+        audition_statuses, cleanup_reference_transport_failure, current_live_frame_for_source,
         current_loudness_match_gain_db, current_lufs_meter_value,
         current_reference_lufs_meter_value, decode_result_is_current, deterministic_shuffle,
         enforce_loop, favorite_toggle, frame_surface_revisions, library_dirty,
@@ -10499,17 +10844,17 @@ mod tests {
         live_spectrogram_display_sample_rate, loop_bounds, main_output_gain, native_launch_options,
         note_editor, note_ratio_for_id, owned_tracks_in_stage, paint_live_playback_overlay,
         planner_insertion_target_is_valid, planner_tracks_with_status, playback_shortcut,
-        project_surface, rebuild_audition_queue, reconcile_audition_queue,
-        reference_decode_result_is_current, reference_output_gain,
+        progress_paired_playback_cleanup, project_surface, rebuild_audition_queue,
+        reconcile_audition_queue, reference_decode_result_is_current, reference_output_gain,
         reference_settings_auxiliary_windows, reference_settings_window_view,
-        refresh_live_spectrogram, refresh_live_spectrograms, review_spectrogram_source,
-        review_status_filter_message, schedule_import, schedule_library_save,
-        schedule_reference_catalog_import, schedule_reference_import,
+        refresh_live_spectrogram, refresh_live_spectrograms, resume_transport_command,
+        review_spectrogram_source, review_status_filter_message, schedule_import,
+        schedule_library_save, schedule_reference_catalog_import, schedule_reference_import,
         schedule_reference_waveform_decode, schedule_replace, schedule_waveform_decode,
         seek_synchronized_positions, selected_reference_notes, selected_track, stage_dropdown,
-        stage_menu_anchor_from_pointer, stage_menu_popover, status_dropdown_for_host,
-        status_filter_dropdown, sync_audition_queue_after_status_change, tracks_with_status,
-        transport_command_is_confirmed, update,
+        stage_menu_anchor_from_pointer, stage_menu_popover, start_source_alongside_active,
+        status_dropdown_for_host, status_filter_dropdown, sync_audition_queue_after_status_change,
+        tracks_with_status, transport_command_is_confirmed, update,
     };
     use crate::transport::{LiveFrameState, Snapshot};
     use crate::{
@@ -13883,6 +14228,31 @@ mod tests {
         state
     }
 
+    fn acknowledge_reference_unload(state: &AppState) {
+        let token = match &state.paired_playback_guard {
+            PairedPlaybackGuard::StoppingMain {
+                reference_unload: ReferenceUnloadState::AwaitingAcknowledgement(token),
+                ..
+            }
+            | PairedPlaybackGuard::StoppingReference {
+                reference_unload: ReferenceUnloadState::AwaitingAcknowledgement(token),
+                ..
+            } => *token,
+            _ => panic!("paired cleanup should have an accepted reference unload"),
+        };
+        state
+            .reference_transport
+            .as_ref()
+            .expect("paired cleanup should retain the reference transport")
+            .set_snapshot_for_test(Snapshot {
+                generation: state.reference_transport_generation,
+                acknowledged_token: token,
+                position_millis: 0,
+                playing: false,
+                ready: false,
+            });
+    }
+
     fn reference_comment_drag_state() -> (AppState, String) {
         let mut state = shared_reference_playback_state();
         let note_id = String::from("reference-move-me");
@@ -14861,8 +15231,35 @@ mod tests {
         assert!(!state.reference_only_playback);
         assert!(matches!(
             state.paired_playback_guard,
+            PairedPlaybackGuard::StoppingReference { .. }
+        ));
+        assert_eq!(
+            state
+                .reference_transport
+                .as_ref()
+                .expect("reference-only cleanup retains its transport")
+                .requested_output_gain_for_test(),
+            0.0
+        );
+        state.transport.set_snapshot_for_test(Snapshot {
+            generation: main_generation,
+            acknowledged_token: 0,
+            position_millis: 510,
+            playing: true,
+            ready: true,
+        });
+        acknowledge_reference_unload(&state);
+        let mut context = ui::UiUpdateContext::default();
+        update(&mut state, Message::Frame, &mut context);
+
+        assert!(matches!(
+            state.paired_playback_guard,
             PairedPlaybackGuard::Idle
         ));
+        assert!(state.transport_playing);
+        assert_eq!(state.transport_position_millis, 510);
+        assert_eq!(state.review_cursor_millis, 510);
+        assert_eq!(state.transport_generation, main_generation);
         assert_eq!(state.transport.requested_output_gain_for_test(), 0.37);
     }
 
@@ -14893,6 +15290,51 @@ mod tests {
         assert!(state.reference_transport_polling);
         assert!(state.transport_waiting_token.is_some());
         assert!(state.reference_transport_waiting_token.is_some());
+    }
+
+    #[test]
+    fn pending_main_and_reference_intents_precede_loops_then_enforce_later() {
+        let mut state = shared_reference_playback_state();
+        state.loop_selections = LoopSelections {
+            main: Some(LoopSelection {
+                start_ratio: 0.1,
+                end_ratio: 0.2,
+            }),
+            reference: Some(LoopSelection {
+                start_ratio: 0.5,
+                end_ratio: 0.75,
+            }),
+        };
+        state.pending_main_seek_intent = Some(1_500);
+        state.pending_reference_seek_intent = Some(3_500);
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut state, Message::TogglePlayback, &mut context);
+
+        assert_eq!(state.transport_position_millis, 1_500);
+        assert_eq!(state.reference_transport_position_millis, 3_500);
+        assert_eq!(state.pending_main_seek_intent, None);
+        assert_eq!(state.pending_reference_seek_intent, None);
+
+        state.transport.set_command_queue_size_for_test(0);
+        state
+            .reference_transport
+            .as_ref()
+            .expect("paired state should have a reference transport")
+            .set_command_queue_size_for_test(0);
+        state.transport_playing = true;
+        state.reference_transport_playing = true;
+        state.transport_polling = false;
+        state.reference_transport_polling = false;
+        state.transport_waiting_token = None;
+        state.reference_transport_waiting_token = None;
+
+        enforce_loop(&mut state, true, true);
+
+        assert_eq!(state.transport_position_millis, 200);
+        assert_eq!(state.reference_transport_position_millis, 2_000);
+        assert!(state.transport_polling);
+        assert!(state.reference_transport_polling);
     }
 
     #[test]
@@ -14987,6 +15429,24 @@ mod tests {
         assert_eq!(state.review_cursor_millis, 400);
         assert_eq!(state.reference_transport_position_millis, 2_200);
         assert_eq!(state.loop_selections, loops);
+        assert!(!state.reference_transport_loaded);
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::StoppingMain { .. }
+        ));
+    }
+
+    #[test]
+    fn paired_synchronized_seek_main_failure_enters_cleanup() {
+        let mut state = shared_reference_playback_state();
+        let error = String::from("main seek failed immediately");
+        state.transport.fail_next_command_for_test(error.clone());
+
+        let result = seek_synchronized_positions(&mut state, 900, 2_900, true);
+
+        assert_eq!(result, Err(error.clone()));
+        assert_eq!(state.status, error);
+        assert!(!state.transport_playing);
         assert!(!state.reference_transport_loaded);
         assert!(matches!(
             state.paired_playback_guard,
@@ -15093,6 +15553,263 @@ mod tests {
     }
 
     #[test]
+    fn reference_only_promotion_main_failure_enters_paired_cleanup() {
+        let mut state = shared_reference_playback_state();
+        state.audition_source = AuditionSource::Reference;
+        state.reference_only_playback = true;
+        state.reference_transport_playing = true;
+        let error = String::from("main promotion failed immediately");
+        state.transport.fail_next_command_for_test(error.clone());
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::ActivateAuditionSource(AuditionSource::Main),
+            &mut context,
+        );
+
+        assert_eq!(state.status, error);
+        assert!(!state.transport_playing);
+        assert!(!state.reference_transport_playing);
+        assert!(!state.reference_transport_loaded);
+        assert_eq!(state.transport.requested_output_gain_for_test(), 0.0);
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::StoppingMain { .. }
+        ));
+
+        let main_token = state
+            .transport_waiting_token
+            .expect("promotion cleanup should admit one main pause");
+        state.transport.set_snapshot_for_test(Snapshot {
+            generation: state.transport_generation,
+            acknowledged_token: main_token,
+            position_millis: 0,
+            playing: false,
+            ready: true,
+        });
+        acknowledge_reference_unload(&state);
+        update(&mut state, Message::Frame, &mut context);
+
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::Idle
+        ));
+    }
+
+    #[test]
+    fn async_paired_main_failure_enters_cleanup_and_preserves_root_error() {
+        let mut state = shared_reference_playback_state();
+        state.paired_playback_guard = PairedPlaybackGuard::Active;
+        state.transport_playing = true;
+        state.reference_transport_playing = true;
+        let error = String::from("async main failure");
+        state
+            .transport
+            .set_error_for_test(state.transport_generation, error.clone());
+        state.transport.set_snapshot_for_test(Snapshot {
+            generation: state.transport_generation,
+            acknowledged_token: 0,
+            position_millis: 420,
+            playing: true,
+            ready: true,
+        });
+        let reference_transport = state
+            .reference_transport
+            .as_ref()
+            .expect("paired playback should have a reference transport")
+            .clone();
+        reference_transport.set_snapshot_for_test(Snapshot {
+            generation: state.reference_transport_generation,
+            acknowledged_token: 0,
+            position_millis: 900,
+            playing: true,
+            ready: true,
+        });
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut state, Message::Frame, &mut context);
+
+        assert_eq!(state.status, error);
+        assert!(!state.transport_playing);
+        assert!(!state.reference_transport_playing);
+        assert!(!state.reference_transport_loaded);
+        assert_eq!(state.transport.requested_output_gain_for_test(), 0.0);
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::StoppingMain { .. }
+        ));
+
+        let main_token = state
+            .transport_waiting_token
+            .expect("main failure cleanup should admit one main pause");
+        state.transport.set_snapshot_for_test(Snapshot {
+            generation: state.transport_generation,
+            acknowledged_token: main_token,
+            position_millis: 420,
+            playing: false,
+            ready: true,
+        });
+        acknowledge_reference_unload(&state);
+        update(&mut state, Message::Frame, &mut context);
+
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::Idle
+        ));
+    }
+
+    #[test]
+    fn toggle_pair_pause_failure_reuses_the_admitted_main_pause() {
+        let mut state = shared_reference_playback_state();
+        state.paired_playback_guard = PairedPlaybackGuard::Active;
+        state.transport_playing = true;
+        state.reference_transport_playing = true;
+        let error = String::from("reference toggle pause failed");
+        state
+            .reference_transport
+            .as_ref()
+            .expect("paired playback should have a reference transport")
+            .fail_next_command_for_test(error.clone());
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut state, Message::TogglePlayback, &mut context);
+
+        assert_eq!(state.status, error);
+        let main_token = state
+            .transport_waiting_token
+            .expect("the accepted main pause should remain pending");
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::StoppingMain {
+                main_pause_token: Some(token),
+                ..
+            } if token == main_token
+        ));
+        state.transport.set_command_queue_size_for_test(32);
+        update(&mut state, Message::Frame, &mut context);
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::StoppingMain {
+                main_pause_token: Some(token),
+                ..
+            } if token == main_token
+        ));
+
+        state.transport.set_snapshot_for_test(Snapshot {
+            generation: state.transport_generation,
+            acknowledged_token: main_token,
+            position_millis: 0,
+            playing: false,
+            ready: true,
+        });
+        acknowledge_reference_unload(&state);
+        update(&mut state, Message::Frame, &mut context);
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::Idle
+        ));
+    }
+
+    #[test]
+    fn stop_pair_pause_failure_reuses_the_admitted_main_pause() {
+        let mut state = shared_reference_playback_state();
+        state.paired_playback_guard = PairedPlaybackGuard::Active;
+        state.transport_playing = true;
+        state.reference_transport_playing = true;
+        let error = String::from("reference stop pause failed");
+        state
+            .reference_transport
+            .as_ref()
+            .expect("paired playback should have a reference transport")
+            .fail_next_command_for_test(error.clone());
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut state, Message::StopPlayback, &mut context);
+
+        assert_eq!(state.status, error);
+        let main_token = state
+            .transport_waiting_token
+            .expect("the accepted main pause should remain pending");
+        state.transport.set_command_queue_size_for_test(32);
+        update(&mut state, Message::Frame, &mut context);
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::StoppingMain {
+                main_pause_token: Some(token),
+                ..
+            } if token == main_token
+        ));
+
+        state.transport.set_snapshot_for_test(Snapshot {
+            generation: state.transport_generation,
+            acknowledged_token: main_token,
+            position_millis: 0,
+            playing: false,
+            ready: true,
+        });
+        acknowledge_reference_unload(&state);
+        update(&mut state, Message::Frame, &mut context);
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::Idle
+        ));
+    }
+
+    #[test]
+    fn successful_pair_pause_keeps_guard_until_both_idle_acknowledgements() {
+        let mut state = shared_reference_playback_state();
+        state.paired_playback_guard = PairedPlaybackGuard::Active;
+        state.transport_playing = true;
+        state.reference_transport_playing = true;
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut state, Message::TogglePlayback, &mut context);
+
+        let main_token = state
+            .transport_waiting_token
+            .expect("paired pause should admit a main token");
+        let reference_token = state
+            .reference_transport_waiting_token
+            .expect("paired pause should admit a reference token");
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::Active
+        ));
+        state.transport.set_snapshot_for_test(Snapshot {
+            generation: state.transport_generation,
+            acknowledged_token: main_token,
+            position_millis: 0,
+            playing: false,
+            ready: true,
+        });
+        update(&mut state, Message::Frame, &mut context);
+        assert!(!state.transport_playing);
+        assert!(state.reference_transport_playing);
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::Active
+        ));
+
+        state
+            .reference_transport
+            .as_ref()
+            .expect("paired playback should have a reference transport")
+            .set_snapshot_for_test(Snapshot {
+                generation: state.reference_transport_generation,
+                acknowledged_token: reference_token,
+                position_millis: 0,
+                playing: false,
+                ready: true,
+            });
+        update(&mut state, Message::Frame, &mut context);
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::Idle
+        ));
+    }
+
+    #[test]
     fn paired_cleanup_retries_full_main_queue_without_replacing_root_error() {
         let mut state = shared_reference_playback_state();
         let root_error = String::from("reference cleanup root error");
@@ -15128,6 +15845,7 @@ mod tests {
             playing: false,
             ready: true,
         });
+        acknowledge_reference_unload(&state);
         update(&mut state, Message::Frame, &mut context);
 
         assert_eq!(state.status, root_error);
@@ -15192,6 +15910,7 @@ mod tests {
             playing: false,
             ready: true,
         });
+        acknowledge_reference_unload(&state);
         update(&mut state, Message::Frame, &mut context);
 
         assert_eq!(state.status, root_error);
@@ -15264,8 +15983,175 @@ mod tests {
         assert!(!state.reference_only_playback);
         assert!(matches!(
             state.paired_playback_guard,
+            PairedPlaybackGuard::StoppingReference { .. }
+        ));
+        assert_eq!(
+            state
+                .reference_transport
+                .as_ref()
+                .expect("reference-only cleanup retains its transport")
+                .requested_output_gain_for_test(),
+            0.0
+        );
+        acknowledge_reference_unload(&state);
+        let mut context = ui::UiUpdateContext::default();
+        update(&mut state, Message::Frame, &mut context);
+
+        assert!(matches!(
+            state.paired_playback_guard,
             PairedPlaybackGuard::Idle
         ));
+        assert!(state.transport_playing);
+        assert_eq!(state.transport_position_millis, 510);
+        assert_eq!(state.review_cursor_millis, 510);
+        assert_eq!(state.transport_generation, main_generation);
+        assert_eq!(state.transport.requested_output_gain_for_test(), 0.37);
+    }
+
+    #[test]
+    fn reference_only_cleanup_retries_busy_unload_without_touching_main() {
+        let mut state = shared_reference_playback_state();
+        state.audition_source = AuditionSource::Reference;
+        state.reference_only_playback = true;
+        state.transport_playing = true;
+        state.transport_position_millis = 510;
+        state.review_cursor_millis = 510;
+        state.transport.set_output_gain(0.37);
+        state
+            .reference_transport
+            .as_ref()
+            .expect("reference-only playback should have a reference transport")
+            .set_output_gain(0.42);
+        let main_generation = state.transport_generation;
+        let main_position = state.transport_position_millis;
+        state
+            .reference_transport
+            .as_ref()
+            .expect("reference-only playback should have a reference transport")
+            .force_command_queue_full_for_test();
+
+        cleanup_reference_transport_failure(&mut state, String::from("reference unload busy"));
+
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::StoppingReference {
+                reference_unload: ReferenceUnloadState::PendingAdmission,
+                ..
+            }
+        ));
+        assert_eq!(state.transport_generation, main_generation);
+        assert_eq!(state.transport_position_millis, main_position);
+        assert!(state.transport_playing);
+        assert_eq!(state.transport.requested_output_gain_for_test(), 0.37);
+        assert_eq!(
+            state
+                .reference_transport
+                .as_ref()
+                .expect("reference-only cleanup retains its transport")
+                .requested_output_gain_for_test(),
+            0.0
+        );
+
+        let reference_transport = state
+            .reference_transport
+            .as_ref()
+            .expect("reference-only cleanup retains its transport")
+            .clone();
+        reference_transport.set_command_queue_size_for_test(31);
+        progress_paired_playback_cleanup(&mut state);
+        let unload_token = match state.paired_playback_guard {
+            PairedPlaybackGuard::StoppingReference {
+                reference_unload: ReferenceUnloadState::AwaitingAcknowledgement(token),
+                ..
+            } => token,
+            _ => panic!("cleanup should await the accepted unload"),
+        };
+
+        reference_transport.set_command_queue_size_for_test(32);
+        progress_paired_playback_cleanup(&mut state);
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::StoppingReference {
+                reference_unload: ReferenceUnloadState::AwaitingAcknowledgement(token),
+                ..
+            } if token == unload_token
+        ));
+
+        reference_transport.set_snapshot_for_test(Snapshot {
+            generation: state.reference_transport_generation,
+            acknowledged_token: unload_token,
+            position_millis: 0,
+            playing: false,
+            ready: false,
+        });
+        progress_paired_playback_cleanup(&mut state);
+
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::Idle
+        ));
+        assert_eq!(state.transport_generation, main_generation);
+        assert_eq!(state.transport_position_millis, main_position);
+        assert!(state.transport_playing);
+        assert_eq!(state.transport.requested_output_gain_for_test(), 0.37);
+        assert_eq!(
+            reference_transport.requested_output_gain_for_test(),
+            reference_output_gain(&state)
+        );
+    }
+
+    #[test]
+    fn reference_only_cleanup_retries_non_busy_unload_admission_error() {
+        let mut state = shared_reference_playback_state();
+        state.reference_only_playback = true;
+        let reference_transport = state
+            .reference_transport
+            .as_ref()
+            .expect("reference-only cleanup retains its transport")
+            .clone();
+        reference_transport.fail_next_command_for_test(String::from("unload admission failed"));
+
+        cleanup_reference_transport_failure(&mut state, String::from("reference failure"));
+
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::StoppingReference {
+                reference_unload: ReferenceUnloadState::PendingAdmission,
+                ..
+            }
+        ));
+        reference_transport.set_command_queue_size_for_test(0);
+        progress_paired_playback_cleanup(&mut state);
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::StoppingReference {
+                reference_unload: ReferenceUnloadState::AwaitingAcknowledgement(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn reference_only_cleanup_without_transport_does_not_touch_main() {
+        let mut state = main_only_loop_state();
+        state.reference_only_playback = true;
+        state.transport_playing = true;
+        state.transport_position_millis = 510;
+        state.review_cursor_millis = 510;
+        state.transport.set_output_gain(0.37);
+        let main_generation = state.transport_generation;
+
+        cleanup_reference_transport_failure(&mut state, String::from("reference failure"));
+
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::Idle
+        ));
+        assert_eq!(state.transport_generation, main_generation);
+        assert!(state.transport_playing);
+        assert_eq!(state.transport_position_millis, 510);
+        assert_eq!(state.review_cursor_millis, 510);
+        assert_eq!(state.transport.requested_output_gain_for_test(), 0.37);
     }
 
     #[test]
@@ -17292,10 +18178,16 @@ mod tests {
         );
         assert_eq!(state.review_cursor_millis, 750);
         assert_eq!(state.transport_position_millis, 750);
+        assert_eq!(state.pending_main_seek_intent, Some(750));
+        assert_eq!(
+            resume_transport_command(&state, AuditionSource::Main, 750, None),
+            ResumeTransportCommand::Seek
+        );
 
         update(&mut state, Message::TogglePlayback, &mut context);
 
         assert_eq!(state.transport_position_millis, 750);
+        assert_eq!(state.pending_main_seek_intent, None);
         assert!(state.transport_polling);
     }
 
@@ -17324,10 +18216,264 @@ mod tests {
             &mut context,
         );
         assert_eq!(state.reference_transport_position_millis, 2_500);
+        assert_eq!(state.pending_reference_seek_intent, Some(2_500));
+        assert_eq!(
+            resume_transport_command(&state, AuditionSource::Reference, 2_500, None),
+            ResumeTransportCommand::Seek
+        );
 
         update(&mut state, Message::TogglePlayback, &mut context);
 
         assert_eq!(state.reference_transport_position_millis, 2_500);
+        assert_eq!(state.pending_reference_seek_intent, None);
+        assert!(state.reference_transport_polling);
+    }
+
+    #[test]
+    fn comment_seek_intent_survives_frames_and_busy_admission() {
+        let mut state = main_only_loop_state();
+        state.pending_main_seek_intent = Some(state.transport_position_millis);
+        assert_eq!(
+            resume_transport_command(
+                &state,
+                AuditionSource::Main,
+                state.transport_position_millis,
+                None,
+            ),
+            ResumeTransportCommand::Seek
+        );
+        update(
+            &mut state,
+            Message::Frame,
+            &mut ui::UiUpdateContext::default(),
+        );
+        assert_eq!(state.pending_main_seek_intent, Some(0));
+
+        state.transport.force_command_queue_full_for_test();
+        let mut context = ui::UiUpdateContext::default();
+        update(&mut state, Message::TogglePlayback, &mut context);
+        assert_eq!(state.status, transport::CONTROLS_BUSY_ERROR);
+        assert_eq!(state.pending_main_seek_intent, Some(0));
+
+        state.transport.set_command_queue_size_for_test(0);
+        update(&mut state, Message::TogglePlayback, &mut context);
+        assert_eq!(state.pending_main_seek_intent, None);
+        assert!(state.transport_polling);
+
+        assert_eq!(
+            resume_transport_command(&state, AuditionSource::Main, 0, None),
+            ResumeTransportCommand::Play
+        );
+    }
+
+    #[test]
+    fn paused_scrub_supersedes_pending_main_comment_seek() {
+        let mut state = main_only_loop_state();
+        state.pending_main_seek_intent = Some(750);
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::WaveformPlayheadDragStarted { ratio: 0.25 },
+            &mut context,
+        );
+
+        assert_eq!(state.transport_position_millis, 500);
+        assert_eq!(state.pending_main_seek_intent, None);
+    }
+
+    fn assert_normalized_pending_comment_intents_clear_after_admission(
+        main_intent_millis: u64,
+        reference_intent_millis: u64,
+    ) {
+        let mut state = shared_reference_playback_state();
+        state.loop_selections = LoopSelections {
+            main: Some(LoopSelection {
+                start_ratio: 0.1,
+                end_ratio: 0.2,
+            }),
+            reference: Some(LoopSelection {
+                start_ratio: 0.5,
+                end_ratio: 0.75,
+            }),
+        };
+        let loops = state.loop_selections;
+        state.pending_main_seek_intent = Some(main_intent_millis);
+        state.pending_reference_seek_intent = Some(reference_intent_millis);
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut state, Message::TogglePlayback, &mut context);
+
+        assert_eq!(state.transport_position_millis, 0);
+        assert_eq!(state.reference_transport_position_millis, 0);
+        assert_eq!(state.pending_main_seek_intent, None);
+        assert_eq!(state.pending_reference_seek_intent, None);
+        assert_eq!(state.loop_selections, loops);
+
+        state.transport.set_command_queue_size_for_test(0);
+        state
+            .reference_transport
+            .as_ref()
+            .expect("paired state should have a reference transport")
+            .set_command_queue_size_for_test(0);
+        state.transport_playing = false;
+        state.reference_transport_playing = false;
+        state.transport_polling = false;
+        state.reference_transport_polling = false;
+        state.transport_waiting_token = None;
+        state.reference_transport_waiting_token = None;
+        state.loop_selections.clear_all();
+
+        assert_eq!(
+            resume_transport_command(&state, AuditionSource::Main, 0, None),
+            ResumeTransportCommand::Play
+        );
+        assert_eq!(
+            resume_transport_command(&state, AuditionSource::Reference, 0, None),
+            ResumeTransportCommand::Play
+        );
+
+        update(&mut state, Message::TogglePlayback, &mut context);
+
+        assert!(state.transport_polling);
+        assert!(state.reference_transport_polling);
+        assert_eq!(state.transport_position_millis, 0);
+        assert_eq!(state.reference_transport_position_millis, 0);
+    }
+
+    #[test]
+    fn source_start_clears_normalized_main_and_reference_intents_after_seek() {
+        let mut state = shared_reference_playback_state();
+        state.loop_selections = LoopSelections {
+            main: Some(LoopSelection {
+                start_ratio: 0.1,
+                end_ratio: 0.2,
+            }),
+            reference: Some(LoopSelection {
+                start_ratio: 0.5,
+                end_ratio: 0.75,
+            }),
+        };
+        state.pending_main_seek_intent = Some(2_000);
+        state.pending_reference_seek_intent = Some(4_500);
+        state.reference_transport_playing = true;
+
+        start_source_alongside_active(&mut state, AuditionSource::Main)
+            .expect("main source start should admit a normalized seek");
+        assert_eq!(state.transport_position_millis, 0);
+        assert_eq!(state.pending_main_seek_intent, None);
+        assert!(state.loop_selections.main.is_some());
+
+        start_source_alongside_active(&mut state, AuditionSource::Reference)
+            .expect("reference source start should admit a normalized seek");
+        assert_eq!(state.reference_transport_position_millis, 0);
+        assert_eq!(state.pending_reference_seek_intent, None);
+        assert!(state.loop_selections.reference.is_some());
+    }
+
+    #[test]
+    fn exact_duration_pending_comment_intents_clear_after_normalized_seek() {
+        assert_normalized_pending_comment_intents_clear_after_admission(2_000, 4_000);
+    }
+
+    #[test]
+    fn beyond_duration_pending_comment_intents_clear_after_normalized_seek() {
+        assert_normalized_pending_comment_intents_clear_after_admission(2_500, 4_500);
+    }
+
+    #[test]
+    fn normalized_pending_comment_intents_survive_busy_admission() {
+        let mut state = shared_reference_playback_state();
+        state.loop_selections = LoopSelections {
+            main: Some(LoopSelection {
+                start_ratio: 0.1,
+                end_ratio: 0.2,
+            }),
+            reference: Some(LoopSelection {
+                start_ratio: 0.5,
+                end_ratio: 0.75,
+            }),
+        };
+        state.pending_main_seek_intent = Some(2_000);
+        state.pending_reference_seek_intent = Some(4_000);
+        state
+            .reference_transport
+            .as_ref()
+            .expect("paired state should have a reference transport")
+            .force_command_queue_full_for_test();
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut state, Message::TogglePlayback, &mut context);
+
+        assert_eq!(state.status, transport::CONTROLS_BUSY_ERROR);
+        assert_eq!(state.pending_main_seek_intent, Some(2_000));
+        assert_eq!(state.pending_reference_seek_intent, Some(4_000));
+        assert!(state.loop_selections.main.is_some());
+        assert!(state.loop_selections.reference.is_some());
+    }
+
+    #[test]
+    fn normalized_pending_comment_intents_survive_failed_admission() {
+        let mut state = shared_reference_playback_state();
+        state.loop_selections = LoopSelections {
+            main: Some(LoopSelection {
+                start_ratio: 0.1,
+                end_ratio: 0.2,
+            }),
+            reference: Some(LoopSelection {
+                start_ratio: 0.5,
+                end_ratio: 0.75,
+            }),
+        };
+        state.pending_main_seek_intent = Some(2_000);
+        state.pending_reference_seek_intent = Some(4_000);
+        state
+            .transport
+            .fail_next_command_for_test(String::from("main seek failed"));
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut state, Message::TogglePlayback, &mut context);
+
+        assert_eq!(state.status, "main seek failed");
+        assert_eq!(state.pending_main_seek_intent, Some(2_000));
+        assert_eq!(state.pending_reference_seek_intent, Some(4_000));
+    }
+
+    #[test]
+    fn global_play_uses_one_resuming_seek_for_a_pending_reference_comment() {
+        let mut state = shared_reference_playback_state();
+        state.pending_reference_seek_intent = Some(state.reference_transport_position_millis);
+        state
+            .reference_transport
+            .as_ref()
+            .expect("paired state should have a reference transport")
+            .set_command_queue_size_for_test(31);
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut state, Message::TogglePlayback, &mut context);
+
+        assert_ne!(state.status, transport::CONTROLS_BUSY_ERROR);
+        assert_eq!(state.pending_reference_seek_intent, None);
+        assert!(state.reference_transport_polling);
+        assert!(state.reference_transport_waiting_token.is_some());
+    }
+
+    #[test]
+    fn global_play_targets_a_staged_comment_seek_intent() {
+        let mut state = shared_reference_playback_state();
+        state.reference_transport_position_millis = 500;
+        state.pending_reference_seek_intent = Some(1_750);
+        state
+            .reference_transport
+            .as_ref()
+            .expect("paired state should have a reference transport")
+            .set_command_queue_size_for_test(31);
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut state, Message::TogglePlayback, &mut context);
+
+        assert_eq!(state.reference_transport_position_millis, 1_750);
+        assert_eq!(state.pending_reference_seek_intent, None);
         assert!(state.reference_transport_polling);
     }
 
