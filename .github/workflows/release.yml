@@ -304,7 +304,7 @@ jobs:
             [[ "$version_base" == "$original_cargo_base_version" ]] || { echo "Cargo.toml base version $original_cargo_base_version does not match release version $version" >&2; exit 1; }
           fi
 
-          short_sha="${original_source_sha:0:12}"
+          short_sha="${source_sha:0:12}"
           if [[ "$channel" == stable ]]; then
             build_id="cadence-v${version}-${RUN_NUMBER}"
           else
@@ -351,11 +351,6 @@ jobs:
       source_sha: ${{ needs.prepare.outputs.source_sha }}
     env:
       CARGO_TERM_COLOR: always
-      APPLE_DEVELOPER_ID_APPLICATION_CERT_BASE64: ${{ secrets.CADENCE_PRODUCTION_APPLE_DEVELOPER_ID_APPLICATION_CERT_BASE64 }}
-      APPLE_DEVELOPER_ID_APPLICATION_CERT_PASSWORD: ${{ secrets.CADENCE_PRODUCTION_APPLE_DEVELOPER_ID_APPLICATION_CERT_PASSWORD }}
-      APPLE_NOTARY_KEY_BASE64: ${{ secrets.CADENCE_PRODUCTION_APPLE_NOTARY_KEY_BASE64 }}
-      APPLE_NOTARY_KEY_ID: ${{ secrets.CADENCE_PRODUCTION_APPLE_NOTARY_KEY_ID }}
-      APPLE_NOTARY_ISSUER_ID: ${{ secrets.CADENCE_PRODUCTION_APPLE_NOTARY_ISSUER_ID }}
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -374,14 +369,6 @@ jobs:
           cargo +stable test --locked
           cargo +stable clippy --all-targets --all-features --locked -- -D warnings
 
-      - name: Verify Apple production secrets
-        shell: bash
-        run: |
-          set -euo pipefail
-          for name in APPLE_DEVELOPER_ID_APPLICATION_CERT_BASE64 APPLE_DEVELOPER_ID_APPLICATION_CERT_PASSWORD APPLE_NOTARY_KEY_BASE64 APPLE_NOTARY_KEY_ID APPLE_NOTARY_ISSUER_ID; do
-            [[ -n "${!name:-}" ]] || { echo "Missing required Apple release secret: $name" >&2; exit 1; }
-          done
-
       - name: Reuse existing release artifact when available
         id: reuse_artifact
         continue-on-error: true
@@ -399,6 +386,11 @@ jobs:
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
           RELEASE_BUILD_ID: ${{ needs.prepare.outputs.build_id }}
           GITHUB_SHA: ${{ needs.prepare.outputs.source_sha }}
+          APPLE_DEVELOPER_ID_APPLICATION_CERT_BASE64: ${{ secrets.CADENCE_PRODUCTION_APPLE_DEVELOPER_ID_APPLICATION_CERT_BASE64 }}
+          APPLE_DEVELOPER_ID_APPLICATION_CERT_PASSWORD: ${{ secrets.CADENCE_PRODUCTION_APPLE_DEVELOPER_ID_APPLICATION_CERT_PASSWORD }}
+          APPLE_NOTARY_KEY_BASE64: ${{ secrets.CADENCE_PRODUCTION_APPLE_NOTARY_KEY_BASE64 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.CADENCE_PRODUCTION_APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.CADENCE_PRODUCTION_APPLE_NOTARY_ISSUER_ID }}
         run: |
           set -euo pipefail
           export GITHUB_SHA="${{ needs.prepare.outputs.source_sha }}"
