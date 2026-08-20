@@ -814,6 +814,7 @@ enum AudioImportTarget {
     Main,
     AssignedReference { track_id: String },
     Catalog,
+    Replacement { track_id: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -5511,12 +5512,19 @@ fn start_audio_import_preflight(
 ) {
     let completion_request = request.clone();
     let path = request.path.clone();
+    let replacement_preflight = matches!(request.target, AudioImportTarget::Replacement { .. });
     context
         .business()
         .background("cadence-import-preflight")
         .run(
             move |_| {
-                let decoded = audio::decode_audio_file(&path)?;
+                let decoded = audio::decode_audio_file(&path).map_err(|error| {
+                    if replacement_preflight {
+                        format!("Could not decode replacement {}: {error}", path.display())
+                    } else {
+                        error
+                    }
+                })?;
                 let cache_path = storage::waveform_cache_path(&path);
                 let _ = audio::write_waveform_cache_if_unchanged(
                     decoded.path(),
@@ -5583,6 +5591,20 @@ fn start_reference_catalog_commit(
         );
 }
 
+fn start_replace_commit(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    track_id: String,
+    decoded: audio::DecodedAudioFile,
+) {
+    let library = state.library.clone();
+    let commit_track_id = track_id.clone();
+    context.business().blocking_io("cadence-replace-track").run(
+        move |_| storage::replace_track(library, &commit_track_id, decoded),
+        move |result| Message::ReplaceCompleted { track_id, result },
+    );
+}
+
 fn complete_audio_import_preflight(
     state: &mut AppState,
     context: &mut ui::UiUpdateContext<Message>,
@@ -5603,6 +5625,9 @@ fn complete_audio_import_preflight(
         (AudioImportTarget::Catalog, Ok(decoded)) => {
             start_reference_catalog_commit(state, context, path, decoded);
         }
+        (AudioImportTarget::Replacement { track_id }, Ok(decoded)) => {
+            start_replace_commit(state, context, track_id, decoded);
+        }
         (AudioImportTarget::Main, Err(error)) => {
             update(state, Message::ImportCompleted(Err(error)), context);
         }
@@ -5612,6 +5637,16 @@ fn complete_audio_import_preflight(
                 Message::ReferenceImportCompleted {
                     track_id,
                     path,
+                    result: Err(error),
+                },
+                context,
+            );
+        }
+        (AudioImportTarget::Replacement { track_id }, Err(error)) => {
+            update(
+                state,
+                Message::ReplaceCompleted {
+                    track_id,
                     result: Err(error),
                 },
                 context,
@@ -5856,13 +5891,11 @@ fn schedule_replace(
     }
     state.busy = true;
     state.status = format!("Replacing with {}…", path.display());
-    let library = state.library.clone();
-    let completion_track_id = track_id.clone();
-    context.business().blocking_io("cadence-replace-track").run(
-        move |_| storage::replace_track(library, &track_id, path),
-        move |result| Message::ReplaceCompleted {
-            track_id: completion_track_id,
-            result,
+    start_audio_import_preflight(
+        context,
+        AudioImportRequest {
+            target: AudioImportTarget::Replacement { track_id },
+            path,
         },
     );
     context.request_repaint();
@@ -10472,10 +10505,10 @@ mod tests {
         refresh_live_spectrogram, refresh_live_spectrograms, review_spectrogram_source,
         review_status_filter_message, schedule_import, schedule_library_save,
         schedule_reference_catalog_import, schedule_reference_import,
-        schedule_reference_waveform_decode, schedule_waveform_decode, seek_synchronized_positions,
-        selected_reference_notes, selected_track, stage_dropdown, stage_menu_anchor_from_pointer,
-        stage_menu_popover, status_dropdown_for_host, status_filter_dropdown,
-        sync_audition_queue_after_status_change, tracks_with_status,
+        schedule_reference_waveform_decode, schedule_replace, schedule_waveform_decode,
+        seek_synchronized_positions, selected_reference_notes, selected_track, stage_dropdown,
+        stage_menu_anchor_from_pointer, stage_menu_popover, status_dropdown_for_host,
+        status_filter_dropdown, sync_audition_queue_after_status_change, tracks_with_status,
         transport_command_is_confirmed, update,
     };
     use crate::transport::{LiveFrameState, Snapshot};
@@ -10501,9 +10534,10 @@ mod tests {
         },
     };
     use std::{
+        fs,
         path::PathBuf,
         sync::Arc,
-        time::{Duration, Instant},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
     struct RuntimeTaskBridge<Bridge>(Bridge);
@@ -10706,6 +10740,40 @@ mod tests {
             status: TrackStatus::Inbox,
             notes: Vec::new(),
         }
+    }
+
+    fn tiny_pcm_wav() -> Vec<u8> {
+        let mut bytes = Vec::from(*b"RIFF");
+        bytes.extend_from_slice(&38_u32.to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&8_000_u32.to_le_bytes());
+        bytes.extend_from_slice(&16_000_u32.to_le_bytes());
+        bytes.extend_from_slice(&2_u16.to_le_bytes());
+        bytes.extend_from_slice(&16_u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&2_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_i16.to_le_bytes());
+        bytes
+    }
+
+    fn decoded_replacement_fixture() -> (PathBuf, crate::audio::DecodedAudioFile, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "cadence-replacement-routing-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock should be after the epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create replacement routing test directory");
+        let path = root.join("replacement.wav");
+        fs::write(&path, tiny_pcm_wav()).expect("write replacement audio fixture");
+        let decoded = crate::audio::decode_audio_file(&path)
+            .expect("valid replacement audio should pass preflight");
+        (path, decoded, root)
     }
 
     fn audition_waveform() -> WaveformData {
@@ -23583,6 +23651,83 @@ mod tests {
                 .business_task_priority("cadence-import-reference-catalog"),
             None
         );
+    }
+
+    #[test]
+    fn replacement_preflight_routes_background_and_terminal_failure() {
+        let track_id = String::from("replacement-target");
+        let path = PathBuf::from("/external/corrupt-replacement.wav");
+        let mut state = AppState::default();
+        state.library.tracks.push(audition_track(&track_id));
+        let mut context = ui::UiUpdateContext::default();
+
+        schedule_replace(&mut state, &mut context, track_id.clone(), path.clone());
+
+        assert!(state.busy);
+        assert_eq!(
+            context
+                .into_command()
+                .business_task_priority("cadence-import-preflight"),
+            Some(TaskPriority::Background)
+        );
+
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::AudioImportPreflightCompleted {
+                request: AudioImportRequest {
+                    target: AudioImportTarget::Replacement {
+                        track_id: track_id.clone(),
+                    },
+                    path,
+                },
+                result: Err(String::from("corrupt replacement")),
+            },
+            &mut context,
+        );
+
+        assert!(!state.busy);
+        assert_eq!(state.status, "corrupt replacement");
+        assert_eq!(
+            context
+                .into_command()
+                .business_task_priority("cadence-replace-track"),
+            None
+        );
+    }
+
+    #[test]
+    fn successful_replacement_preflight_routes_proof_to_blocking_io() {
+        let track_id = String::from("replacement-target");
+        let (path, decoded, root) = decoded_replacement_fixture();
+        let mut state = AppState::default();
+        state.library.tracks.push(audition_track(&track_id));
+        let mut context = ui::UiUpdateContext::default();
+
+        schedule_replace(&mut state, &mut context, track_id.clone(), path.clone());
+        let _ = context.into_command();
+
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::AudioImportPreflightCompleted {
+                request: AudioImportRequest {
+                    target: AudioImportTarget::Replacement { track_id },
+                    path,
+                },
+                result: Ok(decoded),
+            },
+            &mut context,
+        );
+
+        assert!(state.busy);
+        assert_eq!(
+            context
+                .into_command()
+                .business_task_priority("cadence-replace-track"),
+            Some(TaskPriority::BlockingIo)
+        );
+        fs::remove_dir_all(root).expect("remove replacement routing test directory");
     }
 
     #[test]
