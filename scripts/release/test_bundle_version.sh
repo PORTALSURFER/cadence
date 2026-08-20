@@ -55,12 +55,15 @@ assert_default_bundle_versions() {
 }
 
 assert_rejected_without_explicit_version() {
-    local output_path="$test_dir/Cadence-override-without-version.app"
+    local option_name="$1"
+    local option_value="$2"
+    local output_name="$3"
+    local output_path="$test_dir/Cadence-${output_name}.app"
     if "$bundle_script" \
         --executable "$fake_executable" \
         --output "$output_path" \
-        --bundle-short-version "0.1.0"; then
-        printf '%s\n' "bundle version override unexpectedly succeeded without --version" >&2
+        "$option_name" "$option_value"; then
+        printf '%s\n' "$option_name unexpectedly succeeded without --version" >&2
         exit 1
     fi
 }
@@ -76,9 +79,31 @@ assert_rejected_empty_version() {
     fi
 }
 
+assert_explicit_blank_overrides_derive() {
+    local output_path="$test_dir/Cadence-explicit-blank-overrides.app"
+
+    "$bundle_script" \
+        --executable "$fake_executable" \
+        --output "$output_path" \
+        --version "0.1.0-rc.2" \
+        --bundle-short-version "" \
+        --bundle-build-number ""
+
+    local actual_short_version
+    local actual_build_number
+    actual_short_version="$(/usr/bin/plutil -extract CFBundleShortVersionString raw -o - "$output_path/Contents/Info.plist")"
+    actual_build_number="$(/usr/bin/plutil -extract CFBundleVersion raw -o - "$output_path/Contents/Info.plist")"
+    [[ "$actual_short_version" == "0.1.0" ]]
+    [[ "$actual_build_number" == "2" ]]
+}
+
 assert_default_bundle_versions
-assert_rejected_without_explicit_version
+assert_rejected_without_explicit_version --bundle-short-version "0.1.0" nonempty-short-override-without-version
+assert_rejected_without_explicit_version --bundle-short-version "" blank-short-override-without-version
+assert_rejected_without_explicit_version --bundle-build-number "1" nonempty-build-override-without-version
+assert_rejected_without_explicit_version --bundle-build-number "" blank-build-override-without-version
 assert_rejected_empty_version
+assert_explicit_blank_overrides_derive
 assert_bundle_versions "0.1.0" "0.1.0" "0.1.0"
 assert_bundle_versions "0.1.0-rc.2" "0.1.0" "2"
 assert_bundle_versions "0.1.0-nightly.1" "0.1.0" "1"

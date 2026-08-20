@@ -9,7 +9,9 @@ output_was_set=false
 bundle_version=""
 version_was_supplied=false
 bundle_short_version=""
+bundle_short_version_was_supplied=false
 bundle_build_number=""
+bundle_build_number_was_supplied=false
 signing_identity="-"
 production_signing=false
 
@@ -47,6 +49,7 @@ while (($# > 0)); do
                 exit 2
             fi
             bundle_short_version="$2"
+            bundle_short_version_was_supplied=true
             shift 2
             ;;
         --bundle-build-number)
@@ -55,6 +58,7 @@ while (($# > 0)); do
                 exit 2
             fi
             bundle_build_number="$2"
+            bundle_build_number_was_supplied=true
             shift 2
             ;;
         --signing-identity)
@@ -106,7 +110,7 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
     exit 1
 fi
 
-if [[ "$version_was_supplied" == false && ( -n "$bundle_short_version" || -n "$bundle_build_number" ) ]]; then
+if [[ "$version_was_supplied" == false && ( "$bundle_short_version_was_supplied" == true || "$bundle_build_number_was_supplied" == true ) ]]; then
     printf '%s\n' "--bundle-short-version and --bundle-build-number require --version." >&2
     exit 2
 fi
