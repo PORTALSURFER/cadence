@@ -77,7 +77,7 @@ enum Message {
         result: Result<audio::DecodedAudioFile, String>,
     },
     LibrarySaved {
-        revision: u64,
+        attempt: LibrarySaveAttempt,
         result: Result<(), String>,
     },
     DecodeCompleted {
@@ -796,6 +796,12 @@ struct ImportBatchProgress {
     failed: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LibrarySaveAttempt {
+    id: u64,
+    revision: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct WaveformDecodeRequest {
     track_id: String,
@@ -847,7 +853,8 @@ struct AppState {
     busy: bool,
     library_revision: u64,
     persisted_library_revision: u64,
-    save_in_flight_revision: Option<u64>,
+    save_in_flight: Option<LibrarySaveAttempt>,
+    last_save_attempt_id: u64,
     waveform: Option<audio::WaveformData>,
     waveform_track_id: Option<String>,
     waveform_busy: bool,
@@ -969,7 +976,8 @@ impl Default for AppState {
             busy: false,
             library_revision: 0,
             persisted_library_revision: 0,
-            save_in_flight_revision: None,
+            save_in_flight: None,
+            last_save_attempt_id: 0,
             waveform: None,
             waveform_track_id: None,
             waveform_busy: false,
@@ -1397,7 +1405,7 @@ fn activate_loaded_library(
     state.library = library;
     state.library_revision = 0;
     state.persisted_library_revision = 0;
-    state.save_in_flight_revision = None;
+    state.save_in_flight = None;
     storage::normalize_planner_order(&mut state.library);
     let (startup_track_id, startup_selection_changed) =
         normalize_startup_track_selection(&mut state.library);
@@ -2445,14 +2453,14 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             context.request_repaint();
         }
         Message::RetryLibrarySave => retry_library_save(state, context),
-        Message::LibrarySaved { revision, result } => {
-            if state.save_in_flight_revision != Some(revision) {
+        Message::LibrarySaved { attempt, result } => {
+            if state.save_in_flight != Some(attempt) {
                 return;
             }
-            state.save_in_flight_revision = None;
+            state.save_in_flight = None;
             match result {
                 Ok(()) => {
-                    state.persisted_library_revision = revision;
+                    state.persisted_library_revision = attempt.revision;
                     state.status = String::from("All changes saved locally.");
                     if library_dirty(state) {
                         dispatch_library_save(state, context);
@@ -5906,20 +5914,25 @@ fn library_dirty(state: &AppState) -> bool {
 }
 
 fn library_persistence_pending(state: &AppState) -> bool {
-    library_dirty(state) || state.save_in_flight_revision.is_some()
+    library_dirty(state) || state.save_in_flight.is_some()
 }
 
 fn dispatch_library_save(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
-    if !library_is_ready(state) || !library_dirty(state) || state.save_in_flight_revision.is_some()
-    {
+    if !library_is_ready(state) || !library_dirty(state) || state.save_in_flight.is_some() {
         return;
     }
     let revision = state.library_revision;
+    let id = state
+        .last_save_attempt_id
+        .checked_add(1)
+        .expect("library save attempt id overflow");
+    state.last_save_attempt_id = id;
+    let attempt = LibrarySaveAttempt { id, revision };
     let library = state.library.clone();
-    state.save_in_flight_revision = Some(revision);
+    state.save_in_flight = Some(attempt);
     context.business().blocking_io("cadence-save-library").run(
         move |_| storage::persist_library(&library),
-        move |result| Message::LibrarySaved { revision, result },
+        move |result| Message::LibrarySaved { attempt, result },
     );
 }
 
@@ -5932,7 +5945,7 @@ fn schedule_library_save(state: &mut AppState, context: &mut ui::UiUpdateContext
 }
 
 fn retry_library_save(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
-    if !library_is_ready(state) || state.busy || state.save_in_flight_revision.is_some() {
+    if !library_is_ready(state) || state.busy || state.save_in_flight.is_some() {
         return;
     }
     dispatch_library_save(state, context);
@@ -5941,7 +5954,7 @@ fn retry_library_save(state: &mut AppState, context: &mut ui::UiUpdateContext<Me
 fn mark_library_snapshot_persisted(state: &mut AppState) {
     state.library_revision = state.library_revision.wrapping_add(1);
     state.persisted_library_revision = state.library_revision;
-    state.save_in_flight_revision = None;
+    state.save_in_flight = None;
 }
 
 fn reset_transport(state: &mut AppState) {
@@ -7221,7 +7234,7 @@ fn project_surface(state: &AppState) -> ui::View<Message> {
         ])
         .fill_width()
         .height(38.0)
-    } else if library_dirty(state) && !state.busy && state.save_in_flight_revision.is_none() {
+    } else if library_dirty(state) && !state.busy && state.save_in_flight.is_none() {
         ui::stack([
             ui::card().fill(),
             ui::row([
@@ -10437,14 +10450,15 @@ mod tests {
     use super::{
         APP_VERSION_LABEL, AppState, AudioImportRequest, AudioImportTarget, AuditionSource,
         DEFAULT_LIVE_SPECTROGRAM_DISPLAY_SAMPLE_RATE, FavoriteMarkerWidget, ImportBatchProgress,
-        LibraryLoadState, LiveSpectrogramMode, LoopBounds, LoopSelection, LoopSelections, Message,
-        NoteDraft, PairedPlaybackGuard, PlannerInsertionTarget, REFERENCE_MENU_WIDTH,
-        SETTINGS_REFERENCE_ROW_METADATA_HEIGHT, SETTINGS_REFERENCE_ROW_TEXT_HEIGHT,
-        SETTINGS_REFERENCE_ROW_TEXT_SPACING, SETTINGS_REFERENCE_ROW_TITLE_HEIGHT,
-        STATUS_BAR_VERSION_WIDTH, StatusMenuHost, TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER,
-        TRACK_CARD_SELECTED_CORAL, WAVEFORM_HEIGHT, WaveformDecodeRequest, WorkspaceMode,
-        animation_requested, apply_transport_snapshot, audition_panel, audition_shuffle_seed,
-        audition_statuses, cleanup_reference_transport_failure, current_live_frame_for_source,
+        LibraryLoadState, LibrarySaveAttempt, LiveSpectrogramMode, LoopBounds, LoopSelection,
+        LoopSelections, Message, NoteDraft, PairedPlaybackGuard, PlannerInsertionTarget,
+        REFERENCE_MENU_WIDTH, SETTINGS_REFERENCE_ROW_METADATA_HEIGHT,
+        SETTINGS_REFERENCE_ROW_TEXT_HEIGHT, SETTINGS_REFERENCE_ROW_TEXT_SPACING,
+        SETTINGS_REFERENCE_ROW_TITLE_HEIGHT, STATUS_BAR_VERSION_WIDTH, StatusMenuHost,
+        TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER, TRACK_CARD_SELECTED_CORAL, WAVEFORM_HEIGHT,
+        WaveformDecodeRequest, WorkspaceMode, animation_requested, apply_transport_snapshot,
+        audition_panel, audition_shuffle_seed, audition_statuses,
+        cleanup_reference_transport_failure, current_live_frame_for_source,
         current_loudness_match_gain_db, current_lufs_meter_value,
         current_reference_lufs_meter_value, decode_result_is_current, deterministic_shuffle,
         enforce_loop, favorite_toggle, frame_surface_revisions, library_dirty,
@@ -11597,7 +11611,7 @@ mod tests {
                 state.library.selected_track_id.as_deref(),
                 Some(first_track_id.as_str())
             );
-            assert!(state.save_in_flight_revision.is_some());
+            assert!(state.save_in_flight.is_some());
             let command = context.into_command();
             let expected_focus_id = library_track_title_id(&first_track_id);
             assert_eq!(focus_request_id(&command), Some(expected_focus_id));
@@ -12434,7 +12448,7 @@ mod tests {
         assert!(state.reference_draft_note.is_none());
         assert!(!state.reference_transport_loaded);
         assert!(state.reference_waveform_generation > previous_generation);
-        assert!(state.save_in_flight_revision.is_some());
+        assert!(state.save_in_flight.is_some());
     }
 
     #[test]
@@ -12653,7 +12667,7 @@ mod tests {
             &mut context,
         );
         assert!(state.persisted_note_drag.is_none());
-        assert!(state.save_in_flight_revision.is_some());
+        assert!(state.save_in_flight.is_some());
         let note_ids = selected_track(&state).map(|track| {
             track
                 .notes
@@ -12714,7 +12728,7 @@ mod tests {
             Some(500)
         );
         assert!(state.persisted_note_drag.is_none());
-        assert!(state.save_in_flight_revision.is_none());
+        assert!(state.save_in_flight.is_none());
 
         update(
             &mut state,
@@ -12728,7 +12742,7 @@ mod tests {
             Some(500)
         );
         assert!(state.persisted_note_drag.is_none());
-        assert!(state.save_in_flight_revision.is_none());
+        assert!(state.save_in_flight.is_none());
     }
 
     #[test]
@@ -13960,7 +13974,7 @@ mod tests {
             &mut context,
         );
         assert!(state.reference_persisted_note_drag.is_none());
-        assert!(state.save_in_flight_revision.is_some());
+        assert!(state.save_in_flight.is_some());
         assert_eq!(
             state.status,
             "Reference comment moved to 00:03 and saved locally."
@@ -14016,7 +14030,7 @@ mod tests {
             Some(500)
         );
         assert!(state.reference_persisted_note_drag.is_none());
-        assert!(state.save_in_flight_revision.is_none());
+        assert!(state.save_in_flight.is_none());
     }
 
     fn main_only_loop_state() -> AppState {
@@ -16161,7 +16175,7 @@ mod tests {
         assert_eq!(track.notes.len(), 1);
         assert_eq!(track.notes[0].id, "keep-note");
         assert!(state.draft_note.is_none());
-        assert!(state.save_in_flight_revision.is_some());
+        assert!(state.save_in_flight.is_some());
         assert_eq!(state.status, "Comment deleted locally.");
     }
 
@@ -17737,7 +17751,7 @@ mod tests {
             busy: false,
             library_revision: 1,
             persisted_library_revision: 0,
-            save_in_flight_revision: Some(1),
+            save_in_flight: Some(LibrarySaveAttempt { id: 1, revision: 1 }),
             library_load_state: LibraryLoadState::Ready,
             library: Library {
                 tracks: vec![first_track, second_track],
@@ -17844,7 +17858,7 @@ mod tests {
             busy: false,
             library_revision: 1,
             persisted_library_revision: 0,
-            save_in_flight_revision: Some(1),
+            save_in_flight: Some(LibrarySaveAttempt { id: 1, revision: 1 }),
             library_load_state: LibraryLoadState::Ready,
             library: Library {
                 tracks: vec![first_track, second_track],
@@ -20007,7 +20021,7 @@ mod tests {
         assert!(track.favorite);
         assert_eq!(track.notes.len(), 1);
         assert!(state.status_menu_track_id.is_none());
-        assert!(state.save_in_flight_revision.is_some());
+        assert!(state.save_in_flight.is_some());
         assert_eq!(state.status, "Status set to Release.");
     }
 
@@ -20042,7 +20056,7 @@ mod tests {
         );
 
         assert_eq!(state.library.tracks[0].status, TrackStatus::Maybe);
-        assert!(state.save_in_flight_revision.is_none());
+        assert!(state.save_in_flight.is_none());
         assert!(!library_dirty(&state));
         assert!(state.status_menu_track_id.is_none());
     }
@@ -23155,23 +23169,23 @@ mod tests {
         let mut context = ui::UiUpdateContext::default();
 
         schedule_library_save(&mut state, &mut context);
-        let revision = state
-            .save_in_flight_revision
+        let attempt = state
+            .save_in_flight
             .expect("the first mutation should dispatch a save");
-        assert_eq!(revision, state.library_revision);
+        assert_eq!(attempt.revision, state.library_revision);
         let _ = context.into_command();
 
         let mut context = ui::UiUpdateContext::default();
         update(
             &mut state,
             Message::LibrarySaved {
-                revision,
+                attempt,
                 result: Err(String::from("disk full")),
             },
             &mut context,
         );
         assert!(library_dirty(&state));
-        assert_eq!(state.save_in_flight_revision, None);
+        assert_eq!(state.save_in_flight, None);
         assert_eq!(state.status, "disk full");
 
         let queued_path = PathBuf::from("/external/queued-after-save-failure.wav");
@@ -23187,9 +23201,13 @@ mod tests {
 
         let mut context = ui::UiUpdateContext::default();
         update(&mut state, Message::RetryLibrarySave, &mut context);
-        assert_eq!(state.library_revision, revision);
+        let retry_attempt = state
+            .save_in_flight
+            .expect("retry should dispatch the same revision");
+        assert_eq!(state.library_revision, attempt.revision);
         assert_eq!(state.persisted_library_revision, 0);
-        assert_eq!(state.save_in_flight_revision, Some(revision));
+        assert_eq!(retry_attempt.revision, attempt.revision);
+        assert_ne!(retry_attempt.id, attempt.id);
         assert_eq!(
             context
                 .into_command()
@@ -23199,13 +23217,12 @@ mod tests {
     }
 
     #[test]
-    fn matching_retry_save_success_resumes_queued_import_and_clears_dirty_state() {
+    fn duplicate_failed_save_attempt_cannot_retire_same_revision_retry() {
         let mut state = AppState::default();
-        let queued_path = PathBuf::from("/external/queued-after-retry.wav");
         let mut context = ui::UiUpdateContext::default();
         schedule_library_save(&mut state, &mut context);
-        let revision = state
-            .save_in_flight_revision
+        let attempt_a = state
+            .save_in_flight
             .expect("the first mutation should dispatch a save");
         let _ = context.into_command();
 
@@ -23213,7 +23230,101 @@ mod tests {
         update(
             &mut state,
             Message::LibrarySaved {
-                revision,
+                attempt: attempt_a,
+                result: Err(String::from("first save failed")),
+            },
+            &mut context,
+        );
+        let queued_path = PathBuf::from("/external/retry-queued.wav");
+        schedule_import(&mut state, &mut context, queued_path.clone());
+        let _ = context.into_command();
+
+        let mut context = ui::UiUpdateContext::default();
+        update(&mut state, Message::RetryLibrarySave, &mut context);
+        let attempt_b = state
+            .save_in_flight
+            .expect("retry should dispatch a distinct attempt");
+        assert_eq!(attempt_b.revision, attempt_a.revision);
+        assert_ne!(attempt_b.id, attempt_a.id);
+        let _ = context.into_command();
+
+        let status_before_duplicate = state.status.clone();
+        let revision_before_duplicate = state.library_revision;
+        let persisted_before_duplicate = state.persisted_library_revision;
+        let pending_before_duplicate = state.pending_import_paths.clone();
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::LibrarySaved {
+                attempt: attempt_a,
+                result: Err(String::from("stale duplicate failure")),
+            },
+            &mut context,
+        );
+        assert_eq!(state.save_in_flight, Some(attempt_b));
+        assert_eq!(state.library_revision, revision_before_duplicate);
+        assert_eq!(state.persisted_library_revision, persisted_before_duplicate);
+        assert_eq!(state.status, status_before_duplicate);
+        assert_eq!(state.pending_import_paths, pending_before_duplicate);
+        let command = context.into_command();
+        assert_eq!(command.business_task_priority("cadence-save-library"), None);
+        assert_eq!(
+            command.business_task_priority("cadence-import-preflight"),
+            None
+        );
+
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::LibrarySaved {
+                attempt: attempt_b,
+                result: Ok(()),
+            },
+            &mut context,
+        );
+        assert!(!library_dirty(&state));
+        assert_eq!(state.save_in_flight, None);
+        assert!(state.pending_import_paths.is_empty());
+        assert!(state.busy);
+        assert_eq!(
+            context
+                .into_command()
+                .business_task_priority("cadence-import-preflight"),
+            Some(TaskPriority::Background)
+        );
+
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::AudioImportPreflightCompleted {
+                request: AudioImportRequest {
+                    target: AudioImportTarget::Main,
+                    path: queued_path,
+                },
+                result: Err(String::from("queued import failed")),
+            },
+            &mut context,
+        );
+        assert!(!state.busy);
+        assert!(state.import_batch.is_none());
+    }
+
+    #[test]
+    fn matching_retry_save_success_resumes_queued_import_and_clears_dirty_state() {
+        let mut state = AppState::default();
+        let queued_path = PathBuf::from("/external/queued-after-retry.wav");
+        let mut context = ui::UiUpdateContext::default();
+        schedule_library_save(&mut state, &mut context);
+        let attempt = state
+            .save_in_flight
+            .expect("the first mutation should dispatch a save");
+        let _ = context.into_command();
+
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::LibrarySaved {
+                attempt,
                 result: Err(String::from("temporary save failure")),
             },
             &mut context,
@@ -23223,21 +23334,25 @@ mod tests {
 
         let mut context = ui::UiUpdateContext::default();
         update(&mut state, Message::RetryLibrarySave, &mut context);
-        assert_eq!(state.save_in_flight_revision, Some(revision));
+        let retry_attempt = state
+            .save_in_flight
+            .expect("retry should dispatch the same revision");
+        assert_eq!(retry_attempt.revision, attempt.revision);
+        assert_ne!(retry_attempt.id, attempt.id);
         let _ = context.into_command();
 
         let mut context = ui::UiUpdateContext::default();
         update(
             &mut state,
             Message::LibrarySaved {
-                revision,
+                attempt: retry_attempt,
                 result: Ok(()),
             },
             &mut context,
         );
 
         assert!(!library_dirty(&state));
-        assert_eq!(state.save_in_flight_revision, None);
+        assert_eq!(state.save_in_flight, None);
         assert!(state.busy, "the retained import should resume after save");
         assert!(state.pending_import_paths.is_empty());
         assert_eq!(
@@ -23254,14 +23369,15 @@ mod tests {
         let mut context = ui::UiUpdateContext::default();
 
         schedule_library_save(&mut state, &mut context);
-        let first_revision = state
-            .save_in_flight_revision
+        let first_attempt = state
+            .save_in_flight
             .expect("first mutation should dispatch");
+        let first_revision = first_attempt.revision;
         let _ = context.into_command();
         let mut context = ui::UiUpdateContext::default();
         schedule_library_save(&mut state, &mut context);
         assert_eq!(state.library_revision, first_revision + 1);
-        assert_eq!(state.save_in_flight_revision, Some(first_revision));
+        assert_eq!(state.save_in_flight, Some(first_attempt));
         assert_eq!(
             context
                 .into_command()
@@ -23273,14 +23389,18 @@ mod tests {
         update(
             &mut state,
             Message::LibrarySaved {
-                revision: first_revision,
+                attempt: first_attempt,
                 result: Ok(()),
             },
             &mut context,
         );
         let second_revision = first_revision + 1;
         assert_eq!(state.persisted_library_revision, first_revision);
-        assert_eq!(state.save_in_flight_revision, Some(second_revision));
+        let second_attempt = state
+            .save_in_flight
+            .expect("newer revision should dispatch after the first success");
+        assert_eq!(second_attempt.revision, second_revision);
+        assert_ne!(second_attempt.id, first_attempt.id);
         assert_eq!(
             context
                 .into_command()
@@ -23293,13 +23413,13 @@ mod tests {
         update(
             &mut state,
             Message::LibrarySaved {
-                revision: first_revision,
+                attempt: first_attempt,
                 result: Err(String::from("stale duplicate")),
             },
             &mut context,
         );
         assert_eq!(state.status, status_after_first_success);
-        assert_eq!(state.save_in_flight_revision, Some(second_revision));
+        assert_eq!(state.save_in_flight, Some(second_attempt));
         assert_eq!(
             context
                 .into_command()
@@ -23311,14 +23431,14 @@ mod tests {
         update(
             &mut state,
             Message::LibrarySaved {
-                revision: second_revision,
+                attempt: second_attempt,
                 result: Ok(()),
             },
             &mut context,
         );
         assert!(!library_dirty(&state));
         assert_eq!(state.persisted_library_revision, second_revision);
-        assert_eq!(state.save_in_flight_revision, None);
+        assert_eq!(state.save_in_flight, None);
     }
 
     #[test]
@@ -23497,7 +23617,7 @@ mod tests {
         let batch_before = state.import_batch.clone();
         let library_revision_before = state.library_revision;
         let persisted_library_revision_before = state.persisted_library_revision;
-        let save_in_flight_revision_before = state.save_in_flight_revision;
+        let save_in_flight_before = state.save_in_flight;
 
         update(
             &mut state,
@@ -23519,10 +23639,7 @@ mod tests {
             state.persisted_library_revision,
             persisted_library_revision_before
         );
-        assert_eq!(
-            state.save_in_flight_revision,
-            save_in_flight_revision_before
-        );
+        assert_eq!(state.save_in_flight, save_in_flight_before);
     }
 
     #[test]
@@ -23664,17 +23781,17 @@ mod tests {
         );
         assert_eq!(state.pending_import_paths, vec![main_path]);
         assert!(
-            state.save_in_flight_revision.is_some(),
+            state.save_in_flight.is_some(),
             "final reference selection should save"
         );
 
-        let save_revision = state
-            .save_in_flight_revision
+        let save_attempt = state
+            .save_in_flight
             .expect("the final reference selection save should have a revision");
         update(
             &mut state,
             Message::LibrarySaved {
-                revision: save_revision,
+                attempt: save_attempt,
                 result: Ok(()),
             },
             &mut context,
