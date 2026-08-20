@@ -1510,16 +1510,18 @@ fn start_waveform_decode(
     let cache_path = storage::waveform_cache_path(&path);
     let progress_track_id = track_id.clone();
     let completion_track_id = track_id;
-    let cancellation = context
+    let cancellation = ui::CancellationToken::new();
+    state.waveform_cancellation = Some(cancellation.clone());
+    let worker_cancellation = cancellation.clone();
+    context
         .business()
         .background("cadence-decode-waveform")
-        .cancellable()
         .stream_latest(
-            move |work, sink| {
+            move |_work, sink| {
                 decode_or_load_cached_waveform(
                     &path,
                     &cache_path,
-                    || work.is_cancelled(),
+                    || worker_cancellation.is_cancelled(),
                     |progress| {
                         let _ = sink.emit(progress);
                     },
@@ -1536,7 +1538,6 @@ fn start_waveform_decode(
                 result,
             },
         );
-    state.waveform_cancellation = Some(cancellation);
     context.request_repaint();
 }
 
@@ -1625,16 +1626,18 @@ fn start_reference_waveform_decode(
     let cache_path = storage::waveform_cache_path(&path);
     let progress_track_id = track_id.clone();
     let completion_track_id = track_id;
-    let cancellation = context
+    let cancellation = ui::CancellationToken::new();
+    state.reference_waveform_cancellation = Some(cancellation.clone());
+    let worker_cancellation = cancellation.clone();
+    context
         .business()
         .background("cadence-decode-reference-waveform")
-        .cancellable()
         .stream_latest(
-            move |work, sink| {
+            move |_work, sink| {
                 decode_or_load_cached_waveform(
                     &path,
                     &cache_path,
-                    || work.is_cancelled(),
+                    || worker_cancellation.is_cancelled(),
                     |progress| {
                         let _ = sink.emit(progress);
                     },
@@ -1651,7 +1654,6 @@ fn start_reference_waveform_decode(
                 result,
             },
         );
-    state.reference_waveform_cancellation = Some(cancellation);
     context.request_repaint();
 }
 
@@ -10269,7 +10271,8 @@ mod tests {
         runtime::{
             Command, DeclarativeOwnedCommandRuntimeBridge, DeclarativeOwnedRuntimeBridge, Event,
             FocusTraversal, PaintPrimitive, PaintTextAlign, PlatformRequest, PlatformResponse,
-            RepaintScope, SurfaceRuntime, TaskPriority, TransientOverlayContext,
+            RepaintScope, RuntimeBridge, RuntimeHostCapabilities, RuntimeTaskHost, SurfaceRuntime,
+            TaskPriority, TransientOverlayContext, UiSurface,
         },
         theme::ThemeTokens,
         widgets::{
@@ -10277,7 +10280,81 @@ mod tests {
             WidgetInput,
         },
     };
-    use std::{path::PathBuf, sync::Arc, time::Duration};
+    use std::{
+        path::PathBuf,
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+
+    struct RuntimeTaskBridge<Bridge>(Bridge);
+
+    impl<Bridge, Message> RuntimeBridge<Message> for RuntimeTaskBridge<Bridge>
+    where
+        Bridge: RuntimeBridge<Message>,
+    {
+        fn project_surface(&mut self) -> Arc<UiSurface<Message>> {
+            self.0.project_surface()
+        }
+
+        fn pull_surface(&mut self) -> UiSurface<Message> {
+            self.0.pull_surface()
+        }
+
+        fn reduce_message(&mut self, message: Message) {
+            self.0.reduce_message(message);
+        }
+
+        fn update(&mut self, message: Message) -> Command<Message> {
+            self.0.update(message)
+        }
+
+        fn host_capabilities(&self) -> RuntimeHostCapabilities<Self, Message> {
+            RuntimeHostCapabilities::new().with_tasks()
+        }
+    }
+
+    impl<Bridge, Message> RuntimeTaskHost<Message> for RuntimeTaskBridge<Bridge> {
+        fn spawn_worker_task(
+            &mut self,
+            _name: &'static str,
+            _priority: TaskPriority,
+            _is_cancelled: Option<Box<dyn Fn() -> bool + Send + Sync + 'static>>,
+            work: Box<dyn FnOnce() + Send + 'static>,
+        ) -> bool {
+            std::thread::spawn(work);
+            true
+        }
+    }
+
+    fn drain_decode_runtime_until<Project, Update, Predicate>(
+        runtime: &mut SurfaceRuntime<
+            RuntimeTaskBridge<
+                DeclarativeOwnedCommandRuntimeBridge<AppState, Message, Project, Update>,
+            >,
+            Message,
+        >,
+        mut predicate: Predicate,
+    ) -> usize
+    where
+        Project: FnMut(&mut AppState) -> UiSurface<Message>,
+        Update: FnMut(&mut AppState, Message) -> Command<Message>,
+        Predicate: FnMut(&AppState) -> bool,
+    {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut messages_dispatched = 0;
+        loop {
+            let outcome = runtime.drain_runtime_messages();
+            messages_dispatched += outcome.messages_dispatched;
+            if predicate(runtime.bridge().0.state()) {
+                return messages_dispatched;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "runtime decode did not reach the expected lifecycle state"
+            );
+            std::thread::yield_now();
+        }
+    }
 
     fn planner_drag_state(pointer: Point) -> AppState {
         let mut state = AppState {
@@ -17433,6 +17510,231 @@ mod tests {
         assert_eq!(
             state.reference_waveform_track_id.as_deref(),
             Some(newest_request.track_id.as_str())
+        );
+    }
+
+    #[test]
+    fn main_waveform_runtime_retires_cancelled_first_decode_before_latest_error() {
+        let first_id = String::from("runtime-main-first");
+        let second_id = String::from("runtime-main-second");
+        let first_path = PathBuf::from("/definitely/missing/runtime-main-first.wav");
+        let second_path = PathBuf::from("/definitely/missing/runtime-main-second.wav");
+        assert!(!first_path.exists());
+        assert!(!second_path.exists());
+        let mut first_track = audition_track(&first_id);
+        first_track.path = first_path.clone();
+        first_track.reference_path = None;
+        let mut second_track = audition_track(&second_id);
+        second_track.path = second_path.clone();
+        second_track.reference_path = None;
+        let state = AppState {
+            busy: false,
+            save_in_flight: true,
+            library_load_state: LibraryLoadState::Ready,
+            library: Library {
+                tracks: vec![first_track, second_track],
+                selected_track_id: Some(first_id.clone()),
+                ..Library::default()
+            },
+            ..AppState::default()
+        };
+        let bridge = RuntimeTaskBridge(DeclarativeOwnedCommandRuntimeBridge::new(
+            state,
+            |state| project_surface(state).into_surface(),
+            |state, message| {
+                let mut context = ui::UiUpdateContext::default();
+                update(state, message, &mut context);
+                context.into_command()
+            },
+        ));
+        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1_180.0, 720.0));
+
+        runtime.dispatch_message(Message::SelectTrack(first_id.clone()));
+        let first_request = runtime
+            .bridge()
+            .0
+            .state()
+            .waveform_in_flight
+            .clone()
+            .expect("the first main decode should be admitted");
+        let first_cancellation = runtime
+            .bridge()
+            .0
+            .state()
+            .waveform_cancellation
+            .clone()
+            .expect("the first main decode should retain its Cadence token");
+
+        runtime.dispatch_message(Message::SelectTrack(second_id.clone()));
+        let second_request = runtime
+            .bridge()
+            .0
+            .state()
+            .waveform_pending
+            .clone()
+            .expect("the second main decode should remain pending");
+        assert_eq!(
+            runtime.bridge().0.state().waveform_in_flight,
+            Some(first_request.clone())
+        );
+        assert_eq!(second_request.track_id, second_id);
+        assert_eq!(second_request.path, second_path);
+        assert!(
+            first_cancellation.is_cancelled(),
+            "superseding the first main decode should cancel its Cadence token"
+        );
+
+        let first_messages = drain_decode_runtime_until(&mut runtime, |state| {
+            state.waveform_in_flight.as_ref() == Some(&second_request)
+                && state.waveform_pending.is_none()
+        });
+        assert!(
+            first_messages > 0,
+            "the first terminal completion should be delivered through SurfaceRuntime"
+        );
+        assert!(
+            runtime
+                .bridge()
+                .0
+                .state()
+                .waveform_cancellation
+                .as_ref()
+                .is_some_and(|token| !token.is_cancelled())
+        );
+
+        let latest_messages = drain_decode_runtime_until(&mut runtime, |state| {
+            state.waveform_in_flight.is_none()
+                && state.waveform_pending.is_none()
+                && !state.waveform_busy
+        });
+        assert!(
+            latest_messages > 0,
+            "the newest terminal completion should be delivered through SurfaceRuntime"
+        );
+        let final_state = runtime.bridge().0.state();
+        assert!(final_state.waveform_cancellation.is_none());
+        assert!(!final_state.waveform_busy);
+        assert!(final_state.status.contains("Waveform unavailable"));
+        assert!(
+            final_state
+                .status
+                .contains(second_path.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn reference_waveform_runtime_retires_cancelled_first_decode_before_latest_error() {
+        let first_id = String::from("runtime-reference-first");
+        let second_id = String::from("runtime-reference-second");
+        let first_path = PathBuf::from("/definitely/missing/runtime-reference-first.wav");
+        let second_path = PathBuf::from("/definitely/missing/runtime-reference-second.wav");
+        assert!(!first_path.exists());
+        assert!(!second_path.exists());
+        let first_track = audition_track(&first_id);
+        let second_track = audition_track(&second_id);
+        let state = AppState {
+            busy: false,
+            save_in_flight: true,
+            library_load_state: LibraryLoadState::Ready,
+            library: Library {
+                tracks: vec![first_track, second_track],
+                selected_track_id: Some(first_id.clone()),
+                ..Library::default()
+            },
+            ..AppState::default()
+        };
+        let bridge = RuntimeTaskBridge(DeclarativeOwnedCommandRuntimeBridge::new(
+            state,
+            |state| project_surface(state).into_surface(),
+            |state, message| {
+                let mut context = ui::UiUpdateContext::default();
+                update(state, message, &mut context);
+                context.into_command()
+            },
+        ));
+        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1_180.0, 720.0));
+
+        runtime.dispatch_message(Message::SetReferenceTrack {
+            track_id: first_id.clone(),
+            path: first_path.clone(),
+        });
+        let first_request = runtime
+            .bridge()
+            .0
+            .state()
+            .reference_waveform_in_flight
+            .clone()
+            .expect("the first reference decode should be admitted");
+        let first_cancellation = runtime
+            .bridge()
+            .0
+            .state()
+            .reference_waveform_cancellation
+            .clone()
+            .expect("the first reference decode should retain its Cadence token");
+
+        runtime.bridge_mut().0.state_mut().library.selected_track_id = Some(second_id.clone());
+        runtime.dispatch_message(Message::SetReferenceTrack {
+            track_id: second_id.clone(),
+            path: second_path.clone(),
+        });
+        let second_request = runtime
+            .bridge()
+            .0
+            .state()
+            .reference_waveform_pending
+            .clone()
+            .expect("the second reference decode should remain pending");
+        assert_eq!(
+            runtime.bridge().0.state().reference_waveform_in_flight,
+            Some(first_request.clone())
+        );
+        assert_eq!(second_request.track_id, second_id);
+        assert_eq!(second_request.path, second_path);
+        assert!(
+            first_cancellation.is_cancelled(),
+            "superseding the first reference decode should cancel its Cadence token"
+        );
+
+        let first_messages = drain_decode_runtime_until(&mut runtime, |state| {
+            state.reference_waveform_in_flight.as_ref() == Some(&second_request)
+                && state.reference_waveform_pending.is_none()
+        });
+        assert!(
+            first_messages > 0,
+            "the first reference terminal completion should be delivered through SurfaceRuntime"
+        );
+        assert!(
+            runtime
+                .bridge()
+                .0
+                .state()
+                .reference_waveform_cancellation
+                .as_ref()
+                .is_some_and(|token| !token.is_cancelled())
+        );
+
+        let latest_messages = drain_decode_runtime_until(&mut runtime, |state| {
+            state.reference_waveform_in_flight.is_none()
+                && state.reference_waveform_pending.is_none()
+                && !state.reference_waveform_busy
+        });
+        assert!(
+            latest_messages > 0,
+            "the newest reference terminal completion should be delivered through SurfaceRuntime"
+        );
+        let final_state = runtime.bridge().0.state();
+        assert!(final_state.reference_waveform_cancellation.is_none());
+        assert!(!final_state.reference_waveform_busy);
+        assert!(
+            final_state
+                .status
+                .contains("Reference waveform unavailable")
+        );
+        assert!(
+            final_state
+                .status
+                .contains(second_path.to_string_lossy().as_ref())
         );
     }
 
