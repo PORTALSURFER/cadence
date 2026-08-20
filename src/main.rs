@@ -58,6 +58,9 @@ enum Message {
     },
     FileDropped(ui::NativeFileDrop),
     LibraryLoaded(Result<storage::Library, String>),
+    RetryLibraryLoad,
+    PreserveLibraryAndStartFresh,
+    LibraryRecoveryCompleted(Result<PathBuf, String>),
     ImportCompleted(Result<storage::Library, String>),
     ReplaceCompleted {
         track_id: String,
@@ -785,6 +788,13 @@ struct ImportBatchProgress {
     failed: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LibraryLoadState {
+    Loading,
+    Ready,
+    RecoveryRequired,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum PairedPlaybackGuard {
     Idle,
@@ -803,6 +813,7 @@ enum PairedPlaybackGuard {
 #[derive(Clone, Debug)]
 struct AppState {
     library: storage::Library,
+    library_load_state: LibraryLoadState,
     workspace_mode: WorkspaceMode,
     status: String,
     busy: bool,
@@ -919,9 +930,10 @@ impl Default for AppState {
     fn default() -> Self {
         Self {
             library: storage::Library::default(),
+            library_load_state: LibraryLoadState::Ready,
             workspace_mode: WorkspaceMode::Review,
-            status: String::from("Loading local library…"),
-            busy: true,
+            status: String::from("Ready — import a track to begin."),
+            busy: false,
             save_in_flight: false,
             save_again: false,
             waveform: None,
@@ -1008,6 +1020,16 @@ impl Default for AppState {
             reference_menu_track_id: None,
             reference_menu_anchor: None,
             settings_open: false,
+        }
+    }
+}
+
+impl AppState {
+    fn loading() -> Self {
+        Self {
+            library_load_state: LibraryLoadState::Loading,
+            status: String::from("Loading local library…"),
+            ..Self::default()
         }
     }
 }
@@ -1285,7 +1307,7 @@ fn main() -> radiant::Result {
         }
     };
 
-    radiant::app(AppState::default())
+    radiant::app(AppState::loading())
         .options(native_launch_options())
         .title("Cadence — local track review")
         .size(1180, 720)
@@ -1313,6 +1335,103 @@ fn schedule_library_load(context: &mut ui::UiUpdateContext<Message>) {
         .business()
         .blocking_io("cadence-load-library")
         .run(|_| storage::load_library(), Message::LibraryLoaded);
+}
+
+fn library_is_ready(state: &AppState) -> bool {
+    state.library_load_state == LibraryLoadState::Ready
+}
+
+fn library_unavailable_status(state: &AppState) -> &'static str {
+    match state.library_load_state {
+        LibraryLoadState::Loading => "The library is still loading.",
+        LibraryLoadState::Ready => "",
+        LibraryLoadState::RecoveryRequired => {
+            "The library needs recovery before it can be changed."
+        }
+    }
+}
+
+fn activate_loaded_library(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    mut library: storage::Library,
+) {
+    storage::normalize_planner_order(&mut library);
+    let (startup_track_id, startup_selection_changed) =
+        normalize_startup_track_selection(&mut library);
+    state.status = if library.tracks.is_empty() {
+        String::from("Ready — import a track to begin.")
+    } else {
+        format!(
+            "{} local track{} loaded.",
+            library.tracks.len(),
+            plural(library.tracks.len())
+        )
+    };
+    state.library = library;
+    state.library_load_state = LibraryLoadState::Ready;
+    if state.workspace_mode == WorkspaceMode::Audition {
+        rebuild_audition_queue(state);
+    }
+    state.review_cursor_millis = 0;
+    state.draft_note = None;
+    state.reference_draft_note = None;
+    rollback_persisted_note_drag(state);
+    rollback_reference_persisted_note_drag(state);
+    state.reference_playhead_drag_active = false;
+    state.selected_note_id = None;
+    state.hovered_note_id = None;
+    state.selected_reference_note_id = None;
+    state.hovered_reference_note_id = None;
+    state.comment_source = CommentSource::Main;
+    state.comment_source_explicit = false;
+    close_stage_menu(state);
+    close_status_menu(state);
+    close_reference_menu(state);
+    close_settings(state);
+    state.remove_confirmation_track_id = None;
+    reset_transport(state);
+    reset_reference_transport(state);
+    state.reference_match_enabled = false;
+    if startup_selection_changed {
+        schedule_library_save(state, context);
+    }
+    if let Some(track_id) = startup_track_id.as_deref() {
+        context.focus(library_track_title_id(track_id));
+    }
+    schedule_selected_waveform_decode(state, context);
+    schedule_selected_reference_decode(state, context);
+    schedule_next_pending_import(state, context);
+    schedule_next_pending_reference_import(state, context);
+}
+
+fn retry_library_load(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
+    if state.library_load_state != LibraryLoadState::RecoveryRequired {
+        return;
+    }
+    state.library_load_state = LibraryLoadState::Loading;
+    state.status = String::from("Retrying local library load…");
+    schedule_library_load(context);
+    context.request_repaint();
+}
+
+fn preserve_library_and_start_fresh(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+) {
+    if state.library_load_state != LibraryLoadState::RecoveryRequired || state.busy {
+        return;
+    }
+    state.busy = true;
+    state.status = String::from("Preserving the unreadable library and starting fresh…");
+    context
+        .business()
+        .blocking_io("cadence-preserve-library-recovery")
+        .run(
+            |_| storage::preserve_unreadable_library_and_start_fresh(),
+            Message::LibraryRecoveryCompleted,
+        );
+    context.request_repaint();
 }
 
 fn decode_or_load_cached_waveform(
@@ -1653,6 +1772,11 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
         }
         Message::ReferenceCatalogImportCompleted { path, result } => {
             state.busy = false;
+            if !library_is_ready(state) {
+                state.status = library_unavailable_status(state).to_string();
+                context.request_repaint();
+                return;
+            }
             state.reference_catalog_import_completed = state
                 .reference_catalog_import_completed
                 .saturating_add(1)
@@ -1700,65 +1824,44 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
         }
         Message::LibraryLoaded(result) => {
-            state.busy = false;
             clear_planner_drag(state);
             match result {
-                Ok(mut library) => {
-                    storage::normalize_planner_order(&mut library);
-                    let (startup_track_id, startup_selection_changed) =
-                        normalize_startup_track_selection(&mut library);
-                    state.status = if library.tracks.is_empty() {
-                        String::from("Ready — import a track to begin.")
-                    } else {
-                        format!(
-                            "{} local track{} loaded.",
-                            library.tracks.len(),
-                            plural(library.tracks.len())
-                        )
-                    };
-                    state.library = library;
-                    if state.workspace_mode == WorkspaceMode::Audition {
-                        rebuild_audition_queue(state);
-                    }
-                    state.review_cursor_millis = 0;
-                    state.draft_note = None;
-                    state.reference_draft_note = None;
-                    rollback_persisted_note_drag(state);
-                    rollback_reference_persisted_note_drag(state);
-                    state.reference_playhead_drag_active = false;
-                    state.selected_note_id = None;
-                    state.hovered_note_id = None;
-                    state.selected_reference_note_id = None;
-                    state.hovered_reference_note_id = None;
-                    state.comment_source = CommentSource::Main;
-                    state.comment_source_explicit = false;
-                    close_stage_menu(state);
-                    close_status_menu(state);
-                    close_reference_menu(state);
-                    close_settings(state);
-                    state.remove_confirmation_track_id = None;
-                    reset_transport(state);
-                    reset_reference_transport(state);
-                    state.reference_match_enabled = false;
-                    if startup_selection_changed {
-                        schedule_library_save(state, context);
-                    }
-                    if let Some(track_id) = startup_track_id.as_deref() {
-                        context.focus(library_track_title_id(track_id));
-                    }
-                    schedule_selected_waveform_decode(state, context);
-                    schedule_selected_reference_decode(state, context);
-                }
+                Ok(library) => activate_loaded_library(state, context, library),
                 Err(error) => {
-                    state.status = error;
+                    state.library_load_state = LibraryLoadState::RecoveryRequired;
+                    state.status =
+                        format!("Could not load the local library: {error} Recovery is required.");
                 }
             }
-            schedule_next_pending_import(state, context);
+            context.request_repaint();
+        }
+        Message::RetryLibraryLoad => retry_library_load(state, context),
+        Message::PreserveLibraryAndStartFresh => preserve_library_and_start_fresh(state, context),
+        Message::LibraryRecoveryCompleted(result) => {
+            state.busy = false;
+            match result {
+                Ok(backup_path) => {
+                    activate_loaded_library(state, context, storage::Library::default());
+                    state.status = format!(
+                        "Started a fresh library. The unreadable file was preserved at {}.",
+                        backup_path.display()
+                    );
+                }
+                Err(error) => {
+                    state.library_load_state = LibraryLoadState::RecoveryRequired;
+                    state.status = format!("Could not start a fresh library: {error}");
+                }
+            }
             context.request_repaint();
         }
         Message::ImportCompleted(result) => {
             let failed = result.is_err();
             state.busy = false;
+            if !library_is_ready(state) {
+                state.status = library_unavailable_status(state).to_string();
+                context.request_repaint();
+                return;
+            }
             record_import_attempt(state, failed);
             clear_planner_drag(state);
             match result {
@@ -1804,6 +1907,11 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
         }
         Message::ReplaceCompleted { track_id, result } => {
             state.busy = false;
+            if !library_is_ready(state) {
+                state.status = library_unavailable_status(state).to_string();
+                context.request_repaint();
+                return;
+            }
             clear_planner_drag(state);
             match result {
                 Ok(library) => {
@@ -1851,6 +1959,11 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
         } => {
             let failed = result.is_err();
             state.busy = false;
+            if !library_is_ready(state) {
+                state.status = library_unavailable_status(state).to_string();
+                context.request_repaint();
+                return;
+            }
             record_import_attempt(state, failed);
             match result {
                 Ok(library) => {
@@ -1898,7 +2011,8 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             context.request_repaint();
         }
         Message::ToggleReferenceMenu(track_id) => {
-            if !state.busy
+            if library_is_ready(state)
+                && !state.busy
                 && state
                     .library
                     .tracks
@@ -1917,7 +2031,8 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
         }
         Message::ToggleReferenceMenuAt { track_id, position } => {
-            if !state.busy
+            if library_is_ready(state)
+                && !state.busy
                 && state
                     .library
                     .tracks
@@ -2198,7 +2313,10 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             context.request_repaint();
         }
         Message::SelectTrack(id) => {
-            if !state.busy && state.library.tracks.iter().any(|track| track.id == id) {
+            if library_is_ready(state)
+                && !state.busy
+                && state.library.tracks.iter().any(|track| track.id == id)
+            {
                 state.pending_comment_playback = None;
                 if state.workspace_mode == WorkspaceMode::Audition {
                     state.audition_heard.retain(|heard_id| heard_id != &id);
@@ -2210,7 +2328,10 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             set_workspace_mode(state, context, mode);
         }
         Message::SetAuditionFilter(status) => {
-            if state.busy || state.workspace_mode != WorkspaceMode::Audition {
+            if !library_is_ready(state)
+                || state.busy
+                || state.workspace_mode != WorkspaceMode::Audition
+            {
                 return;
             }
             state.audition_status_filter = status;
@@ -2260,7 +2381,8 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             shuffle_audition(state, context);
         }
         Message::ToggleFavorite(id) => {
-            if !state.busy
+            if library_is_ready(state)
+                && !state.busy
                 && let Some(track) = state.library.tracks.iter_mut().find(|track| track.id == id)
             {
                 track.favorite = !track.favorite;
@@ -2268,7 +2390,10 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
         }
         Message::ToggleStageMenu(id) => {
-            if !state.busy && state.library.tracks.iter().any(|track| track.id == id) {
+            if library_is_ready(state)
+                && !state.busy
+                && state.library.tracks.iter().any(|track| track.id == id)
+            {
                 if state.stage_menu_track_id.as_deref() == Some(id.as_str()) {
                     close_stage_menu(state);
                 } else {
@@ -2280,7 +2405,8 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
         }
         Message::ToggleStageMenuAt { track_id, position } => {
-            if !state.busy
+            if library_is_ready(state)
+                && !state.busy
                 && state
                     .library
                     .tracks
@@ -2298,7 +2424,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
         }
         Message::SetStage { track_id, stage } => {
-            if !state.busy {
+            if library_is_ready(state) && !state.busy {
                 let changed = match storage::set_track_stage(&mut state.library, &track_id, stage) {
                     Ok(changed) => changed,
                     Err(error) => {
@@ -2321,7 +2447,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             toggle_status_menu(state, track_id, host, context);
         }
         Message::RemoveReferenceTrack(path) => {
-            if state.busy {
+            if !library_is_ready(state) || state.busy {
                 return;
             }
             let selected_affected = selected_track(state)
@@ -2364,7 +2490,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             context.request_repaint();
         }
         Message::SetReferenceTrack { track_id, path } => {
-            if !state.busy {
+            if library_is_ready(state) && !state.busy {
                 let selected =
                     state.library.selected_track_id.as_deref() == Some(track_id.as_str());
                 let changed = match storage::set_reference_track_selection(
@@ -2397,7 +2523,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
         }
         Message::SetStatus { track_id, status } => {
-            if !state.busy {
+            if library_is_ready(state) && !state.busy {
                 let pending_selected_audition = state.workspace_mode == WorkspaceMode::Audition
                     && state.library.selected_track_id.as_deref() == Some(track_id.as_str())
                     && state.audition_pending_play_track_id.as_deref() == Some(track_id.as_str())
@@ -2428,7 +2554,10 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
         }
         Message::PlannerCardDrag { track_id, message } => {
-            if state.busy || state.workspace_mode != WorkspaceMode::Planner {
+            if !library_is_ready(state)
+                || state.busy
+                || state.workspace_mode != WorkspaceMode::Planner
+            {
                 return;
             }
             if !state
@@ -2515,7 +2644,10 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
         }
         Message::PlannerInsertionDropped(target) => {
-            if state.busy || state.workspace_mode != WorkspaceMode::Planner {
+            if !library_is_ready(state)
+                || state.busy
+                || state.workspace_mode != WorkspaceMode::Planner
+            {
                 return;
             }
             let Some(source_id) = state.planner_drag_source_track_id.clone() else {
@@ -2550,7 +2682,10 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             context.request_repaint();
         }
         Message::RequestRemoveTrack(id) => {
-            if !state.busy && state.library.tracks.iter().any(|track| track.id == id) {
+            if library_is_ready(state)
+                && !state.busy
+                && state.library.tracks.iter().any(|track| track.id == id)
+            {
                 close_stage_menu(state);
                 close_status_menu(state);
                 state.remove_confirmation_track_id = Some(id);
@@ -2561,7 +2696,10 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
         }
         Message::ConfirmRemoveTrack(id) => {
-            if state.busy || state.remove_confirmation_track_id.as_deref() != Some(id.as_str()) {
+            if !library_is_ready(state)
+                || state.busy
+                || state.remove_confirmation_track_id.as_deref() != Some(id.as_str())
+            {
                 return;
             }
             let selected = state.library.selected_track_id.as_deref() == Some(id.as_str());
@@ -2672,7 +2810,11 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
         }
         Message::WaveformLoopDragStarted { .. } => {
-            if state.busy || state.waveform_busy || state.waveform.is_none() {
+            if !library_is_ready(state)
+                || state.busy
+                || state.waveform_busy
+                || state.waveform.is_none()
+            {
                 return;
             }
             disarm_audition_auto_advance(state);
@@ -2686,12 +2828,19 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             end_ratio,
         } => finish_loop_selection(state, context, AuditionSource::Main, start_ratio, end_ratio),
         Message::WaveformLoopDragCancelled => {
+            if !library_is_ready(state) {
+                return;
+            }
             state.loop_selections.clear(AuditionSource::Main);
             state.status = String::from("Loop selection canceled.");
             context.request_repaint();
         }
         Message::ReferenceLoopDragStarted { .. } => {
-            if state.busy || state.reference_waveform_busy || state.waveform_busy {
+            if !library_is_ready(state)
+                || state.busy
+                || state.reference_waveform_busy
+                || state.waveform_busy
+            {
                 return;
             }
             if selected_reference_details(state).is_none() {
@@ -2714,6 +2863,9 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             end_ratio,
         ),
         Message::ReferenceLoopDragCancelled => {
+            if !library_is_ready(state) {
+                return;
+            }
             state.loop_selections.clear(AuditionSource::Reference);
             state.status = String::from("Reference loop selection canceled.");
             context.request_repaint();
@@ -2722,12 +2874,15 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             seek_reference_waveform_position(state, context, ratio, true)
         }
         Message::ReferenceCommentClicked { ratio } => {
+            if !library_is_ready(state) {
+                return;
+            }
             state.comment_source = CommentSource::Reference;
             state.comment_source_explicit = true;
             start_reference_comment_draft(state, context, ratio)
         }
         Message::WaveformClicked { ratio, lower } => {
-            if state.busy || state.waveform_busy {
+            if !library_is_ready(state) || state.busy || state.waveform_busy {
                 return;
             }
             let Some(waveform) = state.waveform.as_ref() else {
@@ -2753,7 +2908,11 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             context.request_repaint();
         }
         Message::WaveformPlayheadDragStarted { ratio } => {
-            if state.busy || state.waveform_busy || state.waveform.is_none() {
+            if !library_is_ready(state)
+                || state.busy
+                || state.waveform_busy
+                || state.waveform.is_none()
+            {
                 return;
             }
             rollback_persisted_note_drag(state);
@@ -2776,7 +2935,11 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             context.request_repaint();
         }
         Message::ReferencePlayheadDragStarted { ratio } => {
-            if state.busy || state.waveform_busy || state.reference_waveform_busy {
+            if !library_is_ready(state)
+                || state.busy
+                || state.waveform_busy
+                || state.reference_waveform_busy
+            {
                 return;
             }
             if selected_reference_details(state).is_none() {
@@ -2802,7 +2965,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             context.request_repaint();
         }
         Message::CommentDragStarted { ratio, note_index } => {
-            if state.busy || state.waveform_busy {
+            if !library_is_ready(state) || state.busy || state.waveform_busy {
                 return;
             }
             if let Some(note_index) = note_index {
@@ -2813,7 +2976,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
         }
         Message::CommentDragEnded { ratio } => {
-            if state.busy || state.waveform_busy {
+            if !library_is_ready(state) || state.busy || state.waveform_busy {
                 return;
             }
             if state.persisted_note_drag.is_some() {
@@ -2823,6 +2986,9 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
         }
         Message::CommentDragCancelled => {
+            if !library_is_ready(state) {
+                return;
+            }
             if state.persisted_note_drag.is_some() {
                 rollback_persisted_note_drag(state);
             } else {
@@ -2832,7 +2998,11 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             context.request_repaint();
         }
         Message::ReferenceCommentDragStarted { ratio, note_index } => {
-            if state.busy || state.waveform_busy || state.reference_waveform_busy {
+            if !library_is_ready(state)
+                || state.busy
+                || state.waveform_busy
+                || state.reference_waveform_busy
+            {
                 return;
             }
             if let Some(note_index) = note_index {
@@ -2843,7 +3013,11 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
         }
         Message::ReferenceCommentDragEnded { ratio } => {
-            if state.busy || state.waveform_busy || state.reference_waveform_busy {
+            if !library_is_ready(state)
+                || state.busy
+                || state.waveform_busy
+                || state.reference_waveform_busy
+            {
                 return;
             }
             if state.reference_persisted_note_drag.is_some() {
@@ -2853,6 +3027,9 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
         }
         Message::ReferenceCommentDragCancelled => {
+            if !library_is_ready(state) {
+                return;
+            }
             if state.reference_persisted_note_drag.is_some() {
                 rollback_reference_persisted_note_drag(state);
             } else {
@@ -2869,13 +3046,16 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
         }
         Message::SaveDraftNote => save_draft_note(state, context),
         Message::CancelDraftNote => {
+            if !library_is_ready(state) {
+                return;
+            }
             state.draft_note = None;
             rollback_persisted_note_drag(state);
             state.status = String::from("Comment canceled.");
             context.request_repaint();
         }
         Message::SelectNote(id) => {
-            if state.busy {
+            if !library_is_ready(state) || state.busy {
                 return;
             }
             state.comment_source = CommentSource::Main;
@@ -2902,7 +3082,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             note_id,
         } => play_comment(state, context, track_id, source, note_id),
         Message::CommentHoverStarted(id) => {
-            if state.busy {
+            if !library_is_ready(state) || state.busy {
                 return;
             }
             let is_current_note = selected_track(state)
@@ -2919,7 +3099,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
         }
         Message::ReferenceCommentHoverStarted(id) => {
-            if state.busy {
+            if !library_is_ready(state) || state.busy {
                 return;
             }
             let is_current_note = selected_reference_notes(state)
@@ -2941,7 +3121,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             context.request_repaint();
         }
         Message::EditNote(id) => {
-            if state.busy {
+            if !library_is_ready(state) || state.busy {
                 return;
             }
             state.comment_source = CommentSource::Main;
@@ -2971,7 +3151,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
         }
         Message::DeleteNote(id) => {
-            if state.busy {
+            if !library_is_ready(state) || state.busy {
                 return;
             }
             rollback_persisted_note_drag(state);
@@ -3015,12 +3195,15 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
         }
         Message::SaveReferenceDraftNote => save_reference_draft_note(state, context),
         Message::CancelReferenceDraftNote => {
+            if !library_is_ready(state) {
+                return;
+            }
             state.reference_draft_note = None;
             state.status = String::from("Reference comment canceled.");
             context.request_repaint();
         }
         Message::SelectReferenceNote(id) => {
-            if state.busy {
+            if !library_is_ready(state) || state.busy {
                 return;
             }
             state.comment_source = CommentSource::Reference;
@@ -3041,7 +3224,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
         }
         Message::EditReferenceNote(id) => {
-            if state.busy {
+            if !library_is_ready(state) || state.busy {
                 return;
             }
             state.comment_source = CommentSource::Reference;
@@ -3072,7 +3255,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
         }
         Message::DeleteReferenceNote(id) => {
-            if state.busy {
+            if !library_is_ready(state) || state.busy {
                 return;
             }
             let removed = selected_reference_track_mut(state).and_then(|reference| {
@@ -3498,6 +3681,9 @@ fn seek_reference_waveform_position(
     ratio: f32,
     resume: bool,
 ) {
+    if !library_is_ready(state) {
+        return;
+    }
     if let Some(error) = paired_playback_cleanup_error(state) {
         state.status = error.to_owned();
         context.request_repaint();
@@ -3679,6 +3865,9 @@ fn finish_loop_selection(
     start_ratio: f32,
     end_ratio: f32,
 ) {
+    if !library_is_ready(state) {
+        return;
+    }
     if let Some(error) = paired_playback_cleanup_error(state) {
         state.status = error.to_owned();
         context.request_repaint();
@@ -3746,6 +3935,9 @@ fn select_audition_source(
     context: &mut ui::UiUpdateContext<Message>,
     source: AuditionSource,
 ) {
+    if !library_is_ready(state) {
+        return;
+    }
     if let Some(error) = paired_playback_cleanup_error(state) {
         state.status = error.to_owned();
         context.request_repaint();
@@ -3962,6 +4154,9 @@ fn set_audition_source(state: &mut AppState, source: AuditionSource) {
 }
 
 fn play_audition(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
+    if !library_is_ready(state) {
+        return;
+    }
     if let Some(error) = paired_playback_cleanup_error(state) {
         state.status = error.to_owned();
         context.request_repaint();
@@ -4071,6 +4266,9 @@ fn move_audition(
     context: &mut ui::UiUpdateContext<Message>,
     direction: AuditionMove,
 ) {
+    if !library_is_ready(state) {
+        return;
+    }
     if let Some(error) = paired_playback_cleanup_error(state) {
         state.status = error.to_owned();
         context.request_repaint();
@@ -4228,6 +4426,9 @@ fn stop_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Message
 }
 
 fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
+    if !library_is_ready(state) {
+        return;
+    }
     if let Some(error) = paired_playback_cleanup_error(state) {
         state.status = error.to_owned();
         context.request_repaint();
@@ -4472,7 +4673,7 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
 }
 
 fn start_note_at_current_time(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
-    if state.busy || state.waveform_busy {
+    if !library_is_ready(state) || state.busy || state.waveform_busy {
         return;
     }
     let Some(track_id) = state.library.selected_track_id.as_deref() else {
@@ -4519,6 +4720,11 @@ fn start_main_note_draft(
 }
 
 fn save_draft_note(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
+    if !library_is_ready(state) {
+        state.status = library_unavailable_status(state).to_string();
+        context.request_repaint();
+        return;
+    }
     if state.busy {
         state.status = String::from("Finish importing before saving a comment.");
         context.request_repaint();
@@ -4566,7 +4772,7 @@ fn start_reference_comment_draft(
     context: &mut ui::UiUpdateContext<Message>,
     ratio: f32,
 ) {
-    if state.busy || state.reference_waveform_busy {
+    if !library_is_ready(state) || state.busy || state.reference_waveform_busy {
         return;
     }
     let Some(waveform) = state
@@ -4599,6 +4805,11 @@ fn start_reference_comment_draft(
 }
 
 fn save_reference_draft_note(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
+    if !library_is_ready(state) {
+        state.status = library_unavailable_status(state).to_string();
+        context.request_repaint();
+        return;
+    }
     if state.busy {
         state.status = String::from("Finish importing before saving a reference comment.");
         context.request_repaint();
@@ -4668,6 +4879,9 @@ fn start_persisted_note_drag(
     context: &mut ui::UiUpdateContext<Message>,
     note_index: usize,
 ) {
+    if !library_is_ready(state) {
+        return;
+    }
     rollback_persisted_note_drag(state);
     if state.busy {
         return;
@@ -4726,6 +4940,9 @@ fn finish_persisted_note_drag(
     context: &mut ui::UiUpdateContext<Message>,
     ratio: f32,
 ) {
+    if !library_is_ready(state) {
+        return;
+    }
     let Some(drag) = state.persisted_note_drag.take() else {
         return;
     };
@@ -4817,6 +5034,9 @@ fn start_reference_persisted_note_drag(
     context: &mut ui::UiUpdateContext<Message>,
     note_index: usize,
 ) {
+    if !library_is_ready(state) {
+        return;
+    }
     rollback_reference_persisted_note_drag(state);
     if state.busy {
         return;
@@ -4875,6 +5095,9 @@ fn finish_reference_persisted_note_drag(
     context: &mut ui::UiUpdateContext<Message>,
     ratio: f32,
 ) {
+    if !library_is_ready(state) {
+        return;
+    }
     let Some(drag) = state.reference_persisted_note_drag.take() else {
         return;
     };
@@ -4936,8 +5159,13 @@ fn finish_reference_persisted_note_drag(
 }
 
 fn request_import(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
+    if !library_is_ready(state) {
+        state.status = library_unavailable_status(state).to_string();
+        context.request_repaint();
+        return;
+    }
     if state.busy {
-        state.status = String::from("The library is still loading.");
+        state.status = String::from("The library is busy with another operation.");
         context.request_repaint();
         return;
     }
@@ -4954,8 +5182,13 @@ fn request_replace(
     context: &mut ui::UiUpdateContext<Message>,
     track_id: String,
 ) {
+    if !library_is_ready(state) {
+        state.status = library_unavailable_status(state).to_string();
+        context.request_repaint();
+        return;
+    }
     if state.busy {
-        state.status = String::from("The library is still loading.");
+        state.status = String::from("The library is busy with another operation.");
         context.request_repaint();
         return;
     }
@@ -4984,8 +5217,13 @@ fn request_reference(
     context: &mut ui::UiUpdateContext<Message>,
     track_id: String,
 ) {
+    if !library_is_ready(state) {
+        state.status = library_unavailable_status(state).to_string();
+        context.request_repaint();
+        return;
+    }
     if state.busy {
-        state.status = String::from("The library is still loading.");
+        state.status = String::from("The library is busy with another operation.");
         context.request_repaint();
         return;
     }
@@ -5018,8 +5256,13 @@ fn request_reference(
 }
 
 fn request_add_reference_tracks(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
+    if !library_is_ready(state) {
+        state.status = library_unavailable_status(state).to_string();
+        context.request_repaint();
+        return;
+    }
     if state.busy {
-        state.status = String::from("The library is still loading or importing.");
+        state.status = String::from("The library is busy with another operation.");
         context.request_repaint();
         return;
     }
@@ -5072,6 +5315,9 @@ fn pick_reference_tracks() -> Vec<PathBuf> {
 }
 
 fn record_import_attempt(state: &mut AppState, failed: bool) {
+    if !library_is_ready(state) {
+        return;
+    }
     if let Some(batch) = state.import_batch.as_mut() {
         batch.completed = batch.completed.saturating_add(1).min(batch.total);
         if failed {
@@ -5081,6 +5327,9 @@ fn record_import_attempt(state: &mut AppState, failed: bool) {
 }
 
 fn finish_import_batch(state: &mut AppState) {
+    if !library_is_ready(state) {
+        return;
+    }
     let should_finish = match state.import_batch.as_ref() {
         Some(batch) => {
             batch.completed >= batch.total
@@ -5107,6 +5356,9 @@ fn finish_import_batch(state: &mut AppState) {
 }
 
 fn start_import(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>, path: PathBuf) {
+    if !library_is_ready(state) {
+        return;
+    }
     state.busy = true;
     state.status = format!("Importing {}…", path.display());
     let library = state.library.clone();
@@ -5122,12 +5374,24 @@ fn schedule_import(
     context: &mut ui::UiUpdateContext<Message>,
     path: PathBuf,
 ) {
+    if state.library_load_state == LibraryLoadState::RecoveryRequired {
+        state.status = library_unavailable_status(state).to_string();
+        context.request_repaint();
+        return;
+    }
     let batch = state.import_batch.get_or_insert_with(Default::default);
     batch.total = batch.total.saturating_add(1);
-    if state.busy || state.save_in_flight {
+    if state.library_load_state == LibraryLoadState::Loading || state.busy || state.save_in_flight {
         let display_name = path.display().to_string();
         state.pending_import_paths.push(path);
-        state.status = if state.busy {
+        state.status = if state.library_load_state == LibraryLoadState::Loading {
+            format!(
+                "Queued {} for import while the library loads · {} file{} waiting.",
+                display_name,
+                state.pending_import_paths.len(),
+                plural(state.pending_import_paths.len())
+            )
+        } else if state.busy {
             format!(
                 "Queued {} for import · {} file{} waiting.",
                 display_name,
@@ -5144,7 +5408,7 @@ fn schedule_import(
 }
 
 fn schedule_next_pending_import(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
-    if state.busy || state.save_in_flight {
+    if !library_is_ready(state) || state.busy || state.save_in_flight {
         return;
     }
     let Some(path) =
@@ -5161,6 +5425,11 @@ fn schedule_reference_import(
     track_id: String,
     paths: Vec<PathBuf>,
 ) {
+    if !library_is_ready(state) {
+        state.status = library_unavailable_status(state).to_string();
+        context.request_repaint();
+        return;
+    }
     if paths.is_empty() {
         state.status = String::from("Reference import canceled.");
         context.request_repaint();
@@ -5182,11 +5451,10 @@ fn schedule_reference_import(
     state.reference_draft_note = None;
     state.selected_reference_note_id = None;
     state.hovered_reference_note_id = None;
-    state.import_batch = Some(ImportBatchProgress {
-        total: state.pending_reference_paths.len(),
-        completed: 0,
-        failed: 0,
-    });
+    let batch = state.import_batch.get_or_insert_with(Default::default);
+    batch.total = batch
+        .total
+        .saturating_add(state.pending_reference_paths.len());
     schedule_next_pending_reference_import(state, context);
 }
 
@@ -5194,7 +5462,7 @@ fn schedule_next_pending_reference_import(
     state: &mut AppState,
     context: &mut ui::UiUpdateContext<Message>,
 ) {
-    if state.busy || state.save_in_flight {
+    if !library_is_ready(state) || state.busy || state.save_in_flight {
         return;
     }
     let Some(track_id) = state.pending_reference_track_id.clone() else {
@@ -5213,6 +5481,11 @@ fn schedule_reference_catalog_import(
     context: &mut ui::UiUpdateContext<Message>,
     paths: Vec<PathBuf>,
 ) {
+    if !library_is_ready(state) {
+        state.status = library_unavailable_status(state).to_string();
+        context.request_repaint();
+        return;
+    }
     state.pending_reference_catalog_paths = paths;
     state.reference_catalog_import_total = state.pending_reference_catalog_paths.len();
     state.reference_catalog_import_completed = 0;
@@ -5224,7 +5497,7 @@ fn schedule_next_reference_catalog_import(
     state: &mut AppState,
     context: &mut ui::UiUpdateContext<Message>,
 ) {
-    if state.busy || state.save_in_flight {
+    if !library_is_ready(state) || state.busy || state.save_in_flight {
         return;
     }
     let Some(path) = (!state.pending_reference_catalog_paths.is_empty())
@@ -5240,6 +5513,9 @@ fn start_reference_catalog_import(
     context: &mut ui::UiUpdateContext<Message>,
     path: PathBuf,
 ) {
+    if !library_is_ready(state) {
+        return;
+    }
     state.busy = true;
     state.status = format!(
         "Adding {} to the reference catalog…",
@@ -5266,7 +5542,11 @@ fn schedule_replace(
     track_id: String,
     path: PathBuf,
 ) {
-    if state.busy {
+    if !library_is_ready(state) || state.busy {
+        if !library_is_ready(state) {
+            state.status = library_unavailable_status(state).to_string();
+            context.request_repaint();
+        }
         return;
     }
     if state.save_in_flight {
@@ -5304,7 +5584,11 @@ fn schedule_reference(
     track_id: String,
     path: PathBuf,
 ) {
-    if state.busy {
+    if !library_is_ready(state) || state.busy {
+        if !library_is_ready(state) {
+            state.status = library_unavailable_status(state).to_string();
+            context.request_repaint();
+        }
         return;
     }
     if state.save_in_flight {
@@ -5343,6 +5627,9 @@ fn schedule_reference(
 }
 
 fn schedule_library_save(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
+    if !library_is_ready(state) {
+        return;
+    }
     if state.save_in_flight {
         // The next completion will schedule one save from the newest in-memory snapshot.
         // This keeps the blocking-I/O lane from receiving stale whole-library writes.
@@ -5626,6 +5913,9 @@ fn seek_review_position(
     ratio: f32,
     resume: bool,
 ) {
+    if !library_is_ready(state) {
+        return;
+    }
     if let Some(error) = paired_playback_cleanup_error(state) {
         state.status = error.to_owned();
         context.request_repaint();
@@ -5690,7 +5980,7 @@ fn play_comment(
     source: CommentSource,
     note_id: String,
 ) {
-    if state.busy {
+    if !library_is_ready(state) || state.busy {
         return;
     }
     if comment_time_for_track(state, &track_id, source, &note_id).is_none() {
@@ -5726,6 +6016,9 @@ fn maybe_start_pending_comment_playback(
     state: &mut AppState,
     context: &mut ui::UiUpdateContext<Message>,
 ) {
+    if !library_is_ready(state) {
+        return;
+    }
     if let Some(error) = paired_playback_cleanup_error(state) {
         state.status = error.to_owned();
         context.request_repaint();
@@ -5859,7 +6152,10 @@ fn select_track_internal(
     id: String,
     pending_play: bool,
 ) {
-    if state.busy || !state.library.tracks.iter().any(|track| track.id == id) {
+    if !library_is_ready(state)
+        || state.busy
+        || !state.library.tracks.iter().any(|track| track.id == id)
+    {
         return;
     }
     let in_audition = state.workspace_mode == WorkspaceMode::Audition;
@@ -5936,6 +6232,9 @@ fn set_workspace_mode(
     context: &mut ui::UiUpdateContext<Message>,
     mode: WorkspaceMode,
 ) {
+    if !library_is_ready(state) {
+        return;
+    }
     if state.workspace_mode == mode {
         return;
     }
@@ -6240,6 +6539,9 @@ fn advance_audition(state: &mut AppState, context: &mut ui::UiUpdateContext<Mess
 }
 
 fn maybe_start_pending_audition(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
+    if !library_is_ready(state) {
+        return;
+    }
     if let Some(error) = paired_playback_cleanup_error(state) {
         state.status = error.to_owned();
         context.request_repaint();
@@ -6598,63 +6900,85 @@ fn project_surface(state: &AppState) -> ui::View<Message> {
     .fill_width()
     .height(36.0)
     .spacing(12.0);
-    let status_bar =
-        if let Some(batch) = state.import_batch.as_ref().filter(|batch| batch.total > 1) {
-            let current = batch.completed.saturating_add(1).min(batch.total);
-            let remaining = batch.total.saturating_sub(batch.completed);
-            let progress = ui::column([
-                ui::row([
-                    ui::text(format!(
-                        "Importing {current} of {} · {remaining} remaining · {} failed",
-                        batch.total, batch.failed
-                    ))
+    let status_bar = if state.library_load_state == LibraryLoadState::RecoveryRequired {
+        ui::stack([
+            ui::card().fill(),
+            ui::row([
+                ui::text(state.status.clone())
                     .truncate()
-                    .height(20.0)
+                    .height(24.0)
                     .fill_width(),
-                    ui::text("SPACE  play · ESC  stop · N  note")
-                        .height(20.0)
-                        .width(280.0)
-                        .subtle(),
-                    status_bar_version_label(20.0),
-                ])
-                .fill_width()
-                .height(20.0)
-                .spacing(12.0),
-                ui::determinate_progress_bar(batch.completed as f32 / batch.total as f32)
-                    .passive::<Message>()
-                    .fill_width()
-                    .height(10.0),
+                ui::button("Retry load")
+                    .message(Message::RetryLibraryLoad)
+                    .height(24.0),
+                ui::button("Preserve old + start fresh")
+                    .message(Message::PreserveLibraryAndStartFresh)
+                    .height(24.0),
+                status_bar_version_label(24.0),
             ])
             .padding_x(8.0)
-            .padding_y(4.0)
-            .fill_width()
-            .height(38.0)
-            .spacing(2.0);
-            ui::stack([ui::card().fill(), progress])
-                .fill_width()
-                .height(46.0)
-        } else {
-            ui::stack([
-                ui::card().fill(),
-                ui::row([
-                    ui::text(state.status.clone())
-                        .truncate()
-                        .height(24.0)
-                        .fill_width(),
-                    ui::text("SPACE  play · ESC  stop · N  note")
-                        .height(24.0)
-                        .width(280.0)
-                        .subtle(),
-                    status_bar_version_label(24.0),
-                ])
-                .padding_x(8.0)
-                .fill_width()
-                .height(24.0)
-                .spacing(12.0),
-            ])
             .fill_width()
             .height(30.0)
-        };
+            .spacing(8.0),
+        ])
+        .fill_width()
+        .height(38.0)
+    } else if let Some(batch) = state.import_batch.as_ref().filter(|batch| batch.total > 1) {
+        let current = batch.completed.saturating_add(1).min(batch.total);
+        let remaining = batch.total.saturating_sub(batch.completed);
+        let progress = ui::column([
+            ui::row([
+                ui::text(format!(
+                    "Importing {current} of {} · {remaining} remaining · {} failed",
+                    batch.total, batch.failed
+                ))
+                .truncate()
+                .height(20.0)
+                .fill_width(),
+                ui::text("SPACE  play · ESC  stop · N  note")
+                    .height(20.0)
+                    .width(280.0)
+                    .subtle(),
+                status_bar_version_label(20.0),
+            ])
+            .fill_width()
+            .height(20.0)
+            .spacing(12.0),
+            ui::determinate_progress_bar(batch.completed as f32 / batch.total as f32)
+                .passive::<Message>()
+                .fill_width()
+                .height(10.0),
+        ])
+        .padding_x(8.0)
+        .padding_y(4.0)
+        .fill_width()
+        .height(38.0)
+        .spacing(2.0);
+        ui::stack([ui::card().fill(), progress])
+            .fill_width()
+            .height(46.0)
+    } else {
+        ui::stack([
+            ui::card().fill(),
+            ui::row([
+                ui::text(state.status.clone())
+                    .truncate()
+                    .height(24.0)
+                    .fill_width(),
+                ui::text("SPACE  play · ESC  stop · N  note")
+                    .height(24.0)
+                    .width(280.0)
+                    .subtle(),
+                status_bar_version_label(24.0),
+            ])
+            .padding_x(8.0)
+            .fill_width()
+            .height(24.0)
+            .spacing(12.0),
+        ])
+        .fill_width()
+        .height(30.0)
+    };
 
     let content = ui::column([
         header,
@@ -9752,9 +10076,9 @@ fn plural(count: usize) -> &'static str {
 mod tests {
     use super::{
         APP_VERSION_LABEL, AppState, AuditionSource, DEFAULT_LIVE_SPECTROGRAM_DISPLAY_SAMPLE_RATE,
-        FavoriteMarkerWidget, ImportBatchProgress, LiveSpectrogramMode, LoopBounds, LoopSelection,
-        LoopSelections, Message, NoteDraft, PairedPlaybackGuard, PlannerInsertionTarget,
-        REFERENCE_MENU_WIDTH, SETTINGS_REFERENCE_ROW_METADATA_HEIGHT,
+        FavoriteMarkerWidget, ImportBatchProgress, LibraryLoadState, LiveSpectrogramMode,
+        LoopBounds, LoopSelection, LoopSelections, Message, NoteDraft, PairedPlaybackGuard,
+        PlannerInsertionTarget, REFERENCE_MENU_WIDTH, SETTINGS_REFERENCE_ROW_METADATA_HEIGHT,
         SETTINGS_REFERENCE_ROW_TEXT_HEIGHT, SETTINGS_REFERENCE_ROW_TEXT_SPACING,
         SETTINGS_REFERENCE_ROW_TITLE_HEIGHT, STATUS_BAR_VERSION_WIDTH, StatusMenuHost,
         TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER, TRACK_CARD_SELECTED_CORAL, WAVEFORM_HEIGHT,
@@ -9770,10 +10094,11 @@ mod tests {
         reconcile_audition_queue, reference_decode_result_is_current, reference_output_gain,
         reference_settings_auxiliary_windows, reference_settings_window_view,
         refresh_live_spectrogram, refresh_live_spectrograms, review_spectrogram_source,
-        review_status_filter_message, seek_synchronized_positions, selected_reference_notes,
-        selected_track, stage_dropdown, stage_menu_anchor_from_pointer, stage_menu_popover,
-        status_dropdown_for_host, status_filter_dropdown, sync_audition_queue_after_status_change,
-        tracks_with_status, transport_command_is_confirmed, update,
+        review_status_filter_message, schedule_library_save, seek_synchronized_positions,
+        selected_reference_notes, selected_track, stage_dropdown, stage_menu_anchor_from_pointer,
+        stage_menu_popover, status_dropdown_for_host, status_filter_dropdown,
+        sync_audition_queue_after_status_change, tracks_with_status,
+        transport_command_is_confirmed, update,
     };
     use crate::transport::{LiveFrameState, Snapshot};
     use crate::{
@@ -21936,6 +22261,220 @@ mod tests {
                 && (track.rect.height() - fill.rect.height()).abs() < f32::EPSILON
                 && (fill.rect.width() - track.rect.width() / 3.0).abs() < 0.01
         }));
+    }
+
+    #[test]
+    fn loading_drop_is_retained_but_recovery_rejects_later_drop_and_save_mutations() {
+        let track = audition_track("existing");
+        let mut state = AppState::loading();
+        state.library.tracks.push(track);
+        state.library.selected_track_id = Some(String::from("existing"));
+        let mut context = ui::UiUpdateContext::default();
+        let queued = PathBuf::from("/external/queued.wav");
+        let rejected = PathBuf::from("/external/rejected.wav");
+
+        update(
+            &mut state,
+            Message::FileDropped(ui::NativeFileDrop::dropped(queued.clone(), None, None)),
+            &mut context,
+        );
+        assert_eq!(state.pending_import_paths, vec![queued]);
+        assert_eq!(
+            state.import_batch.as_ref().map(|batch| batch.total),
+            Some(1)
+        );
+
+        update(
+            &mut state,
+            Message::LibraryLoaded(Err(String::from("malformed library"))),
+            &mut context,
+        );
+        assert_eq!(state.library_load_state, LibraryLoadState::RecoveryRequired);
+        let library_before = state.library.clone();
+        let pending_before = state.pending_import_paths.clone();
+        let batch_before = state.import_batch.clone();
+        let save_in_flight_before = state.save_in_flight;
+        let save_again_before = state.save_again;
+
+        update(
+            &mut state,
+            Message::FileDropped(ui::NativeFileDrop::dropped(rejected, None, None)),
+            &mut context,
+        );
+        update(
+            &mut state,
+            Message::ToggleFavorite(String::from("existing")),
+            &mut context,
+        );
+        schedule_library_save(&mut state, &mut context);
+
+        assert_eq!(state.library, library_before);
+        assert_eq!(state.pending_import_paths, pending_before);
+        assert_eq!(state.import_batch, batch_before);
+        assert_eq!(state.save_in_flight, save_in_flight_before);
+        assert_eq!(state.save_again, save_again_before);
+    }
+
+    #[test]
+    fn successful_retry_dispatches_each_loading_queued_import_once() {
+        let mut state = AppState::loading();
+        let mut context = ui::UiUpdateContext::default();
+        let queued = PathBuf::from("/external/retry.wav");
+        update(
+            &mut state,
+            Message::FileDropped(ui::NativeFileDrop::dropped(queued, None, None)),
+            &mut context,
+        );
+        update(
+            &mut state,
+            Message::LibraryLoaded(Err(String::from("malformed library"))),
+            &mut context,
+        );
+
+        update(&mut state, Message::RetryLibraryLoad, &mut context);
+        assert_eq!(state.library_load_state, LibraryLoadState::Loading);
+        assert_eq!(state.pending_import_paths.len(), 1);
+
+        update(
+            &mut state,
+            Message::LibraryLoaded(Ok(Library::default())),
+            &mut context,
+        );
+        assert_eq!(state.library_load_state, LibraryLoadState::Ready);
+        assert!(state.pending_import_paths.is_empty());
+        assert!(state.busy, "the retained import should be dispatched");
+
+        update(
+            &mut state,
+            Message::ImportCompleted(Err(String::from("queued import failed"))),
+            &mut context,
+        );
+        assert!(state.import_batch.is_none());
+        assert!(!state.busy);
+        assert!(state.pending_import_paths.is_empty());
+    }
+
+    #[test]
+    fn recovery_status_area_exposes_retry_and_fresh_start_actions() {
+        let state = AppState {
+            library_load_state: LibraryLoadState::RecoveryRequired,
+            status: String::from("Recovery required."),
+            ..AppState::default()
+        };
+        let frame = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 720.0));
+        let labels = frame.paint_plan.text_label_strings();
+
+        assert!(labels.iter().any(|label| label == "Retry load"));
+        assert!(
+            labels
+                .iter()
+                .any(|label| label == "Preserve old + start fresh")
+        );
+    }
+
+    #[test]
+    fn reference_picker_batch_extends_queued_main_import_and_finishes_after_both_queues() {
+        let track_id = String::from("reference-owner");
+        let mut state = AppState {
+            busy: true,
+            ..AppState::default()
+        };
+        state.library.tracks.push(audition_track(&track_id));
+        state.library.selected_track_id = Some(track_id.clone());
+        let mut context = ui::UiUpdateContext::default();
+        let main_path = PathBuf::from("/external/main.wav");
+        let first_reference = PathBuf::from("/external/reference-a.wav");
+        let second_reference = PathBuf::from("/external/reference-b.wav");
+
+        update(
+            &mut state,
+            Message::FileDropped(ui::NativeFileDrop::dropped(main_path.clone(), None, None)),
+            &mut context,
+        );
+        update(
+            &mut state,
+            Message::ReferenceFilesPicked {
+                track_id: track_id.clone(),
+                paths: vec![first_reference.clone(), second_reference.clone()],
+            },
+            &mut context,
+        );
+        assert_eq!(
+            state.import_batch,
+            Some(ImportBatchProgress {
+                total: 3,
+                completed: 0,
+                failed: 0,
+            })
+        );
+        assert_eq!(state.pending_import_paths, vec![main_path.clone()]);
+        assert_eq!(
+            state.pending_reference_paths,
+            vec![second_reference.clone()]
+        );
+        assert!(state.busy, "the first reference import should be active");
+
+        let reference_library = state.library.clone();
+        update(
+            &mut state,
+            Message::ReferenceImportCompleted {
+                track_id: track_id.clone(),
+                path: first_reference,
+                result: Ok(reference_library),
+            },
+            &mut context,
+        );
+        assert_eq!(
+            state.import_batch,
+            Some(ImportBatchProgress {
+                total: 3,
+                completed: 1,
+                failed: 0,
+            })
+        );
+        assert!(state.busy, "the second reference import should be active");
+
+        update(
+            &mut state,
+            Message::ReferenceImportCompleted {
+                track_id: track_id.clone(),
+                path: second_reference,
+                result: Err(String::from("reference failed")),
+            },
+            &mut context,
+        );
+        assert_eq!(
+            state.import_batch,
+            Some(ImportBatchProgress {
+                total: 3,
+                completed: 2,
+                failed: 1,
+            })
+        );
+        assert_eq!(state.pending_import_paths, vec![main_path]);
+        assert!(
+            state.save_in_flight,
+            "final reference selection should save"
+        );
+
+        update(&mut state, Message::LibrarySaved(Ok(())), &mut context);
+        assert!(
+            state.busy,
+            "the retained main import should advance after save"
+        );
+        assert!(state.pending_import_paths.is_empty());
+
+        update(
+            &mut state,
+            Message::ImportCompleted(Err(String::from("main failed"))),
+            &mut context,
+        );
+        assert!(state.import_batch.is_none());
+        assert!(!state.busy);
+        assert!(state.pending_import_paths.is_empty());
+        assert!(state.pending_reference_paths.is_empty());
+        assert_eq!(state.status, "Imported 1 of 3 files; 2 failed.");
     }
 
     #[test]
