@@ -283,10 +283,15 @@ pub fn import_into_library(mut library: Library, path: PathBuf) -> Result<Librar
 /// Replace the source file for one existing track while preserving its stable
 /// identity, favorite state, and workflow stage. A replacement is a new audio
 /// version, so timestamped comments are intentionally cleared.
-pub fn replace_track(
+pub fn replace_track(library: Library, track_id: &str, path: PathBuf) -> Result<Library, String> {
+    replace_track_at(library, track_id, path, &library_path())
+}
+
+fn replace_track_at(
     mut library: Library,
     track_id: &str,
     path: PathBuf,
+    library_path: &Path,
 ) -> Result<Library, String> {
     validate_audio_path(&path)?;
     let metadata = fs::metadata(&path)
@@ -295,8 +300,10 @@ pub fn replace_track(
         return Err(format!("{} is not a file", path.display()));
     }
 
+    crate::audio::decode_waveform(&path)
+        .map_err(|error| format!("Could not decode replacement {}: {error}", path.display()))?;
     replace_track_metadata(&mut library, track_id, path, metadata.len())?;
-    persist_library(&library)?;
+    persist_library_at(&library, library_path)?;
     Ok(library)
 }
 
@@ -1536,6 +1543,34 @@ mod tests {
         assert!(track.favorite);
         assert_eq!(track.stage, TrackStage::Mixdown);
         assert_eq!(track.status, TrackStatus::Maybe);
+    }
+
+    #[test]
+    fn corrupt_replacement_leaves_library_and_persisted_snapshot_unchanged() {
+        let directory = TestDirectory::new();
+        let library_path = directory.path.join("library.json");
+        let replacement_path = directory.path.join("corrupt-replacement.wav");
+        let library = persistence_fixture();
+        persist_library_at(&library, &library_path).expect("original library should persist");
+        let original_bytes =
+            fs::read(&library_path).expect("original persisted library should be readable");
+        fs::write(&replacement_path, b"this is not a wave file")
+            .expect("corrupt replacement should be writable");
+
+        let before = library.clone();
+        let error = replace_track_at(library.clone(), "track-1", replacement_path, &library_path)
+            .expect_err("corrupt replacement should fail decoding");
+
+        assert!(error.contains("Could not decode replacement"));
+        assert_eq!(library, before);
+        assert_eq!(
+            fs::read(&library_path).expect("persisted library should remain readable"),
+            original_bytes
+        );
+        assert_eq!(
+            load_library_at(&library_path).expect("original library should still reload"),
+            before
+        );
     }
 
     #[test]
