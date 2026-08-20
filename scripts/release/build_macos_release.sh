@@ -7,7 +7,7 @@ output_dir="$project_dir/release-output"
 version="${CADENCE_RELEASE_VERSION:-}"
 channel="${CADENCE_RELEASE_CHANNEL:-stable}"
 build_id="${CADENCE_RELEASE_BUILD_ID:-}"
-source_git_sha="${GITHUB_SHA:-}"
+source_git_sha=""
 
 usage() {
     cat <<'EOF'
@@ -133,6 +133,36 @@ team_id_from_codesign_identity() {
     return 1
 }
 
+resolve_verified_source_sha() {
+    local head_sha
+    local provided_sha
+
+    if ! head_sha="$(git -C "$project_dir" rev-parse --verify HEAD^{commit})"; then
+        echo "could not resolve the checked-out repository HEAD." >&2
+        return 1
+    fi
+    head_sha="$(printf '%s' "$head_sha" | tr '[:upper:]' '[:lower:]')"
+    if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
+        echo "checked-out repository HEAD is not a 40-character commit SHA." >&2
+        return 1
+    fi
+
+    provided_sha="${GITHUB_SHA:-}"
+    if [[ -n "$provided_sha" ]]; then
+        provided_sha="$(printf '%s' "$provided_sha" | tr '[:upper:]' '[:lower:]')"
+        if [[ ! "$provided_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "GITHUB_SHA must be a 40-character commit SHA." >&2
+            return 1
+        fi
+        if [[ "$provided_sha" != "$head_sha" ]]; then
+            echo "GITHUB_SHA does not match the checked-out repository HEAD." >&2
+            return 1
+        fi
+    fi
+
+    printf '%s\n' "$head_sha"
+}
+
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
     return 0
 fi
@@ -171,6 +201,10 @@ while (($# > 0)); do
     esac
 done
 
+if ! source_git_sha="$(resolve_verified_source_sha)"; then
+    exit 1
+fi
+
 if ! output_dir="$(validate_release_output_dir "$output_dir" "$caller_cwd")"; then
     exit 2
 fi
@@ -205,14 +239,6 @@ if [[ ! "$version" =~ $version_re ]]; then
     echo "$channel releases require the matching channel version format: $version" >&2
     exit 2
 fi
-if [[ -z "$source_git_sha" ]]; then
-    source_git_sha="$(git -C "$project_dir" rev-parse HEAD)"
-fi
-source_git_sha="$(printf '%s' "$source_git_sha" | tr '[:upper:]' '[:lower:]')"
-if [[ ! "$source_git_sha" =~ ^[0-9a-f]{40}$ ]]; then
-    echo "GITHUB_SHA or HEAD must be a 40-character commit SHA." >&2
-    exit 1
-fi
 if [[ -n "$(git -C "$project_dir" status --porcelain --untracked-files=all)" ]]; then
     echo "production release builds require a clean checkout" >&2
     exit 1
@@ -230,25 +256,59 @@ if [[ ! "$build_id" =~ ^[a-z0-9][a-z0-9._-]{1,127}$ ]]; then
     exit 2
 fi
 
-require_env() {
-    local name="$1"
-    if [[ -z "${!name:-}" ]]; then
-        echo "missing required production signing secret: $name" >&2
+apple_developer_id_application_cert_base64="${APPLE_DEVELOPER_ID_APPLICATION_CERT_BASE64:-}"
+apple_developer_id_application_cert_password="${APPLE_DEVELOPER_ID_APPLICATION_CERT_PASSWORD:-}"
+apple_notary_key_base64="${APPLE_NOTARY_KEY_BASE64:-}"
+apple_notary_key_id="${APPLE_NOTARY_KEY_ID:-}"
+apple_notary_issuer_id="${APPLE_NOTARY_ISSUER_ID:-}"
+codesign_identity_override="${APPLE_CODESIGN_IDENTITY:-}"
+
+require_release_secret() {
+    local value_name="$1"
+    local environment_name="$2"
+    [[ -n "${!value_name}" ]] || {
+        echo "missing required production signing secret: $environment_name" >&2
         exit 1
-    fi
+    }
 }
 
-require_env APPLE_DEVELOPER_ID_APPLICATION_CERT_BASE64
-require_env APPLE_DEVELOPER_ID_APPLICATION_CERT_PASSWORD
-require_env APPLE_NOTARY_KEY_BASE64
-require_env APPLE_NOTARY_KEY_ID
-require_env APPLE_NOTARY_ISSUER_ID
+require_release_secret apple_developer_id_application_cert_base64 APPLE_DEVELOPER_ID_APPLICATION_CERT_BASE64
+require_release_secret apple_developer_id_application_cert_password APPLE_DEVELOPER_ID_APPLICATION_CERT_PASSWORD
+require_release_secret apple_notary_key_base64 APPLE_NOTARY_KEY_BASE64
+require_release_secret apple_notary_key_id APPLE_NOTARY_KEY_ID
+require_release_secret apple_notary_issuer_id APPLE_NOTARY_ISSUER_ID
+
+unset \
+    APPLE_DEVELOPER_ID_APPLICATION_CERT_BASE64 \
+    APPLE_DEVELOPER_ID_APPLICATION_CERT_PASSWORD \
+    APPLE_NOTARY_KEY_BASE64 \
+    APPLE_NOTARY_KEY_ID \
+    APPLE_NOTARY_ISSUER_ID \
+    APPLE_CODESIGN_IDENTITY
+
+bundle_short_version="${version%%-*}"
+bundle_build_number="$bundle_short_version"
+if [[ "$channel" != stable ]]; then
+    bundle_build_number="${version##*.}"
+fi
+
+target_triple=aarch64-apple-darwin
+executable_path="$project_dir/target/$target_triple/release/cadence-native"
+env \
+    -u APPLE_DEVELOPER_ID_APPLICATION_CERT_BASE64 \
+    -u APPLE_DEVELOPER_ID_APPLICATION_CERT_PASSWORD \
+    -u APPLE_NOTARY_KEY_BASE64 \
+    -u APPLE_NOTARY_KEY_ID \
+    -u APPLE_NOTARY_ISSUER_ID \
+    -u APPLE_CODESIGN_IDENTITY \
+    cargo build --target "$target_triple" --release --locked --manifest-path "$project_dir/Cargo.toml"
+"$project_dir/scripts/release/verify_macos_architecture.sh" "$executable_path"
 
 work_dir="$(mktemp -d -t cadence-release.XXXXXX)"
 keychain_path="$work_dir/cadence-release-signing.keychain-db"
 keychain_password="$(/usr/bin/uuidgen | tr -d '-')"
 certificate_path="$work_dir/developer-id-application.p12"
-notary_key_path="$work_dir/AuthKey_${APPLE_NOTARY_KEY_ID}.p8"
+notary_key_path="$work_dir/AuthKey_${apple_notary_key_id}.p8"
 notary_zip_path="$work_dir/cadence-notary.zip"
 app_path="$work_dir/Cadence.app"
 original_keychains_path="$work_dir/original-keychains.txt"
@@ -278,10 +338,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-decode_base64 "$APPLE_DEVELOPER_ID_APPLICATION_CERT_BASE64" "$certificate_path"
-decode_base64 "$APPLE_NOTARY_KEY_BASE64" "$notary_key_path"
+decode_base64 "$apple_developer_id_application_cert_base64" "$certificate_path"
+decode_base64 "$apple_notary_key_base64" "$notary_key_path"
 chmod 600 "$certificate_path" "$notary_key_path"
-openssl pkcs12 -in "$certificate_path" -passin "pass:${APPLE_DEVELOPER_ID_APPLICATION_CERT_PASSWORD}" -info -noout >/dev/null 2>&1 || {
+openssl pkcs12 -in "$certificate_path" -passin "pass:${apple_developer_id_application_cert_password}" -info -noout >/dev/null 2>&1 || {
     echo "Apple certificate material is not a readable .p12 for the supplied password." >&2
     exit 1
 }
@@ -295,10 +355,10 @@ while IFS= read -r keychain; do
     [[ -n "$keychain" ]] && original_keychains+=("$keychain")
 done < "$original_keychains_path"
 security list-keychains -d user -s "$keychain_path" "${original_keychains[@]}"
-security import "$certificate_path" -P "$APPLE_DEVELOPER_ID_APPLICATION_CERT_PASSWORD" -A -t cert -f pkcs12 -k "$keychain_path"
+security import "$certificate_path" -P "$apple_developer_id_application_cert_password" -A -t cert -f pkcs12 -k "$keychain_path"
 security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain_path" >/dev/null
 
-codesign_identity="${APPLE_CODESIGN_IDENTITY:-}"
+codesign_identity="$codesign_identity_override"
 if [[ -z "$codesign_identity" ]]; then
     codesign_identity="$(security find-identity -v -p codesigning "$keychain_path" | sed -n 's/.*"\(Developer ID Application:.*\)".*/\1/p' | head -n 1)"
 fi
@@ -308,16 +368,6 @@ if [[ -z "$codesign_identity" || "$codesign_identity" != Developer\ ID\ Applicat
 fi
 team_id="$(team_id_from_codesign_identity "$codesign_identity")" || exit 1
 
-bundle_short_version="${version%%-*}"
-bundle_build_number="$bundle_short_version"
-if [[ "$channel" != stable ]]; then
-    bundle_build_number="${version##*.}"
-fi
-
-target_triple=aarch64-apple-darwin
-executable_path="$project_dir/target/$target_triple/release/cadence-native"
-cargo build --target "$target_triple" --release --locked --manifest-path "$project_dir/Cargo.toml"
-"$project_dir/scripts/release/verify_macos_architecture.sh" "$executable_path"
 rm -rf "$app_path"
 "$project_dir/scripts/build_native_app_bundle.sh" \
     --executable "$executable_path" \
@@ -332,8 +382,8 @@ codesign --verify --deep --strict --verbose=2 "$app_path"
 ditto -c -k --sequesterRsrc --keepParent "$app_path" "$notary_zip_path"
 xcrun notarytool submit "$notary_zip_path" \
     --key "$notary_key_path" \
-    --key-id "$APPLE_NOTARY_KEY_ID" \
-    --issuer "$APPLE_NOTARY_ISSUER_ID" \
+    --key-id "$apple_notary_key_id" \
+    --issuer "$apple_notary_issuer_id" \
     --wait \
     --output-format json > "$notary_response_path"
 

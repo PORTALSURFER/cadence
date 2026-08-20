@@ -11,6 +11,7 @@ import test from "node:test";
 
 const execFileAsync = promisify(execFile);
 const releaseDirectory = path.dirname(fileURLToPath(import.meta.url));
+const projectDirectory = path.resolve(releaseDirectory, "../..");
 const allocatorScript = path.join(releaseDirectory, "allocate_nightly_version.sh");
 const buildScript = path.join(releaseDirectory, "build_macos_release.sh");
 const manifestScript = path.join(releaseDirectory, "create_manifest.mjs");
@@ -187,9 +188,76 @@ test("release output cleanup keeps temporary cleanup but never removes caller ou
   assert.doesNotMatch(script, /rm -rf "\$output_dir"/);
   assert.match(script, /rm -rf "\$work_dir"/);
   assert.ok(
-    script.indexOf('validate_release_output_dir "$output_dir" "$caller_cwd"')
-      < script.indexOf("require_env APPLE_DEVELOPER_ID_APPLICATION_CERT_BASE64"),
+    script.indexOf("resolve_verified_source_sha")
+      < script.indexOf('validate_release_output_dir "$output_dir" "$caller_cwd"'),
   );
+});
+
+test("release build rejects malformed and mismatched provenance before output or signing work", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cadence-provenance-test-"));
+  try {
+    const outputDirectory = path.join(root, "release-output");
+    const runBuild = (githubSha) => execFileAsync(
+      buildScript,
+      ["--version", "0.1.0", "--output-dir", outputDirectory],
+      {
+        cwd: projectDirectory,
+        env: { ...process.env, GITHUB_SHA: githubSha },
+      },
+    );
+
+    await assert.rejects(
+      runBuild("not-a-commit-sha"),
+      (error) => error.code === 1
+        && error.stderr.includes("GITHUB_SHA must be a 40-character commit SHA")
+        && !error.stderr.includes("missing required production signing secret")
+        && !error.stderr.includes("Cadence production releases must be built on macOS"),
+    );
+    await assert.rejects(fs.lstat(outputDirectory), { code: "ENOENT" });
+
+    const { stdout: headOutput } = await execFileAsync(
+      "git",
+      ["rev-parse", "HEAD"],
+      { cwd: projectDirectory },
+    );
+    const headSha = headOutput.trim();
+    const mismatchedSha = headSha === "a".repeat(40) ? "b".repeat(40) : "a".repeat(40);
+    await assert.rejects(
+      runBuild(mismatchedSha),
+      (error) => error.code === 1
+        && error.stderr.includes("GITHUB_SHA does not match the checked-out repository HEAD")
+        && !error.stderr.includes("missing required production signing secret"),
+    );
+    await assert.rejects(fs.lstat(outputDirectory), { code: "ENOENT" });
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("release build uses verified HEAD and isolates Apple credentials from Cargo and bundle helpers", async () => {
+  const script = await fs.readFile(buildScript, "utf8");
+  const provenanceIndex = script.indexOf("if ! source_git_sha=\"$(resolve_verified_source_sha)\"; then");
+  const outputValidationIndex = script.indexOf('if ! output_dir="$(validate_release_output_dir "$output_dir" "$caller_cwd")"; then');
+  const cargoIndex = script.indexOf("cargo build --target");
+  const decodeIndex = script.indexOf('decode_base64 "$apple_developer_id_application_cert_base64"');
+  const keychainImportIndex = script.indexOf('security import "$certificate_path"');
+  const outputPreparationIndex = script.indexOf('if ! output_dir="$(prepare_release_output_dir "$output_dir" "$caller_cwd")"; then');
+  assert.ok(provenanceIndex >= 0, "the build must resolve a verified source SHA");
+  assert.ok(outputValidationIndex > provenanceIndex, "provenance must precede output validation");
+  assert.ok(cargoIndex > provenanceIndex, "Cargo must use verified provenance");
+  assert.ok(decodeIndex > cargoIndex, "Cargo must precede certificate decoding");
+  assert.ok(keychainImportIndex > cargoIndex, "Cargo must precede keychain import");
+  assert.ok(outputPreparationIndex > cargoIndex, "Cargo must precede release output creation");
+  assert.match(script, /head_sha=.*rev-parse --verify HEAD\^\{commit\}/);
+  assert.match(script, /provided_sha=.*GITHUB_SHA/);
+  assert.match(script, /tr '\[:upper:\]' '\[:lower:\]'/);
+  assert.match(script, /GITHUB_SHA does not match the checked-out repository HEAD/);
+  assert.match(script, /--git-sha "\$source_git_sha"/);
+  assert.match(script, /apple_developer_id_application_cert_base64="\$\{APPLE_DEVELOPER_ID_APPLICATION_CERT_BASE64:-\}"/);
+  assert.match(script, /apple_developer_id_application_cert_password="\$\{APPLE_DEVELOPER_ID_APPLICATION_CERT_PASSWORD:-\}"/);
+  assert.match(script, /unset \\\n(?:.*\\\n){5}/);
+  assert.match(script, /env \\\n(?:    -u APPLE_[^\n]+ \\\n){6}    cargo build --target/);
+  assert.match(script, /--executable "\$executable_path"/);
 });
 
 test("manifest preserves the stable default and emits supported channels", async (t) => {
@@ -365,6 +433,15 @@ test("release workflow reserves nightly versions before immutable builds", async
   assert.match(buildJob, /export GITHUB_SHA=/);
   assert.match(buildJob, /actions\/upload-artifact@v4/);
   assert.match(buildJob, /path: release-output\//);
+  const jobEnvStart = buildJob.indexOf("    env:\n");
+  const stepsStart = buildJob.indexOf("    steps:\n");
+  assert.ok(jobEnvStart >= 0 && stepsStart > jobEnvStart, "build job must have a distinct job-level env block");
+  const jobEnv = buildJob.slice(jobEnvStart, stepsStart);
+  const signingStepStart = buildJob.indexOf("      - name: Build, sign, notarize, and describe release");
+  const signingStepEnd = buildJob.indexOf("\n      - name: Upload immutable release artifact", signingStepStart);
+  assert.ok(signingStepStart >= 0 && signingStepEnd > signingStepStart, "build job must have a signing step");
+  const signingStep = buildJob.slice(signingStepStart, signingStepEnd);
+  assert.doesNotMatch(buildJob, /- name: Verify Apple production secrets/);
   for (const secret of [
     "CADENCE_PRODUCTION_APPLE_DEVELOPER_ID_APPLICATION_CERT_BASE64",
     "CADENCE_PRODUCTION_APPLE_DEVELOPER_ID_APPLICATION_CERT_PASSWORD",
@@ -372,7 +449,10 @@ test("release workflow reserves nightly versions before immutable builds", async
     "CADENCE_PRODUCTION_APPLE_NOTARY_KEY_ID",
     "CADENCE_PRODUCTION_APPLE_NOTARY_ISSUER_ID",
   ]) {
-    assert.match(buildJob, new RegExp(`\\$\\{\\{ secrets\\.${secret} \\}\\}`));
+    const secretReference = new RegExp(`\\$\\{\\{ secrets\\.${secret} \\}\\}`);
+    assert.doesNotMatch(jobEnv, secretReference, `${secret} must not be job-scoped`);
+    assert.match(signingStep, secretReference, `${secret} must be scoped to signing`);
+    assert.equal(buildJob.match(new RegExp(secretReference.source, "g"))?.length, 1);
   }
   assert.doesNotMatch(buildJob, /CADENCE_RELEASE_UPLOAD_TOKEN|PORTALSURFER_RELEASE_ENDPOINT|publish_release\.mjs|gh release/);
 
