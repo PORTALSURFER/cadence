@@ -45,6 +45,34 @@ pub struct WaveformData {
     pub summary: Arc<GpuSignalSummary>,
 }
 
+/// A fully decoded audio source together with the source identity observed
+/// before and after decoding. Storage commits consume this proof rather than
+/// trusting a path that may have been replaced while analysis was running.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DecodedAudioFile {
+    path: PathBuf,
+    fingerprint: WaveformCacheFingerprint,
+    waveform: WaveformData,
+}
+
+impl DecodedAudioFile {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn fingerprint(&self) -> WaveformCacheFingerprint {
+        self.fingerprint
+    }
+
+    pub fn waveform(&self) -> &WaveformData {
+        &self.waveform
+    }
+
+    pub fn is_unchanged(&self) -> bool {
+        waveform_cache_fingerprint(&self.path) == Some(self.fingerprint)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct WaveformProgress {
     pub waveform: WaveformData,
@@ -123,6 +151,30 @@ pub fn waveform_cache_fingerprint(path: &Path) -> Option<WaveformCacheFingerprin
         modified_seconds: modified.as_secs(),
         modified_nanos: modified.subsec_nanos(),
     })
+}
+
+/// Decode one complete audio file and retain the source fingerprint needed for
+/// a later proof-checked library commit.
+pub fn decode_audio_file(path: &Path) -> Result<DecodedAudioFile, String> {
+    let fingerprint = waveform_cache_fingerprint(path).ok_or_else(|| {
+        format!(
+            "Could not inspect {} before waveform analysis",
+            path.display()
+        )
+    })?;
+    let waveform = decode_waveform(path)?;
+    let decoded = DecodedAudioFile {
+        path: path.to_path_buf(),
+        fingerprint,
+        waveform,
+    };
+    if !decoded.is_unchanged() {
+        return Err(format!(
+            "Audio source changed while decoding {}; import was not committed",
+            path.display()
+        ));
+    }
+    Ok(decoded)
 }
 
 pub fn write_waveform_cache_if_unchanged(
@@ -1221,7 +1273,7 @@ fn summary_from_peaks(peaks: &[PeakMeasurement]) -> GpuSignalSummary {
 mod tests {
     use super::{
         LoudnessAccumulator, LoudnessPoint, MAX_LOUDNESS_MATCH_DB, MAX_LOUDNESS_PROFILE_POINTS,
-        PeakMeasurement, PeakReducer, PeakWindow, WaveformData,
+        PeakMeasurement, PeakReducer, PeakWindow, WaveformData, decode_audio_file,
         decode_waveform_with_progress_and_cancellation, linear_gain_for_db, load_waveform_cache,
         loudness_at_position, loudness_channel_map, loudness_match_gain_db, preview_progress,
         preview_waveform, progressive_preview, summary_from_peaks, waveform_cache_fingerprint,
@@ -1534,6 +1586,29 @@ mod tests {
         );
 
         assert_eq!(result, Err(String::from("cancelled")));
+    }
+
+    #[test]
+    fn decode_audio_file_rejects_corrupt_audio_before_import_commit() {
+        let root = std::env::temp_dir().join(format!(
+            "cadence-decode-audio-file-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock should be after the epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create decode test directory");
+        let path = root.join("corrupt.wav");
+        fs::write(&path, b"not a wave file").expect("write corrupt audio fixture");
+
+        let error = decode_audio_file(&path).expect_err("corrupt audio must fail preflight");
+
+        assert!(
+            error.contains("Could not identify") || error.contains("Could not read"),
+            "unexpected corrupt-audio error: {error}"
+        );
+        fs::remove_dir_all(root).expect("remove decode test directory");
     }
 
     #[test]

@@ -61,6 +61,7 @@ enum Message {
     RetryLibraryLoad,
     PreserveLibraryAndStartFresh,
     LibraryRecoveryCompleted(Result<PathBuf, String>),
+    RetryLibrarySave,
     ImportCompleted(Result<storage::Library, String>),
     ReplaceCompleted {
         track_id: String,
@@ -71,7 +72,14 @@ enum Message {
         path: PathBuf,
         result: Result<storage::Library, String>,
     },
-    LibrarySaved(Result<(), String>),
+    AudioImportPreflightCompleted {
+        request: AudioImportRequest,
+        result: Result<audio::DecodedAudioFile, String>,
+    },
+    LibrarySaved {
+        revision: u64,
+        result: Result<(), String>,
+    },
     DecodeCompleted {
         track_id: String,
         generation: u64,
@@ -795,6 +803,19 @@ struct WaveformDecodeRequest {
     generation: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AudioImportTarget {
+    Main,
+    AssignedReference { track_id: String },
+    Catalog,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AudioImportRequest {
+    target: AudioImportTarget,
+    path: PathBuf,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LibraryLoadState {
     Loading,
@@ -824,8 +845,9 @@ struct AppState {
     workspace_mode: WorkspaceMode,
     status: String,
     busy: bool,
-    save_in_flight: bool,
-    save_again: bool,
+    library_revision: u64,
+    persisted_library_revision: u64,
+    save_in_flight_revision: Option<u64>,
     waveform: Option<audio::WaveformData>,
     waveform_track_id: Option<String>,
     waveform_busy: bool,
@@ -945,8 +967,9 @@ impl Default for AppState {
             workspace_mode: WorkspaceMode::Review,
             status: String::from("Ready — import a track to begin."),
             busy: false,
-            save_in_flight: false,
-            save_again: false,
+            library_revision: 0,
+            persisted_library_revision: 0,
+            save_in_flight_revision: None,
             waveform: None,
             waveform_track_id: None,
             waveform_busy: false,
@@ -1369,21 +1392,24 @@ fn library_unavailable_status(state: &AppState) -> &'static str {
 fn activate_loaded_library(
     state: &mut AppState,
     context: &mut ui::UiUpdateContext<Message>,
-    mut library: storage::Library,
+    library: storage::Library,
 ) {
-    storage::normalize_planner_order(&mut library);
+    state.library = library;
+    state.library_revision = 0;
+    state.persisted_library_revision = 0;
+    state.save_in_flight_revision = None;
+    storage::normalize_planner_order(&mut state.library);
     let (startup_track_id, startup_selection_changed) =
-        normalize_startup_track_selection(&mut library);
-    state.status = if library.tracks.is_empty() {
+        normalize_startup_track_selection(&mut state.library);
+    state.status = if state.library.tracks.is_empty() {
         String::from("Ready — import a track to begin.")
     } else {
         format!(
             "{} local track{} loaded.",
-            library.tracks.len(),
-            plural(library.tracks.len())
+            state.library.tracks.len(),
+            plural(state.library.tracks.len())
         )
     };
-    state.library = library;
     state.library_load_state = LibraryLoadState::Ready;
     if state.workspace_mode == WorkspaceMode::Audition {
         rebuild_audition_queue(state);
@@ -1886,6 +1912,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             match result {
                 Ok(library) => {
                     state.library = library;
+                    mark_library_snapshot_persisted(state);
                     state.status = format!(
                         "Added {} to the reference catalog.",
                         reference_track_name(&path)
@@ -1912,6 +1939,9 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 schedule_next_reference_catalog_import(state, context);
             }
             context.request_repaint();
+        }
+        Message::AudioImportPreflightCompleted { request, result } => {
+            complete_audio_import_preflight(state, context, request, result);
         }
         Message::FileDropped(drop) => {
             if drop.phase == ui::NativeFileDropPhase::Drop
@@ -1969,6 +1999,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                         plural(library.tracks.len())
                     );
                     state.library = library;
+                    mark_library_snapshot_persisted(state);
                     if state.workspace_mode == WorkspaceMode::Audition {
                         reconcile_audition_queue(state);
                     }
@@ -2019,6 +2050,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                         .map(|track| track.title.clone())
                         .unwrap_or_else(|| String::from("track"));
                     state.library = library;
+                    mark_library_snapshot_persisted(state);
                     state.library.selected_track_id = Some(track_id);
                     if state.workspace_mode == WorkspaceMode::Audition {
                         reconcile_audition_queue(state);
@@ -2065,6 +2097,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             match result {
                 Ok(library) => {
                     state.library = library;
+                    mark_library_snapshot_persisted(state);
                     if state.reference_import_selected_path.is_none() {
                         state.reference_import_selected_path = Some(path);
                     }
@@ -2411,18 +2444,25 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             update_live_spectrogram_resize(state, message);
             context.request_repaint();
         }
-        Message::LibrarySaved(result) => {
-            state.save_in_flight = false;
-            let save_again = state.save_again;
-            state.save_again = false;
-            state.status = match result {
-                Ok(()) => String::from("All changes saved locally."),
-                Err(error) => error,
-            };
-            if save_again {
-                schedule_library_save(state, context);
-            } else {
-                schedule_next_pending_library_operation(state, context);
+        Message::RetryLibrarySave => retry_library_save(state, context),
+        Message::LibrarySaved { revision, result } => {
+            if state.save_in_flight_revision != Some(revision) {
+                return;
+            }
+            state.save_in_flight_revision = None;
+            match result {
+                Ok(()) => {
+                    state.persisted_library_revision = revision;
+                    state.status = String::from("All changes saved locally.");
+                    if library_dirty(state) {
+                        dispatch_library_save(state, context);
+                    } else {
+                        schedule_next_pending_library_operation(state, context);
+                    }
+                }
+                Err(error) => {
+                    state.status = error;
+                }
             }
             context.request_repaint();
         }
@@ -5271,7 +5311,7 @@ fn request_import(state: &mut AppState, context: &mut ui::UiUpdateContext<Messag
         context.request_repaint();
         return;
     }
-    if state.save_in_flight {
+    if library_persistence_pending(state) {
         state.status = String::from("Saving the library — try importing again in a moment.");
         context.request_repaint();
         return;
@@ -5294,7 +5334,7 @@ fn request_replace(
         context.request_repaint();
         return;
     }
-    if state.save_in_flight {
+    if library_persistence_pending(state) {
         state.status = String::from("Saving the library — try replacing again in a moment.");
         context.request_repaint();
         return;
@@ -5329,7 +5369,7 @@ fn request_reference(
         context.request_repaint();
         return;
     }
-    if state.save_in_flight {
+    if library_persistence_pending(state) {
         state.status =
             String::from("Saving the library — try importing a reference again in a moment.");
         context.request_repaint();
@@ -5368,7 +5408,7 @@ fn request_add_reference_tracks(state: &mut AppState, context: &mut ui::UiUpdate
         context.request_repaint();
         return;
     }
-    if state.save_in_flight {
+    if library_persistence_pending(state) {
         state.status =
             String::from("Saving the library — try adding references again in a moment.");
         context.request_repaint();
@@ -5457,16 +5497,143 @@ fn finish_import_batch(state: &mut AppState) {
     }
 }
 
+fn start_audio_import_preflight(
+    context: &mut ui::UiUpdateContext<Message>,
+    request: AudioImportRequest,
+) {
+    let completion_request = request.clone();
+    let path = request.path.clone();
+    context
+        .business()
+        .background("cadence-import-preflight")
+        .run(
+            move |_| {
+                let decoded = audio::decode_audio_file(&path)?;
+                let cache_path = storage::waveform_cache_path(&path);
+                let _ = audio::write_waveform_cache_if_unchanged(
+                    decoded.path(),
+                    &cache_path,
+                    decoded.fingerprint(),
+                    decoded.waveform(),
+                );
+                Ok(decoded)
+            },
+            move |result| Message::AudioImportPreflightCompleted {
+                request: completion_request,
+                result,
+            },
+        );
+}
+
+fn start_import_commit(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    decoded: audio::DecodedAudioFile,
+) {
+    let library = state.library.clone();
+    context.business().blocking_io("cadence-import-track").run(
+        move |_| storage::import_into_library(library, decoded),
+        Message::ImportCompleted,
+    );
+}
+
+fn start_reference_commit(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    track_id: String,
+    path: PathBuf,
+    decoded: audio::DecodedAudioFile,
+) {
+    let library = state.library.clone();
+    let commit_track_id = track_id.clone();
+    context
+        .business()
+        .blocking_io("cadence-import-reference")
+        .run(
+            move |_| storage::set_reference_track(library, &commit_track_id, decoded),
+            move |result| Message::ReferenceImportCompleted {
+                track_id,
+                path,
+                result,
+            },
+        );
+}
+
+fn start_reference_catalog_commit(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    path: PathBuf,
+    decoded: audio::DecodedAudioFile,
+) {
+    let library = state.library.clone();
+    context
+        .business()
+        .blocking_io("cadence-import-reference-catalog")
+        .run(
+            move |_| storage::add_reference_track(library, decoded),
+            move |result| Message::ReferenceCatalogImportCompleted { path, result },
+        );
+}
+
+fn complete_audio_import_preflight(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    request: AudioImportRequest,
+    result: Result<audio::DecodedAudioFile, String>,
+) {
+    let AudioImportRequest { target, path } = request;
+    let result = if library_is_ready(state) {
+        result
+    } else {
+        Err(library_unavailable_status(state).to_string())
+    };
+    match (target, result) {
+        (AudioImportTarget::Main, Ok(decoded)) => start_import_commit(state, context, decoded),
+        (AudioImportTarget::AssignedReference { track_id }, Ok(decoded)) => {
+            start_reference_commit(state, context, track_id, path, decoded);
+        }
+        (AudioImportTarget::Catalog, Ok(decoded)) => {
+            start_reference_catalog_commit(state, context, path, decoded);
+        }
+        (AudioImportTarget::Main, Err(error)) => {
+            update(state, Message::ImportCompleted(Err(error)), context);
+        }
+        (AudioImportTarget::AssignedReference { track_id }, Err(error)) => {
+            update(
+                state,
+                Message::ReferenceImportCompleted {
+                    track_id,
+                    path,
+                    result: Err(error),
+                },
+                context,
+            );
+        }
+        (AudioImportTarget::Catalog, Err(error)) => {
+            update(
+                state,
+                Message::ReferenceCatalogImportCompleted {
+                    path,
+                    result: Err(error),
+                },
+                context,
+            );
+        }
+    }
+}
+
 fn start_import(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>, path: PathBuf) {
     if !library_is_ready(state) {
         return;
     }
     state.busy = true;
     state.status = format!("Importing {}…", path.display());
-    let library = state.library.clone();
-    context.business().blocking_io("cadence-import-track").run(
-        move |_| storage::import_into_library(library, path),
-        Message::ImportCompleted,
+    start_audio_import_preflight(
+        context,
+        AudioImportRequest {
+            target: AudioImportTarget::Main,
+            path,
+        },
     );
     context.request_repaint();
 }
@@ -5483,7 +5650,10 @@ fn schedule_import(
     }
     let batch = state.import_batch.get_or_insert_with(Default::default);
     batch.total = batch.total.saturating_add(1);
-    if state.library_load_state == LibraryLoadState::Loading || state.busy || state.save_in_flight {
+    if state.library_load_state == LibraryLoadState::Loading
+        || state.busy
+        || library_persistence_pending(state)
+    {
         let display_name = path.display().to_string();
         state.pending_import_paths.push(path);
         state.status = if state.library_load_state == LibraryLoadState::Loading {
@@ -5513,7 +5683,7 @@ fn schedule_next_pending_library_operation(
     state: &mut AppState,
     context: &mut ui::UiUpdateContext<Message>,
 ) {
-    if !library_is_ready(state) || state.busy || state.save_in_flight {
+    if !library_is_ready(state) || state.busy || library_persistence_pending(state) {
         return;
     }
     if let Some(path) =
@@ -5579,7 +5749,7 @@ fn schedule_next_pending_reference_import(
     state: &mut AppState,
     context: &mut ui::UiUpdateContext<Message>,
 ) {
-    if !library_is_ready(state) || state.busy || state.save_in_flight {
+    if !library_is_ready(state) || state.busy || library_persistence_pending(state) {
         return;
     }
     let Some(track_id) = state.pending_reference_track_id.clone() else {
@@ -5614,7 +5784,7 @@ fn schedule_next_reference_catalog_import(
     state: &mut AppState,
     context: &mut ui::UiUpdateContext<Message>,
 ) {
-    if !library_is_ready(state) || state.busy || state.save_in_flight {
+    if !library_is_ready(state) || state.busy || library_persistence_pending(state) {
         return;
     }
     let Some(path) = (!state.pending_reference_catalog_paths.is_empty())
@@ -5638,18 +5808,13 @@ fn start_reference_catalog_import(
         "Adding {} to the reference catalog…",
         reference_track_name(&path)
     );
-    let library = state.library.clone();
-    let completion_path = path.clone();
-    context
-        .business()
-        .blocking_io("cadence-import-reference-catalog")
-        .run(
-            move |_| storage::add_reference_track(library, path),
-            move |result| Message::ReferenceCatalogImportCompleted {
-                path: completion_path,
-                result,
-            },
-        );
+    start_audio_import_preflight(
+        context,
+        AudioImportRequest {
+            target: AudioImportTarget::Catalog,
+            path,
+        },
+    );
     context.request_repaint();
 }
 
@@ -5666,7 +5831,7 @@ fn schedule_replace(
         }
         return;
     }
-    if state.save_in_flight {
+    if library_persistence_pending(state) {
         state.status = String::from("Saving the library — try replacing again in a moment.");
         context.request_repaint();
         return;
@@ -5708,7 +5873,7 @@ fn schedule_reference(
         }
         return;
     }
-    if state.save_in_flight {
+    if library_persistence_pending(state) {
         state.status =
             String::from("Saving the library — try importing a reference again in a moment.");
         context.request_repaint();
@@ -5726,39 +5891,57 @@ fn schedule_reference(
     }
     state.busy = true;
     state.status = format!("Importing reference {}…", path.display());
-    let library = state.library.clone();
-    let completion_track_id = track_id.clone();
-    let completion_path = path.clone();
-    context
-        .business()
-        .blocking_io("cadence-import-reference")
-        .run(
-            move |_| storage::set_reference_track(library, &track_id, path),
-            move |result| Message::ReferenceImportCompleted {
-                track_id: completion_track_id,
-                path: completion_path,
-                result,
-            },
-        );
+    start_audio_import_preflight(
+        context,
+        AudioImportRequest {
+            target: AudioImportTarget::AssignedReference { track_id },
+            path,
+        },
+    );
     context.request_repaint();
+}
+
+fn library_dirty(state: &AppState) -> bool {
+    state.library_revision != state.persisted_library_revision
+}
+
+fn library_persistence_pending(state: &AppState) -> bool {
+    library_dirty(state) || state.save_in_flight_revision.is_some()
+}
+
+fn dispatch_library_save(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
+    if !library_is_ready(state) || !library_dirty(state) || state.save_in_flight_revision.is_some()
+    {
+        return;
+    }
+    let revision = state.library_revision;
+    let library = state.library.clone();
+    state.save_in_flight_revision = Some(revision);
+    context.business().blocking_io("cadence-save-library").run(
+        move |_| storage::persist_library(&library),
+        move |result| Message::LibrarySaved { revision, result },
+    );
 }
 
 fn schedule_library_save(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
     if !library_is_ready(state) {
         return;
     }
-    if state.save_in_flight {
-        // The next completion will schedule one save from the newest in-memory snapshot.
-        // This keeps the blocking-I/O lane from receiving stale whole-library writes.
-        state.save_again = true;
+    state.library_revision = state.library_revision.wrapping_add(1);
+    dispatch_library_save(state, context);
+}
+
+fn retry_library_save(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
+    if !library_is_ready(state) || state.busy || state.save_in_flight_revision.is_some() {
         return;
     }
-    let library = state.library.clone();
-    state.save_in_flight = true;
-    context.business().blocking_io("cadence-save-library").run(
-        move |_| storage::persist_library(&library),
-        Message::LibrarySaved,
-    );
+    dispatch_library_save(state, context);
+}
+
+fn mark_library_snapshot_persisted(state: &mut AppState) {
+    state.library_revision = state.library_revision.wrapping_add(1);
+    state.persisted_library_revision = state.library_revision;
+    state.save_in_flight_revision = None;
 }
 
 fn reset_transport(state: &mut AppState) {
@@ -7028,6 +7211,26 @@ fn project_surface(state: &AppState) -> ui::View<Message> {
                     .height(24.0),
                 ui::button("Preserve old + start fresh")
                     .message(Message::PreserveLibraryAndStartFresh)
+                    .height(24.0),
+                status_bar_version_label(24.0),
+            ])
+            .padding_x(8.0)
+            .fill_width()
+            .height(30.0)
+            .spacing(8.0),
+        ])
+        .fill_width()
+        .height(38.0)
+    } else if library_dirty(state) && !state.busy && state.save_in_flight_revision.is_none() {
+        ui::stack([
+            ui::card().fill(),
+            ui::row([
+                ui::text(state.status.clone())
+                    .truncate()
+                    .height(24.0)
+                    .fill_width(),
+                ui::button("Retry save")
+                    .message(Message::RetryLibrarySave)
                     .height(24.0),
                 status_bar_version_label(24.0),
             ])
@@ -10232,31 +10435,34 @@ fn plural(count: usize) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        APP_VERSION_LABEL, AppState, AuditionSource, DEFAULT_LIVE_SPECTROGRAM_DISPLAY_SAMPLE_RATE,
-        FavoriteMarkerWidget, ImportBatchProgress, LibraryLoadState, LiveSpectrogramMode,
-        LoopBounds, LoopSelection, LoopSelections, Message, NoteDraft, PairedPlaybackGuard,
-        PlannerInsertionTarget, REFERENCE_MENU_WIDTH, SETTINGS_REFERENCE_ROW_METADATA_HEIGHT,
-        SETTINGS_REFERENCE_ROW_TEXT_HEIGHT, SETTINGS_REFERENCE_ROW_TEXT_SPACING,
-        SETTINGS_REFERENCE_ROW_TITLE_HEIGHT, STATUS_BAR_VERSION_WIDTH, StatusMenuHost,
-        TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER, TRACK_CARD_SELECTED_CORAL, WAVEFORM_HEIGHT,
-        WaveformDecodeRequest, WorkspaceMode, animation_requested, apply_transport_snapshot,
-        audition_panel, audition_shuffle_seed, audition_statuses,
-        cleanup_reference_transport_failure, current_live_frame_for_source,
+        APP_VERSION_LABEL, AppState, AudioImportRequest, AudioImportTarget, AuditionSource,
+        DEFAULT_LIVE_SPECTROGRAM_DISPLAY_SAMPLE_RATE, FavoriteMarkerWidget, ImportBatchProgress,
+        LibraryLoadState, LiveSpectrogramMode, LoopBounds, LoopSelection, LoopSelections, Message,
+        NoteDraft, PairedPlaybackGuard, PlannerInsertionTarget, REFERENCE_MENU_WIDTH,
+        SETTINGS_REFERENCE_ROW_METADATA_HEIGHT, SETTINGS_REFERENCE_ROW_TEXT_HEIGHT,
+        SETTINGS_REFERENCE_ROW_TEXT_SPACING, SETTINGS_REFERENCE_ROW_TITLE_HEIGHT,
+        STATUS_BAR_VERSION_WIDTH, StatusMenuHost, TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER,
+        TRACK_CARD_SELECTED_CORAL, WAVEFORM_HEIGHT, WaveformDecodeRequest, WorkspaceMode,
+        animation_requested, apply_transport_snapshot, audition_panel, audition_shuffle_seed,
+        audition_statuses, cleanup_reference_transport_failure, current_live_frame_for_source,
         current_loudness_match_gain_db, current_lufs_meter_value,
         current_reference_lufs_meter_value, decode_result_is_current, deterministic_shuffle,
-        enforce_loop, favorite_toggle, frame_surface_revisions, library_track_title_id,
-        live_frame_matches_current_session, live_spectrogram_display_sample_rate, loop_bounds,
-        main_output_gain, native_launch_options, note_editor, note_ratio_for_id,
-        owned_tracks_in_stage, paint_live_playback_overlay, planner_insertion_target_is_valid,
-        planner_tracks_with_status, playback_shortcut, project_surface, rebuild_audition_queue,
-        reconcile_audition_queue, reference_decode_result_is_current, reference_output_gain,
+        enforce_loop, favorite_toggle, frame_surface_revisions, library_dirty,
+        library_track_title_id, live_frame_matches_current_session,
+        live_spectrogram_display_sample_rate, loop_bounds, main_output_gain, native_launch_options,
+        note_editor, note_ratio_for_id, owned_tracks_in_stage, paint_live_playback_overlay,
+        planner_insertion_target_is_valid, planner_tracks_with_status, playback_shortcut,
+        project_surface, rebuild_audition_queue, reconcile_audition_queue,
+        reference_decode_result_is_current, reference_output_gain,
         reference_settings_auxiliary_windows, reference_settings_window_view,
         refresh_live_spectrogram, refresh_live_spectrograms, review_spectrogram_source,
-        review_status_filter_message, schedule_library_save, schedule_reference_waveform_decode,
-        schedule_waveform_decode, seek_synchronized_positions, selected_reference_notes,
-        selected_track, stage_dropdown, stage_menu_anchor_from_pointer, stage_menu_popover,
-        status_dropdown_for_host, status_filter_dropdown, sync_audition_queue_after_status_change,
-        tracks_with_status, transport_command_is_confirmed, update,
+        review_status_filter_message, schedule_import, schedule_library_save,
+        schedule_reference_catalog_import, schedule_reference_import,
+        schedule_reference_waveform_decode, schedule_waveform_decode, seek_synchronized_positions,
+        selected_reference_notes, selected_track, stage_dropdown, stage_menu_anchor_from_pointer,
+        stage_menu_popover, status_dropdown_for_host, status_filter_dropdown,
+        sync_audition_queue_after_status_change, tracks_with_status,
+        transport_command_is_confirmed, update,
     };
     use crate::transport::{LiveFrameState, Snapshot};
     use crate::{
@@ -11391,7 +11597,7 @@ mod tests {
                 state.library.selected_track_id.as_deref(),
                 Some(first_track_id.as_str())
             );
-            assert!(state.save_in_flight);
+            assert!(state.save_in_flight_revision.is_some());
             let command = context.into_command();
             let expected_focus_id = library_track_title_id(&first_track_id);
             assert_eq!(focus_request_id(&command), Some(expected_focus_id));
@@ -12228,7 +12434,7 @@ mod tests {
         assert!(state.reference_draft_note.is_none());
         assert!(!state.reference_transport_loaded);
         assert!(state.reference_waveform_generation > previous_generation);
-        assert!(state.save_in_flight);
+        assert!(state.save_in_flight_revision.is_some());
     }
 
     #[test]
@@ -12447,7 +12653,7 @@ mod tests {
             &mut context,
         );
         assert!(state.persisted_note_drag.is_none());
-        assert!(state.save_in_flight);
+        assert!(state.save_in_flight_revision.is_some());
         let note_ids = selected_track(&state).map(|track| {
             track
                 .notes
@@ -12508,7 +12714,7 @@ mod tests {
             Some(500)
         );
         assert!(state.persisted_note_drag.is_none());
-        assert!(!state.save_in_flight);
+        assert!(state.save_in_flight_revision.is_none());
 
         update(
             &mut state,
@@ -12522,7 +12728,7 @@ mod tests {
             Some(500)
         );
         assert!(state.persisted_note_drag.is_none());
-        assert!(!state.save_in_flight);
+        assert!(state.save_in_flight_revision.is_none());
     }
 
     #[test]
@@ -13754,7 +13960,7 @@ mod tests {
             &mut context,
         );
         assert!(state.reference_persisted_note_drag.is_none());
-        assert!(state.save_in_flight);
+        assert!(state.save_in_flight_revision.is_some());
         assert_eq!(
             state.status,
             "Reference comment moved to 00:03 and saved locally."
@@ -13810,7 +14016,7 @@ mod tests {
             Some(500)
         );
         assert!(state.reference_persisted_note_drag.is_none());
-        assert!(!state.save_in_flight);
+        assert!(state.save_in_flight_revision.is_none());
     }
 
     fn main_only_loop_state() -> AppState {
@@ -15955,7 +16161,7 @@ mod tests {
         assert_eq!(track.notes.len(), 1);
         assert_eq!(track.notes[0].id, "keep-note");
         assert!(state.draft_note.is_none());
-        assert!(state.save_in_flight);
+        assert!(state.save_in_flight_revision.is_some());
         assert_eq!(state.status, "Comment deleted locally.");
     }
 
@@ -17529,7 +17735,9 @@ mod tests {
         second_track.reference_path = None;
         let state = AppState {
             busy: false,
-            save_in_flight: true,
+            library_revision: 1,
+            persisted_library_revision: 0,
+            save_in_flight_revision: Some(1),
             library_load_state: LibraryLoadState::Ready,
             library: Library {
                 tracks: vec![first_track, second_track],
@@ -17634,7 +17842,9 @@ mod tests {
         let second_track = audition_track(&second_id);
         let state = AppState {
             busy: false,
-            save_in_flight: true,
+            library_revision: 1,
+            persisted_library_revision: 0,
+            save_in_flight_revision: Some(1),
             library_load_state: LibraryLoadState::Ready,
             library: Library {
                 tracks: vec![first_track, second_track],
@@ -19797,7 +20007,7 @@ mod tests {
         assert!(track.favorite);
         assert_eq!(track.notes.len(), 1);
         assert!(state.status_menu_track_id.is_none());
-        assert!(state.save_in_flight);
+        assert!(state.save_in_flight_revision.is_some());
         assert_eq!(state.status, "Status set to Release.");
     }
 
@@ -19832,8 +20042,8 @@ mod tests {
         );
 
         assert_eq!(state.library.tracks[0].status, TrackStatus::Maybe);
-        assert!(!state.save_in_flight);
-        assert!(!state.save_again);
+        assert!(state.save_in_flight_revision.is_none());
+        assert!(!library_dirty(&state));
         assert!(state.status_menu_track_id.is_none());
     }
 
@@ -22940,6 +23150,322 @@ mod tests {
     }
 
     #[test]
+    fn failed_library_save_stays_dirty_blocks_import_and_retries_same_revision() {
+        let mut state = AppState::default();
+        let mut context = ui::UiUpdateContext::default();
+
+        schedule_library_save(&mut state, &mut context);
+        let revision = state
+            .save_in_flight_revision
+            .expect("the first mutation should dispatch a save");
+        assert_eq!(revision, state.library_revision);
+        let _ = context.into_command();
+
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::LibrarySaved {
+                revision,
+                result: Err(String::from("disk full")),
+            },
+            &mut context,
+        );
+        assert!(library_dirty(&state));
+        assert_eq!(state.save_in_flight_revision, None);
+        assert_eq!(state.status, "disk full");
+
+        let queued_path = PathBuf::from("/external/queued-after-save-failure.wav");
+        schedule_import(&mut state, &mut context, queued_path.clone());
+        assert_eq!(state.pending_import_paths, vec![queued_path]);
+        assert_eq!(
+            context
+                .into_command()
+                .business_task_priority("cadence-import-preflight"),
+            None,
+            "a dirty library must block import preflight"
+        );
+
+        let mut context = ui::UiUpdateContext::default();
+        update(&mut state, Message::RetryLibrarySave, &mut context);
+        assert_eq!(state.library_revision, revision);
+        assert_eq!(state.persisted_library_revision, 0);
+        assert_eq!(state.save_in_flight_revision, Some(revision));
+        assert_eq!(
+            context
+                .into_command()
+                .business_task_priority("cadence-save-library"),
+            Some(TaskPriority::BlockingIo)
+        );
+    }
+
+    #[test]
+    fn matching_retry_save_success_resumes_queued_import_and_clears_dirty_state() {
+        let mut state = AppState::default();
+        let queued_path = PathBuf::from("/external/queued-after-retry.wav");
+        let mut context = ui::UiUpdateContext::default();
+        schedule_library_save(&mut state, &mut context);
+        let revision = state
+            .save_in_flight_revision
+            .expect("the first mutation should dispatch a save");
+        let _ = context.into_command();
+
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::LibrarySaved {
+                revision,
+                result: Err(String::from("temporary save failure")),
+            },
+            &mut context,
+        );
+        schedule_import(&mut state, &mut context, queued_path.clone());
+        let _ = context.into_command();
+
+        let mut context = ui::UiUpdateContext::default();
+        update(&mut state, Message::RetryLibrarySave, &mut context);
+        assert_eq!(state.save_in_flight_revision, Some(revision));
+        let _ = context.into_command();
+
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::LibrarySaved {
+                revision,
+                result: Ok(()),
+            },
+            &mut context,
+        );
+
+        assert!(!library_dirty(&state));
+        assert_eq!(state.save_in_flight_revision, None);
+        assert!(state.busy, "the retained import should resume after save");
+        assert!(state.pending_import_paths.is_empty());
+        assert_eq!(
+            context
+                .into_command()
+                .business_task_priority("cadence-import-preflight"),
+            Some(TaskPriority::Background)
+        );
+    }
+
+    #[test]
+    fn newer_mutation_dispatches_after_older_save_and_stale_completion_is_ignored() {
+        let mut state = AppState::default();
+        let mut context = ui::UiUpdateContext::default();
+
+        schedule_library_save(&mut state, &mut context);
+        let first_revision = state
+            .save_in_flight_revision
+            .expect("first mutation should dispatch");
+        let _ = context.into_command();
+        let mut context = ui::UiUpdateContext::default();
+        schedule_library_save(&mut state, &mut context);
+        assert_eq!(state.library_revision, first_revision + 1);
+        assert_eq!(state.save_in_flight_revision, Some(first_revision));
+        assert_eq!(
+            context
+                .into_command()
+                .business_task_priority("cadence-save-library"),
+            None
+        );
+
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::LibrarySaved {
+                revision: first_revision,
+                result: Ok(()),
+            },
+            &mut context,
+        );
+        let second_revision = first_revision + 1;
+        assert_eq!(state.persisted_library_revision, first_revision);
+        assert_eq!(state.save_in_flight_revision, Some(second_revision));
+        assert_eq!(
+            context
+                .into_command()
+                .business_task_priority("cadence-save-library"),
+            Some(TaskPriority::BlockingIo)
+        );
+
+        let status_after_first_success = state.status.clone();
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::LibrarySaved {
+                revision: first_revision,
+                result: Err(String::from("stale duplicate")),
+            },
+            &mut context,
+        );
+        assert_eq!(state.status, status_after_first_success);
+        assert_eq!(state.save_in_flight_revision, Some(second_revision));
+        assert_eq!(
+            context
+                .into_command()
+                .business_task_priority("cadence-save-library"),
+            None
+        );
+
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::LibrarySaved {
+                revision: second_revision,
+                result: Ok(()),
+            },
+            &mut context,
+        );
+        assert!(!library_dirty(&state));
+        assert_eq!(state.persisted_library_revision, second_revision);
+        assert_eq!(state.save_in_flight_revision, None);
+    }
+
+    #[test]
+    fn dirty_idle_status_bar_exposes_retry_save_action() {
+        let state = AppState {
+            library_revision: 1,
+            persisted_library_revision: 0,
+            status: String::from("Could not save the library."),
+            ..AppState::default()
+        };
+        let frame = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 720.0));
+        let labels = frame.paint_plan.text_label_strings();
+
+        assert!(labels.iter().any(|label| label == "Retry save"));
+    }
+
+    #[test]
+    fn corrupt_main_preflight_uses_background_and_terminal_failure_once() {
+        let mut state = AppState::default();
+        let path = PathBuf::from("/external/corrupt-main.wav");
+        let request = AudioImportRequest {
+            target: AudioImportTarget::Main,
+            path: path.clone(),
+        };
+        let mut context = ui::UiUpdateContext::default();
+        schedule_import(&mut state, &mut context, path);
+        assert!(state.busy);
+        assert_eq!(
+            state.import_batch.as_ref().map(|batch| batch.total),
+            Some(1)
+        );
+        assert_eq!(
+            context
+                .into_command()
+                .business_task_priority("cadence-import-preflight"),
+            Some(TaskPriority::Background)
+        );
+
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::AudioImportPreflightCompleted {
+                request,
+                result: Err(String::from("corrupt audio")),
+            },
+            &mut context,
+        );
+        assert!(!state.busy);
+        assert!(state.import_batch.is_none());
+        assert_eq!(
+            context
+                .into_command()
+                .business_task_priority("cadence-import-track"),
+            None
+        );
+    }
+
+    #[test]
+    fn corrupt_assigned_reference_preflight_uses_background_and_terminal_failure_once() {
+        let track_id = String::from("reference-owner");
+        let path = PathBuf::from("/external/corrupt-reference.wav");
+        let mut state = AppState::default();
+        state.library.tracks.push(audition_track(&track_id));
+        let mut context = ui::UiUpdateContext::default();
+        schedule_reference_import(
+            &mut state,
+            &mut context,
+            track_id.clone(),
+            vec![path.clone()],
+        );
+        assert!(state.busy);
+        assert_eq!(
+            state.import_batch.as_ref().map(|batch| batch.total),
+            Some(1)
+        );
+        assert_eq!(
+            context
+                .into_command()
+                .business_task_priority("cadence-import-preflight"),
+            Some(TaskPriority::Background)
+        );
+
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::AudioImportPreflightCompleted {
+                request: AudioImportRequest {
+                    target: AudioImportTarget::AssignedReference {
+                        track_id: track_id.clone(),
+                    },
+                    path: path.clone(),
+                },
+                result: Err(String::from("corrupt reference audio")),
+            },
+            &mut context,
+        );
+        assert!(!state.busy);
+        assert!(state.import_batch.is_none());
+        assert_eq!(
+            context
+                .into_command()
+                .business_task_priority("cadence-import-reference"),
+            None
+        );
+    }
+
+    #[test]
+    fn corrupt_catalog_preflight_uses_background_and_terminal_failure_once() {
+        let path = PathBuf::from("/external/corrupt-catalog.wav");
+        let mut state = AppState::default();
+        let mut context = ui::UiUpdateContext::default();
+        schedule_reference_catalog_import(&mut state, &mut context, vec![path.clone()]);
+        assert!(state.busy);
+        assert_eq!(state.reference_catalog_import_total, 1);
+        assert_eq!(
+            context
+                .into_command()
+                .business_task_priority("cadence-import-preflight"),
+            Some(TaskPriority::Background)
+        );
+
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::AudioImportPreflightCompleted {
+                request: AudioImportRequest {
+                    target: AudioImportTarget::Catalog,
+                    path: path.clone(),
+                },
+                result: Err(String::from("corrupt catalog audio")),
+            },
+            &mut context,
+        );
+        assert!(!state.busy);
+        assert_eq!(state.reference_catalog_import_total, 0);
+        assert_eq!(state.reference_catalog_import_completed, 0);
+        assert_eq!(state.reference_catalog_import_failed, 0);
+        assert_eq!(
+            context
+                .into_command()
+                .business_task_priority("cadence-import-reference-catalog"),
+            None
+        );
+    }
+
+    #[test]
     fn loading_drop_is_retained_but_recovery_rejects_later_drop_and_save_mutations() {
         let track = audition_track("existing");
         let mut state = AppState::loading();
@@ -22969,8 +23495,9 @@ mod tests {
         let library_before = state.library.clone();
         let pending_before = state.pending_import_paths.clone();
         let batch_before = state.import_batch.clone();
-        let save_in_flight_before = state.save_in_flight;
-        let save_again_before = state.save_again;
+        let library_revision_before = state.library_revision;
+        let persisted_library_revision_before = state.persisted_library_revision;
+        let save_in_flight_revision_before = state.save_in_flight_revision;
 
         update(
             &mut state,
@@ -22987,8 +23514,15 @@ mod tests {
         assert_eq!(state.library, library_before);
         assert_eq!(state.pending_import_paths, pending_before);
         assert_eq!(state.import_batch, batch_before);
-        assert_eq!(state.save_in_flight, save_in_flight_before);
-        assert_eq!(state.save_again, save_again_before);
+        assert_eq!(state.library_revision, library_revision_before);
+        assert_eq!(
+            state.persisted_library_revision,
+            persisted_library_revision_before
+        );
+        assert_eq!(
+            state.save_in_flight_revision,
+            save_in_flight_revision_before
+        );
     }
 
     #[test]
@@ -23130,11 +23664,21 @@ mod tests {
         );
         assert_eq!(state.pending_import_paths, vec![main_path]);
         assert!(
-            state.save_in_flight,
+            state.save_in_flight_revision.is_some(),
             "final reference selection should save"
         );
 
-        update(&mut state, Message::LibrarySaved(Ok(())), &mut context);
+        let save_revision = state
+            .save_in_flight_revision
+            .expect("the final reference selection save should have a revision");
+        update(
+            &mut state,
+            Message::LibrarySaved {
+                revision: save_revision,
+                result: Ok(()),
+            },
+            &mut context,
+        );
         assert!(
             state.busy,
             "the retained main import should advance after save"

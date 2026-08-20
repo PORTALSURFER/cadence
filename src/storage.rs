@@ -239,13 +239,27 @@ pub fn preserve_unreadable_library_and_start_fresh_at(path: &Path) -> Result<Pat
     Ok(backup_path)
 }
 
-pub fn import_into_library(mut library: Library, path: PathBuf) -> Result<Library, String> {
+pub fn import_into_library(
+    library: Library,
+    decoded: crate::audio::DecodedAudioFile,
+) -> Result<Library, String> {
+    import_into_library_at(library, decoded, &library_path())
+}
+
+fn import_into_library_at(
+    mut library: Library,
+    decoded: crate::audio::DecodedAudioFile,
+    library_path: &Path,
+) -> Result<Library, String> {
+    let path = decoded.path().to_path_buf();
     validate_audio_path(&path)?;
+    ensure_decoded_audio_unchanged(&decoded)?;
     let metadata = fs::metadata(&path)
         .map_err(|error| format!("Could not inspect {}: {error}", path.display()))?;
     if !metadata.is_file() {
         return Err(format!("{} is not a file", path.display()));
     }
+    ensure_decoded_audio_unchanged(&decoded)?;
 
     let original_name = path
         .file_name()
@@ -276,7 +290,8 @@ pub fn import_into_library(mut library: Library, path: PathBuf) -> Result<Librar
     });
     normalize_planner_order(&mut library);
     library.selected_track_id = Some(id);
-    persist_library(&library)?;
+    ensure_decoded_audio_unchanged(&decoded)?;
+    persist_library_at(&library, library_path)?;
     Ok(library)
 }
 
@@ -311,36 +326,75 @@ fn replace_track_at(
 /// external path, just like the primary source, so importing it never copies or
 /// mutates the user's audio file.
 pub fn set_reference_track(
+    library: Library,
+    track_id: &str,
+    decoded: crate::audio::DecodedAudioFile,
+) -> Result<Library, String> {
+    set_reference_track_at(library, track_id, decoded, &library_path())
+}
+
+fn set_reference_track_at(
     mut library: Library,
     track_id: &str,
-    path: PathBuf,
+    decoded: crate::audio::DecodedAudioFile,
+    library_path: &Path,
 ) -> Result<Library, String> {
+    let path = decoded.path().to_path_buf();
     validate_audio_path(&path)?;
+    ensure_decoded_audio_unchanged(&decoded)?;
     let metadata = fs::metadata(&path)
         .map_err(|error| format!("Could not inspect {}: {error}", path.display()))?;
     if !metadata.is_file() {
         return Err(format!("{} is not a file", path.display()));
     }
+    ensure_decoded_audio_unchanged(&decoded)?;
 
     set_reference_track_metadata(&mut library, track_id, path)?;
-    persist_library(&library)?;
+    ensure_decoded_audio_unchanged(&decoded)?;
+    persist_library_at(&library, library_path)?;
     Ok(library)
 }
 
 /// Add an audio file to the global reference catalog without assigning it to
 /// any main track. The catalog stores the external path only; importing a
 /// reference never copies or mutates the user's audio file.
-pub fn add_reference_track(mut library: Library, path: PathBuf) -> Result<Library, String> {
+pub fn add_reference_track(
+    library: Library,
+    decoded: crate::audio::DecodedAudioFile,
+) -> Result<Library, String> {
+    add_reference_track_at(library, decoded, &library_path())
+}
+
+fn add_reference_track_at(
+    mut library: Library,
+    decoded: crate::audio::DecodedAudioFile,
+    library_path: &Path,
+) -> Result<Library, String> {
+    let path = decoded.path().to_path_buf();
     validate_audio_path(&path)?;
+    ensure_decoded_audio_unchanged(&decoded)?;
     let metadata = fs::metadata(&path)
         .map_err(|error| format!("Could not inspect {}: {error}", path.display()))?;
     if !metadata.is_file() {
         return Err(format!("{} is not a file", path.display()));
     }
+    ensure_decoded_audio_unchanged(&decoded)?;
 
     ensure_reference_track(&mut library, path);
-    persist_library(&library)?;
+    ensure_decoded_audio_unchanged(&decoded)?;
+    persist_library_at(&library, library_path)?;
     Ok(library)
+}
+
+fn ensure_decoded_audio_unchanged(decoded: &crate::audio::DecodedAudioFile) -> Result<(), String> {
+    if decoded.is_unchanged() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Audio source changed after preflight: {}",
+            decoded.path().display()
+        ))
+    }
 }
 
 fn set_reference_track_metadata(
@@ -1005,6 +1059,31 @@ mod tests {
         }
     }
 
+    fn tiny_pcm_wav() -> Vec<u8> {
+        let mut bytes = Vec::from(*b"RIFF");
+        bytes.extend_from_slice(&38_u32.to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&8_000_u32.to_le_bytes());
+        bytes.extend_from_slice(&16_000_u32.to_le_bytes());
+        bytes.extend_from_slice(&2_u16.to_le_bytes());
+        bytes.extend_from_slice(&16_u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&2_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_i16.to_le_bytes());
+        bytes
+    }
+
+    fn decoded_audio_fixture(directory: &Path) -> (PathBuf, crate::audio::DecodedAudioFile) {
+        let source = directory.join("source.wav");
+        fs::write(&source, tiny_pcm_wav()).expect("valid audio fixture should be writable");
+        let decoded = crate::audio::decode_audio_file(&source)
+            .expect("valid audio fixture should pass preflight");
+        (source, decoded)
+    }
+
     #[test]
     fn persist_library_replaces_and_round_trips_a_complete_snapshot() {
         let directory = TestDirectory::new();
@@ -1570,6 +1649,84 @@ mod tests {
         assert_eq!(
             load_library_at(&library_path).expect("original library should still reload"),
             before
+        );
+    }
+
+    #[test]
+    fn stale_main_import_proof_leaves_library_and_persisted_snapshot_unchanged() {
+        let directory = TestDirectory::new();
+        let library_path = directory.path.join("library.json");
+        let (source, decoded) = decoded_audio_fixture(&directory.path);
+        let library = persistence_fixture();
+        persist_library_at(&library, &library_path).expect("original library should persist");
+        let original_bytes = fs::read(&library_path).expect("persisted library should be readable");
+        fs::write(&source, b"source replaced after preflight")
+            .expect("stale source should be writable");
+
+        let error = import_into_library_at(library.clone(), decoded, &library_path)
+            .expect_err("stale main import proof must be rejected");
+
+        assert!(error.contains("changed after preflight"));
+        assert_eq!(library, persistence_fixture());
+        assert_eq!(
+            fs::read(&library_path).expect("library should remain readable"),
+            original_bytes
+        );
+        assert_eq!(
+            load_library_at(&library_path).expect("library should reload"),
+            library
+        );
+    }
+
+    #[test]
+    fn stale_assigned_reference_proof_leaves_library_and_persisted_snapshot_unchanged() {
+        let directory = TestDirectory::new();
+        let library_path = directory.path.join("library.json");
+        let (source, decoded) = decoded_audio_fixture(&directory.path);
+        let library = persistence_fixture();
+        persist_library_at(&library, &library_path).expect("original library should persist");
+        let original_bytes = fs::read(&library_path).expect("persisted library should be readable");
+        fs::write(&source, b"source replaced after preflight")
+            .expect("stale source should be writable");
+
+        let error = set_reference_track_at(library.clone(), "track-1", decoded, &library_path)
+            .expect_err("stale assigned reference proof must be rejected");
+
+        assert!(error.contains("changed after preflight"));
+        assert_eq!(library, persistence_fixture());
+        assert_eq!(
+            fs::read(&library_path).expect("library should remain readable"),
+            original_bytes
+        );
+        assert_eq!(
+            load_library_at(&library_path).expect("library should reload"),
+            library
+        );
+    }
+
+    #[test]
+    fn stale_catalog_proof_leaves_library_and_persisted_snapshot_unchanged() {
+        let directory = TestDirectory::new();
+        let library_path = directory.path.join("library.json");
+        let (source, decoded) = decoded_audio_fixture(&directory.path);
+        let library = persistence_fixture();
+        persist_library_at(&library, &library_path).expect("original library should persist");
+        let original_bytes = fs::read(&library_path).expect("persisted library should be readable");
+        fs::write(&source, b"source replaced after preflight")
+            .expect("stale source should be writable");
+
+        let error = add_reference_track_at(library.clone(), decoded, &library_path)
+            .expect_err("stale catalog proof must be rejected");
+
+        assert!(error.contains("changed after preflight"));
+        assert_eq!(library, persistence_fixture());
+        assert_eq!(
+            fs::read(&library_path).expect("library should remain readable"),
+            original_bytes
+        );
+        assert_eq!(
+            load_library_at(&library_path).expect("library should reload"),
+            library
         );
     }
 
