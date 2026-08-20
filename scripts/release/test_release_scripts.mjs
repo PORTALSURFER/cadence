@@ -486,10 +486,20 @@ test("release workflow reserves nightly versions before immutable builds", async
   assert.match(publishJob, /run-id: \$\{\{ github\.run_id \}\}/);
   assert.match(publishJob, /\.source\.git_sha == \$git_sha/);
   assert.doesNotMatch(publishJob, /and \.git_sha == \$git_sha/);
-  assert.match(
-    publishJob,
-    /\$\{\{ secrets\.CADENCE_PRODUCTION_PORTALSURFER_RELEASE_TOKEN \}\}/,
+
+  const publishJobEnvStart = publishJob.indexOf("    env:\n");
+  const publishStepsStart = publishJob.indexOf("    steps:\n");
+  assert.ok(
+    publishJobEnvStart >= 0 && publishStepsStart > publishJobEnvStart,
+    "publish job must have a distinct job-level env block",
   );
+  const publishJobEnv = publishJob.slice(publishJobEnvStart, publishStepsStart);
+  assert.doesNotMatch(
+    publishJobEnv,
+    /CADENCE_RELEASE_UPLOAD_TOKEN|CADENCE_PRODUCTION_PORTALSURFER_RELEASE_TOKEN/,
+    "PortalSurfer upload credentials must not be job-scoped",
+  );
+
   assert.match(publishJob, /gh release view/);
   assert.match(publishJob, /gh release create/);
   assert.match(publishJob, /git\/ref\/tags\/\$RELEASE_TAG/);
@@ -500,9 +510,28 @@ test("release workflow reserves nightly versions before immutable builds", async
   const githubReleaseIndex = publishJob.indexOf("Create or verify GitHub release idempotently");
   const portalSurferIndex = publishJob.indexOf("Publish exact release to PortalSurfer");
   assert.ok(githubReleaseIndex >= 0 && githubReleaseIndex < portalSurferIndex, "PortalSurfer publication must be last");
+  const publisherStepEnd = publishJob.indexOf("\n      - name: ", portalSurferIndex);
+  assert.equal(publisherStepEnd, -1, "PortalSurfer publication must remain the final publish step");
+  const publisherStep = publishJob.slice(portalSurferIndex);
   assert.match(
-    publishJob,
-    /- name: Publish exact release to PortalSurfer\n        run: \|\n          node scripts\/release\/publish_release\.mjs \\\n            --manifest release-output\/cadence-release-manifest\.json \\\n            --root release-output/,
+    publisherStep,
+    /Publish exact release to PortalSurfer\n        env:\n          CADENCE_RELEASE_UPLOAD_TOKEN: \$\{\{ secrets\.CADENCE_PRODUCTION_PORTALSURFER_RELEASE_TOKEN \}\}\n        run: \|\n/,
+    "PortalSurfer upload credentials must be scoped to the final publisher step",
+  );
+  assert.equal(
+    workflow.match(/\$\{\{ secrets\.CADENCE_PRODUCTION_PORTALSURFER_RELEASE_TOKEN \}\}/g)?.length,
+    1,
+    "the PortalSurfer production secret must occur exactly once in the workflow",
+  );
+  const beforePublisher = publishJob.slice(0, portalSurferIndex);
+  assert.doesNotMatch(
+    beforePublisher,
+    /Verify PortalSurfer upload token|CADENCE_RELEASE_UPLOAD_TOKEN|CADENCE_PRODUCTION_PORTALSURFER_RELEASE_TOKEN/,
+    "PortalSurfer token validation and references must not precede the final publisher",
+  );
+  assert.match(
+    publisherStep,
+    /Publish exact release to PortalSurfer\n        env:\n          CADENCE_RELEASE_UPLOAD_TOKEN: \$\{\{ secrets\.CADENCE_PRODUCTION_PORTALSURFER_RELEASE_TOKEN \}\}\n        run: \|\n          node scripts\/release\/publish_release\.mjs \\\n            --manifest release-output\/cadence-release-manifest\.json \\\n            --root release-output/,
     "publisher arguments must remain separate shell arguments after YAML parsing",
   );
 

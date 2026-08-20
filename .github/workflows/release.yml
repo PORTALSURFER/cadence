@@ -417,7 +417,6 @@ jobs:
       contents: write
       actions: read
     env:
-      CADENCE_RELEASE_UPLOAD_TOKEN: ${{ secrets.CADENCE_PRODUCTION_PORTALSURFER_RELEASE_TOKEN }}
       PORTALSURFER_RELEASE_ENDPOINT: ${{ vars.PORTALSURFER_RELEASE_ENDPOINT || 'https://portalsurfer.org' }}
       RELEASE_CHANNEL: ${{ needs.build.outputs.channel }}
       RELEASE_VERSION: ${{ needs.build.outputs.version }}
@@ -455,12 +454,6 @@ jobs:
             --arg git_sha "$SOURCE_SHA" \
             '.version == $version and .channel == $channel and .build_id == $build_id and .source.git_sha == $git_sha' \
             "$manifest_path" >/dev/null
-
-      - name: Verify PortalSurfer upload token
-        shell: bash
-        run: |
-          set -euo pipefail
-          [[ -n "${CADENCE_RELEASE_UPLOAD_TOKEN:-}" ]] || { echo "Missing required release secret: CADENCE_RELEASE_UPLOAD_TOKEN" >&2; exit 1; }
 
       - name: Create or verify GitHub release idempotently
         if: needs.build.outputs.create_github_release == 'true'
@@ -547,6 +540,8 @@ jobs:
           done
 
       - name: Publish exact release to PortalSurfer
+        env:
+          CADENCE_RELEASE_UPLOAD_TOKEN: ${{ secrets.CADENCE_PRODUCTION_PORTALSURFER_RELEASE_TOKEN }}
         run: |
           node scripts/release/publish_release.mjs \
             --manifest release-output/cadence-release-manifest.json \
