@@ -519,9 +519,9 @@ test("release workflow reserves nightly versions before immutable builds", async
     "PortalSurfer upload credentials must be scoped to the final publisher step",
   );
   assert.equal(
-    publishJob.match(/\$\{\{ secrets\.CADENCE_PRODUCTION_PORTALSURFER_RELEASE_TOKEN \}\}/g)?.length,
+    workflow.match(/\$\{\{ secrets\.CADENCE_PRODUCTION_PORTALSURFER_RELEASE_TOKEN \}\}/g)?.length,
     1,
-    "the PortalSurfer production secret must occur exactly once in the publish job",
+    "the PortalSurfer production secret must occur exactly once in the workflow",
   );
   const beforePublisher = publishJob.slice(0, portalSurferIndex);
   assert.doesNotMatch(
