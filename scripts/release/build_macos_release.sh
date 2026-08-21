@@ -8,6 +8,7 @@ version="${CADENCE_RELEASE_VERSION:-}"
 channel="${CADENCE_RELEASE_CHANNEL:-stable}"
 build_id="${CADENCE_RELEASE_BUILD_ID:-}"
 source_git_sha=""
+base_version_re='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
 
 usage() {
     cat <<'EOF'
@@ -163,6 +164,141 @@ resolve_verified_source_sha() {
     printf '%s\n' "$head_sha"
 }
 
+resolve_root_cargo_package_version() {
+    local metadata
+    local root_manifest="$project_dir/Cargo.toml"
+    local package_version
+
+    if ! metadata="$(env \
+        -u APPLE_DEVELOPER_ID_APPLICATION_CERT_BASE64 \
+        -u APPLE_DEVELOPER_ID_APPLICATION_CERT_PASSWORD \
+        -u APPLE_NOTARY_KEY_BASE64 \
+        -u APPLE_NOTARY_KEY_ID \
+        -u APPLE_NOTARY_ISSUER_ID \
+        -u APPLE_CODESIGN_IDENTITY \
+        cargo metadata \
+        --locked \
+        --no-deps \
+        --format-version 1 \
+        --manifest-path "$root_manifest" \
+        2>/dev/null
+    )"; then
+        echo "could not read the locked Cargo metadata for the root Cadence package." >&2
+        return 1
+    fi
+    if ! package_version="$(jq -er \
+        --arg root_manifest "$root_manifest" \
+        '[.packages[]? | select(.name == "cadence-native" and .manifest_path == $root_manifest) | .version]
+         | if length == 1 and .[0] != "" then .[0] else error("root cadence-native package is missing or ambiguous") end' \
+        <<<"$metadata"
+    )"; then
+        echo "locked Cargo metadata must contain exactly one root cadence-native package." >&2
+        return 1
+    fi
+    printf '%s\n' "$package_version"
+}
+
+resolve_locked_cargo_package_version() {
+    local lockfile="$project_dir/Cargo.lock"
+    local package_version
+
+    if ! package_version="$(awk '
+        function finish_package() {
+            if (!is_root) {
+                return
+            }
+            matches++
+            if (version == "") {
+                malformed=1
+            } else if (matches == 1) {
+                selected=version
+            }
+        }
+        /^\[\[package\]\]$/ {
+            finish_package()
+            in_package=1
+            is_root=0
+            version=""
+            next
+        }
+        in_package && /^\[/ {
+            finish_package()
+            in_package=0
+            is_root=0
+            version=""
+        }
+        in_package && $0 == "name = \"cadence-native\"" {
+            is_root=1
+            next
+        }
+        in_package && /^version = \"/ {
+            version=$0
+            sub(/^version = \"/, "", version)
+            sub(/\"$/, "", version)
+        }
+        END {
+            finish_package()
+            if (matches != 1 || malformed) {
+                exit 1
+            }
+            print selected
+        }
+    ' "$lockfile")"; then
+        echo "Cargo.lock must contain exactly one root cadence-native package." >&2
+        return 1
+    fi
+    printf '%s\n' "$package_version"
+}
+
+validate_release_version_against_cargo() {
+    local package_version="$1"
+    local lock_version="$2"
+    local package_numeric_version
+    local version_re
+
+    [[ "$package_version" == "$lock_version" ]] || {
+        echo "Cargo.toml and Cargo.lock cadence-native package versions differ: $package_version vs $lock_version" >&2
+        return 1
+    }
+    package_numeric_version="${package_version%%-*}"
+    [[ "$package_numeric_version" =~ ^${base_version_re}$ ]] || {
+        echo "root cadence-native package version must have a numeric X.Y.Z base: $package_version" >&2
+        return 1
+    }
+
+    case "$channel" in
+        stable)
+            version_re="^${base_version_re}$"
+            ;;
+        rc)
+            version_re="^${base_version_re}-rc\.[1-9][0-9]*$"
+            ;;
+        nightly)
+            version_re="^${base_version_re}-nightly\.[1-9][0-9]*$"
+            ;;
+        *)
+            echo "invalid release channel: $channel (expected stable, rc, or nightly)" >&2
+            return 2
+            ;;
+    esac
+    if [[ ! "$version" =~ $version_re ]]; then
+        echo "$channel releases require the matching channel version format: $version" >&2
+        return 2
+    fi
+
+    if [[ "$channel" == stable ]]; then
+        [[ "$version" == "$package_version" ]] || {
+            echo "stable release version $version does not match root cadence-native package version $package_version" >&2
+            return 1
+        }
+    else
+        [[ "${version%%-*}" == "$package_numeric_version" ]] || {
+            echo "$channel release version $version does not match root cadence-native package base version $package_numeric_version" >&2
+            return 1
+        }
+    fi
+}
+
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
     return 0
 fi
@@ -205,40 +341,23 @@ if ! source_git_sha="$(resolve_verified_source_sha)"; then
     exit 1
 fi
 
+if ! root_cargo_package_version="$(resolve_root_cargo_package_version)"; then
+    exit 1
+fi
+if ! locked_cargo_package_version="$(resolve_locked_cargo_package_version)"; then
+    exit 1
+fi
+validate_release_version_against_cargo "$root_cargo_package_version" "$locked_cargo_package_version"
+
 if ! output_dir="$(validate_release_output_dir "$output_dir" "$caller_cwd")"; then
     exit 2
 fi
-
-case "$channel" in
-    stable|rc|nightly)
-        ;;
-    *)
-        echo "invalid release channel: $channel (expected stable, rc, or nightly)" >&2
-        exit 2
-        ;;
-esac
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
     echo "Cadence production releases must be built on macOS." >&2
     exit 1
 fi
 
-base_version_re='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
-case "$channel" in
-    stable)
-        version_re="^${base_version_re}$"
-        ;;
-    rc)
-        version_re="^${base_version_re}-rc\.[1-9][0-9]*$"
-        ;;
-    nightly)
-        version_re="^${base_version_re}-nightly\.[1-9][0-9]*$"
-        ;;
-esac
-if [[ ! "$version" =~ $version_re ]]; then
-    echo "$channel releases require the matching channel version format: $version" >&2
-    exit 2
-fi
 if [[ -n "$(git -C "$project_dir" status --porcelain --untracked-files=all)" ]]; then
     echo "production release builds require a clean checkout" >&2
     exit 1

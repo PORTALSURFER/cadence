@@ -48,10 +48,10 @@ Optionally set the repository variable `PORTALSURFER_RELEASE_ENDPOINT`; it defau
 
 The release builder accepts `--output-dir DIR` for a caller-selected artifact directory. Relative paths resolve from the caller's current working directory, and the parent directory must already exist. The target may be absent or an existing empty directory; symlinks, files, special nodes, nonempty directories (including hidden entries), `.`, `..`, `/`, and paths resolving to the repository root are rejected. The builder validates this before reading signing credentials and again immediately before output creation, and never recursively removes a caller-controlled output directory.
 
-The local scripts are intentionally production-gated. Check their syntax without contacting Apple or PortalSurfer:
+The local scripts are intentionally production-gated. Direct callers must pass a stable version exactly matching the root `cadence-native` package version; RC and nightly versions must use that same numeric `X.Y.Z` base, and `Cargo.lock` must agree with the package metadata. Check their syntax without contacting Apple or PortalSurfer:
 
 ```sh
-bash -n scripts/build_native_app_bundle.sh scripts/release/allocate_nightly_version.sh scripts/release/build_macos_release.sh scripts/release/verify_macos_architecture.sh scripts/release/test_macos_architecture.sh
+bash -n scripts/build_native_app_bundle.sh scripts/release/allocate_nightly_version.sh scripts/release/build_macos_release.sh scripts/release/verify_tag_target.sh scripts/release/verify_macos_architecture.sh scripts/release/test_macos_architecture.sh
 node --check scripts/release/create_manifest.mjs
 node --check scripts/release/publish_release.mjs
 node --check scripts/release/test_release_scripts.mjs
