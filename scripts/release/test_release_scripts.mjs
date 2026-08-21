@@ -625,6 +625,12 @@ test("release workflow reserves nightly versions before immutable builds", async
   assert.match(reservationJob, /git push --atomic origin HEAD:refs\/heads\/main "refs\/tags\/\$reservation_tag"/);
   assert.match(reservationJob, /git add Cargo\.toml Cargo\.lock/);
   assert.match(reservationJob, /git diff --cached --name-only/);
+  assert.match(reservationJob, /if \[\[ "\$source_sha" != "\$original_source_sha" \]\]; then/);
+  assert.match(reservationJob, /assert_reservation_commit "\$source_sha" "\$reserved_cargo_version"/);
+  assert.match(reservationJob, /git rev-list --parents -n 1 "\$commit"/);
+  assert.match(reservationJob, /"\$commit \$original_source_sha"/);
+  assert.match(reservationJob, /git diff-tree --no-commit-id --name-status -r "\$commit"/);
+  assert.match(reservationJob, /reservation commit changed non-version content/);
 
   assert.match(prepareJob, /needs: reserve_nightly/);
   assert.match(prepareJob, /if: \$\{\{ always\(\) && \(needs\.reserve_nightly\.result == 'success' \|\| needs\.reserve_nightly\.result == 'skipped'\) \}\}/);

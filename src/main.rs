@@ -1815,12 +1815,17 @@ fn handle_main_transport_source_mismatch(state: &mut AppState) {
 }
 
 fn handle_reference_transport_source_mismatch(state: &mut AppState) {
+    let restore_main_focus =
+        paired_playback_intended(state) && state.audition_source == AuditionSource::Reference;
     mark_reference_transport_source_mismatch(state);
     if paired_playback_intended(state) {
         cleanup_reference_transport_failure(state, String::from(REFERENCE_SOURCE_MISMATCH_STATUS));
     } else {
         reset_reference_transport(state);
         state.status = String::from(REFERENCE_SOURCE_MISMATCH_STATUS);
+    }
+    if restore_main_focus {
+        set_audition_source(state, AuditionSource::Main);
     }
 }
 
@@ -18079,6 +18084,87 @@ mod tests {
         assert!(state.waveform.is_some());
         assert!(state.waveform_source_ticket.is_some());
         assert_eq!(state.transport_generation, 0);
+    }
+
+    #[test]
+    fn async_paired_reference_source_mismatch_restores_main_focus_after_cleanup() {
+        let mut state = shared_reference_playback_state();
+        state.paired_playback_guard = PairedPlaybackGuard::Active;
+        state.audition_source = AuditionSource::Reference;
+        state.audition_volume = 0.37;
+        state.reference_match_enabled = true;
+        state.transport_playing = true;
+        state.reference_transport_playing = true;
+        let transport_generation = state.transport_generation;
+        let reference_generation = state.reference_transport_generation;
+        let reference_transport = state
+            .reference_transport
+            .as_ref()
+            .expect("paired playback should have a reference transport")
+            .clone();
+        state.transport.set_snapshot_for_test(Snapshot {
+            generation: transport_generation,
+            acknowledged_token: 0,
+            position_millis: 720,
+            playing: true,
+            ready: true,
+        });
+        reference_transport.set_snapshot_for_test(Snapshot {
+            generation: reference_generation,
+            acknowledged_token: 0,
+            position_millis: 2_640,
+            playing: true,
+            ready: true,
+        });
+        reference_transport.set_error_for_test(
+            reference_generation,
+            String::from("Audio source changed while playing."),
+        );
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut state, Message::Frame, &mut context);
+
+        assert_eq!(state.status, REFERENCE_SOURCE_MISMATCH_STATUS);
+        assert_eq!(state.audition_source, AuditionSource::Main);
+        assert!(!state.transport_playing);
+        assert!(!state.reference_transport_playing);
+        assert_eq!(state.transport.requested_output_gain_for_test(), 0.0);
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::StoppingMain { .. }
+        ));
+        let main_pause_token = state
+            .transport_waiting_token
+            .expect("paired mismatch cleanup should await the main pause");
+
+        state.transport.set_snapshot_for_test(Snapshot {
+            generation: transport_generation,
+            acknowledged_token: main_pause_token,
+            position_millis: 720,
+            playing: false,
+            ready: true,
+        });
+        acknowledge_reference_unload(&state);
+        update(&mut state, Message::Frame, &mut context);
+
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::Idle
+        ));
+        assert_eq!(state.audition_source, AuditionSource::Main);
+        assert_eq!(state.transport.requested_output_gain_for_test(), 0.37);
+        assert_eq!(main_output_gain(&state), 0.37);
+        assert!(!state.transport_playing);
+
+        state.transport.set_command_queue_size_for_test(0);
+        reference_transport.set_command_queue_size_for_test(0);
+        update(&mut state, Message::TogglePlayback, &mut context);
+
+        assert!(state.transport_polling);
+        assert!(state.transport_waiting_token.is_some());
+        assert_eq!(state.transport.requested_output_gain_for_test(), 0.37);
+        assert!(!state.reference_transport_polling);
+        assert!(state.reference_transport_waiting_token.is_none());
     }
 
     #[test]

@@ -105,6 +105,62 @@ jobs:
             [[ "$toml_version" == "$expected" ]] || { echo "Cargo.toml Cadence version $toml_version does not match $expected" >&2; exit 1; }
             [[ "$lock_version" == "$expected" ]] || { echo "Cargo.lock Cadence version $lock_version does not match $expected" >&2; exit 1; }
           }
+          assert_reservation_commit() {
+            local commit="$1"
+            local expected="$2"
+            [[ "$(git rev-list --parents -n 1 "$commit")" == "$commit $original_source_sha" ]] || {
+              echo "nightly reservation tag must point to the original source or a single reservation commit with the original source as its exact parent" >&2
+              exit 1
+            }
+            changed_status="$(git diff-tree --no-commit-id --name-status -r "$commit" | LC_ALL=C sort)"
+            [[ "$changed_status" == $'M\tCargo.lock\nM\tCargo.toml' ]] || {
+              echo "nightly reservation commit must modify only Cargo.toml and Cargo.lock" >&2
+              exit 1
+            }
+            [[ -z "$(git diff --no-ext-diff --summary "$original_source_sha" "$commit" -- Cargo.lock Cargo.toml)" ]] || {
+              echo "nightly reservation commit must not change file modes" >&2
+              exit 1
+            }
+            python3 - "$original_source_sha" "$commit" "$original_cargo_version" "$expected" <<'PY'
+          import re
+          import subprocess
+          import sys
+
+          parent, commit, original, expected = sys.argv[1:]
+          patterns = {
+              "Cargo.toml": re.compile(
+                  r'(?ms)^\[package\]\nname = "cadence-native"\nversion = "([^"]+)"'
+              ),
+              "Cargo.lock": re.compile(
+                  r'(?ms)^\[\[package\]\]\nname = "cadence-native"\nversion = "([^"]+)"'
+              ),
+          }
+
+          def contents(revision, path):
+              return subprocess.check_output(
+                  ["git", "show", f"{revision}:{path}"], text=True
+              )
+
+          def normalize(text, match):
+              return text[:match.start(1)] + expected + text[match.end(1):]
+
+          for path, pattern in patterns.items():
+              before = contents(parent, path)
+              after = contents(commit, path)
+              before_matches = list(pattern.finditer(before))
+              after_matches = list(pattern.finditer(after))
+              if len(before_matches) != 1 or len(after_matches) != 1:
+                  raise SystemExit(f"expected one Cadence package entry in {path}")
+              before_match = before_matches[0]
+              after_match = after_matches[0]
+              if before_match.group(1) != original:
+                  raise SystemExit(f"original Cadence package version drifted in {path}")
+              if after_match.group(1) != expected:
+                  raise SystemExit(f"reservation version mismatch in {path}")
+              if normalize(before, before_match) != normalize(after, after_match):
+                  raise SystemExit(f"reservation commit changed non-version content in {path}")
+          PY
+          }
           write_output() {
             printf '%s\n' "$1=$2" >> "$GITHUB_OUTPUT"
           }
@@ -147,6 +203,9 @@ jobs:
             [[ "$reserved_base_version" =~ ^${base_version_re}$ ]] || { echo "reservation tag does not contain a numeric Cadence package version" >&2; exit 1; }
             [[ "$reserved_cargo_version" == "$reserved_base_version" ]] || { echo "reservation Cargo package version must be numeric: $reserved_cargo_version" >&2; exit 1; }
             [[ "$reserved_lock_version" == "$reserved_cargo_version" ]] || { echo "reservation Cargo.toml and Cargo.lock versions differ" >&2; exit 1; }
+            if [[ "$source_sha" != "$original_source_sha" ]]; then
+              assert_reservation_commit "$source_sha" "$reserved_cargo_version"
+            fi
           else
             git fetch --no-tags origin main
             [[ "$(git rev-parse origin/main)" == "$original_source_sha" ]] || {
