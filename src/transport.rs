@@ -2349,9 +2349,9 @@ mod tests {
         LIVE_SPECTRUM_DISPLAY_MIN_FREQUENCY, LIVE_SPECTRUM_DISPLAY_TILT_DB_PER_OCTAVE,
         LIVE_SPECTRUM_DISPLAY_TILT_REFERENCE_FREQUENCY, LIVE_SPECTRUM_FFT_SIZE,
         LIVE_SPECTRUM_HOP_SIZE, LIVE_SPECTRUM_POINT_COUNT, LiveAnalysisSource, LiveAnalyzer,
-        LiveCaptureSession, LiveSpectrogramFrame, MAX_OUTPUT_GAIN, PendingLoad, SharedSnapshot,
-        clamp_position, display_tilt_db, finish_analyzer_fallback, handle_command, is_current,
-        live_band_ranges, live_display_frequency_bounds, live_spectrum_point_frequency,
+        LiveCaptureSession, LiveSpectrogramFrame, LoadedTrack, MAX_OUTPUT_GAIN, PendingLoad,
+        SharedSnapshot, clamp_position, display_tilt_db, finish_analyzer_fallback, handle_command,
+        is_current, live_band_ranges, live_display_frequency_bounds, live_spectrum_point_frequency,
         live_spectrum_point_mappings, load_track, normalize_output_gain, normalize_volume,
         publish_live_frame_if_due, publish_live_frame_if_due_at, run_live_analyzer_iteration,
     };
@@ -2381,6 +2381,20 @@ mod tests {
             },
         )
         .expect("test source ticket should be valid")
+    }
+
+    fn replaced_ticket_fixture(label: &str) -> (PathBuf, VerifiedSourceTicket) {
+        let path = std::env::temp_dir().join(format!(
+            "cadence-transport-command-reload-{label}-{}",
+            std::process::id()
+        ));
+        fs::write(&path, b"original").expect("fixture should write");
+        let verified = crate::source::open_and_hash(&path, || false)
+            .expect("source should hash before playback");
+        let ticket = verified.ticket();
+        drop(verified);
+        fs::write(&path, b"replaced").expect("replacement should write");
+        (path, ticket)
     }
 
     #[test]
@@ -2538,6 +2552,95 @@ mod tests {
         assert!(player.is_none());
         assert!(loaded.is_none());
         assert!(!shared.snapshot().ready);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn play_reload_command_rejects_replaced_ticket_atomically() {
+        let generation = 11;
+        let token = 101;
+        let (path, ticket) = replaced_ticket_fixture("play");
+        let (shared, session) = active_test_session(generation);
+        shared.ready.store(true, Ordering::Release);
+        shared.playing.store(true, Ordering::Release);
+        let (empty_player, _queue) = Player::new();
+        let mut player = Some(empty_player);
+        let mut loaded = Some(LoadedTrack {
+            generation,
+            ticket,
+            duration_millis: 1_000,
+        });
+        let mut live_session = Some(Arc::clone(&session));
+
+        handle_command(
+            Command::Play { token, generation },
+            &shared,
+            None,
+            &mut player,
+            &mut loaded,
+            &mut live_session,
+        );
+
+        let error = shared
+            .take_error(generation)
+            .expect("play reload should publish a source error");
+        assert!(error.contains("Audio source changed"));
+        let snapshot = shared.snapshot();
+        assert_eq!(snapshot.generation, generation);
+        assert_eq!(snapshot.acknowledged_token, token);
+        assert!(!snapshot.ready);
+        assert!(!snapshot.playing);
+        assert!(player.is_none());
+        assert!(loaded.is_none());
+        assert!(live_session.is_none());
+        assert!(!session.active.load(Ordering::Acquire));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn seek_reload_command_rejects_replaced_ticket_atomically() {
+        let generation = 12;
+        let token = 102;
+        let (path, ticket) = replaced_ticket_fixture("seek");
+        let (shared, session) = active_test_session(generation);
+        shared.ready.store(true, Ordering::Release);
+        shared.playing.store(true, Ordering::Release);
+        let (empty_player, _queue) = Player::new();
+        let mut player = Some(empty_player);
+        let mut loaded = Some(LoadedTrack {
+            generation,
+            ticket,
+            duration_millis: 1_000,
+        });
+        let mut live_session = Some(Arc::clone(&session));
+
+        handle_command(
+            Command::Seek {
+                token,
+                generation,
+                position_millis: 250,
+                resume: true,
+            },
+            &shared,
+            None,
+            &mut player,
+            &mut loaded,
+            &mut live_session,
+        );
+
+        let error = shared
+            .take_error(generation)
+            .expect("seek reload should publish a source error");
+        assert!(error.contains("Audio source changed"));
+        let snapshot = shared.snapshot();
+        assert_eq!(snapshot.generation, generation);
+        assert_eq!(snapshot.acknowledged_token, token);
+        assert!(!snapshot.ready);
+        assert!(!snapshot.playing);
+        assert!(player.is_none());
+        assert!(loaded.is_none());
+        assert!(live_session.is_none());
+        assert!(!session.active.load(Ordering::Acquire));
         let _ = fs::remove_file(path);
     }
 
