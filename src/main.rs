@@ -85,8 +85,8 @@ enum Message {
         result: Result<audio::DecodedAudioFile, String>,
     },
     RequestBindHistoricalComments(HistoricalBindingOwner),
-    ConfirmBindHistoricalComments,
-    CancelBindHistoricalComments,
+    ConfirmBindHistoricalComments(HistoricalBindingCandidate),
+    CancelBindHistoricalComments(HistoricalBindingCandidate),
     HistoricalBindingCompleted {
         request: HistoricalBindingRequest,
         result: Result<crate::source::AudioSourceProof, String>,
@@ -236,9 +236,12 @@ enum Message {
         ratio: f32,
     },
     ReferenceCommentDragCancelled,
-    DraftNoteChanged(String),
-    SaveDraftNote,
-    CancelDraftNote,
+    DraftNoteChanged {
+        identity: NoteDraftIdentity,
+        body: String,
+    },
+    SaveDraftNote(NoteDraftIdentity),
+    CancelDraftNote(NoteDraftIdentity),
     SelectNote(NoteAddress),
     PlayComment {
         address: NoteAddress,
@@ -249,9 +252,12 @@ enum Message {
     ReferenceCommentHoverEnded(NoteAddress),
     EditNote(NoteAddress),
     DeleteNote(NoteAddress),
-    ReferenceDraftNoteChanged(String),
-    SaveReferenceDraftNote,
-    CancelReferenceDraftNote,
+    ReferenceDraftNoteChanged {
+        identity: NoteDraftIdentity,
+        body: String,
+    },
+    SaveReferenceDraftNote(NoteDraftIdentity),
+    CancelReferenceDraftNote(NoteDraftIdentity),
     SelectReferenceNote(NoteAddress),
     EditReferenceNote(NoteAddress),
     FocusCommentEditor(u64),
@@ -268,6 +274,13 @@ enum NoteOwner {
 struct NoteAddress {
     owner: NoteOwner,
     note_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct NoteDraftIdentity {
+    owner: NoteOwner,
+    note_id: Option<String>,
+    nonce: u64,
 }
 
 impl NoteAddress {
@@ -1068,6 +1081,7 @@ struct AppState {
     historical_binding_in_flight: Option<HistoricalBindingRequest>,
     historical_binding_cancellation: Option<ui::CancellationToken>,
     next_historical_binding_request_id: u64,
+    next_note_draft_nonce: u64,
     next_reference_selection_request_id: u64,
     import_batch: Option<ImportBatchProgress>,
     pending_import_paths: Vec<PathBuf>,
@@ -1087,11 +1101,20 @@ struct AppState {
 struct NoteDraft {
     owner: NoteOwner,
     note_id: Option<String>,
+    nonce: u64,
     time_millis: u64,
     body: String,
 }
 
 impl NoteDraft {
+    fn identity(&self) -> NoteDraftIdentity {
+        NoteDraftIdentity {
+            owner: self.owner.clone(),
+            note_id: self.note_id.clone(),
+            nonce: self.nonce,
+        }
+    }
+
     fn address(&self) -> Option<NoteAddress> {
         self.note_id
             .as_ref()
@@ -1210,6 +1233,7 @@ impl Default for AppState {
             historical_binding_in_flight: None,
             historical_binding_cancellation: None,
             next_historical_binding_request_id: 0,
+            next_note_draft_nonce: 0,
             next_reference_selection_request_id: 0,
             import_batch: None,
             pending_import_paths: Vec::new(),
@@ -1235,6 +1259,18 @@ impl AppState {
             ..Self::default()
         }
     }
+}
+
+fn allocate_note_draft_nonce(state: &mut AppState) -> u64 {
+    state.next_note_draft_nonce = state
+        .next_note_draft_nonce
+        .checked_add(1)
+        .expect("note draft nonce overflow");
+    state.next_note_draft_nonce
+}
+
+fn active_draft_matches(draft: Option<&NoteDraft>, identity: &NoteDraftIdentity) -> bool {
+    draft.is_some_and(|draft| draft.identity().eq(identity))
 }
 
 fn playback_shortcut(state: &AppState, press: ui::KeyPress) -> ui::ShortcutResolution<Message> {
@@ -2501,11 +2537,20 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             );
             context.request_repaint();
         }
-        Message::ConfirmBindHistoricalComments => {
-            start_historical_binding(state, context);
+        Message::ConfirmBindHistoricalComments(candidate) => {
+            start_historical_binding(state, context, candidate);
         }
-        Message::CancelBindHistoricalComments => {
-            if state.historical_binding_in_flight.is_some() {
+        Message::CancelBindHistoricalComments(candidate) => {
+            let matches_confirmation =
+                state.historical_binding_confirmation.as_ref() == Some(&candidate);
+            let matches_in_flight = state
+                .historical_binding_in_flight
+                .as_ref()
+                .is_some_and(|request| request.candidate == candidate);
+            if !matches_confirmation && !matches_in_flight {
+                return;
+            }
+            if matches_in_flight {
                 clear_historical_binding(state);
                 state.busy = false;
                 state.status = String::from(
@@ -4024,7 +4069,10 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             state.status = String::from("Reference comment canceled.");
             context.request_repaint();
         }
-        Message::DraftNoteChanged(body) => {
+        Message::DraftNoteChanged { identity, body } => {
+            if !active_draft_matches(state.draft_note.as_ref(), &identity) {
+                return;
+            }
             if !main_annotations_available(state) && reject_unknown_main_source(state, context) {
                 return;
             }
@@ -4033,13 +4081,19 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 context.request_repaint();
             }
         }
-        Message::SaveDraftNote => {
+        Message::SaveDraftNote(identity) => {
+            if !active_draft_matches(state.draft_note.as_ref(), &identity) {
+                return;
+            }
             if !main_annotations_available(state) && reject_unknown_main_source(state, context) {
                 return;
             }
-            save_draft_note(state, context)
+            save_draft_note(state, context, &identity)
         }
-        Message::CancelDraftNote => {
+        Message::CancelDraftNote(identity) => {
+            if !active_draft_matches(state.draft_note.as_ref(), &identity) {
+                return;
+            }
             if !library_is_ready(state) {
                 return;
             }
@@ -4153,6 +4207,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 .cloned();
             if let Some(note) = note {
                 let editor_id = main_inline_comment_editor_id(&address);
+                let nonce = allocate_note_draft_nonce(state);
                 set_pending_seek_intent(state, AuditionSource::Main, note.time_millis);
                 state.review_cursor_millis = note.time_millis;
                 state.transport_position_millis = note.time_millis;
@@ -4160,6 +4215,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 state.draft_note = Some(NoteDraft {
                     owner: address.owner,
                     note_id: Some(note.id),
+                    nonce,
                     time_millis: note.time_millis,
                     body: note.body,
                 });
@@ -4217,7 +4273,10 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
             context.request_repaint();
         }
-        Message::ReferenceDraftNoteChanged(body) => {
+        Message::ReferenceDraftNoteChanged { identity, body } => {
+            if !active_draft_matches(state.reference_draft_note.as_ref(), &identity) {
+                return;
+            }
             if !reference_annotations_available(state)
                 && reject_unknown_reference_source(state, context)
             {
@@ -4228,15 +4287,21 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 context.request_repaint();
             }
         }
-        Message::SaveReferenceDraftNote => {
+        Message::SaveReferenceDraftNote(identity) => {
+            if !active_draft_matches(state.reference_draft_note.as_ref(), &identity) {
+                return;
+            }
             if !reference_annotations_available(state)
                 && reject_unknown_reference_source(state, context)
             {
                 return;
             }
-            save_reference_draft_note(state, context)
+            save_reference_draft_note(state, context, &identity)
         }
-        Message::CancelReferenceDraftNote => {
+        Message::CancelReferenceDraftNote(identity) => {
+            if !active_draft_matches(state.reference_draft_note.as_ref(), &identity) {
+                return;
+            }
             if !library_is_ready(state) {
                 return;
             }
@@ -4293,12 +4358,14 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 .cloned();
             if let Some(note) = note {
                 let editor_id = reference_inline_comment_editor_id(&address);
+                let nonce = allocate_note_draft_nonce(state);
                 set_pending_seek_intent(state, AuditionSource::Reference, note.time_millis);
                 state.selected_reference_note_id = Some(address.clone());
                 state.reference_transport_position_millis = note.time_millis;
                 state.reference_draft_note = Some(NoteDraft {
                     owner: address.owner,
                     note_id: Some(note.id),
+                    nonce,
                     time_millis: note.time_millis,
                     body: note.body,
                 });
@@ -6155,9 +6222,11 @@ fn start_main_note_draft(
     let Some(track_id) = state.library.selected_track_id.clone() else {
         return;
     };
+    let nonce = allocate_note_draft_nonce(state);
     state.draft_note = Some(NoteDraft {
         owner: NoteOwner::MainTrack(track_id),
         note_id: None,
+        nonce,
         time_millis,
         body: String::new(),
     });
@@ -6170,7 +6239,14 @@ fn start_main_note_draft(
     context.request_repaint();
 }
 
-fn save_draft_note(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
+fn save_draft_note(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    identity: &NoteDraftIdentity,
+) {
+    if !active_draft_matches(state.draft_note.as_ref(), identity) {
+        return;
+    }
     if !library_is_ready(state) {
         state.status = library_unavailable_status(state).to_string();
         context.request_repaint();
@@ -6262,9 +6338,11 @@ fn start_reference_comment_draft(
     let Some(owner) = selected_reference_owner(state) else {
         return;
     };
+    let nonce = allocate_note_draft_nonce(state);
     state.reference_draft_note = Some(NoteDraft {
         owner,
         note_id: None,
+        nonce,
         time_millis,
         body: String::new(),
     });
@@ -6278,7 +6356,14 @@ fn start_reference_comment_draft(
     context.request_repaint();
 }
 
-fn save_reference_draft_note(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
+fn save_reference_draft_note(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    identity: &NoteDraftIdentity,
+) {
+    if !active_draft_matches(state.reference_draft_note.as_ref(), identity) {
+        return;
+    }
     if !library_is_ready(state) {
         state.status = library_unavailable_status(state).to_string();
         context.request_repaint();
@@ -7230,13 +7315,21 @@ fn complete_audio_import_preflight(
     }
 }
 
-fn start_historical_binding(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
+fn start_historical_binding(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    candidate: HistoricalBindingCandidate,
+) {
     if state.busy || !library_is_ready(state) {
         return;
     }
-    let Some(candidate) = state.historical_binding_confirmation.take() else {
+    if state.historical_binding_confirmation.as_ref() != Some(&candidate) {
         return;
-    };
+    }
+    let candidate = state
+        .historical_binding_confirmation
+        .take()
+        .expect("the matching historical binding candidate should be present");
     if historical_binding_candidate(state, candidate.owner.clone()).as_ref() != Some(&candidate) {
         state.status = String::from(
             "The displayed source changed before binding; retained historical comments were not changed.",
@@ -11800,19 +11893,20 @@ fn comments_panel(state: &AppState, track: &storage::Track) -> ui::View<Message>
             .is_some_and(|request| request.candidate.owner == owner)
         {
             ui::text("Binding…").subtle().height(28.0)
-        } else if state
+        } else if let Some(candidate) = state
             .historical_binding_confirmation
             .as_ref()
-            .is_some_and(|candidate| candidate.owner == owner)
+            .filter(|candidate| candidate.owner == owner)
+            .cloned()
         {
             ui::row([
                 ui::button("Confirm binding")
                     .primary()
-                    .message(Message::ConfirmBindHistoricalComments)
+                    .message(Message::ConfirmBindHistoricalComments(candidate.clone()))
                     .height(28.0),
                 ui::button("Cancel")
                     .subtle()
-                    .message(Message::CancelBindHistoricalComments)
+                    .message(Message::CancelBindHistoricalComments(candidate))
                     .height(28.0),
             ])
             .spacing(6.0)
@@ -11925,6 +12019,8 @@ fn comments_panel(state: &AppState, track: &storage::Track) -> ui::View<Message>
 }
 
 fn note_editor(draft: &NoteDraft) -> ui::View<Message> {
+    let identity = draft.identity();
+    let editor_identity = identity.clone();
     ui::column([
         ui::text(format!(
             "COMMENT AT {}",
@@ -11935,13 +12031,16 @@ fn note_editor(draft: &NoteDraft) -> ui::View<Message> {
         .subtle(),
         ui::text_input(draft.body.clone())
             .placeholder("Write a comment…")
-            .message_event(|input| {
+            .message_event(move |input| {
                 let submitted = input.is_submitted();
                 let value = input.into_value();
                 if submitted {
-                    Message::SaveDraftNote
+                    Message::SaveDraftNote(editor_identity.clone())
                 } else {
-                    Message::DraftNoteChanged(value)
+                    Message::DraftNoteChanged {
+                        identity: editor_identity.clone(),
+                        body: value,
+                    }
                 }
             })
             .id(MAIN_COMMENT_EDITOR_ID)
@@ -11950,11 +12049,11 @@ fn note_editor(draft: &NoteDraft) -> ui::View<Message> {
         ui::row([
             ui::button("Save comment")
                 .primary()
-                .message(Message::SaveDraftNote)
+                .message(Message::SaveDraftNote(identity.clone()))
                 .height(28.0),
             ui::button("Cancel")
                 .subtle()
-                .message(Message::CancelDraftNote)
+                .message(Message::CancelDraftNote(identity))
                 .height(28.0),
         ])
         .spacing(8.0)
@@ -11966,6 +12065,8 @@ fn note_editor(draft: &NoteDraft) -> ui::View<Message> {
 }
 
 fn reference_note_editor(draft: &NoteDraft) -> ui::View<Message> {
+    let identity = draft.identity();
+    let editor_identity = identity.clone();
     ui::column([
         ui::text(format!(
             "REFERENCE COMMENT AT {}",
@@ -11976,13 +12077,16 @@ fn reference_note_editor(draft: &NoteDraft) -> ui::View<Message> {
         .subtle(),
         ui::text_input(draft.body.clone())
             .placeholder("Write a reference comment…")
-            .message_event(|input| {
+            .message_event(move |input| {
                 let submitted = input.is_submitted();
                 let value = input.into_value();
                 if submitted {
-                    Message::SaveReferenceDraftNote
+                    Message::SaveReferenceDraftNote(editor_identity.clone())
                 } else {
-                    Message::ReferenceDraftNoteChanged(value)
+                    Message::ReferenceDraftNoteChanged {
+                        identity: editor_identity.clone(),
+                        body: value,
+                    }
                 }
             })
             .id(REFERENCE_COMMENT_EDITOR_ID)
@@ -11991,11 +12095,11 @@ fn reference_note_editor(draft: &NoteDraft) -> ui::View<Message> {
         ui::row([
             ui::button("Save reference comment")
                 .primary()
-                .message(Message::SaveReferenceDraftNote)
+                .message(Message::SaveReferenceDraftNote(identity.clone()))
                 .height(28.0),
             ui::button("Cancel")
                 .subtle()
-                .message(Message::CancelReferenceDraftNote)
+                .message(Message::CancelReferenceDraftNote(identity))
                 .height(28.0),
         ])
         .spacing(8.0)
@@ -12035,6 +12139,7 @@ fn note_row(
     let selected = selected_note_id == Some(&address);
     let domain_hovered = hovered_note_id == Some(&address);
     let editing = editing_note.is_some_and(|draft| draft.address().as_ref() == Some(&address));
+    let editing_identity = editing_note.map(NoteDraft::identity);
     let note_key = qualified_note_identity_key(&address);
     let note_body = note.body.clone();
     let note_time_millis = note.time_millis;
@@ -12049,12 +12154,19 @@ fn note_row(
         .size(28.0, 24.0);
     let body = if editing {
         let draft = editing_note.expect("an editing row should have a matching draft");
+        let identity = editing_identity
+            .as_ref()
+            .expect("an editing row should have a matching draft identity")
+            .clone();
         ui::text_input(draft.body.clone())
-            .message_event(|input| {
+            .message_event(move |input| {
                 if input.is_submitted() {
-                    Message::SaveDraftNote
+                    Message::SaveDraftNote(identity.clone())
                 } else {
-                    Message::DraftNoteChanged(input.into_value())
+                    Message::DraftNoteChanged {
+                        identity: identity.clone(),
+                        body: input.into_value(),
+                    }
                 }
             })
             .id(main_inline_comment_editor_id(&address))
@@ -12074,14 +12186,16 @@ fn note_row(
             .fill_width()
     };
     let trailing_control = if editing {
+        let identity =
+            editing_identity.expect("an editing row should have a matching draft identity");
         ui::row([
             ui::button("Save")
                 .primary()
-                .message(Message::SaveDraftNote)
+                .message(Message::SaveDraftNote(identity.clone()))
                 .height(28.0),
             ui::button("Cancel")
                 .subtle()
-                .message(Message::CancelDraftNote)
+                .message(Message::CancelDraftNote(identity))
                 .height(28.0),
         ])
         .spacing(4.0)
@@ -12169,6 +12283,7 @@ fn reference_note_row(
     let selected = selected_note_id == Some(&address);
     let domain_hovered = hovered_note_id == Some(&address);
     let editing = editing_note.is_some_and(|draft| draft.address().as_ref() == Some(&address));
+    let editing_identity = editing_note.map(NoteDraft::identity);
     let note_key = qualified_note_identity_key(&address);
     let note_body = note.body.clone();
     let note_time_millis = note.time_millis;
@@ -12183,12 +12298,19 @@ fn reference_note_row(
         .size(28.0, 24.0);
     let body = if editing {
         let draft = editing_note.expect("an editing reference row should have a matching draft");
+        let identity = editing_identity
+            .as_ref()
+            .expect("an editing row should have a matching draft identity")
+            .clone();
         ui::text_input(draft.body.clone())
-            .message_event(|input| {
+            .message_event(move |input| {
                 if input.is_submitted() {
-                    Message::SaveReferenceDraftNote
+                    Message::SaveReferenceDraftNote(identity.clone())
                 } else {
-                    Message::ReferenceDraftNoteChanged(input.into_value())
+                    Message::ReferenceDraftNoteChanged {
+                        identity: identity.clone(),
+                        body: input.into_value(),
+                    }
                 }
             })
             .id(reference_inline_comment_editor_id(&address))
@@ -12208,14 +12330,16 @@ fn reference_note_row(
             .fill_width()
     };
     let trailing_control = if editing {
+        let identity =
+            editing_identity.expect("an editing row should have a matching draft identity");
         ui::row([
             ui::button("Save")
                 .primary()
-                .message(Message::SaveReferenceDraftNote)
+                .message(Message::SaveReferenceDraftNote(identity.clone()))
                 .height(28.0),
             ui::button("Cancel")
                 .subtle()
-                .message(Message::CancelReferenceDraftNote)
+                .message(Message::CancelReferenceDraftNote(identity))
                 .height(28.0),
         ])
         .spacing(4.0)
@@ -14237,12 +14361,18 @@ mod tests {
         state.draft_note = Some(NoteDraft {
             owner: NoteOwner::MainTrack(String::from("main-comment-id-track")),
             note_id: None,
+            nonce: 1,
             time_millis: 500,
             body: String::from("New main comment"),
         });
         let mut context = ui::UiUpdateContext::default();
+        let identity = state
+            .draft_note
+            .as_ref()
+            .expect("the test draft should be active")
+            .identity();
 
-        update(&mut state, Message::SaveDraftNote, &mut context);
+        update(&mut state, Message::SaveDraftNote(identity), &mut context);
 
         assert!(state.draft_note.is_none());
         assert_eq!(state.library.tracks[0].notes.len(), 2);
@@ -14283,12 +14413,22 @@ mod tests {
                     .expect("the test track should have a reference path"),
             ),
             note_id: None,
+            nonce: 1,
             time_millis: 1_000,
             body: String::from("New reference comment"),
         });
         let mut context = ui::UiUpdateContext::default();
+        let identity = state
+            .reference_draft_note
+            .as_ref()
+            .expect("the test draft should be active")
+            .identity();
 
-        update(&mut state, Message::SaveReferenceDraftNote, &mut context);
+        update(
+            &mut state,
+            Message::SaveReferenceDraftNote(identity),
+            &mut context,
+        );
 
         assert!(state.reference_draft_note.is_none());
         assert_eq!(state.library.reference_tracks[0].notes.len(), 2);
@@ -14302,6 +14442,78 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn stale_main_editor_events_do_not_touch_a_replacement_draft() {
+        let mut state = audition_state(&["stale-editor-track"]);
+        state.review_cursor_millis = 125;
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut state, Message::NewNoteAtCurrentTime, &mut context);
+        let stale_identity = state
+            .draft_note
+            .as_ref()
+            .expect("the first draft should be active")
+            .identity();
+
+        state.review_cursor_millis = 875;
+        update(&mut state, Message::NewNoteAtCurrentTime, &mut context);
+        let active_identity = state
+            .draft_note
+            .as_ref()
+            .expect("the replacement draft should be active")
+            .identity();
+        assert_ne!(stale_identity, active_identity);
+        assert!(active_identity.nonce > stale_identity.nonce);
+        assert_eq!(
+            &active_identity.owner,
+            &NoteOwner::MainTrack(String::from("stale-editor-track"))
+        );
+
+        update(
+            &mut state,
+            Message::DraftNoteChanged {
+                identity: stale_identity.clone(),
+                body: String::from("stale body"),
+            },
+            &mut context,
+        );
+        update(
+            &mut state,
+            Message::SaveDraftNote(stale_identity.clone()),
+            &mut context,
+        );
+        update(
+            &mut state,
+            Message::CancelDraftNote(stale_identity),
+            &mut context,
+        );
+
+        let draft = state
+            .draft_note
+            .as_ref()
+            .expect("stale editor events must leave the replacement draft active");
+        assert_eq!(draft.identity(), active_identity);
+        assert_eq!(draft.body, "");
+        assert!(state.library.tracks[0].notes.is_empty());
+
+        update(
+            &mut state,
+            Message::DraftNoteChanged {
+                identity: active_identity.clone(),
+                body: String::from("active body"),
+            },
+            &mut context,
+        );
+        update(
+            &mut state,
+            Message::SaveDraftNote(active_identity),
+            &mut context,
+        );
+
+        assert!(state.draft_note.is_none());
+        assert_eq!(state.library.tracks[0].notes[0].body, "active body");
     }
 
     #[test]
@@ -14839,6 +15051,7 @@ mod tests {
             reference_draft_note: Some(NoteDraft {
                 owner: NoteOwner::ReferenceTrack(reference_path.clone()),
                 note_id: None,
+                nonce: 1,
                 time_millis: 200,
                 body: String::from("stale"),
             }),
@@ -14916,6 +15129,7 @@ mod tests {
             draft_note: Some(NoteDraft {
                 owner: NoteOwner::MainTrack(String::from("playhead-drag")),
                 note_id: None,
+                nonce: 1,
                 time_millis: 100,
                 body: String::from("old draft"),
             }),
@@ -15121,6 +15335,7 @@ mod tests {
         state.draft_note = Some(NoteDraft {
             owner: NoteOwner::MainTrack(track_id.clone()),
             note_id: Some(note_id.clone()),
+            nonce: 1,
             time_millis: 500,
             body: String::from("edit this"),
         });
@@ -15222,6 +15437,7 @@ mod tests {
             draft_note: Some(NoteDraft {
                 owner: NoteOwner::MainTrack(String::from("draft")),
                 note_id: None,
+                nonce: 1,
                 time_millis: 0,
                 body: String::new(),
             }),
@@ -15248,6 +15464,7 @@ mod tests {
             reference_draft_note: Some(NoteDraft {
                 owner: NoteOwner::ReferenceTrack(PathBuf::from("/external/reference.wav")),
                 note_id: None,
+                nonce: 1,
                 time_millis: 0,
                 body: String::new(),
             }),
@@ -15279,6 +15496,7 @@ mod tests {
                 draft: NoteDraft {
                     owner: NoteOwner::MainTrack(String::from("note-editor")),
                     note_id: None,
+                    nonce: 1,
                     time_millis: 1_000,
                     body: String::from("Submit me"),
                 },
@@ -15290,7 +15508,7 @@ mod tests {
                     .into_surface()
             },
             |state, message| {
-                if message == Message::SaveDraftNote {
+                if matches!(message, Message::SaveDraftNote(_)) {
                     state.submitted = true;
                 }
             },
@@ -16517,6 +16735,7 @@ mod tests {
         state.reference_draft_note = Some(NoteDraft {
             owner: NoteOwner::ReferenceTrack(reference_path.clone()),
             note_id: Some(note_id.clone()),
+            nonce: 1,
             time_millis: 500,
             body: String::from("edit this reference comment"),
         });
@@ -19158,12 +19377,24 @@ mod tests {
                 .map(|draft| draft.time_millis),
             Some(250)
         );
+        let identity = state
+            .reference_draft_note
+            .as_ref()
+            .expect("the reference draft should be active")
+            .identity();
         update(
             &mut state,
-            Message::ReferenceDraftNoteChanged(String::from("Check the reference kick.")),
+            Message::ReferenceDraftNoteChanged {
+                identity: identity.clone(),
+                body: String::from("Check the reference kick."),
+            },
             &mut context,
         );
-        update(&mut state, Message::SaveReferenceDraftNote, &mut context);
+        update(
+            &mut state,
+            Message::SaveReferenceDraftNote(identity),
+            &mut context,
+        );
 
         assert!(state.reference_draft_note.is_none());
         assert_eq!(state.library.tracks[0].notes[0].body, "Main track note");
@@ -19241,17 +19472,20 @@ mod tests {
             NoteDraft {
                 owner: NoteOwner::ReferenceTrack(PathBuf::from("/external/track-a-reference.wav")),
                 note_id: None,
+                nonce: 1,
                 time_millis: 1_250,
                 body: String::from("unsaved new A comment"),
             },
             NoteDraft {
                 owner: NoteOwner::ReferenceTrack(PathBuf::from("/external/track-a-reference.wav")),
                 note_id: Some(String::from("shared-reference-note")),
+                nonce: 1,
                 time_millis: 500,
                 body: String::from("edited A comment"),
             },
         ] {
             let mut state = reference_removal_state();
+            let identity = draft.identity();
             state.reference_draft_note = Some(draft);
             state.remove_confirmation_track_id = Some(String::from("track-a"));
             let mut context = ui::UiUpdateContext::default();
@@ -19266,7 +19500,7 @@ mod tests {
             assert!(state.reference_draft_note.is_none());
             update(
                 &mut state,
-                Message::SaveReferenceDraftNote,
+                Message::SaveReferenceDraftNote(identity),
                 &mut ui::UiUpdateContext::default(),
             );
             let successor_reference = state
@@ -19289,6 +19523,7 @@ mod tests {
         state.reference_draft_note = Some(NoteDraft {
             owner: NoteOwner::ReferenceTrack(PathBuf::from("/external/track-a-reference.wav")),
             note_id: Some(String::from("shared-reference-note")),
+            nonce: 1,
             time_millis: 500,
             body: String::from("editing A"),
         });
@@ -19348,6 +19583,7 @@ mod tests {
         state.reference_draft_note = Some(NoteDraft {
             owner: NoteOwner::ReferenceTrack(PathBuf::from("/external/track-b-reference.wav")),
             note_id: Some(String::from("shared-reference-note")),
+            nonce: 1,
             time_millis: 750,
             body: String::from("editing B"),
         });
@@ -19399,6 +19635,7 @@ mod tests {
             draft_note: Some(NoteDraft {
                 owner: NoteOwner::MainTrack(track_id.clone()),
                 note_id: Some(String::from("target-note")),
+                nonce: 1,
                 time_millis: 1_000,
                 body: String::from("edit this"),
             }),
@@ -21527,7 +21764,7 @@ mod tests {
 
         update(
             &mut state,
-            Message::ConfirmBindHistoricalComments,
+            Message::ConfirmBindHistoricalComments(candidate.clone()),
             &mut context,
         );
         let request = state
@@ -21552,6 +21789,74 @@ mod tests {
         assert_eq!(state.library.tracks[0].notes, notes);
         assert!(state.save_in_flight.is_some());
         assert!(state.status.contains("Notes were preserved"));
+    }
+
+    #[test]
+    fn stale_main_binding_confirmation_cannot_consume_replaced_reference_candidate() {
+        let (mut state, main_path, _main_proof, notes) = historical_main_binding_state();
+        let reference_path = PathBuf::from("/external/replacement-reference.wav");
+        let reference_ticket = verified_audition_waveform_for(&reference_path)
+            .ticket()
+            .clone();
+        state.library.tracks[0].reference_path = Some(reference_path.clone());
+        state.library.reference_tracks.push(ReferenceTrack {
+            path: reference_path.clone(),
+            source_proof: crate::source::SourceProvenance::Unknown,
+            notes: Vec::new(),
+        });
+        state.reference_waveform_source_ticket = Some(reference_ticket);
+        state.reference_waveform_track_id = state.library.selected_track_id.clone();
+        state.reference_waveform_generation = 3;
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::RequestBindHistoricalComments(super::HistoricalBindingOwner::Main {
+                track_id: String::from("historical-binding"),
+            }),
+            &mut context,
+        );
+        let main_candidate = state
+            .historical_binding_confirmation
+            .clone()
+            .expect("main binding should require confirmation");
+        assert_eq!(main_candidate.path, main_path);
+
+        update(
+            &mut state,
+            Message::RequestBindHistoricalComments(super::HistoricalBindingOwner::Reference {
+                path: reference_path.clone(),
+            }),
+            &mut context,
+        );
+        let reference_candidate = state
+            .historical_binding_confirmation
+            .clone()
+            .expect("reference binding should replace the pending candidate");
+        assert_eq!(reference_candidate.path, reference_path);
+        assert_ne!(main_candidate, reference_candidate);
+
+        update(
+            &mut state,
+            Message::ConfirmBindHistoricalComments(main_candidate),
+            &mut context,
+        );
+
+        assert_eq!(
+            state.historical_binding_confirmation,
+            Some(reference_candidate)
+        );
+        assert!(state.historical_binding_in_flight.is_none());
+        assert!(!state.busy);
+        assert_eq!(
+            state.library.tracks[0].source_proof,
+            crate::source::SourceProvenance::Unknown
+        );
+        assert_eq!(state.library.tracks[0].notes, notes);
+        assert_eq!(
+            state.library.reference_tracks[0].source_proof,
+            crate::source::SourceProvenance::Unknown
+        );
     }
 
     #[test]
@@ -21593,9 +21898,13 @@ mod tests {
             Message::RequestBindHistoricalComments(owner),
             &mut context,
         );
+        let candidate = state
+            .historical_binding_confirmation
+            .clone()
+            .expect("reference binding should require confirmation");
         update(
             &mut state,
-            Message::ConfirmBindHistoricalComments,
+            Message::ConfirmBindHistoricalComments(candidate),
             &mut context,
         );
         let request = state
@@ -21629,9 +21938,13 @@ mod tests {
             }),
             &mut ui::UiUpdateContext::default(),
         );
+        let candidate = state
+            .historical_binding_confirmation
+            .clone()
+            .expect("binding should require confirmation");
         update(
             &mut state,
-            Message::ConfirmBindHistoricalComments,
+            Message::ConfirmBindHistoricalComments(candidate),
             &mut ui::UiUpdateContext::default(),
         );
         let request = state
@@ -21673,9 +21986,13 @@ mod tests {
             }),
             &mut ui::UiUpdateContext::default(),
         );
+        let candidate = state
+            .historical_binding_confirmation
+            .clone()
+            .expect("binding should require confirmation");
         update(
             &mut state,
-            Message::ConfirmBindHistoricalComments,
+            Message::ConfirmBindHistoricalComments(candidate.clone()),
             &mut ui::UiUpdateContext::default(),
         );
         let request = state
@@ -21684,7 +22001,7 @@ mod tests {
             .expect("binding should be in flight");
         update(
             &mut state,
-            Message::CancelBindHistoricalComments,
+            Message::CancelBindHistoricalComments(candidate),
             &mut ui::UiUpdateContext::default(),
         );
         assert!(!state.busy);
@@ -21718,9 +22035,13 @@ mod tests {
             }),
             &mut ui::UiUpdateContext::default(),
         );
+        let candidate = state
+            .historical_binding_confirmation
+            .clone()
+            .expect("binding should require confirmation");
         update(
             &mut state,
-            Message::ConfirmBindHistoricalComments,
+            Message::ConfirmBindHistoricalComments(candidate),
             &mut ui::UiUpdateContext::default(),
         );
         let request = state
@@ -28301,6 +28622,7 @@ mod tests {
         state.reference_draft_note = Some(NoteDraft {
             owner: NoteOwner::ReferenceTrack(path.clone()),
             note_id: Some(String::from("draft")),
+            nonce: 1,
             time_millis: 99,
             body: String::from("keep this draft"),
         });
@@ -28379,6 +28701,7 @@ mod tests {
         state.reference_draft_note = Some(NoteDraft {
             owner: NoteOwner::ReferenceTrack(path.clone()),
             note_id: None,
+            nonce: 1,
             time_millis: 12,
             body: String::from("legacy draft"),
         });
@@ -28570,6 +28893,7 @@ mod tests {
         state.reference_draft_note = Some(NoteDraft {
             owner: NoteOwner::ReferenceTrack(path.clone()),
             note_id: Some(String::from("reset-draft")),
+            nonce: 1,
             time_millis: 1,
             body: String::from("reset"),
         });
@@ -28624,6 +28948,7 @@ mod tests {
         other.reference_draft_note = Some(NoteDraft {
             owner: NoteOwner::ReferenceTrack(other_path.clone()),
             note_id: None,
+            nonce: 1,
             time_millis: 2,
             body: String::from("preserve"),
         });
