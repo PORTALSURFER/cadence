@@ -1,5 +1,6 @@
 mod audio;
 mod chrome;
+mod source;
 mod spectrogram;
 mod storage;
 mod transport;
@@ -823,6 +824,14 @@ struct AudioImportRequest {
     path: PathBuf,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PendingImportCommit {
+    Main,
+    AssignedReference { track_id: String, path: PathBuf },
+    Catalog { path: PathBuf },
+    Replacement { track_id: String },
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LibraryLoadState {
     Loading,
@@ -947,6 +956,8 @@ struct AppState {
     audition_auto_advance: bool,
     audition_play_token: Option<u64>,
     audition_pending_play_track_id: Option<String>,
+    audio_import_in_flight: Option<AudioImportRequest>,
+    pending_import_commit: Option<PendingImportCommit>,
     import_batch: Option<ImportBatchProgress>,
     pending_import_paths: Vec<PathBuf>,
     pending_reference_paths: Vec<PathBuf>,
@@ -1072,6 +1083,8 @@ impl Default for AppState {
             audition_auto_advance: false,
             audition_play_token: None,
             audition_pending_play_track_id: None,
+            audio_import_in_flight: None,
+            pending_import_commit: None,
             import_batch: None,
             pending_import_paths: Vec::new(),
             pending_reference_paths: Vec::new(),
@@ -1420,6 +1433,8 @@ fn activate_loaded_library(
     context: &mut ui::UiUpdateContext<Message>,
     library: storage::Library,
 ) {
+    state.audio_import_in_flight = None;
+    state.pending_import_commit = None;
     state.library = library;
     state.library_revision = 0;
     state.persisted_library_revision = 0;
@@ -1928,6 +1943,12 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             context.request_repaint();
         }
         Message::ReferenceCatalogImportCompleted { path, result } => {
+            if state.pending_import_commit.as_ref()
+                != Some(&PendingImportCommit::Catalog { path: path.clone() })
+            {
+                return;
+            }
+            state.pending_import_commit = None;
             state.busy = false;
             if !library_is_ready(state) {
                 state.status = library_unavailable_status(state).to_string();
@@ -2017,6 +2038,13 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             context.request_repaint();
         }
         Message::ImportCompleted(result) => {
+            if !matches!(
+                state.pending_import_commit.as_ref(),
+                Some(PendingImportCommit::Main)
+            ) {
+                return;
+            }
+            state.pending_import_commit = None;
             let failed = result.is_err();
             state.busy = false;
             if !library_is_ready(state) {
@@ -2069,6 +2097,14 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             context.request_repaint();
         }
         Message::ReplaceCompleted { track_id, result } => {
+            if state.pending_import_commit.as_ref()
+                != Some(&PendingImportCommit::Replacement {
+                    track_id: track_id.clone(),
+                })
+            {
+                return;
+            }
+            state.pending_import_commit = None;
             state.busy = false;
             if !library_is_ready(state) {
                 state.status = library_unavailable_status(state).to_string();
@@ -2121,6 +2157,15 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             path,
             result,
         } => {
+            if state.pending_import_commit.as_ref()
+                != Some(&PendingImportCommit::AssignedReference {
+                    track_id: track_id.clone(),
+                    path: path.clone(),
+                })
+            {
+                return;
+            }
+            state.pending_import_commit = None;
             let failed = result.is_err();
             state.busy = false;
             if !library_is_ready(state) {
@@ -5847,15 +5892,19 @@ fn start_audio_import_preflight(
     context
         .business()
         .background("cadence-import-preflight")
+        .cancellable()
         .run(
-            move |_| {
-                let decoded = audio::decode_audio_file(&path).map_err(|error| {
-                    if replacement_preflight {
-                        format!("Could not decode replacement {}: {error}", path.display())
-                    } else {
-                        error
-                    }
-                })?;
+            move |work| {
+                let decoded =
+                    audio::decode_audio_file_with_cancellation(&path, || work.is_cancelled())
+                        .map_err(|error| {
+                            if replacement_preflight {
+                                format!("Could not decode replacement {}: {error}", path.display())
+                            } else {
+                                error
+                            }
+                        })?;
+                work.check_cancelled()?;
                 let cache_path = storage::waveform_cache_path(&path);
                 let _ = audio::write_waveform_cache_if_unchanged(
                     decoded.path(),
@@ -5863,6 +5912,7 @@ fn start_audio_import_preflight(
                     decoded.fingerprint(),
                     decoded.waveform(),
                 );
+                work.check_cancelled()?;
                 Ok(decoded)
             },
             move |result| Message::AudioImportPreflightCompleted {
@@ -5877,6 +5927,7 @@ fn start_import_commit(
     context: &mut ui::UiUpdateContext<Message>,
     decoded: audio::DecodedAudioFile,
 ) {
+    state.pending_import_commit = Some(PendingImportCommit::Main);
     let library = state.library.clone();
     context.business().blocking_io("cadence-import-track").run(
         move |_| storage::import_into_library(library, decoded),
@@ -5891,6 +5942,10 @@ fn start_reference_commit(
     path: PathBuf,
     decoded: audio::DecodedAudioFile,
 ) {
+    state.pending_import_commit = Some(PendingImportCommit::AssignedReference {
+        track_id: track_id.clone(),
+        path: path.clone(),
+    });
     let library = state.library.clone();
     let commit_track_id = track_id.clone();
     context
@@ -5912,6 +5967,7 @@ fn start_reference_catalog_commit(
     path: PathBuf,
     decoded: audio::DecodedAudioFile,
 ) {
+    state.pending_import_commit = Some(PendingImportCommit::Catalog { path: path.clone() });
     let library = state.library.clone();
     context
         .business()
@@ -5928,6 +5984,9 @@ fn start_replace_commit(
     track_id: String,
     decoded: audio::DecodedAudioFile,
 ) {
+    state.pending_import_commit = Some(PendingImportCommit::Replacement {
+        track_id: track_id.clone(),
+    });
     let library = state.library.clone();
     let commit_track_id = track_id.clone();
     context.business().blocking_io("cadence-replace-track").run(
@@ -5942,6 +6001,14 @@ fn complete_audio_import_preflight(
     request: AudioImportRequest,
     result: Result<audio::DecodedAudioFile, String>,
 ) {
+    let is_current = state
+        .audio_import_in_flight
+        .as_ref()
+        .is_some_and(|current| current == &request);
+    if !is_current {
+        return;
+    }
+    state.audio_import_in_flight = None;
     let AudioImportRequest { target, path } = request;
     let result = if library_is_ready(state) {
         result
@@ -5960,9 +6027,14 @@ fn complete_audio_import_preflight(
             start_replace_commit(state, context, track_id, decoded);
         }
         (AudioImportTarget::Main, Err(error)) => {
+            state.pending_import_commit = Some(PendingImportCommit::Main);
             update(state, Message::ImportCompleted(Err(error)), context);
         }
         (AudioImportTarget::AssignedReference { track_id }, Err(error)) => {
+            state.pending_import_commit = Some(PendingImportCommit::AssignedReference {
+                track_id: track_id.clone(),
+                path: path.clone(),
+            });
             update(
                 state,
                 Message::ReferenceImportCompleted {
@@ -5974,6 +6046,9 @@ fn complete_audio_import_preflight(
             );
         }
         (AudioImportTarget::Replacement { track_id }, Err(error)) => {
+            state.pending_import_commit = Some(PendingImportCommit::Replacement {
+                track_id: track_id.clone(),
+            });
             update(
                 state,
                 Message::ReplaceCompleted {
@@ -5984,6 +6059,7 @@ fn complete_audio_import_preflight(
             );
         }
         (AudioImportTarget::Catalog, Err(error)) => {
+            state.pending_import_commit = Some(PendingImportCommit::Catalog { path: path.clone() });
             update(
                 state,
                 Message::ReferenceCatalogImportCompleted {
@@ -6002,13 +6078,12 @@ fn start_import(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>
     }
     state.busy = true;
     state.status = format!("Importing {}…", path.display());
-    start_audio_import_preflight(
-        context,
-        AudioImportRequest {
-            target: AudioImportTarget::Main,
-            path,
-        },
-    );
+    let request = AudioImportRequest {
+        target: AudioImportTarget::Main,
+        path,
+    };
+    state.audio_import_in_flight = Some(request.clone());
+    start_audio_import_preflight(context, request);
     context.request_repaint();
 }
 
@@ -6182,13 +6257,12 @@ fn start_reference_catalog_import(
         "Adding {} to the reference catalog…",
         reference_track_name(&path)
     );
-    start_audio_import_preflight(
-        context,
-        AudioImportRequest {
-            target: AudioImportTarget::Catalog,
-            path,
-        },
-    );
+    let request = AudioImportRequest {
+        target: AudioImportTarget::Catalog,
+        path,
+    };
+    state.audio_import_in_flight = Some(request.clone());
+    start_audio_import_preflight(context, request);
     context.request_repaint();
 }
 
@@ -6222,13 +6296,12 @@ fn schedule_replace(
     }
     state.busy = true;
     state.status = format!("Replacing with {}…", path.display());
-    start_audio_import_preflight(
-        context,
-        AudioImportRequest {
-            target: AudioImportTarget::Replacement { track_id },
-            path,
-        },
-    );
+    let request = AudioImportRequest {
+        target: AudioImportTarget::Replacement { track_id },
+        path,
+    };
+    state.audio_import_in_flight = Some(request.clone());
+    start_audio_import_preflight(context, request);
     context.request_repaint();
 }
 
@@ -6263,13 +6336,12 @@ fn schedule_reference(
     }
     state.busy = true;
     state.status = format!("Importing reference {}…", path.display());
-    start_audio_import_preflight(
-        context,
-        AudioImportRequest {
-            target: AudioImportTarget::AssignedReference { track_id },
-            path,
-        },
-    );
+    let request = AudioImportRequest {
+        target: AudioImportTarget::AssignedReference { track_id },
+        path,
+    };
+    state.audio_import_in_flight = Some(request.clone());
+    start_audio_import_preflight(context, request);
     context.request_repaint();
 }
 
@@ -10865,8 +10937,8 @@ mod tests {
         APP_VERSION_LABEL, AppState, AudioImportRequest, AudioImportTarget, AuditionSource,
         DEFAULT_LIVE_SPECTROGRAM_DISPLAY_SAMPLE_RATE, FavoriteMarkerWidget, ImportBatchProgress,
         LibraryLoadState, LibrarySaveAttempt, LiveSpectrogramMode, LoopBounds, LoopSelection,
-        LoopSelections, Message, NoteDraft, PairedPlaybackGuard, PlannerInsertionTarget,
-        REFERENCE_MENU_WIDTH, ReferenceUnloadState, ResumeTransportCommand,
+        LoopSelections, Message, NoteDraft, PairedPlaybackGuard, PendingImportCommit,
+        PlannerInsertionTarget, REFERENCE_MENU_WIDTH, ReferenceUnloadState, ResumeTransportCommand,
         SETTINGS_REFERENCE_ROW_METADATA_HEIGHT, SETTINGS_REFERENCE_ROW_TEXT_HEIGHT,
         SETTINGS_REFERENCE_ROW_TEXT_SPACING, SETTINGS_REFERENCE_ROW_TITLE_HEIGHT,
         STATUS_BAR_VERSION_WIDTH, StatusMenuHost, TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER,
@@ -11004,6 +11076,7 @@ mod tests {
             title: String::from("Preview me"),
             original_name: String::from("preview.wav"),
             path: PathBuf::from("/external/preview.wav"),
+            source_proof: None,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -11114,6 +11187,7 @@ mod tests {
             title: String::from(id),
             original_name: format!("{id}.wav"),
             path: PathBuf::from(format!("/external/{id}.wav")),
+            source_proof: None,
             reference_path: Some(PathBuf::from(format!("/external/{id}-reference.wav"))),
             size: 0,
             favorite: false,
@@ -12348,6 +12422,7 @@ mod tests {
             title: String::from("Edit track"),
             original_name: String::from("edit-track.wav"),
             path: PathBuf::from("/external/edit-track.wav"),
+            source_proof: None,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -12416,6 +12491,7 @@ mod tests {
             title: String::from("Reference edit track"),
             original_name: String::from("reference-edit-main.wav"),
             path: PathBuf::from("/external/reference-edit-main.wav"),
+            source_proof: None,
             reference_path: Some(reference_path.clone()),
             size: 0,
             favorite: false,
@@ -12425,6 +12501,7 @@ mod tests {
         });
         state.library.reference_tracks.push(ReferenceTrack {
             path: reference_path,
+            source_proof: None,
             notes: vec![Note {
                 id: note_id.clone(),
                 time_millis: 875,
@@ -12630,6 +12707,7 @@ mod tests {
             title: String::from("Selected"),
             original_name: String::from("selected.wav"),
             path: PathBuf::from("/external/selected.wav"),
+            source_proof: None,
             reference_path: Some(second_path.clone()),
             size: 0,
             favorite: false,
@@ -12642,6 +12720,7 @@ mod tests {
             title: String::from("Assigned"),
             original_name: String::from("assigned.wav"),
             path: PathBuf::from("/external/assigned.wav"),
+            source_proof: None,
             reference_path: Some(first_path.clone()),
             size: 0,
             favorite: false,
@@ -12652,10 +12731,12 @@ mod tests {
         state.library.reference_tracks = vec![
             ReferenceTrack {
                 path: first_path,
+                source_proof: None,
                 notes: Vec::new(),
             },
             ReferenceTrack {
                 path: second_path,
+                source_proof: None,
                 notes: Vec::new(),
             },
         ];
@@ -12701,6 +12782,7 @@ mod tests {
         let mut state = AppState::default();
         state.library.reference_tracks.push(ReferenceTrack {
             path,
+            source_proof: None,
             notes: Vec::new(),
         });
 
@@ -12807,6 +12889,7 @@ mod tests {
                 title: String::from("Main track"),
                 original_name: String::from("main-track.wav"),
                 path: PathBuf::from("/external/main-track.wav"),
+                source_proof: None,
                 reference_path: None,
                 size: 0,
                 favorite: false,
@@ -12817,12 +12900,14 @@ mod tests {
             selected_track_id: Some(String::from("main-track")),
             reference_tracks: vec![ReferenceTrack {
                 path: path.clone(),
+                source_proof: None,
                 notes: Vec::new(),
             }],
             planner_order: Vec::new(),
         };
         let mut state = AppState {
             busy: true,
+            pending_import_commit: Some(PendingImportCommit::Catalog { path: path.clone() }),
             settings_open: true,
             ..AppState::default()
         };
@@ -12868,6 +12953,7 @@ mod tests {
             title: String::from("Selected"),
             original_name: String::from("selected.wav"),
             path: PathBuf::from("/external/selected.wav"),
+            source_proof: None,
             reference_path: Some(reference_path.clone()),
             size: 0,
             favorite: false,
@@ -12877,6 +12963,7 @@ mod tests {
         });
         state.library.reference_tracks.push(ReferenceTrack {
             path: reference_path.clone(),
+            source_proof: None,
             notes: Vec::new(),
         });
         let previous_generation = state.reference_waveform_generation;
@@ -13061,6 +13148,7 @@ mod tests {
             title: String::from("Comment drag track"),
             original_name: String::from("comment-drag-track.wav"),
             path: PathBuf::from("/external/comment-drag-track.wav"),
+            source_proof: None,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -13570,6 +13658,7 @@ mod tests {
             title: String::from("Match track"),
             original_name: String::from("match-track.wav"),
             path: PathBuf::from("/external/match-track.wav"),
+            source_proof: None,
             reference_path: Some(PathBuf::from("/external/reference.wav")),
             size: 0,
             favorite: false,
@@ -13637,6 +13726,7 @@ mod tests {
             title: String::from("Match unavailable track"),
             original_name: String::from("match-unavailable-track.wav"),
             path: PathBuf::from("/external/match-unavailable-track.wav"),
+            source_proof: None,
             reference_path: Some(PathBuf::from("/external/reference.wav")),
             size: 0,
             favorite: false,
@@ -13697,6 +13787,7 @@ mod tests {
             title: String::from("Audition track"),
             original_name: String::from("audition.wav"),
             path: PathBuf::from("/external/audition.wav"),
+            source_proof: None,
             reference_path: Some(PathBuf::from("/external/reference.wav")),
             size: 0,
             favorite: false,
@@ -13986,6 +14077,7 @@ mod tests {
             title: String::from("Reference click track"),
             original_name: String::from("reference-click.wav"),
             path: PathBuf::from("/external/reference-click.wav"),
+            source_proof: None,
             reference_path: Some(PathBuf::from("/external/reference.wav")),
             size: 0,
             favorite: false,
@@ -14093,6 +14185,7 @@ mod tests {
             title: String::from("Active reference click track"),
             original_name: String::from("active-reference-click.wav"),
             path: PathBuf::from("/external/active-reference-click.wav"),
+            source_proof: None,
             reference_path: Some(PathBuf::from("/external/reference.wav")),
             size: 0,
             favorite: false,
@@ -14181,6 +14274,7 @@ mod tests {
             title: String::from("Main seek track"),
             original_name: String::from("main-seek.wav"),
             path: PathBuf::from("/external/main-seek.wav"),
+            source_proof: None,
             reference_path: Some(PathBuf::from("/external/reference.wav")),
             size: 0,
             favorite: false,
@@ -14254,6 +14348,7 @@ mod tests {
             title: String::from("Paired admission track"),
             original_name: String::from("paired-admission.wav"),
             path: PathBuf::from("/external/paired-admission.wav"),
+            source_proof: None,
             reference_path: Some(PathBuf::from("/external/paired-reference.wav")),
             size: 0,
             favorite: false,
@@ -14298,6 +14393,7 @@ mod tests {
             .expect("the paired state should have a reference path");
         state.library.reference_tracks.push(ReferenceTrack {
             path: reference_path,
+            source_proof: None,
             notes: vec![
                 Note {
                     id: note_id.clone(),
@@ -14856,6 +14952,7 @@ mod tests {
             title: String::from("Resume reference track"),
             original_name: String::from("resume-reference.wav"),
             path: PathBuf::from("/external/resume-reference.wav"),
+            source_proof: None,
             reference_path: Some(PathBuf::from("/external/reference.wav")),
             size: 0,
             favorite: false,
@@ -14926,6 +15023,7 @@ mod tests {
             title: String::from("Loop track"),
             original_name: String::from("loop.wav"),
             path: PathBuf::from("/external/loop.wav"),
+            source_proof: None,
             reference_path: Some(PathBuf::from("/external/reference.wav")),
             size: 0,
             favorite: false,
@@ -16417,6 +16515,7 @@ mod tests {
             title: String::from("Review track"),
             original_name: String::from("review-track.wav"),
             path: PathBuf::from("/external/review-track.wav"),
+            source_proof: None,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -16578,6 +16677,7 @@ mod tests {
             title: String::from("Review track"),
             original_name: String::from("review-track.wav"),
             path: PathBuf::from("/external/review-track.wav"),
+            source_proof: None,
             reference_path: Some(PathBuf::from("/external/reference.wav")),
             size: 0,
             favorite: false,
@@ -16709,6 +16809,7 @@ mod tests {
             title: String::from("Active playback comments"),
             original_name: String::from("active-playback-comments.wav"),
             path: PathBuf::from("/external/active-playback-comments.wav"),
+            source_proof: None,
             reference_path: Some(reference_path.clone()),
             size: 0,
             favorite: false,
@@ -16723,6 +16824,7 @@ mod tests {
         });
         state.library.reference_tracks.push(ReferenceTrack {
             path: reference_path,
+            source_proof: None,
             notes: vec![Note {
                 id: String::from("reference-persisted-note"),
                 time_millis: 500,
@@ -16987,6 +17089,7 @@ mod tests {
             title: String::from("Reference loop header track"),
             original_name: String::from("reference-loop-header.wav"),
             path: PathBuf::from("/external/reference-loop-header.wav"),
+            source_proof: None,
             reference_path: Some(PathBuf::from("/external/reference-header.wav")),
             size: 0,
             favorite: false,
@@ -17027,6 +17130,7 @@ mod tests {
             title: String::from("Reference comment track"),
             original_name: String::from("reference-comment.wav"),
             path: PathBuf::from("/external/reference-comment.wav"),
+            source_proof: None,
             reference_path: Some(first_path.clone()),
             size: 0,
             favorite: false,
@@ -17042,10 +17146,12 @@ mod tests {
         state.library.reference_tracks = vec![
             ReferenceTrack {
                 path: first_path.clone(),
+                source_proof: None,
                 notes: Vec::new(),
             },
             ReferenceTrack {
                 path: second_path.clone(),
+                source_proof: None,
                 notes: vec![Note {
                     id: String::from("second-reference-note"),
                     time_millis: 700,
@@ -17129,6 +17235,7 @@ mod tests {
             title: String::from("Review track"),
             original_name: String::from("review-track.wav"),
             path: PathBuf::from("/external/review-track.wav"),
+            source_proof: None,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -17188,6 +17295,7 @@ mod tests {
             title: String::from("Main draft track"),
             original_name: String::from("main-draft.wav"),
             path: PathBuf::from("/external/main-draft.wav"),
+            source_proof: None,
             reference_path: Some(reference_path.clone()),
             size: 0,
             favorite: false,
@@ -17197,6 +17305,7 @@ mod tests {
         });
         state.library.reference_tracks.push(ReferenceTrack {
             path: reference_path,
+            source_proof: None,
             notes: vec![Note {
                 id: String::from("reference-note"),
                 time_millis: 250,
@@ -17249,6 +17358,7 @@ mod tests {
             title: String::from("Review track"),
             original_name: String::from("review-track.wav"),
             path: PathBuf::from("/external/review-track.wav"),
+            source_proof: None,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -17395,6 +17505,7 @@ mod tests {
             title: String::from("Reference comment selection track"),
             original_name: String::from("reference-comment-selection.wav"),
             path: PathBuf::from("/external/main-reference-comment-selection.wav"),
+            source_proof: None,
             reference_path: Some(reference_path.clone()),
             size: 0,
             favorite: false,
@@ -17404,6 +17515,7 @@ mod tests {
         });
         state.library.reference_tracks.push(ReferenceTrack {
             path: reference_path,
+            source_proof: None,
             notes: vec![Note {
                 id: String::from("selected-reference-note"),
                 time_millis: 1_000,
@@ -17553,6 +17665,7 @@ mod tests {
             title: String::from("Hover track"),
             original_name: String::from("hover-track.wav"),
             path: PathBuf::from("/external/hover-track.wav"),
+            source_proof: None,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -17611,6 +17724,7 @@ mod tests {
             title: String::from("Reference hover track"),
             original_name: String::from("reference-hover.wav"),
             path: PathBuf::from("/external/reference-hover-main.wav"),
+            source_proof: None,
             reference_path: Some(reference_path.clone()),
             size: 0,
             favorite: false,
@@ -17620,6 +17734,7 @@ mod tests {
         });
         state.library.reference_tracks.push(ReferenceTrack {
             path: reference_path,
+            source_proof: None,
             notes: vec![Note {
                 id: note_id.clone(),
                 time_millis: 500,
@@ -17705,6 +17820,7 @@ mod tests {
             title: String::from("Reference rail track"),
             original_name: String::from("reference-rail-main.wav"),
             path: PathBuf::from("/external/reference-rail-main.wav"),
+            source_proof: None,
             reference_path: Some(reference_path.clone()),
             size: 0,
             favorite: false,
@@ -17714,6 +17830,7 @@ mod tests {
         });
         state.library.reference_tracks.push(ReferenceTrack {
             path: reference_path,
+            source_proof: None,
             notes: Vec::new(),
         });
 
@@ -17879,6 +17996,7 @@ mod tests {
             title: String::from("Composed comment track"),
             original_name: String::from("composed-comment-track.wav"),
             path: PathBuf::from("/external/composed-comment-track.wav"),
+            source_proof: None,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -18063,6 +18181,7 @@ mod tests {
             title: String::from("Comment row play track"),
             original_name: String::from("comment-row-play-track.wav"),
             path: PathBuf::from("/external/comment-row-play-track.wav"),
+            source_proof: None,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -18141,6 +18260,7 @@ mod tests {
             title: String::from("Selected track"),
             original_name: String::from("selected-track.wav"),
             path: PathBuf::from("/external/selected-track.wav"),
+            source_proof: None,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -18193,6 +18313,7 @@ mod tests {
             title: String::from("Comment playback track"),
             original_name: String::from("comment-playback-track.wav"),
             path: PathBuf::from("/external/comment-playback-track.wav"),
+            source_proof: None,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -18243,6 +18364,7 @@ mod tests {
             .expect("the shared state should have a reference path");
         state.library.reference_tracks.push(ReferenceTrack {
             path: reference_path,
+            source_proof: None,
             notes: vec![Note {
                 id: String::from("play-from-reference-comment"),
                 time_millis: 2_500,
@@ -18693,6 +18815,7 @@ mod tests {
             title: String::from("Play main comment track"),
             original_name: String::from("play-main-comment.wav"),
             path: PathBuf::from("/external/play-main-comment.wav"),
+            source_proof: None,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -18820,6 +18943,7 @@ mod tests {
             .expect("paired playback state should have a reference path");
         state.library.reference_tracks.push(ReferenceTrack {
             path: reference_path,
+            source_proof: None,
             notes: vec![Note {
                 id: String::from("play-reference-comment"),
                 time_millis: 2_500,
@@ -18886,6 +19010,7 @@ mod tests {
                     .expect("the paired state should have a reference path");
                 state.library.reference_tracks.push(ReferenceTrack {
                     path: reference_path,
+                    source_proof: None,
                     notes: vec![Note {
                         id: note_id.clone(),
                         time_millis,
@@ -19504,6 +19629,7 @@ mod tests {
             title: String::from(id),
             original_name: format!("{id}.wav"),
             path: PathBuf::from(format!("/external/{id}.wav")),
+            source_proof: None,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -19532,6 +19658,7 @@ mod tests {
             title: format!("{id} track"),
             original_name: format!("{id}.wav"),
             path: PathBuf::from(format!("/external/{id}.wav")),
+            source_proof: None,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -19966,6 +20093,7 @@ mod tests {
             title: format!("{id} track"),
             original_name: format!("{id}.wav"),
             path: PathBuf::from(format!("/external/{id}.wav")),
+            source_proof: None,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -20049,6 +20177,7 @@ mod tests {
             title: format!("{id} planner card"),
             original_name: format!("{id}.wav"),
             path: PathBuf::from(format!("/external/{id}.wav")),
+            source_proof: None,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -20191,6 +20320,7 @@ mod tests {
             title: format!("{id} track"),
             original_name: format!("{id}.wav"),
             path: PathBuf::from(format!("/external/{id}.wav")),
+            source_proof: None,
             reference_path: None,
             size: 0,
             favorite,
@@ -20253,6 +20383,7 @@ mod tests {
             title: String::from("Hidden track"),
             original_name: String::from("hidden-track.wav"),
             path: PathBuf::from("/external/hidden-track.wav"),
+            source_proof: None,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -20345,6 +20476,7 @@ mod tests {
             title: format!("{id} track"),
             original_name: format!("{id}.wav"),
             path: PathBuf::from(format!("/external/{id}.wav")),
+            source_proof: None,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -20436,6 +20568,7 @@ mod tests {
             title: format!("{id} track"),
             original_name: format!("{id}.wav"),
             path: PathBuf::from(format!("/external/{id}.wav")),
+            source_proof: None,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -20616,6 +20749,7 @@ mod tests {
             title: format!("{id} track"),
             original_name: format!("{id}.wav"),
             path: PathBuf::from(format!("/external/{id}.wav")),
+            source_proof: None,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -20911,6 +21045,7 @@ mod tests {
             title: String::from("Stage menu"),
             original_name: String::from("stage-menu.wav"),
             path: PathBuf::from("/external/stage-menu.wav"),
+            source_proof: None,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -20946,6 +21081,7 @@ mod tests {
             title: String::from("Stage trigger"),
             original_name: String::from("stage-trigger.wav"),
             path: PathBuf::from("/external/stage-trigger.wav"),
+            source_proof: None,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -21012,6 +21148,7 @@ mod tests {
             title: String::from("Keyboard stage"),
             original_name: String::from("keyboard-stage.wav"),
             path: PathBuf::from("/external/keyboard-stage.wav"),
+            source_proof: None,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -21050,6 +21187,7 @@ mod tests {
             title: String::from("Focused stage"),
             original_name: String::from("focused-stage.wav"),
             path: PathBuf::from("/external/focused-stage.wav"),
+            source_proof: None,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -21115,6 +21253,7 @@ mod tests {
             title: String::from("Context stage"),
             original_name: String::from("context-stage.wav"),
             path: PathBuf::from("/external/context-stage.wav"),
+            source_proof: None,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -21229,6 +21368,7 @@ mod tests {
             title: String::from("Stage popover"),
             original_name: String::from("stage-popover.wav"),
             path: PathBuf::from("/external/stage-popover.wav"),
+            source_proof: None,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -21324,6 +21464,7 @@ mod tests {
             title: String::from("Stage context"),
             original_name: String::from("stage-context.wav"),
             path: PathBuf::from("/external/stage-context.wav"),
+            source_proof: None,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -21392,6 +21533,7 @@ mod tests {
             title: String::from("Reference selector track"),
             original_name: String::from("main.wav"),
             path: PathBuf::from("/external/main.wav"),
+            source_proof: None,
             reference_path: Some(first_path.clone()),
             size: 0,
             favorite: false,
@@ -21402,10 +21544,12 @@ mod tests {
         state.library.reference_tracks = vec![
             ReferenceTrack {
                 path: first_path,
+                source_proof: None,
                 notes: Vec::new(),
             },
             ReferenceTrack {
                 path: second_path.clone(),
+                source_proof: None,
                 notes: Vec::new(),
             },
         ];
@@ -21475,6 +21619,7 @@ mod tests {
             title: String::from("Status menu"),
             original_name: String::from("status-menu.wav"),
             path: PathBuf::from("/external/status-menu.wav"),
+            source_proof: None,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -21513,6 +21658,7 @@ mod tests {
             title: String::from("Status track"),
             original_name: String::from("status-track.wav"),
             path: PathBuf::from("/external/status-track.wav"),
+            source_proof: None,
             reference_path: Some(PathBuf::from("/external/reference.wav")),
             size: 42,
             favorite: true,
@@ -21558,6 +21704,7 @@ mod tests {
             title: String::from("Status track"),
             original_name: String::from("status-track.wav"),
             path: PathBuf::from("/external/status-track.wav"),
+            source_proof: None,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -21593,6 +21740,7 @@ mod tests {
             title: String::from("Menu track"),
             original_name: String::from("menu-track.wav"),
             path: PathBuf::from("/external/menu-track.wav"),
+            source_proof: None,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -21635,6 +21783,7 @@ mod tests {
             title: String::from("Selected header"),
             original_name: String::from("selected-header.wav"),
             path: PathBuf::from("/external/selected-header.wav"),
+            source_proof: None,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -21712,6 +21861,7 @@ mod tests {
             title: String::from(id),
             original_name: format!("{id}.wav"),
             path: PathBuf::from(format!("/external/{id}.wav")),
+            source_proof: None,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -22250,6 +22400,7 @@ mod tests {
             title: String::from(id),
             original_name: format!("{id}.wav"),
             path: PathBuf::from(format!("/external/{id}.wav")),
+            source_proof: None,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -22305,6 +22456,7 @@ mod tests {
             title: String::from(id),
             original_name: format!("{id}.wav"),
             path: PathBuf::from(format!("/external/{id}.wav")),
+            source_proof: None,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -22480,6 +22632,7 @@ mod tests {
             title: String::from(id),
             original_name: format!("{id}.wav"),
             path,
+            source_proof: None,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -22539,6 +22692,7 @@ mod tests {
             title: String::from(id),
             original_name: format!("{id}.wav"),
             path: PathBuf::from(format!("/external/{id}.wav")),
+            source_proof: None,
             reference_path: Some(PathBuf::from(format!("/external/{id}-reference.wav"))),
             size: 0,
             favorite: false,
@@ -22693,6 +22847,7 @@ mod tests {
             title: String::from("Titlebar layout track"),
             original_name: String::from("titlebar-layout-track.wav"),
             path: PathBuf::from("/external/titlebar-layout-track.wav"),
+            source_proof: None,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -22775,6 +22930,7 @@ mod tests {
             title: String::from(id),
             original_name: format!("{id}.wav"),
             path: PathBuf::from(format!("/external/{id}.wav")),
+            source_proof: None,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -24530,6 +24686,7 @@ mod tests {
                 completed: 0,
                 failed: 0,
             }),
+            pending_import_commit: Some(PendingImportCommit::Main),
             pending_import_paths: vec![
                 PathBuf::from("/external/second.wav"),
                 PathBuf::from("/external/third.wav"),
@@ -24557,6 +24714,7 @@ mod tests {
         );
         assert!(state.busy);
 
+        state.pending_import_commit = Some(PendingImportCommit::Main);
         update(
             &mut state,
             Message::ImportCompleted(Err(String::from("second failed"))),
@@ -24573,6 +24731,7 @@ mod tests {
         assert!(state.pending_import_paths.is_empty());
         assert!(state.busy);
 
+        state.pending_import_commit = Some(PendingImportCommit::Main);
         update(
             &mut state,
             Message::ImportCompleted(Ok(Library::default())),
@@ -25184,6 +25343,66 @@ mod tests {
     }
 
     #[test]
+    fn stale_import_preflight_completion_cannot_adopt_a_verified_proof() {
+        let (path, decoded, root) = decoded_replacement_fixture();
+        let mut state = AppState::default();
+        let mut context = ui::UiUpdateContext::default();
+        schedule_import(&mut state, &mut context, path.clone());
+        let stale_request = AudioImportRequest {
+            target: AudioImportTarget::Main,
+            path: path.clone(),
+        };
+        state.audio_import_in_flight = Some(AudioImportRequest {
+            target: AudioImportTarget::Main,
+            path: PathBuf::from("/external/newer-import.wav"),
+        });
+        let library_before = state.library.clone();
+
+        update(
+            &mut state,
+            Message::AudioImportPreflightCompleted {
+                request: stale_request,
+                result: Ok(decoded),
+            },
+            &mut context,
+        );
+
+        assert_eq!(state.library, library_before);
+        assert!(state.pending_import_commit.is_none());
+        assert_eq!(
+            context
+                .into_command()
+                .business_task_priority("cadence-import-track"),
+            None
+        );
+        fs::remove_dir_all(root).expect("remove stale preflight test directory");
+    }
+
+    #[test]
+    fn cancelled_import_preflight_completes_without_adopting_a_proof() {
+        let path = PathBuf::from("/external/cancelled-import.wav");
+        let mut state = AppState::default();
+        let mut context = ui::UiUpdateContext::default();
+        schedule_import(&mut state, &mut context, path.clone());
+        update(
+            &mut state,
+            Message::AudioImportPreflightCompleted {
+                request: AudioImportRequest {
+                    target: AudioImportTarget::Main,
+                    path,
+                },
+                result: Err(String::from("cancelled")),
+            },
+            &mut context,
+        );
+
+        assert!(state.library.tracks.is_empty());
+        assert!(!state.busy);
+        assert!(state.import_batch.is_none());
+        assert!(state.pending_import_commit.is_none());
+    }
+
+    #[test]
     fn loading_drop_is_retained_but_recovery_rejects_later_drop_and_save_mutations() {
         let track = audition_track("existing");
         let mut state = AppState::loading();
@@ -25269,6 +25488,7 @@ mod tests {
         assert!(state.pending_import_paths.is_empty());
         assert!(state.busy, "the retained import should be dispatched");
 
+        state.pending_import_commit = Some(PendingImportCommit::Main);
         update(
             &mut state,
             Message::ImportCompleted(Err(String::from("queued import failed"))),
@@ -25341,11 +25561,15 @@ mod tests {
         assert!(state.busy, "the first reference import should be active");
 
         let reference_library = state.library.clone();
+        state.pending_import_commit = Some(PendingImportCommit::AssignedReference {
+            track_id: track_id.clone(),
+            path: first_reference.clone(),
+        });
         update(
             &mut state,
             Message::ReferenceImportCompleted {
                 track_id: track_id.clone(),
-                path: first_reference,
+                path: first_reference.clone(),
                 result: Ok(reference_library),
             },
             &mut context,
@@ -25360,11 +25584,15 @@ mod tests {
         );
         assert!(state.busy, "the second reference import should be active");
 
+        state.pending_import_commit = Some(PendingImportCommit::AssignedReference {
+            track_id: track_id.clone(),
+            path: second_reference.clone(),
+        });
         update(
             &mut state,
             Message::ReferenceImportCompleted {
                 track_id: track_id.clone(),
-                path: second_reference,
+                path: second_reference.clone(),
                 result: Err(String::from("reference failed")),
             },
             &mut context,
@@ -25400,6 +25628,7 @@ mod tests {
         );
         assert!(state.pending_import_paths.is_empty());
 
+        state.pending_import_commit = Some(PendingImportCommit::Main);
         update(
             &mut state,
             Message::ImportCompleted(Err(String::from("main failed"))),
@@ -25442,10 +25671,13 @@ mod tests {
         assert!(state.busy, "the first catalog import should be active");
 
         let first_library = state.library.clone();
+        state.pending_import_commit = Some(PendingImportCommit::Catalog {
+            path: first_catalog.clone(),
+        });
         update(
             &mut state,
             Message::ReferenceCatalogImportCompleted {
-                path: first_catalog,
+                path: first_catalog.clone(),
                 result: Ok(first_library.clone()),
             },
             &mut context,
@@ -25458,6 +25690,9 @@ mod tests {
         assert_eq!(state.reference_catalog_import_completed, 1);
         assert_eq!(state.pending_reference_catalog_paths.len(), 0);
 
+        state.pending_import_commit = Some(PendingImportCommit::Catalog {
+            path: PathBuf::from("/external/catalog-b.wav"),
+        });
         update(
             &mut state,
             Message::ReferenceCatalogImportCompleted {
@@ -25484,6 +25719,7 @@ mod tests {
             })
         );
 
+        state.pending_import_commit = Some(PendingImportCommit::Main);
         update(
             &mut state,
             Message::ImportCompleted(Err(String::from("main failed"))),
@@ -25506,6 +25742,7 @@ mod tests {
             title: String::from(id),
             original_name: format!("{id}.wav"),
             path: PathBuf::from(format!("/external/{id}.wav")),
+            source_proof: None,
             reference_path: None,
             size: 0,
             favorite: false,
