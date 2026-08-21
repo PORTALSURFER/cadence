@@ -1740,8 +1740,10 @@ fn decode_or_load_cached_waveform(
         return Ok(audio::VerifiedWaveform::new(waveform, ticket));
     }
 
-    let result =
-        audio::decode_waveform_from_verified_source(verified, &should_cancel, &mut on_progress);
+    // Do not publish decoder previews until the retained-handle source fence has
+    // accepted the completed waveform. A cache miss must never make an
+    // unverified version visible while the encoded source can still change.
+    let result = audio::decode_waveform_from_verified_source(verified, &should_cancel, |_| {});
     if should_cancel() {
         return Err(String::from("cancelled"));
     }
@@ -1752,6 +1754,17 @@ fn decode_or_load_cached_waveform(
             verified_waveform.ticket(),
             verified_waveform.waveform(),
         );
+        verified_waveform
+            .ticket()
+            .validate_current(&should_cancel)
+            .map_err(|error| error.to_string())?;
+        if should_cancel() {
+            return Err(String::from("cancelled"));
+        }
+        on_progress(audio::WaveformProgress {
+            waveform: verified_waveform.waveform().clone(),
+            progress: Some(1.0),
+        });
     }
     result
 }
@@ -4339,7 +4352,9 @@ fn seek_synchronized_positions(
     if let Some(error) = paired_playback_cleanup_error(state) {
         return Err(error.to_owned());
     }
-    if state.waveform_busy || state.reference_waveform_busy {
+    if state.waveform_busy
+        || (state.reference_waveform_busy && !reference_source_is_mismatched(state))
+    {
         return Err(String::from("Audio analysis is still building."));
     }
     let Some(main_duration_millis) = state
@@ -5018,9 +5033,7 @@ fn play_audition(state: &mut AppState, context: &mut ui::UiUpdateContext<Message
     if !library_is_ready(state) {
         return;
     }
-    if reject_main_source_mismatch(state, context)
-        || reject_reference_source_mismatch(state, context)
-    {
+    if reject_main_source_mismatch(state, context) {
         return;
     }
     if let Some(error) = paired_playback_cleanup_error(state) {
@@ -5031,7 +5044,10 @@ fn play_audition(state: &mut AppState, context: &mut ui::UiUpdateContext<Message
     if state.busy || state.workspace_mode != WorkspaceMode::Audition {
         return;
     }
-    if state.transport_playing || state.reference_transport_playing {
+    let reference_playback_available = !reference_source_is_mismatched(state);
+    if state.transport_playing
+        || (state.reference_transport_playing && reference_playback_available)
+    {
         state.status = String::from("Audition playback is already active.");
         context.request_repaint();
         return;
@@ -5057,13 +5073,17 @@ fn play_audition(state: &mut AppState, context: &mut ui::UiUpdateContext<Message
     let transport_pending = state.transport_polling
         || state.transport_waiting_token.is_some()
         || state.transport.has_pending_load()
-        || state.reference_transport_polling
-        || state.reference_transport_waiting_token.is_some()
-        || state
-            .reference_transport
-            .as_ref()
-            .is_some_and(transport::AudioTransport::has_pending_load);
-    if !waveform_ready || state.reference_waveform_busy || transport_pending {
+        || (reference_playback_available
+            && (state.reference_transport_polling
+                || state.reference_transport_waiting_token.is_some()
+                || state
+                    .reference_transport
+                    .as_ref()
+                    .is_some_and(transport::AudioTransport::has_pending_load)));
+    if !waveform_ready
+        || (state.reference_waveform_busy && reference_playback_available)
+        || transport_pending
+    {
         state.audition_auto_advance = true;
         state.audition_play_token = None;
         state.audition_pending_play_track_id = Some(track_id.clone());
@@ -5374,9 +5394,7 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
     if !library_is_ready(state) {
         return;
     }
-    if reject_main_source_mismatch(state, context)
-        || reject_reference_source_mismatch(state, context)
-    {
+    if reject_main_source_mismatch(state, context) {
         return;
     }
     if let Some(error) = paired_playback_cleanup_error(state) {
@@ -5384,14 +5402,20 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
         context.request_repaint();
         return;
     }
-    if state.busy || state.waveform_busy || state.reference_waveform_busy {
-        if state.waveform_busy || state.reference_waveform_busy {
+    let reference_playback_available = !reference_source_is_mismatched(state);
+    if state.busy
+        || state.waveform_busy
+        || (state.reference_waveform_busy && reference_playback_available)
+    {
+        if state.waveform_busy || (state.reference_waveform_busy && reference_playback_available) {
             state.status = String::from("Audio analysis is still building.");
             context.request_repaint();
         }
         return;
     }
-    if state.transport_polling || state.reference_transport_polling {
+    if state.transport_polling
+        || (state.reference_transport_polling && reference_playback_available)
+    {
         return;
     }
     let Some(waveform) = state
@@ -5405,7 +5429,8 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
     };
 
     let reference_details = selected_reference_details(state);
-    if let Some(reference_transport) = state.reference_transport.as_ref()
+    if reference_playback_available
+        && let Some(reference_transport) = state.reference_transport.as_ref()
         && !state.reference_transport_loaded
         && reference_transport.has_pending_load()
     {
@@ -5416,14 +5441,20 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
     let reference_pending = selected_track(state)
         .and_then(|track| track.reference_path.as_ref())
         .is_some()
+        && reference_playback_available
         && state.reference_waveform_busy;
-    if !state.transport_playing && !state.reference_transport_playing && reference_pending {
+    if !state.transport_playing
+        && !(state.reference_transport_playing && reference_playback_available)
+        && reference_pending
+    {
         state.status = String::from("Reference analysis is still pending.");
         context.request_repaint();
         return;
     }
 
-    if state.transport_playing || state.reference_transport_playing {
+    if state.transport_playing
+        || (state.reference_transport_playing && reference_playback_available)
+    {
         if state.workspace_mode == WorkspaceMode::Audition {
             state.audition_auto_advance = false;
             state.audition_play_token = None;
@@ -7305,7 +7336,9 @@ fn seek_review_position(
         context.request_repaint();
         return;
     }
-    if state.waveform_busy || state.reference_waveform_busy {
+    if state.waveform_busy
+        || (state.reference_waveform_busy && !reference_source_is_mismatched(state))
+    {
         return;
     }
     let Some(duration_millis) = state
@@ -7454,9 +7487,10 @@ fn maybe_start_pending_comment_playback(
     {
         return;
     }
-    let has_reference = selected_track(state)
-        .and_then(|track| track.reference_path.as_ref())
-        .is_some();
+    let has_reference = !reference_source_is_mismatched(state)
+        && selected_track(state)
+            .and_then(|track| track.reference_path.as_ref())
+            .is_some();
     if has_reference
         && (state.reference_waveform_busy
             || state.reference_waveform_track_id.as_deref() != Some(pending.track_id.as_str())
@@ -7464,15 +7498,17 @@ fn maybe_start_pending_comment_playback(
     {
         return;
     }
+    let reference_playback_available = !reference_source_is_mismatched(state);
     if state.transport_polling
         || state.transport_waiting_token.is_some()
         || state.transport.has_pending_load()
-        || state.reference_transport_polling
-        || state.reference_transport_waiting_token.is_some()
-        || state
-            .reference_transport
-            .as_ref()
-            .is_some_and(transport::AudioTransport::has_pending_load)
+        || (reference_playback_available
+            && (state.reference_transport_polling
+                || state.reference_transport_waiting_token.is_some()
+                || state
+                    .reference_transport
+                    .as_ref()
+                    .is_some_and(transport::AudioTransport::has_pending_load)))
     {
         return;
     }
@@ -8000,7 +8036,7 @@ fn maybe_start_pending_audition(state: &mut AppState, context: &mut ui::UiUpdate
         || state.transport_polling
         || state.transport_waiting_token.is_some()
         || state.transport.has_pending_load()
-        || state.reference_waveform_busy
+        || (state.reference_waveform_busy && !reference_source_is_mismatched(state))
         || state.library.selected_track_id.as_deref() != Some(track_id.as_str())
         || state.waveform_track_id.as_deref() != Some(track_id.as_str())
         || state.waveform.is_none()
@@ -19632,6 +19668,41 @@ mod tests {
     }
 
     #[test]
+    fn playing_a_main_comment_degrades_to_main_only_after_reference_mismatch() {
+        let mut state = shared_reference_playback_state();
+        state.reference_source_mismatch = Some(PathBuf::from("/external/changed-reference.wav"));
+        state.reference_waveform = None;
+        state.reference_waveform_track_id = None;
+        state.reference_waveform_busy = true;
+        state.library.tracks[0].notes.push(Note {
+            id: String::from("main-only-comment-after-reference-mismatch"),
+            time_millis: 750,
+            body: String::from("play main only"),
+            done: false,
+        });
+        let track_id = state.library.tracks[0].id.clone();
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::PlayComment {
+                track_id,
+                source: super::CommentSource::Main,
+                note_id: String::from("main-only-comment-after-reference-mismatch"),
+            },
+            &mut context,
+        );
+
+        assert_eq!(state.transport_position_millis, 750);
+        assert!(state.transport_polling);
+        assert!(state.transport_waiting_token.is_some());
+        assert!(!state.reference_transport_polling);
+        assert!(state.reference_transport_waiting_token.is_none());
+        assert!(state.pending_comment_playback.is_none());
+        assert_eq!(state.status, "Playing comment from 00:00.");
+    }
+
+    #[test]
     fn playing_a_comment_on_another_track_selects_it_and_defers_until_analysis_is_ready() {
         let current_id = String::from("current-comment-track");
         let target_id = String::from("target-comment-track");
@@ -19918,6 +19989,56 @@ mod tests {
         assert_eq!(state.status, MAIN_SOURCE_MISMATCH_STATUS);
         assert!(state.waveform.is_none());
         assert_eq!(state.library.tracks[0].notes[0].body, "keep this");
+    }
+
+    #[test]
+    fn cache_miss_does_not_publish_progress_before_decode_fence() {
+        let path = std::env::temp_dir().join(format!(
+            "cadence-cache-progress-fence-{}-{}.wav",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock should be after the epoch")
+                .as_nanos()
+        ));
+        let sample_count = 2_000_u32;
+        let data_len = sample_count * 2;
+        let mut bytes = Vec::with_capacity(44 + data_len as usize);
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&8_000_u32.to_le_bytes());
+        bytes.extend_from_slice(&16_000_u32.to_le_bytes());
+        bytes.extend_from_slice(&2_u16.to_le_bytes());
+        bytes.extend_from_slice(&16_u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_len.to_le_bytes());
+        bytes.extend(std::iter::repeat_n(0_u8, data_len as usize));
+        fs::write(&path, bytes).expect("write progressive cache fixture");
+
+        let cancel_checks = std::cell::Cell::new(0_u32);
+        let mut progress_count = 0_u32;
+        let result = super::decode_or_load_cached_waveform(
+            &path,
+            None,
+            || {
+                let checks = cancel_checks.get().saturating_add(1);
+                cancel_checks.set(checks);
+                checks >= 9
+            },
+            |_| progress_count = progress_count.saturating_add(1),
+        );
+
+        assert!(
+            result.is_err(),
+            "the deterministic cancellation should fence the decode"
+        );
+        assert!(cancel_checks.get() >= 9);
+        assert_eq!(progress_count, 0);
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -22904,6 +23025,42 @@ mod tests {
         assert!(state.transport_polling);
         assert!(state.transport_waiting_token.is_some());
         assert!(state.audition_auto_advance);
+        assert!(state.audition_pending_play_track_id.is_none());
+    }
+
+    #[test]
+    fn main_playback_degrades_to_main_only_after_reference_mismatch() {
+        let mut state = shared_reference_playback_state();
+        state.reference_source_mismatch = Some(PathBuf::from("/external/changed-reference.wav"));
+        state.reference_waveform = None;
+        state.reference_waveform_track_id = None;
+        state.reference_waveform_busy = true;
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut state, Message::TogglePlayback, &mut context);
+
+        assert!(state.transport_polling);
+        assert!(state.transport_waiting_token.is_some());
+        assert!(!state.reference_transport_polling);
+        assert!(state.reference_transport_waiting_token.is_none());
+        assert!(!state.reference_only_playback);
+    }
+
+    #[test]
+    fn audition_play_degrades_to_main_only_after_reference_mismatch() {
+        let mut state = audition_state(&["reference-mismatch"]);
+        state.reference_source_mismatch = Some(PathBuf::from("/external/changed-reference.wav"));
+        state.reference_waveform = None;
+        state.reference_waveform_track_id = None;
+        state.reference_waveform_busy = true;
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut state, Message::AuditionPlay, &mut context);
+
+        assert!(state.transport_polling);
+        assert!(state.transport_waiting_token.is_some());
+        assert!(!state.reference_transport_polling);
+        assert!(state.reference_transport_waiting_token.is_none());
         assert!(state.audition_pending_play_track_id.is_none());
     }
 
