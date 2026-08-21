@@ -23,6 +23,8 @@ use symphonia::core::{
     probe::Hint,
 };
 
+use crate::source::{self, AudioSourceProof, SourceFileStamp};
+
 const PEAK_WINDOW_FRAMES: usize = 1024;
 const MAX_DISPLAY_BUCKETS: usize = 4096;
 const SUMMARY_BAND_COUNT: usize = 2;
@@ -52,6 +54,8 @@ pub struct WaveformData {
 pub struct DecodedAudioFile {
     path: PathBuf,
     fingerprint: WaveformCacheFingerprint,
+    source_proof: AudioSourceProof,
+    source_stamp: SourceFileStamp,
     waveform: WaveformData,
 }
 
@@ -64,12 +68,32 @@ impl DecodedAudioFile {
         self.fingerprint
     }
 
+    pub fn source_proof(&self) -> &AudioSourceProof {
+        &self.source_proof
+    }
+
+    #[allow(dead_code)]
+    pub fn proof(&self) -> &AudioSourceProof {
+        self.source_proof()
+    }
+
+    #[allow(dead_code)]
+    pub fn source_stamp(&self) -> SourceFileStamp {
+        self.source_stamp
+    }
+
     pub fn waveform(&self) -> &WaveformData {
         &self.waveform
     }
 
+    #[allow(dead_code)]
     pub fn is_unchanged(&self) -> bool {
-        waveform_cache_fingerprint(&self.path) == Some(self.fingerprint)
+        self.validate_source().is_ok()
+    }
+
+    pub fn validate_source(&self) -> Result<(), String> {
+        source::validate_path_stamp(&self.path, self.source_stamp, || false)
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -155,26 +179,43 @@ pub fn waveform_cache_fingerprint(path: &Path) -> Option<WaveformCacheFingerprin
 
 /// Decode one complete audio file and retain the source fingerprint needed for
 /// a later proof-checked library commit.
+#[allow(dead_code)]
 pub fn decode_audio_file(path: &Path) -> Result<DecodedAudioFile, String> {
+    decode_audio_file_with_cancellation(path, || false)
+}
+
+/// Open, hash, rewind, and decode one source while checking cancellation at
+/// bounded encoded-byte checkpoints. The decoder consumes a clone of the
+/// already-opened handle; the retained handle performs the final stamp
+/// validation before this proof can reach persistence.
+pub fn decode_audio_file_with_cancellation(
+    path: &Path,
+    should_cancel: impl Fn() -> bool,
+) -> Result<DecodedAudioFile, String> {
+    let mut verified =
+        source::open_and_hash(path, &should_cancel).map_err(|error| error.to_string())?;
+    let source_stamp = verified.stamp();
+    let source_proof = verified.proof().clone();
+    let decode_file = verified
+        .try_clone_for_decode()
+        .map_err(|error| error.to_string())?;
+    let waveform = decode_waveform_from_open_file(path, decode_file, &should_cancel, |_| {})?;
+    verified
+        .validate_after_decode(&should_cancel)
+        .map_err(|error| error.to_string())?;
     let fingerprint = waveform_cache_fingerprint(path).ok_or_else(|| {
         format!(
-            "Could not inspect {} before waveform analysis",
+            "Could not inspect {} after waveform analysis",
             path.display()
         )
     })?;
-    let waveform = decode_waveform(path)?;
-    let decoded = DecodedAudioFile {
+    Ok(DecodedAudioFile {
         path: path.to_path_buf(),
         fingerprint,
+        source_proof,
+        source_stamp,
         waveform,
-    };
-    if !decoded.is_unchanged() {
-        return Err(format!(
-            "Audio source changed while decoding {}; import was not committed",
-            path.display()
-        ));
-    }
-    Ok(decoded)
+    })
 }
 
 pub fn write_waveform_cache_if_unchanged(
@@ -993,7 +1034,7 @@ pub fn decode_waveform_with_cancellation(
 pub fn decode_waveform_with_progress_and_cancellation(
     path: &Path,
     should_cancel: impl Fn() -> bool,
-    mut on_progress: impl FnMut(WaveformProgress),
+    on_progress: impl FnMut(WaveformProgress),
 ) -> Result<WaveformData, String> {
     if should_cancel() {
         return Err(String::from("cancelled"));
@@ -1004,6 +1045,15 @@ pub fn decode_waveform_with_progress_and_cancellation(
             path.display()
         )
     })?;
+    decode_waveform_from_open_file(path, file, should_cancel, on_progress)
+}
+
+fn decode_waveform_from_open_file(
+    path: &Path,
+    file: File,
+    should_cancel: impl Fn() -> bool,
+    mut on_progress: impl FnMut(WaveformProgress),
+) -> Result<WaveformData, String> {
     let media = MediaSourceStream::new(Box::new(file), Default::default());
     let mut hint = Hint::new();
     if let Some(extension) = path.extension().and_then(|extension| extension.to_str()) {
