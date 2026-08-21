@@ -183,6 +183,32 @@ impl VerifiedSourceTicket {
     }
 }
 
+/// Open the path named by a verified ticket and validate the metadata on that
+/// exact handle before handing it to a decoder.
+///
+/// The handle metadata is the authority here.  Do not add a path-level stat
+/// before opening: an atomic replacement can otherwise land between the stat
+/// and open and silently bind playback to a different inode.  Once the handle
+/// matches the ticket, later path replacement does not affect the bytes read
+/// by that playback session; a future reload opens a fresh handle and must
+/// match the ticket again.
+pub fn open_for_ticket(ticket: &VerifiedSourceTicket) -> Result<File, SourceProofError> {
+    let file = File::open(ticket.path()).map_err(|error| open_failure(ticket.path(), error))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| io_failure(ticket.path(), error))?;
+    if !metadata.is_file() {
+        return Err(SourceProofError::Changed {
+            path: ticket.path().to_path_buf(),
+            detail: String::from("opened source is no longer a regular file"),
+        });
+    }
+    if SourceFileStamp::from_metadata(&metadata) != ticket.stamp() {
+        return Err(changed_ticket_stamp(ticket.path()));
+    }
+    Ok(file)
+}
+
 impl SourceFileStamp {
     pub fn from_metadata(metadata: &Metadata) -> Self {
         platform_stamp(metadata)
@@ -498,6 +524,13 @@ fn changed_stamp(path: &Path) -> SourceProofError {
     }
 }
 
+fn changed_ticket_stamp(path: &Path) -> SourceProofError {
+    SourceProofError::Changed {
+        path: path.to_path_buf(),
+        detail: String::from("opened handle stamp no longer matches verified source"),
+    }
+}
+
 #[allow(dead_code)]
 fn changed_digest(path: &Path) -> SourceProofError {
     SourceProofError::Changed {
@@ -608,7 +641,7 @@ mod tests {
     use super::*;
     use std::{
         fs::{self, OpenOptions},
-        io::Write,
+        io::{Read, Write},
         sync::{
             Arc,
             atomic::{AtomicBool, AtomicU32, Ordering},
@@ -710,5 +743,47 @@ mod tests {
             .expect_err("changed bytes must fail even when metadata could be restored");
         assert!(matches!(error, SourceProofError::Changed { .. }));
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn open_for_ticket_rejects_replacement_before_transport_load() {
+        let path = temp_path("ticket-replacement");
+        fs::write(&path, b"original").expect("fixture should write");
+        let verified = open_and_hash(&path, || false).expect("source should hash");
+        let ticket = verified.ticket();
+        drop(verified);
+
+        // Keep the replacement the same size so this exercises the identity
+        // fence rather than a decoder byte-length mismatch.
+        fs::write(&path, b"replaced").expect("replacement should write");
+        let error = open_for_ticket(&ticket).expect_err("replacement must not load");
+        assert!(matches!(error, SourceProofError::Changed { .. }));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn open_for_ticket_keeps_the_verified_inode_after_atomic_replacement() {
+        let path = temp_path("ticket-open-handle");
+        let replacement = temp_path("ticket-open-handle-replacement");
+        fs::write(&path, b"original").expect("fixture should write");
+        let verified = open_and_hash(&path, || false).expect("source should hash");
+        let ticket = verified.ticket();
+        drop(verified);
+        let mut opened = open_for_ticket(&ticket).expect("unchanged ticket should open");
+
+        fs::write(&replacement, b"replacement").expect("replacement should write");
+        fs::rename(&replacement, &path).expect("replacement should be atomic");
+
+        let mut bytes = Vec::new();
+        opened
+            .read_to_end(&mut bytes)
+            .expect("the already-open handle should remain readable");
+        assert_eq!(bytes, b"original");
+        assert!(matches!(
+            open_for_ticket(&ticket),
+            Err(SourceProofError::Changed { .. })
+        ));
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(replacement);
     }
 }
