@@ -6,11 +6,10 @@
 //! data and service internal control state from the output callback, so this is
 //! intentionally not a lock-free realtime or sample-accurate audio engine.
 
+use crate::source::{self, VerifiedSourceTicket};
 use rodio::{Decoder, DeviceSinkBuilder, Player, Source, source::SeekError};
 use rtrb::{Consumer, Producer, RingBuffer};
 use std::{
-    fs::File,
-    path::PathBuf,
     sync::{
         Arc, Mutex, Weak,
         atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
@@ -1363,7 +1362,7 @@ enum Command {
     Load {
         token: u64,
         generation: u64,
-        path: PathBuf,
+        ticket: VerifiedSourceTicket,
         duration_millis: u64,
     },
     Unload {
@@ -1622,7 +1621,7 @@ impl AudioTransport {
     pub fn load(
         &self,
         generation: u64,
-        path: PathBuf,
+        ticket: VerifiedSourceTicket,
         duration_millis: u64,
     ) -> Result<u64, String> {
         if let Some(error) = self.take_test_command_error() {
@@ -1635,7 +1634,7 @@ impl AudioTransport {
         let command = Command::Load {
             token,
             generation,
-            path,
+            ticket,
             duration_millis,
         };
         if !self.try_reserve_command_slot() {
@@ -1785,7 +1784,7 @@ impl AudioTransport {
 #[derive(Clone, Debug)]
 struct LoadedTrack {
     generation: u64,
-    path: PathBuf,
+    ticket: VerifiedSourceTicket,
     duration_millis: u64,
 }
 
@@ -1793,7 +1792,7 @@ struct LoadedTrack {
 fn finish_loaded_track<S>(
     shared: &SharedSnapshot,
     generation: u64,
-    path: PathBuf,
+    ticket: VerifiedSourceTicket,
     duration_millis: u64,
     player_handle: Player,
     source: S,
@@ -1810,7 +1809,7 @@ fn finish_loaded_track<S>(
     *player = Some(player_handle);
     *loaded = Some(LoadedTrack {
         generation,
-        path,
+        ticket,
         duration_millis,
     });
     *live_session = analysis_session;
@@ -1945,13 +1944,13 @@ fn handle_command(
         Command::Load {
             token,
             generation,
-            path,
+            ticket,
             duration_millis,
         } => (
             token,
             load_track(
                 generation,
-                path,
+                ticket,
                 duration_millis,
                 shared,
                 output,
@@ -1983,7 +1982,7 @@ fn handle_command(
                 {
                     load_track(
                         track.generation,
-                        track.path,
+                        track.ticket,
                         track.duration_millis,
                         shared,
                         output,
@@ -2045,7 +2044,7 @@ fn handle_command(
                         let reloaded = if player.as_ref().is_some_and(Player::empty) {
                             load_track(
                                 track.generation,
-                                track.path,
+                                track.ticket,
                                 track.duration_millis,
                                 shared,
                                 output,
@@ -2110,7 +2109,7 @@ fn handle_command(
 #[allow(clippy::too_many_arguments)]
 fn load_track(
     generation: u64,
-    path: PathBuf,
+    ticket: VerifiedSourceTicket,
     duration_millis: u64,
     shared: &Arc<SharedSnapshot>,
     output: Option<&rodio::MixerDeviceSink>,
@@ -2130,6 +2129,13 @@ fn load_track(
     shared.playing.store(false, Ordering::Release);
     shared.ready.store(false, Ordering::Release);
 
+    let file = match source::open_for_ticket(&ticket) {
+        Ok(file) => file,
+        Err(error) => {
+            shared.set_error(generation, error.to_string());
+            return true;
+        }
+    };
     let Some(output) = output else {
         shared.set_error(
             generation,
@@ -2137,22 +2143,16 @@ fn load_track(
         );
         return true;
     };
-    let file = match File::open(&path) {
-        Ok(file) => file,
-        Err(error) => {
-            shared.set_error(
-                generation,
-                format!("Could not open {} for playback: {error}", path.display()),
-            );
-            return true;
-        }
-    };
-    let byte_len = file.metadata().ok().map(|metadata| metadata.len());
+    let byte_len = Some(ticket.proof().byte_len);
     let mut builder = Decoder::builder().with_data(file);
     if let Some(byte_len) = byte_len {
         builder = builder.with_byte_len(byte_len);
     }
-    if let Some(hint) = path.extension().and_then(|extension| extension.to_str()) {
+    if let Some(hint) = ticket
+        .path()
+        .extension()
+        .and_then(|extension| extension.to_str())
+    {
         builder = builder.with_hint(&hint.to_ascii_lowercase());
     }
     let decoder = match builder.build() {
@@ -2160,7 +2160,10 @@ fn load_track(
         Err(error) => {
             shared.set_error(
                 generation,
-                format!("Could not decode {} for playback: {error}", path.display()),
+                format!(
+                    "Could not decode {} for playback: {error}",
+                    ticket.path().display()
+                ),
             );
             return true;
         }
@@ -2189,7 +2192,7 @@ fn load_track(
         Ok(_) => finish_loaded_track(
             shared,
             generation,
-            path,
+            ticket,
             duration_millis,
             player_handle,
             LiveAnalysisSource::new(decoder, producer, Arc::clone(&session), Arc::clone(shared)),
@@ -2202,7 +2205,7 @@ fn load_track(
             finish_analyzer_fallback(
                 shared,
                 generation,
-                path,
+                ticket,
                 duration_millis,
                 player_handle,
                 decoder,
@@ -2221,7 +2224,7 @@ fn load_track(
 fn finish_analyzer_fallback<S>(
     shared: &SharedSnapshot,
     generation: u64,
-    path: PathBuf,
+    ticket: VerifiedSourceTicket,
     duration_millis: u64,
     player_handle: Player,
     source: S,
@@ -2237,7 +2240,7 @@ fn finish_analyzer_fallback<S>(
     finish_loaded_track(
         shared,
         generation,
-        path,
+        ticket,
         duration_millis,
         player_handle,
         source,
@@ -2349,17 +2352,36 @@ mod tests {
         LiveCaptureSession, LiveSpectrogramFrame, MAX_OUTPUT_GAIN, PendingLoad, SharedSnapshot,
         clamp_position, display_tilt_db, finish_analyzer_fallback, handle_command, is_current,
         live_band_ranges, live_display_frequency_bounds, live_spectrum_point_frequency,
-        live_spectrum_point_mappings, normalize_output_gain, normalize_volume,
+        live_spectrum_point_mappings, load_track, normalize_output_gain, normalize_volume,
         publish_live_frame_if_due, publish_live_frame_if_due_at, run_live_analyzer_iteration,
     };
+    use crate::source::{AudioSourceProof, SourceFileStamp, VerifiedSourceTicket};
     use rodio::{Player, Source, buffer::SamplesBuffer, source::SeekError};
-    use std::path::PathBuf;
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicU64, AtomicUsize, Ordering},
         mpsc,
     };
     use std::time::{Duration, Instant};
+    use std::{fs, path::PathBuf};
+
+    fn test_ticket(path: &str) -> VerifiedSourceTicket {
+        VerifiedSourceTicket::new(
+            PathBuf::from(path),
+            AudioSourceProof {
+                sha256: "0".repeat(64),
+                byte_len: 0,
+            },
+            SourceFileStamp {
+                dev: 0,
+                inode: 0,
+                len: 0,
+                mtime_nanos: 0,
+                ctime_nanos: 0,
+            },
+        )
+        .expect("test source ticket should be valid")
+    }
 
     #[test]
     fn seek_position_is_saturated_to_track_duration() {
@@ -2418,7 +2440,7 @@ mod tests {
         };
 
         transport
-            .load(0, PathBuf::from("pending.wav"), 1_000)
+            .load(0, test_ticket("pending.wav"), 1_000)
             .expect("a full queue should coalesce the load");
         assert!(transport.has_pending_load());
         assert_eq!(
@@ -2465,19 +2487,58 @@ mod tests {
         pending.replace(Command::Load {
             token: 1,
             generation: 1,
-            path: PathBuf::from("first.wav"),
+            ticket: test_ticket("first.wav"),
             duration_millis: 1_000,
         });
         pending.replace(Command::Load {
             token: 2,
             generation: 2,
-            path: PathBuf::from("second.wav"),
+            ticket: test_ticket("second.wav"),
             duration_millis: 2_000,
         });
         assert_eq!(
             pending.take().and_then(|command| command.load_generation()),
             Some(2)
         );
+    }
+
+    #[test]
+    fn reload_rejects_replaced_ticket_and_retires_playback_state() {
+        let path = std::env::temp_dir().join(format!(
+            "cadence-transport-ticket-reload-{}",
+            std::process::id()
+        ));
+        fs::write(&path, b"original").expect("fixture should write");
+        let verified = crate::source::open_and_hash(&path, || false)
+            .expect("source should hash before playback");
+        let ticket = verified.ticket();
+        drop(verified);
+        fs::write(&path, b"replaced").expect("replacement should write");
+
+        let shared = Arc::new(SharedSnapshot::new());
+        shared.requested_generation.store(9, Ordering::Release);
+        shared.ready.store(true, Ordering::Release);
+        let mut player = None;
+        let mut loaded = None;
+        let mut live_session = None;
+        assert!(load_track(
+            9,
+            ticket,
+            1_000,
+            &shared,
+            None,
+            &mut player,
+            &mut loaded,
+            &mut live_session,
+        ));
+        let error = shared
+            .take_error(9)
+            .expect("replacement should surface a source error");
+        assert!(error.contains("opened handle stamp no longer matches"));
+        assert!(player.is_none());
+        assert!(loaded.is_none());
+        assert!(!shared.snapshot().ready);
+        let _ = fs::remove_file(path);
     }
 
     fn active_test_session(generation: u64) -> (Arc<SharedSnapshot>, Arc<LiveCaptureSession>) {
@@ -3842,7 +3903,7 @@ mod tests {
         finish_analyzer_fallback(
             &shared,
             9,
-            PathBuf::from("fallback.wav"),
+            test_ticket("fallback.wav"),
             1_000,
             player_handle,
             SamplesBuffer::new(

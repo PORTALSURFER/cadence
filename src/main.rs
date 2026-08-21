@@ -2588,14 +2588,15 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     };
                     state.waveform_source_ticket = Some(ticket);
                     state.waveform = Some(waveform);
-                    if let Some(path) = selected_track(state)
-                        .filter(|track| track.id == track_id)
-                        .map(|track| track.path.clone())
-                    {
+                    if let Some(ticket) = state.waveform_source_ticket.clone().filter(|ticket| {
+                        selected_track(state).is_some_and(|track| {
+                            track.id == track_id && track.path == ticket.path()
+                        })
+                    }) {
                         clear_live_spectrogram(state, AuditionSource::Main);
                         match state.transport.load(
                             state.transport_generation,
-                            path,
+                            ticket,
                             state
                                 .waveform
                                 .as_ref()
@@ -2611,6 +2612,15 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                                     advance_audition(state, context);
                                 }
                             }
+                        }
+                    } else {
+                        state.status = String::from(
+                            "Audio source verification is unavailable; playback is disabled.",
+                        );
+                        if pending_audition {
+                            state.audition_auto_advance = false;
+                            state.audition_play_token = None;
+                            state.audition_pending_play_track_id = None;
                         }
                     }
                 }
@@ -3990,6 +4000,28 @@ fn selected_main_duration(state: &AppState) -> Option<u64> {
         .map(|waveform| waveform.duration_millis)
 }
 
+fn reference_source_ticket_for_path(
+    state: &AppState,
+    path: &Path,
+) -> Option<crate::source::VerifiedSourceTicket> {
+    let selected_track_id = state.library.selected_track_id.as_deref()?;
+    let track = state
+        .library
+        .tracks
+        .iter()
+        .find(|track| track.id == selected_track_id)?;
+    if track.reference_path.as_deref() != Some(path)
+        || state.reference_waveform_track_id.as_deref() != Some(selected_track_id)
+    {
+        return None;
+    }
+    state
+        .reference_waveform_source_ticket
+        .as_ref()
+        .filter(|ticket| ticket.path() == path)
+        .cloned()
+}
+
 fn projected_loop_bounds(selection: LoopSelection, duration_millis: u64) -> Option<(u64, u64)> {
     let start_millis = waveform::millis_for_ratio(selection.start_ratio, duration_millis);
     let end_millis = waveform::millis_for_ratio(selection.end_ratio, duration_millis);
@@ -4368,6 +4400,14 @@ fn seek_synchronized_positions(
         return Err(String::from("Audio analysis is still pending."));
     };
     let reference_details = selected_reference_details(state);
+    let reference_ticket = reference_details
+        .as_ref()
+        .and_then(|(path, _)| reference_source_ticket_for_path(state, path));
+    if reference_details.is_some() && reference_ticket.is_none() {
+        return Err(String::from(
+            "Reference source verification is still pending.",
+        ));
+    }
     if !state.transport.has_command_capacity(1) {
         return Err(String::from(transport::CONTROLS_BUSY_ERROR));
     }
@@ -4411,7 +4451,7 @@ fn seek_synchronized_positions(
     };
     clear_pending_seek_intent_if_admitted(state, AuditionSource::Main, main_position_millis);
     begin_transport_polling(state, main_token);
-    if let Some((reference_path, reference_duration_millis)) = reference_details {
+    if let Some((_reference_path, reference_duration_millis)) = reference_details {
         let reference_gain = reference_output_gain(state);
         let reference_transport = state
             .reference_transport
@@ -4420,7 +4460,7 @@ fn seek_synchronized_positions(
         if !reference_was_loaded {
             match reference_transport.load(
                 state.reference_transport_generation,
-                reference_path,
+                reference_ticket.expect("reference details require a verified source ticket"),
                 reference_duration_millis,
             ) {
                 Ok(_) => {}
@@ -4500,6 +4540,11 @@ fn seek_reference_waveform_position(
     let Some((path, reference_duration_millis)) = selected_reference_details(state) else {
         return;
     };
+    let Some(reference_ticket) = reference_source_ticket_for_path(state, &path) else {
+        state.status = String::from("Reference source verification is still pending.");
+        context.request_repaint();
+        return;
+    };
     state.loop_selections.clear(AuditionSource::Reference);
     disarm_audition_auto_advance(state);
     set_audition_source(state, AuditionSource::Reference);
@@ -4538,7 +4583,7 @@ fn seek_reference_waveform_position(
     if !state.reference_transport_loaded {
         if let Err(error) = reference_transport.load(
             state.reference_transport_generation,
-            path,
+            reference_ticket,
             reference_duration_millis,
         ) {
             cleanup_reference_transport_failure(state, error);
@@ -4924,6 +4969,8 @@ fn start_source_alongside_active(
         AuditionSource::Reference => {
             let (path, duration_millis) = selected_reference_details(state)
                 .ok_or_else(|| String::from("Import and analyze a reference track first."))?;
+            let reference_ticket = reference_source_ticket_for_path(state, &path)
+                .ok_or_else(|| String::from("Reference source verification is still pending."))?;
             let reference_was_loaded = state.reference_transport_loaded;
             let pending_intent_millis = pending_seek_intent(state, AuditionSource::Reference);
             let reference_uses_resume_seek = pending_intent_millis.is_some();
@@ -4962,7 +5009,7 @@ fn start_source_alongside_active(
                 let load_result = if !loaded {
                     match reference_transport.load(
                         state.reference_transport_generation,
-                        path,
+                        reference_ticket,
                         duration_millis,
                     ) {
                         Ok(_) if !reference_transport.has_pending_load() => {
@@ -5429,6 +5476,14 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
     };
 
     let reference_details = selected_reference_details(state);
+    let reference_ticket = reference_details
+        .as_ref()
+        .and_then(|(path, _)| reference_source_ticket_for_path(state, path));
+    if reference_details.is_some() && reference_ticket.is_none() {
+        state.status = String::from("Reference source verification is still pending.");
+        context.request_repaint();
+        return;
+    }
     if reference_playback_available
         && let Some(reference_transport) = state.reference_transport.as_ref()
         && !state.reference_transport_loaded
@@ -5575,7 +5630,7 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
         }
         begin_transport_polling(state, main_token);
 
-        if let Some((path, reference_duration_millis)) = reference_details {
+        if let Some((_path, reference_duration_millis)) = reference_details {
             let reference_uses_resume_seek = pending_reference_intent_millis.is_some();
             let reference_gain = reference_output_gain(state);
             if !state.reference_transport_loaded {
@@ -5588,7 +5643,9 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
             if !state.reference_transport_loaded {
                 if let Err(error) = reference_transport.load(
                     state.reference_transport_generation,
-                    path,
+                    reference_ticket
+                        .clone()
+                        .expect("reference details require a verified source ticket"),
                     reference_duration_millis,
                 ) {
                     cleanup_reference_transport_failure(state, error);
@@ -14859,6 +14916,16 @@ mod tests {
             status: TrackStatus::Inbox,
             notes: Vec::new(),
         });
+        state.waveform_source_ticket = Some(
+            verified_audition_waveform_for(Path::new("/external/reference-click.wav"))
+                .ticket()
+                .clone(),
+        );
+        state.reference_waveform_source_ticket = Some(
+            verified_audition_waveform_for(Path::new("/external/reference.wav"))
+                .ticket()
+                .clone(),
+        );
         let mut context = ui::UiUpdateContext::default();
 
         update(
@@ -14967,6 +15034,16 @@ mod tests {
             status: TrackStatus::Inbox,
             notes: Vec::new(),
         });
+        state.waveform_source_ticket = Some(
+            verified_audition_waveform_for(Path::new("/external/active-reference-click.wav"))
+                .ticket()
+                .clone(),
+        );
+        state.reference_waveform_source_ticket = Some(
+            verified_audition_waveform_for(Path::new("/external/reference.wav"))
+                .ticket()
+                .clone(),
+        );
         let mut context = ui::UiUpdateContext::default();
 
         update(
@@ -15056,6 +15133,16 @@ mod tests {
             status: TrackStatus::Inbox,
             notes: Vec::new(),
         });
+        state.waveform_source_ticket = Some(
+            verified_audition_waveform_for(Path::new("/external/main-seek.wav"))
+                .ticket()
+                .clone(),
+        );
+        state.reference_waveform_source_ticket = Some(
+            verified_audition_waveform_for(Path::new("/external/reference.wav"))
+                .ticket()
+                .clone(),
+        );
         let mut context = ui::UiUpdateContext::default();
 
         update(
@@ -15130,6 +15217,16 @@ mod tests {
             status: TrackStatus::Inbox,
             notes: Vec::new(),
         });
+        state.waveform_source_ticket = Some(
+            verified_audition_waveform_for(Path::new("/external/paired-admission.wav"))
+                .ticket()
+                .clone(),
+        );
+        state.reference_waveform_source_ticket = Some(
+            verified_audition_waveform_for(Path::new("/external/paired-reference.wav"))
+                .ticket()
+                .clone(),
+        );
         state
     }
 
@@ -15734,6 +15831,16 @@ mod tests {
             status: TrackStatus::Inbox,
             notes: Vec::new(),
         });
+        state.waveform_source_ticket = Some(
+            verified_audition_waveform_for(Path::new("/external/resume-reference.wav"))
+                .ticket()
+                .clone(),
+        );
+        state.reference_waveform_source_ticket = Some(
+            verified_audition_waveform_for(Path::new("/external/reference.wav"))
+                .ticket()
+                .clone(),
+        );
 
         let main_position_millis = 500;
         state.transport_position_millis = main_position_millis;
