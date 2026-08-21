@@ -26,6 +26,7 @@ use radiant::{
     },
 };
 use std::{
+    fmt::Write as _,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -82,6 +83,13 @@ enum Message {
     AudioImportPreflightCompleted {
         request: AudioImportRequest,
         result: Result<audio::DecodedAudioFile, String>,
+    },
+    RequestBindHistoricalComments(HistoricalBindingOwner),
+    ConfirmBindHistoricalComments(HistoricalBindingCandidate),
+    CancelBindHistoricalComments(HistoricalBindingCandidate),
+    HistoricalBindingCompleted {
+        request: HistoricalBindingRequest,
+        result: Result<crate::source::AudioSourceProof, String>,
     },
     LibrarySaved {
         attempt: LibrarySaveAttempt,
@@ -214,7 +222,7 @@ enum Message {
     ReferencePlayheadDragCancelled,
     CommentDragStarted {
         ratio: f32,
-        note_index: Option<usize>,
+        address: Option<NoteAddress>,
     },
     CommentDragEnded {
         ratio: f32,
@@ -222,34 +230,103 @@ enum Message {
     CommentDragCancelled,
     ReferenceCommentDragStarted {
         ratio: f32,
-        note_index: Option<usize>,
+        address: Option<NoteAddress>,
     },
     ReferenceCommentDragEnded {
         ratio: f32,
     },
     ReferenceCommentDragCancelled,
-    DraftNoteChanged(String),
-    SaveDraftNote,
-    CancelDraftNote,
-    SelectNote(String),
-    PlayComment {
-        track_id: String,
-        source: CommentSource,
-        note_id: String,
+    DraftNoteChanged {
+        identity: NoteDraftIdentity,
+        body: String,
     },
-    CommentHoverStarted(String),
-    CommentHoverEnded(String),
-    ReferenceCommentHoverStarted(String),
-    ReferenceCommentHoverEnded(String),
-    EditNote(String),
-    DeleteNote(String),
-    ReferenceDraftNoteChanged(String),
-    SaveReferenceDraftNote,
-    CancelReferenceDraftNote,
-    SelectReferenceNote(String),
-    EditReferenceNote(String),
+    SaveDraftNote(NoteDraftIdentity),
+    CancelDraftNote(NoteDraftIdentity),
+    SelectNote(NoteAddress),
+    PlayComment {
+        address: NoteAddress,
+    },
+    CommentHoverStarted(NoteAddress),
+    CommentHoverEnded(NoteAddress),
+    ReferenceCommentHoverStarted(NoteAddress),
+    ReferenceCommentHoverEnded(NoteAddress),
+    EditNote(NoteAddress),
+    DeleteNote(NoteAddress),
+    ReferenceDraftNoteChanged {
+        identity: NoteDraftIdentity,
+        body: String,
+    },
+    SaveReferenceDraftNote(NoteDraftIdentity),
+    CancelReferenceDraftNote(NoteDraftIdentity),
+    SelectReferenceNote(NoteAddress),
+    EditReferenceNote(NoteAddress),
     FocusCommentEditor(u64),
-    DeleteReferenceNote(String),
+    DeleteReferenceNote(NoteAddress),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum NoteOwner {
+    MainTrack(String),
+    ReferenceTrack(PathBuf),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct NoteAddress {
+    owner: NoteOwner,
+    note_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct NoteDraftIdentity {
+    owner: NoteOwner,
+    note_id: Option<String>,
+    nonce: u64,
+}
+
+impl NoteAddress {
+    fn main(track_id: impl Into<String>, note_id: impl Into<String>) -> Self {
+        Self {
+            owner: NoteOwner::MainTrack(track_id.into()),
+            note_id: note_id.into(),
+        }
+    }
+
+    fn reference(path: impl Into<PathBuf>, note_id: impl Into<String>) -> Self {
+        Self {
+            owner: NoteOwner::ReferenceTrack(path.into()),
+            note_id: note_id.into(),
+        }
+    }
+
+    fn source(&self) -> CommentSource {
+        match &self.owner {
+            NoteOwner::MainTrack(_) => CommentSource::Main,
+            NoteOwner::ReferenceTrack(_) => CommentSource::Reference,
+        }
+    }
+}
+
+fn qualified_note_identity_key(address: &NoteAddress) -> String {
+    let (owner_kind, owner_bytes) = match &address.owner {
+        NoteOwner::MainTrack(track_id) => ("main", track_id.as_bytes()),
+        NoteOwner::ReferenceTrack(path) => ("reference", path.as_os_str().as_encoded_bytes()),
+    };
+    let note_bytes = address.note_id.as_bytes();
+    format!(
+        "{owner_kind}:{}:{}:{}:{}",
+        owner_bytes.len(),
+        hex_bytes(owner_bytes),
+        note_bytes.len(),
+        hex_bytes(note_bytes),
+    )
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -818,6 +895,27 @@ struct WaveformDecodeRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+enum HistoricalBindingOwner {
+    Main { track_id: String },
+    Reference { path: PathBuf },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HistoricalBindingCandidate {
+    owner: HistoricalBindingOwner,
+    path: PathBuf,
+    note_count: usize,
+    generation: u64,
+    displayed_proof: crate::source::AudioSourceProof,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HistoricalBindingRequest {
+    id: u64,
+    candidate: HistoricalBindingCandidate,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum AudioImportTarget {
     Main,
     AssignedReference {
@@ -898,8 +996,6 @@ struct AppState {
     waveform: Option<audio::WaveformData>,
     waveform_source_ticket: Option<crate::source::VerifiedSourceTicket>,
     main_source_mismatch: Option<PathBuf>,
-    main_legacy_source_warning_shown: bool,
-    reference_legacy_source_warning_shown: bool,
     waveform_track_id: Option<String>,
     waveform_busy: bool,
     waveform_generation: u64,
@@ -956,10 +1052,10 @@ struct AppState {
     reference_draft_note: Option<NoteDraft>,
     persisted_note_drag: Option<PersistedNoteDrag>,
     reference_persisted_note_drag: Option<PersistedNoteDrag>,
-    selected_note_id: Option<String>,
-    hovered_note_id: Option<String>,
-    selected_reference_note_id: Option<String>,
-    hovered_reference_note_id: Option<String>,
+    selected_note_id: Option<NoteAddress>,
+    hovered_note_id: Option<NoteAddress>,
+    selected_reference_note_id: Option<NoteAddress>,
+    hovered_reference_note_id: Option<NoteAddress>,
     stage_menu_track_id: Option<String>,
     stage_menu_anchor: Option<Point>,
     status_menu_track_id: Option<String>,
@@ -981,6 +1077,11 @@ struct AppState {
     audition_pending_play_track_id: Option<String>,
     audio_import_in_flight: Option<AudioImportRequest>,
     pending_import_commit: Option<PendingImportCommit>,
+    historical_binding_confirmation: Option<HistoricalBindingCandidate>,
+    historical_binding_in_flight: Option<HistoricalBindingRequest>,
+    historical_binding_cancellation: Option<ui::CancellationToken>,
+    next_historical_binding_request_id: u64,
+    next_note_draft_nonce: u64,
     next_reference_selection_request_id: u64,
     import_batch: Option<ImportBatchProgress>,
     pending_import_paths: Vec<PathBuf>,
@@ -998,23 +1099,38 @@ struct AppState {
 
 #[derive(Clone, Debug)]
 struct NoteDraft {
+    owner: NoteOwner,
     note_id: Option<String>,
+    nonce: u64,
     time_millis: u64,
     body: String,
 }
 
+impl NoteDraft {
+    fn identity(&self) -> NoteDraftIdentity {
+        NoteDraftIdentity {
+            owner: self.owner.clone(),
+            note_id: self.note_id.clone(),
+            nonce: self.nonce,
+        }
+    }
+
+    fn address(&self) -> Option<NoteAddress> {
+        self.note_id
+            .as_ref()
+            .map(|note_id| note_address_for_owner(&self.owner, note_id))
+    }
+}
+
 #[derive(Clone, Debug)]
 struct PersistedNoteDrag {
-    track_id: String,
-    note_id: String,
+    address: NoteAddress,
     original_time_millis: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PendingCommentPlayback {
-    track_id: String,
-    source: CommentSource,
-    note_id: String,
+    address: NoteAddress,
 }
 
 impl Default for AppState {
@@ -1032,8 +1148,6 @@ impl Default for AppState {
             waveform: None,
             waveform_source_ticket: None,
             main_source_mismatch: None,
-            main_legacy_source_warning_shown: false,
-            reference_legacy_source_warning_shown: false,
             waveform_track_id: None,
             waveform_busy: false,
             waveform_generation: 0,
@@ -1115,6 +1229,11 @@ impl Default for AppState {
             audition_pending_play_track_id: None,
             audio_import_in_flight: None,
             pending_import_commit: None,
+            historical_binding_confirmation: None,
+            historical_binding_in_flight: None,
+            historical_binding_cancellation: None,
+            next_historical_binding_request_id: 0,
+            next_note_draft_nonce: 0,
             next_reference_selection_request_id: 0,
             import_batch: None,
             pending_import_paths: Vec::new(),
@@ -1140,6 +1259,18 @@ impl AppState {
             ..Self::default()
         }
     }
+}
+
+fn allocate_note_draft_nonce(state: &mut AppState) -> u64 {
+    state.next_note_draft_nonce = state
+        .next_note_draft_nonce
+        .checked_add(1)
+        .expect("note draft nonce overflow");
+    state.next_note_draft_nonce
+}
+
+fn active_draft_matches(draft: Option<&NoteDraft>, identity: &NoteDraftIdentity) -> bool {
+    draft.is_some_and(|draft| draft.identity().eq(identity))
 }
 
 fn playback_shortcut(state: &AppState, press: ui::KeyPress) -> ui::ShortcutResolution<Message> {
@@ -1594,47 +1725,191 @@ fn preserve_source_mismatch_status(state: &mut AppState) {
     }
 }
 
-fn adopt_legacy_main_source_proof(
+fn main_annotations_available(state: &AppState) -> bool {
+    selected_track(state).is_some_and(|track| track.source_provenance().verified_proof().is_some())
+}
+
+fn reference_annotations_available(state: &AppState) -> bool {
+    selected_track(state)
+        .and_then(|track| track.reference_path.as_ref())
+        .and_then(|path| {
+            state
+                .library
+                .reference_tracks
+                .iter()
+                .find(|reference| &reference.path == path)
+        })
+        .is_some_and(|reference| reference.source_provenance().verified_proof().is_some())
+}
+
+fn historical_source_warning(
+    owner: &HistoricalBindingOwner,
+    path: &Path,
+    note_count: usize,
+) -> String {
+    let owner_label = match owner {
+        HistoricalBindingOwner::Main { .. } => "main track",
+        HistoricalBindingOwner::Reference { .. } => "reference",
+    };
+    format!(
+        "Historical comments for this {owner_label} are retained but not bound to the current file ({note_count} comment{}). Bind them explicitly to {}.",
+        plural(note_count),
+        path.display()
+    )
+}
+
+fn reject_unknown_main_source(
     state: &mut AppState,
     context: &mut ui::UiUpdateContext<Message>,
-    track_id: &str,
-    ticket: &crate::source::VerifiedSourceTicket,
 ) -> bool {
-    let Some(track) = state
-        .library
-        .tracks
-        .iter_mut()
-        .find(|track| track.id == track_id && track.path == ticket.path())
-    else {
+    let Some(track) = selected_track(state) else {
         return false;
     };
-    if track.source_proof.is_some() {
+    if !track.source_provenance().is_unknown() {
         return false;
     }
-    track.source_proof = Some(ticket.proof().clone());
-    schedule_library_save(state, context);
+    state.status = historical_source_warning(
+        &HistoricalBindingOwner::Main {
+            track_id: track.id.clone(),
+        },
+        &track.path,
+        track.notes.len(),
+    );
+    context.request_repaint();
     true
 }
 
-fn adopt_legacy_reference_source_proof(
+fn reject_unknown_reference_source(
     state: &mut AppState,
     context: &mut ui::UiUpdateContext<Message>,
-    ticket: &crate::source::VerifiedSourceTicket,
 ) -> bool {
+    let Some(track) = selected_track(state) else {
+        return false;
+    };
+    let Some(path) = track.reference_path.as_ref() else {
+        return false;
+    };
     let Some(reference) = state
         .library
         .reference_tracks
-        .iter_mut()
-        .find(|reference| reference.path == ticket.path())
+        .iter()
+        .find(|reference| &reference.path == path)
     else {
         return false;
     };
-    if reference.source_proof.is_some() {
+    if !reference.source_provenance().is_unknown() {
         return false;
     }
-    reference.source_proof = Some(ticket.proof().clone());
-    schedule_library_save(state, context);
+    state.status = historical_source_warning(
+        &HistoricalBindingOwner::Reference { path: path.clone() },
+        path,
+        reference.notes.len(),
+    );
+    context.request_repaint();
     true
+}
+
+fn historical_binding_candidate(
+    state: &AppState,
+    owner: HistoricalBindingOwner,
+) -> Option<HistoricalBindingCandidate> {
+    match owner.clone() {
+        HistoricalBindingOwner::Main { track_id } => {
+            let track = state
+                .library
+                .tracks
+                .iter()
+                .find(|track| track.id == track_id)?;
+            let ticket = state.waveform_source_ticket.as_ref()?;
+            (state.library.selected_track_id.as_deref() == Some(track_id.as_str())
+                && state.waveform_track_id.as_deref() == Some(track_id.as_str())
+                && ticket.path() == track.path
+                && track.source_provenance().is_unknown())
+            .then_some(HistoricalBindingCandidate {
+                owner,
+                path: track.path.clone(),
+                note_count: track.notes.len(),
+                generation: state.waveform_generation,
+                displayed_proof: ticket.proof().clone(),
+            })
+        }
+        HistoricalBindingOwner::Reference { path } => {
+            let track = selected_track(state)?;
+            let reference = state
+                .library
+                .reference_tracks
+                .iter()
+                .find(|reference| reference.path == path)?;
+            let ticket = state.reference_waveform_source_ticket.as_ref()?;
+            (track.reference_path.as_ref() == Some(&path)
+                && state.reference_waveform_track_id.as_deref() == Some(track.id.as_str())
+                && ticket.path() == path
+                && reference.source_provenance().is_unknown())
+            .then_some(HistoricalBindingCandidate {
+                owner,
+                path,
+                note_count: reference.notes.len(),
+                generation: state.reference_waveform_generation,
+                displayed_proof: ticket.proof().clone(),
+            })
+        }
+    }
+}
+
+fn current_historical_binding_ticket(
+    state: &AppState,
+    candidate: &HistoricalBindingCandidate,
+) -> Option<crate::source::VerifiedSourceTicket> {
+    match &candidate.owner {
+        HistoricalBindingOwner::Main { track_id } => (state.library.selected_track_id.as_deref()
+            == Some(track_id.as_str())
+            && state.waveform_track_id.as_deref() == Some(track_id.as_str())
+            && state.waveform_generation == candidate.generation)
+            .then(|| state.waveform_source_ticket.clone())
+            .flatten(),
+        HistoricalBindingOwner::Reference { path } => {
+            let selected_track_id = selected_track(state)
+                .filter(|track| track.reference_path.as_ref() == Some(path))
+                .map(|track| track.id.as_str());
+            (selected_track_id == state.reference_waveform_track_id.as_deref()
+                && state.reference_waveform_generation == candidate.generation)
+                .then(|| state.reference_waveform_source_ticket.clone())
+                .flatten()
+        }
+    }
+}
+
+fn binding_owner_is_still_unknown(
+    state: &AppState,
+    candidate: &HistoricalBindingCandidate,
+) -> bool {
+    match &candidate.owner {
+        HistoricalBindingOwner::Main { track_id } => state
+            .library
+            .tracks
+            .iter()
+            .find(|track| track.id == *track_id && track.path == candidate.path)
+            .is_some_and(|track| track.source_provenance().is_unknown()),
+        HistoricalBindingOwner::Reference { path } => state
+            .library
+            .reference_tracks
+            .iter()
+            .find(|reference| &reference.path == path)
+            .is_some_and(|reference| reference.source_provenance().is_unknown()),
+    }
+}
+
+fn clear_historical_binding(state: &mut AppState) {
+    state.historical_binding_confirmation = None;
+    let was_in_flight = state.historical_binding_in_flight.is_some();
+    if let Some(cancellation) = state.historical_binding_cancellation.as_ref() {
+        cancellation.cancel();
+    }
+    state.historical_binding_in_flight = None;
+    state.historical_binding_cancellation = None;
+    if was_in_flight {
+        state.busy = false;
+    }
 }
 
 fn decode_or_load_cached_waveform(
@@ -1826,6 +2101,7 @@ fn schedule_waveform_decode(
     track_id: String,
     path: PathBuf,
 ) {
+    clear_historical_binding(state);
     state.waveform_generation = state.waveform_generation.wrapping_add(1);
     if state.main_source_mismatch.as_ref() != Some(&path) {
         state.main_source_mismatch = None;
@@ -1835,7 +2111,7 @@ fn schedule_waveform_decode(
         .tracks
         .iter()
         .find(|track| track.id == track_id && track.path == path)
-        .and_then(|track| track.source_proof.clone());
+        .and_then(|track| track.source_provenance().verified_proof().cloned());
     let request = WaveformDecodeRequest {
         track_id,
         path,
@@ -1870,6 +2146,7 @@ fn schedule_waveform_decode(
 }
 
 fn reset_waveform_decode(state: &mut AppState) {
+    clear_historical_binding(state);
     state.waveform_generation = state.waveform_generation.wrapping_add(1);
     state.waveform_pending = None;
     if let Some(cancellation) = state.waveform_cancellation.as_ref() {
@@ -1956,6 +2233,7 @@ fn schedule_reference_waveform_decode(
     track_id: String,
     path: PathBuf,
 ) {
+    clear_historical_binding(state);
     state.reference_waveform_generation = state.reference_waveform_generation.wrapping_add(1);
     if state.reference_source_mismatch.as_ref() != Some(&path) {
         state.reference_source_mismatch = None;
@@ -1965,7 +2243,7 @@ fn schedule_reference_waveform_decode(
         .reference_tracks
         .iter()
         .find(|reference| reference.path == path)
-        .and_then(|reference| reference.source_proof.clone());
+        .and_then(|reference| reference.source_provenance().verified_proof().cloned());
     let request = WaveformDecodeRequest {
         track_id,
         path,
@@ -1991,6 +2269,7 @@ fn schedule_reference_waveform_decode(
 }
 
 fn reset_reference_waveform_decode(state: &mut AppState) {
+    clear_historical_binding(state);
     state.reference_waveform_generation = state.reference_waveform_generation.wrapping_add(1);
     state.reference_waveform_pending = None;
     if let Some(cancellation) = state.reference_waveform_cancellation.as_ref() {
@@ -2237,6 +2516,57 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
         }
         Message::AudioImportPreflightCompleted { request, result } => {
             complete_audio_import_preflight(state, context, request, result);
+        }
+        Message::RequestBindHistoricalComments(owner) => {
+            if state.busy || !library_is_ready(state) {
+                return;
+            }
+            let Some(candidate) = historical_binding_candidate(state, owner) else {
+                state.status = String::from(
+                    "The current verified source is unavailable; historical comments were not bound.",
+                );
+                context.request_repaint();
+                return;
+            };
+            state.historical_binding_confirmation = Some(candidate.clone());
+            state.status = format!(
+                "Confirm binding {} historical comment{} to {}.",
+                candidate.note_count,
+                plural(candidate.note_count),
+                candidate.path.display()
+            );
+            context.request_repaint();
+        }
+        Message::ConfirmBindHistoricalComments(candidate) => {
+            start_historical_binding(state, context, candidate);
+        }
+        Message::CancelBindHistoricalComments(candidate) => {
+            let matches_confirmation =
+                state.historical_binding_confirmation.as_ref() == Some(&candidate);
+            let matches_in_flight = state
+                .historical_binding_in_flight
+                .as_ref()
+                .is_some_and(|request| request.candidate == candidate);
+            if !matches_confirmation && !matches_in_flight {
+                return;
+            }
+            if matches_in_flight {
+                clear_historical_binding(state);
+                state.busy = false;
+                state.status = String::from(
+                    "Historical comment binding canceled; retained comments were not changed.",
+                );
+            } else if let Some(candidate) = state.historical_binding_confirmation.take() {
+                state.status = historical_source_warning(
+                    &candidate.owner,
+                    &candidate.path,
+                    candidate.note_count,
+                );
+            }
+            context.request_repaint();
+        }
+        Message::HistoricalBindingCompleted { request, result } => {
+            complete_historical_binding(state, context, request, result);
         }
         Message::FileDropped(drop) => {
             if drop.phase == ui::NativeFileDropPhase::Drop
@@ -2576,16 +2906,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     let waveform = verified.into_waveform();
                     state.waveform_track_id = Some(track_id.clone());
                     state.main_source_mismatch = None;
-                    let adopted_legacy = retired_request.expected_proof.is_none()
-                        && adopt_legacy_main_source_proof(state, context, &track_id, &ticket);
-                    state.status = if adopted_legacy && !state.main_legacy_source_warning_shown {
-                        state.main_legacy_source_warning_shown = true;
-                        String::from(
-                            "Waveform ready. Historical source bytes could not be verified; the current proof was adopted.",
-                        )
-                    } else {
-                        String::from("Waveform ready.")
-                    };
+                    state.status = String::from("Waveform ready.");
                     state.waveform_source_ticket = Some(ticket);
                     state.waveform = Some(waveform);
                     if let Some(ticket) = state.waveform_source_ticket.clone().filter(|ticket| {
@@ -2631,7 +2952,12 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     if state
                         .pending_comment_playback
                         .as_ref()
-                        .is_some_and(|pending| pending.track_id == track_id)
+                        .is_some_and(|pending| {
+                            matches!(
+                                &pending.address.owner,
+                                NoteOwner::MainTrack(owner_id) if owner_id == &track_id
+                            )
+                        })
                     {
                         cancel_pending_comment_playback(state);
                     }
@@ -2651,7 +2977,12 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     if state
                         .pending_comment_playback
                         .as_ref()
-                        .is_some_and(|pending| pending.track_id == track_id)
+                        .is_some_and(|pending| {
+                            matches!(
+                                &pending.address.owner,
+                                NoteOwner::MainTrack(owner_id) if owner_id == &track_id
+                            )
+                        })
                     {
                         cancel_pending_comment_playback(state);
                     }
@@ -2725,18 +3056,6 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     state.reference_waveform_source_ticket = Some(ticket);
                     state.reference_waveform = Some(waveform);
                     state.reference_source_mismatch = None;
-                    let reference_ticket = state.reference_waveform_source_ticket.clone();
-                    if retired_request.expected_proof.is_none()
-                        && reference_ticket.as_ref().is_some_and(|ticket| {
-                            adopt_legacy_reference_source_proof(state, context, ticket)
-                        })
-                        && !state.reference_legacy_source_warning_shown
-                    {
-                        state.reference_legacy_source_warning_shown = true;
-                        state.status = String::from(
-                            "Reference waveform ready. Historical source bytes could not be verified; the current proof was adopted.",
-                        );
-                    }
                 }
                 Err(error) if error == "cancelled" => {
                     state.reference_waveform = None;
@@ -2745,7 +3064,12 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     if state
                         .pending_comment_playback
                         .as_ref()
-                        .is_some_and(|pending| pending.track_id == track_id)
+                        .is_some_and(|pending| {
+                            matches!(
+                                &pending.address.owner,
+                                NoteOwner::ReferenceTrack(path) if path == &retired_request.path
+                            )
+                        })
                     {
                         cancel_pending_comment_playback(state);
                     }
@@ -2765,7 +3089,12 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     if state
                         .pending_comment_playback
                         .as_ref()
-                        .is_some_and(|pending| pending.track_id == track_id)
+                        .is_some_and(|pending| {
+                            matches!(
+                                &pending.address.owner,
+                                NoteOwner::ReferenceTrack(path) if path == &retired_request.path
+                            )
+                        })
                     {
                         cancel_pending_comment_playback(state);
                     }
@@ -3129,7 +3458,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 .reference_tracks
                 .iter()
                 .find(|reference| reference.path == path)
-                .map(|reference| reference.source_proof.clone())
+                .map(|reference| reference.source_provenance().verified_proof().cloned())
             else {
                 state.status = String::from(
                     "That reference is no longer in the catalog; remove and re-import it.",
@@ -3403,6 +3732,14 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
         Message::SelectCommentSource(source) => {
             state.comment_source = source;
             state.comment_source_explicit = true;
+            if (source == CommentSource::Main && !main_annotations_available(state))
+                || (source == CommentSource::Reference && !reference_annotations_available(state))
+            {
+                let _ = match source {
+                    CommentSource::Main => reject_unknown_main_source(state, context),
+                    CommentSource::Reference => reject_unknown_reference_source(state, context),
+                };
+            }
             context.request_repaint();
         }
         Message::ToggleReferenceMatch => {
@@ -3527,6 +3864,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
             if reject_main_source_mismatch(state, context)
                 || reject_reference_source_mismatch(state, context)
+                || reject_unknown_reference_source(state, context)
             {
                 return;
             }
@@ -3539,6 +3877,9 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 return;
             }
             if reject_main_source_mismatch(state, context) {
+                return;
+            }
+            if lower && reject_unknown_main_source(state, context) {
                 return;
             }
             let Some(waveform) = state.waveform.as_ref() else {
@@ -3628,15 +3969,18 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             state.reference_playhead_drag_active = false;
             context.request_repaint();
         }
-        Message::CommentDragStarted { ratio, note_index } => {
+        Message::CommentDragStarted { ratio, address } => {
             if !library_is_ready(state) || state.busy || state.waveform_busy {
                 return;
             }
             if reject_main_source_mismatch(state, context) {
                 return;
             }
-            if let Some(note_index) = note_index {
-                start_persisted_note_drag(state, context, note_index);
+            if reject_unknown_main_source(state, context) {
+                return;
+            }
+            if let Some(address) = address {
+                start_persisted_note_drag(state, context, address);
             } else {
                 rollback_persisted_note_drag(state);
                 move_draft_note(state, context, ratio);
@@ -3647,6 +3991,9 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 return;
             }
             if reject_main_source_mismatch(state, context) {
+                return;
+            }
+            if reject_unknown_main_source(state, context) {
                 return;
             }
             if state.persisted_note_drag.is_some() {
@@ -3668,7 +4015,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             state.status = String::from("Comment canceled.");
             context.request_repaint();
         }
-        Message::ReferenceCommentDragStarted { ratio, note_index } => {
+        Message::ReferenceCommentDragStarted { ratio, address } => {
             if !library_is_ready(state)
                 || state.busy
                 || state.waveform_busy
@@ -3678,11 +4025,12 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
             if reject_main_source_mismatch(state, context)
                 || reject_reference_source_mismatch(state, context)
+                || reject_unknown_reference_source(state, context)
             {
                 return;
             }
-            if let Some(note_index) = note_index {
-                start_reference_persisted_note_drag(state, context, note_index);
+            if let Some(address) = address {
+                start_reference_persisted_note_drag(state, context, address);
             } else {
                 rollback_reference_persisted_note_drag(state);
                 move_reference_draft_note(state, context, ratio);
@@ -3698,6 +4046,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
             if reject_main_source_mismatch(state, context)
                 || reject_reference_source_mismatch(state, context)
+                || reject_unknown_reference_source(state, context)
             {
                 return;
             }
@@ -3720,14 +4069,31 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             state.status = String::from("Reference comment canceled.");
             context.request_repaint();
         }
-        Message::DraftNoteChanged(body) => {
+        Message::DraftNoteChanged { identity, body } => {
+            if !active_draft_matches(state.draft_note.as_ref(), &identity) {
+                return;
+            }
+            if !main_annotations_available(state) && reject_unknown_main_source(state, context) {
+                return;
+            }
             if let Some(draft) = state.draft_note.as_mut() {
                 draft.body = body;
                 context.request_repaint();
             }
         }
-        Message::SaveDraftNote => save_draft_note(state, context),
-        Message::CancelDraftNote => {
+        Message::SaveDraftNote(identity) => {
+            if !active_draft_matches(state.draft_note.as_ref(), &identity) {
+                return;
+            }
+            if !main_annotations_available(state) && reject_unknown_main_source(state, context) {
+                return;
+            }
+            save_draft_note(state, context, &identity)
+        }
+        Message::CancelDraftNote(identity) => {
+            if !active_draft_matches(state.draft_note.as_ref(), &identity) {
+                return;
+            }
             if !library_is_ready(state) {
                 return;
             }
@@ -3737,18 +4103,24 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             state.status = String::from("Comment canceled.");
             context.request_repaint();
         }
-        Message::SelectNote(id) => {
+        Message::SelectNote(address) => {
             if !library_is_ready(state) || state.busy {
+                return;
+            }
+            if reject_unknown_main_source(state, context) {
+                return;
+            }
+            if !is_current_main_note_address(state, &address) {
                 return;
             }
             state.comment_source = CommentSource::Main;
             state.comment_source_explicit = true;
             rollback_persisted_note_drag(state);
             let note = selected_track(state)
-                .and_then(|track| track.notes.iter().find(|note| note.id == id))
+                .and_then(|track| track.notes.iter().find(|note| note.id == address.note_id))
                 .cloned();
             if let Some(note) = note {
-                state.selected_note_id = Some(note.id);
+                state.selected_note_id = Some(address);
                 set_pending_seek_intent(state, AuditionSource::Main, note.time_millis);
                 state.review_cursor_millis = note.time_millis;
                 state.transport_position_millis = note.time_millis;
@@ -3760,42 +4132,55 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 context.request_repaint();
             }
         }
-        Message::PlayComment {
-            track_id,
-            source,
-            note_id,
-        } => play_comment(state, context, track_id, source, note_id),
-        Message::CommentHoverStarted(id) => {
+        Message::PlayComment { address } => {
+            let source = address.source();
+            if (source == CommentSource::Main && !main_annotations_available(state))
+                || (source == CommentSource::Reference && !reference_annotations_available(state))
+            {
+                let _ = match source {
+                    CommentSource::Main => reject_unknown_main_source(state, context),
+                    CommentSource::Reference => reject_unknown_reference_source(state, context),
+                };
+                return;
+            }
+            play_comment(state, context, address)
+        }
+        Message::CommentHoverStarted(address) => {
             if !library_is_ready(state) || state.busy {
                 return;
             }
-            let is_current_note = selected_track(state)
-                .is_some_and(|track| track.notes.iter().any(|note| note.id == id));
-            if is_current_note && state.hovered_note_id.as_deref() != Some(id.as_str()) {
-                state.hovered_note_id = Some(id);
+            if reject_unknown_main_source(state, context) {
+                return;
+            }
+            if is_current_main_note_address(state, &address)
+                && state.hovered_note_id.as_ref() != Some(&address)
+            {
+                state.hovered_note_id = Some(address);
                 context.request_repaint();
             }
         }
-        Message::CommentHoverEnded(id) => {
-            if state.hovered_note_id.as_deref() == Some(id.as_str()) {
+        Message::CommentHoverEnded(address) => {
+            if state.hovered_note_id.as_ref() == Some(&address) {
                 state.hovered_note_id = None;
                 context.request_repaint();
             }
         }
-        Message::ReferenceCommentHoverStarted(id) => {
+        Message::ReferenceCommentHoverStarted(address) => {
             if !library_is_ready(state) || state.busy {
                 return;
             }
-            let is_current_note = selected_reference_notes(state)
-                .iter()
-                .any(|note| note.id == id);
-            if is_current_note && state.hovered_reference_note_id.as_deref() != Some(id.as_str()) {
-                state.hovered_reference_note_id = Some(id);
+            if reject_unknown_reference_source(state, context) {
+                return;
+            }
+            if is_current_reference_note_address(state, &address)
+                && state.hovered_reference_note_id.as_ref() != Some(&address)
+            {
+                state.hovered_reference_note_id = Some(address);
                 context.request_repaint();
             }
         }
-        Message::ReferenceCommentHoverEnded(id) => {
-            if state.hovered_reference_note_id.as_deref() == Some(id.as_str()) {
+        Message::ReferenceCommentHoverEnded(address) => {
+            if state.hovered_reference_note_id.as_ref() == Some(&address) {
                 state.hovered_reference_note_id = None;
                 context.request_repaint();
             }
@@ -3804,24 +4189,33 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             context.focus(editor_id);
             context.request_repaint();
         }
-        Message::EditNote(id) => {
+        Message::EditNote(address) => {
             if !library_is_ready(state) || state.busy {
+                return;
+            }
+            if reject_unknown_main_source(state, context) {
+                return;
+            }
+            if !is_current_main_note_address(state, &address) {
                 return;
             }
             state.comment_source = CommentSource::Main;
             state.comment_source_explicit = true;
             rollback_persisted_note_drag(state);
             let note = selected_track(state)
-                .and_then(|track| track.notes.iter().find(|note| note.id == id))
+                .and_then(|track| track.notes.iter().find(|note| note.id == address.note_id))
                 .cloned();
             if let Some(note) = note {
-                let editor_id = main_inline_comment_editor_id(&note.id);
+                let editor_id = main_inline_comment_editor_id(&address);
+                let nonce = allocate_note_draft_nonce(state);
                 set_pending_seek_intent(state, AuditionSource::Main, note.time_millis);
                 state.review_cursor_millis = note.time_millis;
                 state.transport_position_millis = note.time_millis;
-                state.selected_note_id = Some(note.id.clone());
+                state.selected_note_id = Some(address.clone());
                 state.draft_note = Some(NoteDraft {
+                    owner: address.owner,
                     note_id: Some(note.id),
+                    nonce,
                     time_millis: note.time_millis,
                     body: note.body,
                 });
@@ -3835,8 +4229,14 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 );
             }
         }
-        Message::DeleteNote(id) => {
+        Message::DeleteNote(address) => {
             if !library_is_ready(state) || state.busy {
+                return;
+            }
+            if reject_unknown_main_source(state, context) {
+                return;
+            }
+            if !is_current_main_note_address(state, &address) {
                 return;
             }
             rollback_persisted_note_drag(state);
@@ -3844,17 +4244,17 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 track
                     .notes
                     .iter()
-                    .position(|note| note.id == id)
+                    .position(|note| note.id == address.note_id)
                     .map(|index| track.notes.remove(index))
             });
             if removed.is_some() {
-                if state.hovered_note_id.as_deref() == Some(id.as_str()) {
+                if state.hovered_note_id.as_ref() == Some(&address) {
                     state.hovered_note_id = None;
                 }
                 if state
                     .selected_note_id
                     .as_ref()
-                    .is_some_and(|selected_id| selected_id == &id)
+                    .is_some_and(|selected_address| selected_address == &address)
                 {
                     state.selected_note_id = None;
                     clear_pending_seek_intent(state, AuditionSource::Main);
@@ -3862,7 +4262,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 if state
                     .draft_note
                     .as_ref()
-                    .is_some_and(|draft| draft.note_id.as_deref() == Some(id.as_str()))
+                    .is_some_and(|draft| draft.address().as_ref() == Some(&address))
                 {
                     state.draft_note = None;
                 }
@@ -3873,14 +4273,35 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
             context.request_repaint();
         }
-        Message::ReferenceDraftNoteChanged(body) => {
+        Message::ReferenceDraftNoteChanged { identity, body } => {
+            if !active_draft_matches(state.reference_draft_note.as_ref(), &identity) {
+                return;
+            }
+            if !reference_annotations_available(state)
+                && reject_unknown_reference_source(state, context)
+            {
+                return;
+            }
             if let Some(draft) = state.reference_draft_note.as_mut() {
                 draft.body = body;
                 context.request_repaint();
             }
         }
-        Message::SaveReferenceDraftNote => save_reference_draft_note(state, context),
-        Message::CancelReferenceDraftNote => {
+        Message::SaveReferenceDraftNote(identity) => {
+            if !active_draft_matches(state.reference_draft_note.as_ref(), &identity) {
+                return;
+            }
+            if !reference_annotations_available(state)
+                && reject_unknown_reference_source(state, context)
+            {
+                return;
+            }
+            save_reference_draft_note(state, context, &identity)
+        }
+        Message::CancelReferenceDraftNote(identity) => {
+            if !active_draft_matches(state.reference_draft_note.as_ref(), &identity) {
+                return;
+            }
             if !library_is_ready(state) {
                 return;
             }
@@ -3889,18 +4310,25 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             state.status = String::from("Reference comment canceled.");
             context.request_repaint();
         }
-        Message::SelectReferenceNote(id) => {
+        Message::SelectReferenceNote(address) => {
             if !library_is_ready(state) || state.busy {
+                return;
+            }
+            if reject_unknown_reference_source(state, context) {
+                return;
+            }
+            if !is_current_reference_note_address(state, &address) {
                 return;
             }
             state.comment_source = CommentSource::Reference;
             state.comment_source_explicit = true;
+            rollback_reference_persisted_note_drag(state);
             let note = selected_reference_notes(state)
                 .iter()
-                .find(|note| note.id == id)
+                .find(|note| note.id == address.note_id)
                 .cloned();
             if let Some(note) = note {
-                state.selected_reference_note_id = Some(note.id);
+                state.selected_reference_note_id = Some(address);
                 set_pending_seek_intent(state, AuditionSource::Reference, note.time_millis);
                 state.reference_transport_position_millis = note.time_millis;
                 state.reference_draft_note = None;
@@ -3911,23 +4339,33 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 context.request_repaint();
             }
         }
-        Message::EditReferenceNote(id) => {
+        Message::EditReferenceNote(address) => {
             if !library_is_ready(state) || state.busy {
+                return;
+            }
+            if reject_unknown_reference_source(state, context) {
+                return;
+            }
+            if !is_current_reference_note_address(state, &address) {
                 return;
             }
             state.comment_source = CommentSource::Reference;
             state.comment_source_explicit = true;
+            rollback_reference_persisted_note_drag(state);
             let note = selected_reference_notes(state)
                 .iter()
-                .find(|note| note.id == id)
+                .find(|note| note.id == address.note_id)
                 .cloned();
             if let Some(note) = note {
-                let editor_id = reference_inline_comment_editor_id(&note.id);
+                let editor_id = reference_inline_comment_editor_id(&address);
+                let nonce = allocate_note_draft_nonce(state);
                 set_pending_seek_intent(state, AuditionSource::Reference, note.time_millis);
-                state.selected_reference_note_id = Some(note.id.clone());
+                state.selected_reference_note_id = Some(address.clone());
                 state.reference_transport_position_millis = note.time_millis;
                 state.reference_draft_note = Some(NoteDraft {
+                    owner: address.owner,
                     note_id: Some(note.id),
+                    nonce,
                     time_millis: note.time_millis,
                     body: note.body,
                 });
@@ -3943,29 +4381,35 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 );
             }
         }
-        Message::DeleteReferenceNote(id) => {
+        Message::DeleteReferenceNote(address) => {
             if !library_is_ready(state) || state.busy {
+                return;
+            }
+            if reject_unknown_reference_source(state, context) {
+                return;
+            }
+            if !is_current_reference_note_address(state, &address) {
                 return;
             }
             let removed = selected_reference_track_mut(state).and_then(|reference| {
                 reference
                     .notes
                     .iter()
-                    .position(|note| note.id == id)
+                    .position(|note| note.id == address.note_id)
                     .map(|index| reference.notes.remove(index))
             });
             if removed.is_some() {
-                if state.selected_reference_note_id.as_deref() == Some(id.as_str()) {
+                if state.selected_reference_note_id.as_ref() == Some(&address) {
                     state.selected_reference_note_id = None;
                     clear_pending_seek_intent(state, AuditionSource::Reference);
                 }
-                if state.hovered_reference_note_id.as_deref() == Some(id.as_str()) {
+                if state.hovered_reference_note_id.as_ref() == Some(&address) {
                     state.hovered_reference_note_id = None;
                 }
                 if state
                     .reference_draft_note
                     .as_ref()
-                    .is_some_and(|draft| draft.note_id.as_deref() == Some(id.as_str()))
+                    .is_some_and(|draft| draft.address().as_ref() == Some(&address))
                 {
                     state.reference_draft_note = None;
                 }
@@ -5736,6 +6180,9 @@ fn start_note_at_current_time(state: &mut AppState, context: &mut ui::UiUpdateCo
     if reject_main_source_mismatch(state, context) {
         return;
     }
+    if reject_unknown_main_source(state, context) {
+        return;
+    }
     let Some(track_id) = state.library.selected_track_id.as_deref() else {
         state.status = String::from("Select a track before adding a comment.");
         context.request_repaint();
@@ -5763,14 +6210,23 @@ fn start_main_note_draft(
     if reject_main_source_mismatch(state, context) {
         return;
     }
+    if reject_unknown_main_source(state, context) {
+        return;
+    }
     rollback_persisted_note_drag(state);
     state.comment_source = CommentSource::Main;
     state.comment_source_explicit = true;
     set_audition_source(state, AuditionSource::Main);
     state.review_cursor_millis = time_millis;
     set_pending_seek_intent(state, AuditionSource::Main, time_millis);
+    let Some(track_id) = state.library.selected_track_id.clone() else {
+        return;
+    };
+    let nonce = allocate_note_draft_nonce(state);
     state.draft_note = Some(NoteDraft {
+        owner: NoteOwner::MainTrack(track_id),
         note_id: None,
+        nonce,
         time_millis,
         body: String::new(),
     });
@@ -5783,13 +6239,23 @@ fn start_main_note_draft(
     context.request_repaint();
 }
 
-fn save_draft_note(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
+fn save_draft_note(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    identity: &NoteDraftIdentity,
+) {
+    if !active_draft_matches(state.draft_note.as_ref(), identity) {
+        return;
+    }
     if !library_is_ready(state) {
         state.status = library_unavailable_status(state).to_string();
         context.request_repaint();
         return;
     }
     if reject_main_source_mismatch(state, context) {
+        return;
+    }
+    if reject_unknown_main_source(state, context) {
         return;
     }
     if state.busy {
@@ -5800,6 +6266,9 @@ fn save_draft_note(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
     let Some(draft) = state.draft_note.clone() else {
         return;
     };
+    if !is_current_main_owner(state, &draft.owner) {
+        return;
+    }
     let body = draft.body.trim().to_string();
     if body.is_empty() {
         state.status = String::from("Write a comment before saving.");
@@ -5848,6 +6317,9 @@ fn start_reference_comment_draft(
     {
         return;
     }
+    if reject_unknown_reference_source(state, context) {
+        return;
+    }
     let Some(waveform) = state
         .reference_waveform
         .as_ref()
@@ -5863,8 +6335,14 @@ fn start_reference_comment_draft(
     }
     let time_millis = waveform::millis_for_ratio(ratio, waveform.duration_millis);
     set_pending_seek_intent(state, AuditionSource::Reference, time_millis);
+    let Some(owner) = selected_reference_owner(state) else {
+        return;
+    };
+    let nonce = allocate_note_draft_nonce(state);
     state.reference_draft_note = Some(NoteDraft {
+        owner,
         note_id: None,
+        nonce,
         time_millis,
         body: String::new(),
     });
@@ -5878,7 +6356,14 @@ fn start_reference_comment_draft(
     context.request_repaint();
 }
 
-fn save_reference_draft_note(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
+fn save_reference_draft_note(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    identity: &NoteDraftIdentity,
+) {
+    if !active_draft_matches(state.reference_draft_note.as_ref(), identity) {
+        return;
+    }
     if !library_is_ready(state) {
         state.status = library_unavailable_status(state).to_string();
         context.request_repaint();
@@ -5889,6 +6374,9 @@ fn save_reference_draft_note(state: &mut AppState, context: &mut ui::UiUpdateCon
     {
         return;
     }
+    if reject_unknown_reference_source(state, context) {
+        return;
+    }
     if state.busy {
         state.status = String::from("Finish importing before saving a reference comment.");
         context.request_repaint();
@@ -5897,6 +6385,9 @@ fn save_reference_draft_note(state: &mut AppState, context: &mut ui::UiUpdateCon
     let Some(draft) = state.reference_draft_note.clone() else {
         return;
     };
+    if !is_current_reference_owner(state, &draft.owner) {
+        return;
+    }
     let body = draft.body.trim().to_owned();
     if body.is_empty() {
         state.status = String::from("Write a reference comment before saving.");
@@ -5933,6 +6424,9 @@ fn save_reference_draft_note(state: &mut AppState, context: &mut ui::UiUpdateCon
 }
 
 fn move_draft_note(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>, ratio: f32) {
+    if !main_annotations_available(state) {
+        return;
+    }
     let Some(duration_millis) = state
         .waveform
         .as_ref()
@@ -5958,13 +6452,19 @@ fn move_draft_note(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
 fn start_persisted_note_drag(
     state: &mut AppState,
     context: &mut ui::UiUpdateContext<Message>,
-    note_index: usize,
+    address: NoteAddress,
 ) {
     if !library_is_ready(state) {
         return;
     }
+    if !main_annotations_available(state) {
+        return;
+    }
     rollback_persisted_note_drag(state);
     if state.busy {
+        return;
+    }
+    if !is_current_main_note_address(state, &address) {
         return;
     }
     let Some(track_id) = state.library.selected_track_id.clone() else {
@@ -5972,18 +6472,14 @@ fn start_persisted_note_drag(
     };
     let waveform_is_current =
         state.waveform.is_some() && state.waveform_track_id.as_deref() == Some(track_id.as_str());
-    let Some((note_id, time_millis)) = state
+    let Some((_, time_millis)) = state
         .library
         .tracks
         .iter()
         .find(|track| track.id == track_id)
         .filter(|_| waveform_is_current)
-        .and_then(|track| {
-            track
-                .notes
-                .get(note_index)
-                .map(|note| (note.id.clone(), note.time_millis))
-        })
+        .and_then(|track| track.notes.iter().find(|note| note.id == address.note_id))
+        .map(|note| (note.id.clone(), note.time_millis))
     else {
         state.status = String::from("That comment no longer exists.");
         context.request_repaint();
@@ -5993,7 +6489,7 @@ fn start_persisted_note_drag(
     if state
         .draft_note
         .as_ref()
-        .is_some_and(|draft| draft.note_id.as_deref() == Some(note_id.as_str()))
+        .is_some_and(|draft| draft.address().as_ref() == Some(&address))
     {
         if let Some(draft) = state.draft_note.as_mut() {
             draft.time_millis = time_millis;
@@ -6004,11 +6500,10 @@ fn start_persisted_note_drag(
         state.draft_note = None;
     }
     state.persisted_note_drag = Some(PersistedNoteDrag {
-        track_id,
-        note_id: note_id.clone(),
+        address: address.clone(),
         original_time_millis: time_millis,
     });
-    state.selected_note_id = Some(note_id);
+    state.selected_note_id = Some(address);
     state.hovered_note_id = None;
     state.review_cursor_millis = time_millis;
     state.transport_position_millis = time_millis;
@@ -6025,13 +6520,22 @@ fn finish_persisted_note_drag(
     if !library_is_ready(state) {
         return;
     }
+    if !main_annotations_available(state) {
+        return;
+    }
     let Some(drag) = state.persisted_note_drag.take() else {
+        return;
+    };
+    if !is_current_main_note_address(state, &drag.address) {
+        return;
+    }
+    let NoteOwner::MainTrack(track_id) = &drag.address.owner else {
         return;
     };
     let Some(duration_millis) = state
         .waveform
         .as_ref()
-        .filter(|_| state.waveform_track_id.as_deref() == Some(drag.track_id.as_str()))
+        .filter(|_| state.waveform_track_id.as_deref() == Some(track_id.as_str()))
         .map(|waveform| waveform.duration_millis)
     else {
         return;
@@ -6041,13 +6545,17 @@ fn finish_persisted_note_drag(
         .library
         .tracks
         .iter_mut()
-        .find(|track| track.id == drag.track_id)
+        .find(|track| track.id == *track_id)
     else {
         state.status = String::from("That track is no longer in the library.");
         context.request_repaint();
         return;
     };
-    let Some(note) = track.notes.iter_mut().find(|note| note.id == drag.note_id) else {
+    let Some(note) = track
+        .notes
+        .iter_mut()
+        .find(|note| note.id == drag.address.note_id)
+    else {
         state.status = String::from("That comment no longer exists.");
         context.request_repaint();
         return;
@@ -6061,7 +6569,7 @@ fn finish_persisted_note_drag(
     if let Some(draft) = state
         .draft_note
         .as_mut()
-        .filter(|draft| draft.note_id.as_deref() == Some(drag.note_id.as_str()))
+        .filter(|draft| draft.address().as_ref() == Some(&drag.address))
     {
         draft.time_millis = final_time_millis;
     }
@@ -6090,6 +6598,9 @@ fn move_reference_draft_note(
     context: &mut ui::UiUpdateContext<Message>,
     ratio: f32,
 ) {
+    if !reference_annotations_available(state) {
+        return;
+    }
     let Some(duration_millis) = state
         .reference_waveform
         .as_ref()
@@ -6116,13 +6627,19 @@ fn move_reference_draft_note(
 fn start_reference_persisted_note_drag(
     state: &mut AppState,
     context: &mut ui::UiUpdateContext<Message>,
-    note_index: usize,
+    address: NoteAddress,
 ) {
     if !library_is_ready(state) {
         return;
     }
+    if !reference_annotations_available(state) {
+        return;
+    }
     rollback_reference_persisted_note_drag(state);
     if state.busy {
+        return;
+    }
+    if !is_current_reference_note_address(state, &address) {
         return;
     }
     let Some(track_id) = state.library.selected_track_id.clone() else {
@@ -6131,7 +6648,7 @@ fn start_reference_persisted_note_drag(
     let waveform_is_current = state.reference_waveform.is_some()
         && state.reference_waveform_track_id.as_deref() == Some(track_id.as_str())
         && !state.reference_waveform_busy;
-    let Some((note_id, time_millis)) = state
+    let Some((_, time_millis)) = state
         .library
         .tracks
         .iter()
@@ -6139,7 +6656,8 @@ fn start_reference_persisted_note_drag(
         .filter(|_| waveform_is_current)
         .and_then(|track| {
             reference_notes_for_track(&state.library, track)
-                .get(note_index)
+                .iter()
+                .find(|note| note.id == address.note_id)
                 .map(|note| (note.id.clone(), note.time_millis))
         })
     else {
@@ -6151,7 +6669,7 @@ fn start_reference_persisted_note_drag(
     if state
         .reference_draft_note
         .as_ref()
-        .is_some_and(|draft| draft.note_id.as_deref() == Some(note_id.as_str()))
+        .is_some_and(|draft| draft.address().as_ref() == Some(&address))
     {
         if let Some(draft) = state.reference_draft_note.as_mut() {
             draft.time_millis = time_millis;
@@ -6160,11 +6678,10 @@ fn start_reference_persisted_note_drag(
         state.reference_draft_note = None;
     }
     state.reference_persisted_note_drag = Some(PersistedNoteDrag {
-        track_id,
-        note_id: note_id.clone(),
+        address: address.clone(),
         original_time_millis: time_millis,
     });
-    state.selected_reference_note_id = Some(note_id);
+    state.selected_reference_note_id = Some(address);
     state.hovered_reference_note_id = None;
     state.reference_transport_position_millis = time_millis;
     set_pending_seek_intent(state, AuditionSource::Reference, time_millis);
@@ -6183,15 +6700,25 @@ fn finish_reference_persisted_note_drag(
     if !library_is_ready(state) {
         return;
     }
+    if !reference_annotations_available(state) {
+        return;
+    }
     let Some(drag) = state.reference_persisted_note_drag.take() else {
         return;
     };
+    if !is_current_reference_note_address(state, &drag.address) {
+        return;
+    }
+    let NoteOwner::ReferenceTrack(_) = &drag.address.owner else {
+        return;
+    };
+    let selected_track_id = state.library.selected_track_id.clone();
     let Some(duration_millis) = state
         .reference_waveform
         .as_ref()
         .filter(|_| {
             !state.reference_waveform_busy
-                && state.reference_waveform_track_id.as_deref() == Some(drag.track_id.as_str())
+                && state.reference_waveform_track_id.as_deref() == selected_track_id.as_deref()
         })
         .map(|waveform| waveform.duration_millis)
     else {
@@ -6206,7 +6733,7 @@ fn finish_reference_persisted_note_drag(
     let Some(note) = reference
         .notes
         .iter_mut()
-        .find(|note| note.id == drag.note_id)
+        .find(|note| note.id == drag.address.note_id)
     else {
         state.status = String::from("That reference comment no longer exists.");
         context.request_repaint();
@@ -6221,7 +6748,7 @@ fn finish_reference_persisted_note_drag(
     if let Some(draft) = state
         .reference_draft_note
         .as_mut()
-        .filter(|draft| draft.note_id.as_deref() == Some(drag.note_id.as_str()))
+        .filter(|draft| draft.address().as_ref() == Some(&drag.address))
     {
         draft.time_millis = final_time_millis;
     }
@@ -6589,7 +7116,7 @@ fn reference_selection_catalog_matches(
         .reference_tracks
         .iter()
         .find(|reference| reference.path == path)
-        .is_some_and(|reference| reference.source_proof.as_ref() == expected_proof)
+        .is_some_and(|reference| reference.source_provenance().verified_proof() == expected_proof)
 }
 
 fn complete_reference_selection_preflight(
@@ -6786,6 +7313,161 @@ fn complete_audio_import_preflight(
             );
         }
     }
+}
+
+fn start_historical_binding(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    candidate: HistoricalBindingCandidate,
+) {
+    if state.busy || !library_is_ready(state) {
+        return;
+    }
+    if state.historical_binding_confirmation.as_ref() != Some(&candidate) {
+        return;
+    }
+    let candidate = state
+        .historical_binding_confirmation
+        .take()
+        .expect("the matching historical binding candidate should be present");
+    if historical_binding_candidate(state, candidate.owner.clone()).as_ref() != Some(&candidate) {
+        state.status = String::from(
+            "The displayed source changed before binding; retained historical comments were not changed.",
+        );
+        context.request_repaint();
+        return;
+    }
+    state.next_historical_binding_request_id = state
+        .next_historical_binding_request_id
+        .checked_add(1)
+        .expect("historical binding request id overflow");
+    let request = HistoricalBindingRequest {
+        id: state.next_historical_binding_request_id,
+        candidate,
+    };
+    let path = request.candidate.path.clone();
+    let completion_request = request.clone();
+    let cancellation = ui::CancellationToken::new();
+    let worker_cancellation = cancellation.clone();
+    state.historical_binding_in_flight = Some(request);
+    state.historical_binding_cancellation = Some(cancellation);
+    state.busy = true;
+    state.status = format!(
+        "Verifying the current source before binding {} comments…",
+        completion_request.candidate.note_count
+    );
+    context
+        .business()
+        .background("cadence-bind-historical-comments")
+        .cancellable()
+        .run(
+            move |work| {
+                source::hash_file(&path, || {
+                    work.is_cancelled() || worker_cancellation.is_cancelled()
+                })
+                .map_err(|error| error.to_string())
+            },
+            move |result| Message::HistoricalBindingCompleted {
+                request: completion_request,
+                result,
+            },
+        );
+    context.request_repaint();
+}
+
+fn complete_historical_binding(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    request: HistoricalBindingRequest,
+    result: Result<crate::source::AudioSourceProof, String>,
+) {
+    if state.historical_binding_in_flight.as_ref() != Some(&request) {
+        return;
+    }
+    state.historical_binding_in_flight = None;
+    state.historical_binding_cancellation = None;
+    state.busy = false;
+
+    let candidate = request.candidate;
+    let Ok(fresh_proof) = result else {
+        state.status =
+            historical_source_warning(&candidate.owner, &candidate.path, candidate.note_count);
+        context.request_repaint();
+        return;
+    };
+    let Some(ticket) = current_historical_binding_ticket(state, &candidate) else {
+        state.status = String::from(
+            "The displayed source changed before binding; retained historical comments were not changed.",
+        );
+        context.request_repaint();
+        return;
+    };
+    let current_note_count = match &candidate.owner {
+        HistoricalBindingOwner::Main { track_id } => state
+            .library
+            .tracks
+            .iter()
+            .find(|track| track.id == *track_id && track.path == candidate.path)
+            .map_or(0, |track| track.notes.len()),
+        HistoricalBindingOwner::Reference { path } => state
+            .library
+            .reference_tracks
+            .iter()
+            .find(|reference| &reference.path == path)
+            .map_or(0, |reference| reference.notes.len()),
+    };
+    let still_current = ticket.path() == candidate.path
+        && ticket.proof() == &candidate.displayed_proof
+        && fresh_proof == candidate.displayed_proof
+        && binding_owner_is_still_unknown(state, &candidate)
+        && current_note_count == candidate.note_count;
+    if !still_current {
+        state.status = if fresh_proof != candidate.displayed_proof {
+            match candidate.owner {
+                HistoricalBindingOwner::Main { .. } => {
+                    state.main_source_mismatch = Some(candidate.path.clone());
+                    reset_transport(state);
+                    String::from(MAIN_SOURCE_MISMATCH_STATUS)
+                }
+                HistoricalBindingOwner::Reference { .. } => {
+                    state.reference_source_mismatch = Some(candidate.path.clone());
+                    reset_reference_transport(state);
+                    String::from(REFERENCE_SOURCE_MISMATCH_STATUS)
+                }
+            }
+        } else {
+            String::from(
+                "The displayed source changed before binding; retained historical comments were not changed.",
+            )
+        };
+        context.request_repaint();
+        return;
+    }
+
+    let bind_result = match &candidate.owner {
+        HistoricalBindingOwner::Main { track_id } => storage::bind_main_source_proof(
+            &mut state.library,
+            track_id,
+            &candidate.path,
+            fresh_proof,
+        ),
+        HistoricalBindingOwner::Reference { .. } => {
+            storage::bind_reference_source_proof(&mut state.library, &candidate.path, fresh_proof)
+        }
+    };
+    match bind_result {
+        Ok(()) => {
+            state.status = format!(
+                "Bound {} historical comment{} to {}. Notes were preserved.",
+                candidate.note_count,
+                plural(candidate.note_count),
+                candidate.path.display()
+            );
+            schedule_library_save(state, context);
+        }
+        Err(error) => state.status = error,
+    }
+    context.request_repaint();
 }
 
 fn start_import(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>, path: PathBuf) {
@@ -7433,26 +8115,29 @@ fn seek_review_position(
     context.request_repaint();
 }
 
-fn comment_time_for_track(
-    state: &AppState,
-    track_id: &str,
-    source: CommentSource,
-    note_id: &str,
-) -> Option<u64> {
-    let track = state
-        .library
-        .tracks
-        .iter()
-        .find(|track| track.id == track_id)?;
-    match source {
-        CommentSource::Main => track
+fn comment_time_for_address(state: &AppState, address: &NoteAddress) -> Option<u64> {
+    match &address.owner {
+        NoteOwner::MainTrack(track_id) => state
+            .library
+            .tracks
+            .iter()
+            .find(|track| {
+                track.id == *track_id && track.source_provenance().verified_proof().is_some()
+            })?
             .notes
             .iter()
-            .find(|note| note.id == note_id)
+            .find(|note| note.id == address.note_id)
             .map(|note| note.time_millis),
-        CommentSource::Reference => reference_notes_for_track(&state.library, track)
+        NoteOwner::ReferenceTrack(path) => state
+            .library
+            .reference_tracks
             .iter()
-            .find(|note| note.id == note_id)
+            .find(|reference| {
+                reference.path == *path && reference.source_provenance().verified_proof().is_some()
+            })?
+            .notes
+            .iter()
+            .find(|note| note.id == address.note_id)
             .map(|note| note.time_millis),
     }
 }
@@ -7460,49 +8145,57 @@ fn comment_time_for_track(
 fn play_comment(
     state: &mut AppState,
     context: &mut ui::UiUpdateContext<Message>,
-    track_id: String,
-    source: CommentSource,
-    note_id: String,
+    address: NoteAddress,
 ) {
     if !library_is_ready(state) || state.busy {
         return;
     }
+    let source = address.source();
     let blocked = match source {
-        CommentSource::Main => reject_main_source_mismatch(state, context),
+        CommentSource::Main => {
+            reject_main_source_mismatch(state, context)
+                || reject_unknown_main_source(state, context)
+        }
         CommentSource::Reference => {
             reject_main_source_mismatch(state, context)
                 || reject_reference_source_mismatch(state, context)
+                || reject_unknown_reference_source(state, context)
         }
     };
     if blocked {
         return;
     }
-    if comment_time_for_track(state, &track_id, source, &note_id).is_none() {
+    if let NoteOwner::MainTrack(track_id) = &address.owner
+        && state.library.selected_track_id.as_deref() != Some(track_id.as_str())
+    {
+        if comment_time_for_address(state, &address).is_none() {
+            state.status = String::from("That comment no longer exists.");
+            context.request_repaint();
+            return;
+        }
+        let title = state
+            .library
+            .tracks
+            .iter()
+            .find(|track| track.id == *track_id)
+            .map_or_else(|| String::from("track"), |track| track.title.clone());
+        select_track_internal(state, context, track_id.clone(), false);
+        state.pending_comment_playback = Some(PendingCommentPlayback { address });
+        state.status = format!("Loading comment on {title}…");
+        context.request_repaint();
+        return;
+    }
+    let address_is_current = match source {
+        CommentSource::Main => is_current_main_note_address(state, &address),
+        CommentSource::Reference => is_current_reference_note_address(state, &address),
+    };
+    if !address_is_current || comment_time_for_address(state, &address).is_none() {
         state.status = String::from("That comment no longer exists.");
         context.request_repaint();
         return;
     }
 
-    let pending = PendingCommentPlayback {
-        track_id: track_id.clone(),
-        source,
-        note_id,
-    };
-    if state.library.selected_track_id.as_deref() != Some(track_id.as_str()) {
-        let title = state
-            .library
-            .tracks
-            .iter()
-            .find(|track| track.id == track_id)
-            .map_or_else(|| String::from("track"), |track| track.title.clone());
-        select_track_internal(state, context, track_id, false);
-        state.pending_comment_playback = Some(pending);
-        state.status = format!("Loading comment on {title}…");
-        context.request_repaint();
-        return;
-    }
-
-    state.pending_comment_playback = Some(pending);
+    state.pending_comment_playback = Some(PendingCommentPlayback { address });
     maybe_start_pending_comment_playback(state, context);
 }
 
@@ -7516,15 +8209,24 @@ fn maybe_start_pending_comment_playback(
     let Some(pending) = state.pending_comment_playback.clone() else {
         return;
     };
-    if state.library.selected_track_id.as_deref() != Some(pending.track_id.as_str()) {
+    let source = pending.address.source();
+    let address_is_current = match source {
+        CommentSource::Main => is_current_main_note_address(state, &pending.address),
+        CommentSource::Reference => is_current_reference_note_address(state, &pending.address),
+    };
+    if !address_is_current {
         cancel_pending_comment_playback(state);
         return;
     }
-    let blocked = match pending.source {
-        CommentSource::Main => reject_main_source_mismatch(state, context),
+    let blocked = match source {
+        CommentSource::Main => {
+            reject_main_source_mismatch(state, context)
+                || reject_unknown_main_source(state, context)
+        }
         CommentSource::Reference => {
             reject_main_source_mismatch(state, context)
                 || reject_reference_source_mismatch(state, context)
+                || reject_unknown_reference_source(state, context)
         }
     };
     if blocked {
@@ -7539,18 +8241,19 @@ fn maybe_start_pending_comment_playback(
     if state.busy {
         return;
     }
-    let Some(time_millis) =
-        comment_time_for_track(state, &pending.track_id, pending.source, &pending.note_id)
-    else {
+    let Some(time_millis) = comment_time_for_address(state, &pending.address) else {
         cancel_pending_comment_playback(state);
         state.status = String::from("That comment no longer exists.");
         context.request_repaint();
         return;
     };
-    if state.waveform_busy
-        || state.waveform_track_id.as_deref() != Some(pending.track_id.as_str())
-        || state.waveform.is_none()
-    {
+    if state.waveform_busy || state.waveform.is_none() {
+        return;
+    }
+    let Some(selected_track_id) = state.library.selected_track_id.as_deref() else {
+        return;
+    };
+    if state.waveform_track_id.as_deref() != Some(selected_track_id) {
         return;
     }
     let has_reference = !reference_source_is_mismatched(state)
@@ -7559,7 +8262,7 @@ fn maybe_start_pending_comment_playback(
             .is_some();
     if has_reference
         && (state.reference_waveform_busy
-            || state.reference_waveform_track_id.as_deref() != Some(pending.track_id.as_str())
+            || state.reference_waveform_track_id.as_deref() != Some(selected_track_id)
             || state.reference_waveform.is_none())
     {
         return;
@@ -7585,7 +8288,7 @@ fn maybe_start_pending_comment_playback(
     let reference_duration_millis =
         selected_reference_details(state).map(|(_, duration_millis)| duration_millis);
     let main_position_millis = normalize_position_for_duration(
-        match pending.source {
+        match source {
             CommentSource::Main => time_millis,
             CommentSource::Reference => state.transport_position_millis,
         },
@@ -7595,7 +8298,7 @@ fn maybe_start_pending_comment_playback(
         state.reference_transport_position_millis,
         |duration_millis| {
             normalize_position_for_duration(
-                match pending.source {
+                match source {
                     CommentSource::Main => state.reference_transport_position_millis,
                     CommentSource::Reference => time_millis,
                 },
@@ -7604,18 +8307,18 @@ fn maybe_start_pending_comment_playback(
         },
     );
 
-    match pending.source {
+    match source {
         CommentSource::Main => {
             state.comment_source = CommentSource::Main;
             state.comment_source_explicit = true;
-            state.selected_note_id = Some(pending.note_id);
+            state.selected_note_id = Some(pending.address.clone());
             state.draft_note = None;
             set_audition_source(state, AuditionSource::Main);
         }
         CommentSource::Reference => {
             state.comment_source = CommentSource::Reference;
             state.comment_source_explicit = true;
-            state.selected_reference_note_id = Some(pending.note_id);
+            state.selected_reference_note_id = Some(pending.address.clone());
             state.reference_draft_note = None;
             set_audition_source(state, AuditionSource::Reference);
         }
@@ -7624,7 +8327,7 @@ fn maybe_start_pending_comment_playback(
     state.review_cursor_millis = main_position_millis;
     state.transport_position_millis = main_position_millis;
     state.reference_transport_position_millis = reference_position_millis;
-    let start_position_millis = match pending.source {
+    let start_position_millis = match source {
         CommentSource::Main => main_position_millis,
         CommentSource::Reference => reference_position_millis,
     };
@@ -7632,7 +8335,7 @@ fn maybe_start_pending_comment_playback(
     {
         Ok(()) => {
             cancel_pending_comment_playback(state);
-            let source_label = match pending.source {
+            let source_label = match source {
                 CommentSource::Main => "comment",
                 CommentSource::Reference => "reference comment",
             };
@@ -8172,27 +8875,33 @@ fn rollback_persisted_note_drag(state: &mut AppState) {
     let Some(drag) = state.persisted_note_drag.take() else {
         return;
     };
+    let NoteOwner::MainTrack(track_id) = &drag.address.owner else {
+        return;
+    };
 
     let mut note_restored = false;
     if let Some(track) = state
         .library
         .tracks
         .iter_mut()
-        .find(|track| track.id == drag.track_id)
-        && let Some(note) = track.notes.iter_mut().find(|note| note.id == drag.note_id)
+        .find(|track| track.id == *track_id)
+        && let Some(note) = track
+            .notes
+            .iter_mut()
+            .find(|note| note.id == drag.address.note_id)
     {
         note.time_millis = drag.original_time_millis;
         track.notes.sort_by_key(|note| note.time_millis);
         note_restored = true;
     }
-    if note_restored && state.library.selected_track_id.as_deref() == Some(drag.track_id.as_str()) {
+    if note_restored && state.library.selected_track_id.as_deref() == Some(track_id.as_str()) {
         state.review_cursor_millis = drag.original_time_millis;
         state.transport_position_millis = drag.original_time_millis;
     }
     if let Some(draft) = state
         .draft_note
         .as_mut()
-        .filter(|draft| draft.note_id.as_deref() == Some(drag.note_id.as_str()))
+        .filter(|draft| draft.address().as_ref() == Some(&drag.address))
     {
         draft.time_millis = drag.original_time_millis;
     }
@@ -8202,25 +8911,35 @@ fn rollback_reference_persisted_note_drag(state: &mut AppState) {
     let Some(drag) = state.reference_persisted_note_drag.take() else {
         return;
     };
+    let NoteOwner::ReferenceTrack(reference_path) = &drag.address.owner else {
+        return;
+    };
 
     let mut note_restored = false;
-    if let Some(reference) = selected_reference_track_mut(state)
+    if let Some(reference) = state
+        .library
+        .reference_tracks
+        .iter_mut()
+        .find(|reference| reference.path == *reference_path)
         && let Some(note) = reference
             .notes
             .iter_mut()
-            .find(|note| note.id == drag.note_id)
+            .find(|note| note.id == drag.address.note_id)
     {
         note.time_millis = drag.original_time_millis;
         reference.notes.sort_by_key(|note| note.time_millis);
         note_restored = true;
     }
-    if note_restored && state.library.selected_track_id.as_deref() == Some(drag.track_id.as_str()) {
+    let selected_reference_matches = selected_track(state)
+        .and_then(|track| track.reference_path.as_ref())
+        .is_some_and(|path| path == reference_path);
+    if note_restored && selected_reference_matches {
         state.reference_transport_position_millis = drag.original_time_millis;
     }
     if let Some(draft) = state
         .reference_draft_note
         .as_mut()
-        .filter(|draft| draft.note_id.as_deref() == Some(drag.note_id.as_str()))
+        .filter(|draft| draft.address().as_ref() == Some(&drag.address))
     {
         draft.time_millis = drag.original_time_millis;
     }
@@ -8267,12 +8986,14 @@ fn update_live_spectrogram_resize(state: &mut AppState, message: ui::DragHandleM
     }
 }
 
-fn main_inline_comment_editor_id(note_id: &str) -> u64 {
-    ui::stable_widget_id(MAIN_INLINE_COMMENT_EDITOR_SCOPE, note_id)
+fn main_inline_comment_editor_id(address: &NoteAddress) -> u64 {
+    let key = qualified_note_identity_key(address);
+    ui::stable_widget_id(MAIN_INLINE_COMMENT_EDITOR_SCOPE, &key)
 }
 
-fn reference_inline_comment_editor_id(note_id: &str) -> u64 {
-    ui::stable_widget_id(REFERENCE_INLINE_COMMENT_EDITOR_SCOPE, note_id)
+fn reference_inline_comment_editor_id(address: &NoteAddress) -> u64 {
+    let key = qualified_note_identity_key(address);
+    ui::stable_widget_id(REFERENCE_INLINE_COMMENT_EDITOR_SCOPE, &key)
 }
 
 fn library_track_title_id(track_id: &str) -> u64 {
@@ -9424,7 +10145,11 @@ fn planner_card_with_key(
         .key(format!("planner-remove-{}", track.id))
         .tooltip("Remove track")
         .size(28.0, 24.0);
-    let open_comments = track.notes.iter().filter(|note| !note.done).count();
+    let open_comments = if track.source_provenance().verified_proof().is_some() {
+        track.notes.iter().filter(|note| !note.done).count()
+    } else {
+        0
+    };
     let removal_controls = if remove_confirmation_open {
         ui::row([
             card_control(
@@ -10440,7 +11165,9 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
         .waveform
         .as_ref()
         .filter(|_| {
-            !state.waveform_busy && state.waveform_track_id.as_deref() == Some(track.id.as_str())
+            !state.waveform_busy
+                && state.waveform_track_id.as_deref() == Some(track.id.as_str())
+                && track.source_provenance().verified_proof().is_some()
         })
         .map(|waveform| {
             track
@@ -10453,8 +11180,28 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let hovered_note_ratio = note_ratio_for_id(state, &track, state.hovered_note_id.as_deref());
-    let selected_note_ratio = note_ratio_for_id(state, &track, state.selected_note_id.as_deref());
+    let main_note_addresses = state
+        .waveform
+        .as_ref()
+        .filter(|_| {
+            !state.waveform_busy
+                && state.waveform_track_id.as_deref() == Some(track.id.as_str())
+                && track.source_provenance().verified_proof().is_some()
+        })
+        .map(|waveform| {
+            track
+                .notes
+                .iter()
+                .filter_map(|note| {
+                    waveform::ratio_for_millis(note.time_millis, waveform.duration_millis)
+                        .map(|_| NoteAddress::main(track.id.clone(), note.id.clone()))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let hovered_note_ratio = note_ratio_for_address(state, &track, state.hovered_note_id.as_ref());
+    let selected_note_ratio =
+        note_ratio_for_address(state, &track, state.selected_note_id.as_ref());
     let cursor_ratio = state
         .waveform
         .as_ref()
@@ -10469,7 +11216,7 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
     let draft_ratio = state
         .draft_note
         .as_ref()
-        .filter(|draft| draft.note_id.is_none())
+        .filter(|draft| draft.note_id.is_none() && main_annotations_available(state))
         .and_then(|draft| {
             state
                 .waveform
@@ -10491,6 +11238,7 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
         .as_ref()
         .filter(|_| state.waveform_track_id.as_deref() == Some(track.id.as_str()))
     {
+        let main_note_addresses_for_drag = main_note_addresses.clone();
         waveform::view_with_source_progress_and_loop(
             waveform::WaveformSource::Main,
             state.waveform_generation,
@@ -10505,7 +11253,7 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
                 .waveform_busy
                 .then_some(state.waveform_progress)
                 .flatten(),
-            |interaction| match interaction {
+            move |interaction| match interaction {
                 waveform::WaveformInteraction::LoopDragStarted { ratio } => {
                     Message::WaveformLoopDragStarted { ratio }
                 }
@@ -10532,7 +11280,11 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
                     Message::WaveformPlayheadDragCancelled
                 }
                 waveform::WaveformInteraction::CommentDragStarted { ratio, note_index } => {
-                    Message::CommentDragStarted { ratio, note_index }
+                    Message::CommentDragStarted {
+                        ratio,
+                        address: note_index
+                            .and_then(|index| main_note_addresses_for_drag.get(index).cloned()),
+                    }
                 }
                 waveform::WaveformInteraction::CommentDragEnded { ratio } => {
                     Message::CommentDragEnded { ratio }
@@ -10854,22 +11606,54 @@ fn reference_waveform_section(state: &AppState, track: &storage::Track) -> ui::V
             .get(AuditionSource::Reference)
             .map(|selection| (selection.start_ratio, selection.end_ratio));
         let notes = reference_notes_for_track(&state.library, track);
+        let reference_annotations_available = track
+            .reference_path
+            .as_ref()
+            .and_then(|path| {
+                state
+                    .library
+                    .reference_tracks
+                    .iter()
+                    .find(|reference| &reference.path == path)
+            })
+            .is_some_and(|reference| reference.source_provenance().verified_proof().is_some());
         let note_ratios = notes
             .iter()
+            .filter(|_| reference_annotations_available)
             .filter_map(|note| {
                 waveform::ratio_for_millis(note.time_millis, waveform.duration_millis)
                     .map(|ratio| (ratio, note.done))
             })
             .collect::<Vec<_>>();
+        let reference_note_addresses = notes
+            .iter()
+            .filter(|_| reference_annotations_available)
+            .filter_map(|note| {
+                waveform::ratio_for_millis(note.time_millis, waveform.duration_millis).map(|_| {
+                    NoteAddress::reference(
+                        track
+                            .reference_path
+                            .as_ref()
+                            .expect("reference notes require a catalog path")
+                            .clone(),
+                        note.id.clone(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
         let draft_ratio = state
             .reference_draft_note
             .as_ref()
-            .filter(|draft| draft.note_id.is_none())
+            .filter(|draft| draft.note_id.is_none() && reference_annotations_available)
             .and_then(|draft| {
                 waveform::ratio_for_millis(draft.time_millis, waveform.duration_millis)
             });
-        let hovered_note_ratio =
-            reference_note_ratio_for_id(state, track, state.hovered_reference_note_id.as_deref());
+        let hovered_note_ratio = reference_note_ratio_for_address(
+            state,
+            track,
+            state.hovered_reference_note_id.as_ref(),
+        );
+        let reference_note_addresses_for_drag = reference_note_addresses.clone();
         waveform::view_with_source_progress_and_loop(
             waveform::WaveformSource::Reference,
             state.reference_waveform_generation,
@@ -10878,13 +11662,17 @@ fn reference_waveform_section(state: &AppState, track: &storage::Track) -> ui::V
             draft_ratio,
             note_ratios,
             hovered_note_ratio,
-            reference_note_ratio_for_id(state, track, state.selected_reference_note_id.as_deref()),
+            reference_note_ratio_for_address(
+                state,
+                track,
+                state.selected_reference_note_id.as_ref(),
+            ),
             loop_selection,
             state
                 .reference_waveform_busy
                 .then_some(state.reference_waveform_progress)
                 .flatten(),
-            |interaction| match interaction {
+            move |interaction| match interaction {
                 waveform::WaveformInteraction::LoopDragStarted { ratio } => {
                     Message::ReferenceLoopDragStarted { ratio }
                 }
@@ -10915,7 +11703,12 @@ fn reference_waveform_section(state: &AppState, track: &storage::Track) -> ui::V
                     Message::ReferencePlayheadDragCancelled
                 }
                 waveform::WaveformInteraction::CommentDragStarted { ratio, note_index } => {
-                    Message::ReferenceCommentDragStarted { ratio, note_index }
+                    Message::ReferenceCommentDragStarted {
+                        ratio,
+                        address: note_index.and_then(|index| {
+                            reference_note_addresses_for_drag.get(index).cloned()
+                        }),
+                    }
                 }
                 waveform::WaveformInteraction::CommentDragEnded { ratio } => {
                     Message::ReferenceCommentDragEnded { ratio }
@@ -10978,6 +11771,18 @@ fn reference_waveform_section(state: &AppState, track: &storage::Track) -> ui::V
 fn comments_panel(state: &AppState, track: &storage::Track) -> ui::View<Message> {
     let reference_available = track.reference_path.is_some();
     let reference_notes = reference_notes_for_track(&state.library, track);
+    let main_unknown = track.source_provenance().is_unknown();
+    let reference_unknown = track
+        .reference_path
+        .as_ref()
+        .and_then(|path| {
+            state
+                .library
+                .reference_tracks
+                .iter()
+                .find(|reference| &reference.path == path)
+        })
+        .is_some_and(|reference| reference.source_provenance().is_unknown());
     let source = if reference_available {
         if state.comment_source == CommentSource::Reference
             || (!state.comment_source_explicit
@@ -10993,17 +11798,35 @@ fn comments_panel(state: &AppState, track: &storage::Track) -> ui::View<Message>
     };
     let (notes, selected_note_id, empty_message) = match source {
         CommentSource::Main => (
-            track.notes.clone(),
+            if main_unknown {
+                Vec::new()
+            } else {
+                track.notes.clone()
+            },
             state.selected_note_id.clone(),
             "Click the lower main waveform rail to add a comment for this file.",
         ),
         CommentSource::Reference => (
-            reference_notes.to_vec(),
+            if reference_unknown {
+                Vec::new()
+            } else {
+                reference_notes.to_vec()
+            },
             state.selected_reference_note_id.clone(),
             "Click the lower reference waveform rail to add a comment for this file.",
         ),
     };
     let open_count = notes.iter().filter(|note| !note.done).count();
+    let unknown_owner = match source {
+        CommentSource::Main if main_unknown => Some(HistoricalBindingOwner::Main {
+            track_id: track.id.clone(),
+        }),
+        CommentSource::Reference if reference_unknown => track
+            .reference_path
+            .clone()
+            .map(|path| HistoricalBindingOwner::Reference { path }),
+        _ => None,
+    };
     let tabs = ui::row([
         ui::button("MAIN")
             .selected(source == CommentSource::Main)
@@ -11049,6 +11872,61 @@ fn comments_panel(state: &AppState, track: &storage::Track) -> ui::View<Message>
         .fill_width()
         .spacing(8.0),
     ];
+    if let Some(owner) = unknown_owner {
+        let path = match &owner {
+            HistoricalBindingOwner::Main { .. } => track.path.clone(),
+            HistoricalBindingOwner::Reference { path } => path.clone(),
+        };
+        let retained_count = match &owner {
+            HistoricalBindingOwner::Main { .. } => track.notes.len(),
+            HistoricalBindingOwner::Reference { path } => state
+                .library
+                .reference_tracks
+                .iter()
+                .find(|reference| &reference.path == path)
+                .map_or(0, |reference| reference.notes.len()),
+        };
+        let warning = historical_source_warning(&owner, &path, retained_count);
+        let binding_control = if state
+            .historical_binding_in_flight
+            .as_ref()
+            .is_some_and(|request| request.candidate.owner == owner)
+        {
+            ui::text("Binding…").subtle().height(28.0)
+        } else if let Some(candidate) = state
+            .historical_binding_confirmation
+            .as_ref()
+            .filter(|candidate| candidate.owner == owner)
+            .cloned()
+        {
+            ui::row([
+                ui::button("Confirm binding")
+                    .primary()
+                    .message(Message::ConfirmBindHistoricalComments(candidate.clone()))
+                    .height(28.0),
+                ui::button("Cancel")
+                    .subtle()
+                    .message(Message::CancelBindHistoricalComments(candidate))
+                    .height(28.0),
+            ])
+            .spacing(6.0)
+        } else if historical_binding_candidate(state, owner.clone()).is_some() {
+            ui::button("Bind historical comments to this file…")
+                .primary()
+                .message(Message::RequestBindHistoricalComments(owner))
+                .height(28.0)
+        } else {
+            ui::text("Waiting for current source verification…")
+                .subtle()
+                .height(28.0)
+        };
+        children.push(
+            ui::column([ui::text(warning).wrap().fill_width(), binding_control])
+                .padding(10.0)
+                .spacing(6.0)
+                .fill_width(),
+        );
+    }
     if notes.is_empty() {
         children.push(
             ui::text(empty_message)
@@ -11075,23 +11953,30 @@ fn comments_panel(state: &AppState, track: &storage::Track) -> ui::View<Message>
                 .filter(|draft| draft.note_id.is_some()),
         };
         let track_id = track.id.clone();
+        let reference_path = track.reference_path.clone();
         let list = ui::list(notes.into_iter().enumerate(), move |(index, note)| {
             if source_for_rows == CommentSource::Main {
                 note_row(
                     index,
-                    note,
-                    track_id.clone(),
-                    selected_note_id.as_deref(),
-                    hovered_note_id.as_deref(),
+                    note.clone(),
+                    NoteAddress::main(track_id.clone(), note.id.clone()),
+                    selected_note_id.as_ref(),
+                    hovered_note_id.as_ref(),
                     editing_note.as_ref(),
                 )
             } else {
+                let note_id = note.id.clone();
                 reference_note_row(
                     index,
                     note,
-                    track_id.clone(),
-                    selected_note_id.as_deref(),
-                    hovered_note_id.as_deref(),
+                    NoteAddress::reference(
+                        reference_path
+                            .clone()
+                            .expect("reference rows require a catalog path"),
+                        note_id,
+                    ),
+                    selected_note_id.as_ref(),
+                    hovered_note_id.as_ref(),
                     editing_note.as_ref(),
                 )
             }
@@ -11101,7 +11986,7 @@ fn comments_panel(state: &AppState, track: &storage::Track) -> ui::View<Message>
         .fill_height();
         children.push(list);
     }
-    if source == CommentSource::Main {
+    if source == CommentSource::Main && !main_unknown {
         if let Some(draft) = state
             .draft_note
             .as_ref()
@@ -11109,10 +11994,12 @@ fn comments_panel(state: &AppState, track: &storage::Track) -> ui::View<Message>
         {
             children.push(note_editor(draft));
         }
-    } else if let Some(draft) = state
-        .reference_draft_note
-        .as_ref()
-        .filter(|draft| draft.note_id.is_none())
+    } else if source == CommentSource::Reference
+        && !reference_unknown
+        && let Some(draft) = state
+            .reference_draft_note
+            .as_ref()
+            .filter(|draft| draft.note_id.is_none())
     {
         children.push(reference_note_editor(draft));
     }
@@ -11132,6 +12019,8 @@ fn comments_panel(state: &AppState, track: &storage::Track) -> ui::View<Message>
 }
 
 fn note_editor(draft: &NoteDraft) -> ui::View<Message> {
+    let identity = draft.identity();
+    let editor_identity = identity.clone();
     ui::column([
         ui::text(format!(
             "COMMENT AT {}",
@@ -11142,13 +12031,16 @@ fn note_editor(draft: &NoteDraft) -> ui::View<Message> {
         .subtle(),
         ui::text_input(draft.body.clone())
             .placeholder("Write a comment…")
-            .message_event(|input| {
+            .message_event(move |input| {
                 let submitted = input.is_submitted();
                 let value = input.into_value();
                 if submitted {
-                    Message::SaveDraftNote
+                    Message::SaveDraftNote(editor_identity.clone())
                 } else {
-                    Message::DraftNoteChanged(value)
+                    Message::DraftNoteChanged {
+                        identity: editor_identity.clone(),
+                        body: value,
+                    }
                 }
             })
             .id(MAIN_COMMENT_EDITOR_ID)
@@ -11157,11 +12049,11 @@ fn note_editor(draft: &NoteDraft) -> ui::View<Message> {
         ui::row([
             ui::button("Save comment")
                 .primary()
-                .message(Message::SaveDraftNote)
+                .message(Message::SaveDraftNote(identity.clone()))
                 .height(28.0),
             ui::button("Cancel")
                 .subtle()
-                .message(Message::CancelDraftNote)
+                .message(Message::CancelDraftNote(identity))
                 .height(28.0),
         ])
         .spacing(8.0)
@@ -11173,6 +12065,8 @@ fn note_editor(draft: &NoteDraft) -> ui::View<Message> {
 }
 
 fn reference_note_editor(draft: &NoteDraft) -> ui::View<Message> {
+    let identity = draft.identity();
+    let editor_identity = identity.clone();
     ui::column([
         ui::text(format!(
             "REFERENCE COMMENT AT {}",
@@ -11183,13 +12077,16 @@ fn reference_note_editor(draft: &NoteDraft) -> ui::View<Message> {
         .subtle(),
         ui::text_input(draft.body.clone())
             .placeholder("Write a reference comment…")
-            .message_event(|input| {
+            .message_event(move |input| {
                 let submitted = input.is_submitted();
                 let value = input.into_value();
                 if submitted {
-                    Message::SaveReferenceDraftNote
+                    Message::SaveReferenceDraftNote(editor_identity.clone())
                 } else {
-                    Message::ReferenceDraftNoteChanged(value)
+                    Message::ReferenceDraftNoteChanged {
+                        identity: editor_identity.clone(),
+                        body: value,
+                    }
                 }
             })
             .id(REFERENCE_COMMENT_EDITOR_ID)
@@ -11198,11 +12095,11 @@ fn reference_note_editor(draft: &NoteDraft) -> ui::View<Message> {
         ui::row([
             ui::button("Save reference comment")
                 .primary()
-                .message(Message::SaveReferenceDraftNote)
+                .message(Message::SaveReferenceDraftNote(identity.clone()))
                 .height(28.0),
             ui::button("Cancel")
                 .subtle()
-                .message(Message::CancelReferenceDraftNote)
+                .message(Message::CancelReferenceDraftNote(identity))
                 .height(28.0),
         ])
         .spacing(8.0)
@@ -11234,41 +12131,45 @@ fn comment_row_palette(selected: bool, domain_hovered: bool) -> ui::DenseRowPale
 fn note_row(
     index: usize,
     note: storage::Note,
-    track_id: String,
-    selected_note_id: Option<&str>,
-    hovered_note_id: Option<&str>,
+    address: NoteAddress,
+    selected_note_id: Option<&NoteAddress>,
+    hovered_note_id: Option<&NoteAddress>,
     editing_note: Option<&NoteDraft>,
 ) -> ui::View<Message> {
-    let selected = selected_note_id == Some(note.id.as_str());
-    let domain_hovered = hovered_note_id == Some(note.id.as_str());
-    let editing =
-        editing_note.is_some_and(|draft| draft.note_id.as_deref() == Some(note.id.as_str()));
-    let note_id = note.id.clone();
+    let selected = selected_note_id == Some(&address);
+    let domain_hovered = hovered_note_id == Some(&address);
+    let editing = editing_note.is_some_and(|draft| draft.address().as_ref() == Some(&address));
+    let editing_identity = editing_note.map(NoteDraft::identity);
+    let note_key = qualified_note_identity_key(&address);
     let note_body = note.body.clone();
     let note_time_millis = note.time_millis;
-    let play_note_id = note.id.clone();
-    let play_track_id = track_id.clone();
+    let play_address = address.clone();
     let play_control = ui::icon_button(review_transport_icon(&REVIEW_SOURCE_PLAY_ICON, false))
         .subtle()
         .message(Message::PlayComment {
-            track_id: play_track_id,
-            source: CommentSource::Main,
-            note_id: play_note_id,
+            address: play_address,
         })
-        .key(format!("comment-play-{}", note.id))
+        .key(format!("comment-play-{note_key}"))
         .tooltip("Play from comment")
         .size(28.0, 24.0);
     let body = if editing {
         let draft = editing_note.expect("an editing row should have a matching draft");
+        let identity = editing_identity
+            .as_ref()
+            .expect("an editing row should have a matching draft identity")
+            .clone();
         ui::text_input(draft.body.clone())
-            .message_event(|input| {
+            .message_event(move |input| {
                 if input.is_submitted() {
-                    Message::SaveDraftNote
+                    Message::SaveDraftNote(identity.clone())
                 } else {
-                    Message::DraftNoteChanged(input.into_value())
+                    Message::DraftNoteChanged {
+                        identity: identity.clone(),
+                        body: input.into_value(),
+                    }
                 }
             })
-            .id(main_inline_comment_editor_id(&note_id))
+            .id(main_inline_comment_editor_id(&address))
             .fill_width()
             .height(30.0)
     } else {
@@ -11285,14 +12186,16 @@ fn note_row(
             .fill_width()
     };
     let trailing_control = if editing {
+        let identity =
+            editing_identity.expect("an editing row should have a matching draft identity");
         ui::row([
             ui::button("Save")
                 .primary()
-                .message(Message::SaveDraftNote)
+                .message(Message::SaveDraftNote(identity.clone()))
                 .height(28.0),
             ui::button("Cancel")
                 .subtle()
-                .message(Message::CancelDraftNote)
+                .message(Message::CancelDraftNote(identity))
                 .height(28.0),
         ])
         .spacing(4.0)
@@ -11302,8 +12205,8 @@ fn note_row(
             play_control,
             ui::close_button()
                 .subtle()
-                .message(Message::DeleteNote(note_id.clone()))
-                .key(format!("comment-remove-{note_id}"))
+                .message(Message::DeleteNote(address.clone()))
+                .key(format!("comment-remove-{note_key}"))
                 .tooltip("Remove comment")
                 .size(28.0, 24.0),
         ])
@@ -11328,12 +12231,12 @@ fn note_row(
     )
     .without_chrome()
     .fill_width();
-    let row_key = note_id.clone();
-    let hover_id = note_id.clone();
-    let double_edit_id = note_id.clone();
+    let row_key = address.clone();
+    let hover_address = address.clone();
+    let double_edit_address = address.clone();
     let row_actions = ui::row_actions()
         .primary(move || Message::SelectNote(row_key.clone()))
-        .double_activate(move || Message::EditNote(double_edit_id.clone()));
+        .double_activate(move || Message::EditNote(double_edit_address.clone()));
     let row_style = comment_row_style(selected, domain_hovered);
     let mut row_surface = ui::interactive_row_underlay(row)
         .selected(selected)
@@ -11352,17 +12255,17 @@ fn note_row(
                 TRACK_CARD_SELECTED_CORAL,
             ),
         )
-        .stable_row_identity(0xCAD3_0002, note_id.clone())
+        .stable_row_identity(0xCAD3_0002, note_key.clone())
         .actions(row_actions)
         .fill_width()
         .height(44.0);
     ui::stack([
         row_surface,
         chrome::comment_hover(
-            Message::CommentHoverStarted(hover_id.clone()),
-            Message::CommentHoverEnded(hover_id),
+            Message::CommentHoverStarted(hover_address.clone()),
+            Message::CommentHoverEnded(hover_address),
         )
-        .key(format!("comment-hover-{}", note_id))
+        .key(format!("comment-hover-{note_key}"))
         .fill(),
     ])
     .fill_width()
@@ -11372,40 +12275,45 @@ fn note_row(
 fn reference_note_row(
     index: usize,
     note: storage::Note,
-    track_id: String,
-    selected_note_id: Option<&str>,
-    hovered_note_id: Option<&str>,
+    address: NoteAddress,
+    selected_note_id: Option<&NoteAddress>,
+    hovered_note_id: Option<&NoteAddress>,
     editing_note: Option<&NoteDraft>,
 ) -> ui::View<Message> {
-    let selected = selected_note_id == Some(note.id.as_str());
-    let domain_hovered = hovered_note_id == Some(note.id.as_str());
-    let editing =
-        editing_note.is_some_and(|draft| draft.note_id.as_deref() == Some(note.id.as_str()));
-    let note_id = note.id.clone();
+    let selected = selected_note_id == Some(&address);
+    let domain_hovered = hovered_note_id == Some(&address);
+    let editing = editing_note.is_some_and(|draft| draft.address().as_ref() == Some(&address));
+    let editing_identity = editing_note.map(NoteDraft::identity);
+    let note_key = qualified_note_identity_key(&address);
     let note_body = note.body.clone();
     let note_time_millis = note.time_millis;
-    let play_note_id = note.id.clone();
+    let play_address = address.clone();
     let play_control = ui::icon_button(review_transport_icon(&REVIEW_SOURCE_PLAY_ICON, false))
         .subtle()
         .message(Message::PlayComment {
-            track_id,
-            source: CommentSource::Reference,
-            note_id: play_note_id,
+            address: play_address,
         })
-        .key(format!("reference-comment-play-{}", note.id))
+        .key(format!("reference-comment-play-{note_key}"))
         .tooltip("Play from reference comment")
         .size(28.0, 24.0);
     let body = if editing {
         let draft = editing_note.expect("an editing reference row should have a matching draft");
+        let identity = editing_identity
+            .as_ref()
+            .expect("an editing row should have a matching draft identity")
+            .clone();
         ui::text_input(draft.body.clone())
-            .message_event(|input| {
+            .message_event(move |input| {
                 if input.is_submitted() {
-                    Message::SaveReferenceDraftNote
+                    Message::SaveReferenceDraftNote(identity.clone())
                 } else {
-                    Message::ReferenceDraftNoteChanged(input.into_value())
+                    Message::ReferenceDraftNoteChanged {
+                        identity: identity.clone(),
+                        body: input.into_value(),
+                    }
                 }
             })
-            .id(reference_inline_comment_editor_id(&note_id))
+            .id(reference_inline_comment_editor_id(&address))
             .fill_width()
             .height(30.0)
     } else {
@@ -11422,14 +12330,16 @@ fn reference_note_row(
             .fill_width()
     };
     let trailing_control = if editing {
+        let identity =
+            editing_identity.expect("an editing row should have a matching draft identity");
         ui::row([
             ui::button("Save")
                 .primary()
-                .message(Message::SaveReferenceDraftNote)
+                .message(Message::SaveReferenceDraftNote(identity.clone()))
                 .height(28.0),
             ui::button("Cancel")
                 .subtle()
-                .message(Message::CancelReferenceDraftNote)
+                .message(Message::CancelReferenceDraftNote(identity))
                 .height(28.0),
         ])
         .spacing(4.0)
@@ -11439,8 +12349,8 @@ fn reference_note_row(
             play_control,
             ui::close_button()
                 .subtle()
-                .message(Message::DeleteReferenceNote(note_id.clone()))
-                .key(format!("reference-comment-remove-{note_id}"))
+                .message(Message::DeleteReferenceNote(address.clone()))
+                .key(format!("reference-comment-remove-{note_key}"))
                 .tooltip("Remove comment")
                 .size(28.0, 24.0),
         ])
@@ -11465,13 +12375,12 @@ fn reference_note_row(
     )
     .without_chrome()
     .fill_width();
-    let row_key = note_id.clone();
-    let double_edit_id = note_id.clone();
-    let hover_id = note_id.clone();
-    let hover_key = note_id.clone();
+    let row_key = address.clone();
+    let double_edit_address = address.clone();
+    let hover_address = address.clone();
     let row_actions = ui::row_actions()
         .primary(move || Message::SelectReferenceNote(row_key.clone()))
-        .double_activate(move || Message::EditReferenceNote(double_edit_id.clone()));
+        .double_activate(move || Message::EditReferenceNote(double_edit_address.clone()));
     let row_style = comment_row_style(selected, domain_hovered);
     let mut row_surface = ui::interactive_row_underlay(row)
         .selected(selected)
@@ -11490,17 +12399,17 @@ fn reference_note_row(
                 TRACK_CARD_SELECTED_CORAL,
             ),
         )
-        .stable_row_identity(0xCAD3_0003, note_id)
+        .stable_row_identity(0xCAD3_0003, note_key.clone())
         .actions(row_actions)
         .fill_width()
         .height(44.0);
     ui::stack([
         row_surface,
         chrome::comment_hover(
-            Message::ReferenceCommentHoverStarted(hover_id.clone()),
-            Message::ReferenceCommentHoverEnded(hover_id),
+            Message::ReferenceCommentHoverStarted(hover_address.clone()),
+            Message::ReferenceCommentHoverEnded(hover_address),
         )
-        .key(format!("reference-comment-hover-{hover_key}"))
+        .key(format!("reference-comment-hover-{note_key}"))
         .fill(),
     ])
     .fill_width()
@@ -11563,18 +12472,61 @@ fn selected_reference_track_mut(state: &mut AppState) -> Option<&mut storage::Re
         .find(|reference| reference.path == path)
 }
 
+fn is_current_main_owner(state: &AppState, owner: &NoteOwner) -> bool {
+    matches!(
+        (owner, state.library.selected_track_id.as_deref()),
+        (NoteOwner::MainTrack(owner_id), Some(selected_id)) if owner_id == selected_id
+    )
+}
+
+fn selected_reference_owner(state: &AppState) -> Option<NoteOwner> {
+    selected_track(state)
+        .and_then(|track| track.reference_path.clone())
+        .map(NoteOwner::ReferenceTrack)
+}
+
+fn is_current_reference_owner(state: &AppState, owner: &NoteOwner) -> bool {
+    selected_reference_owner(state).as_ref() == Some(owner)
+}
+
+fn is_current_main_note_address(state: &AppState, address: &NoteAddress) -> bool {
+    is_current_main_owner(state, &address.owner)
+        && selected_track(state)
+            .is_some_and(|track| track.notes.iter().any(|note| note.id == address.note_id))
+}
+
+fn is_current_reference_note_address(state: &AppState, address: &NoteAddress) -> bool {
+    is_current_reference_owner(state, &address.owner)
+        && selected_reference_notes(state)
+            .iter()
+            .any(|note| note.id == address.note_id)
+}
+
+fn note_address_for_owner(owner: &NoteOwner, note_id: &str) -> NoteAddress {
+    NoteAddress {
+        owner: owner.clone(),
+        note_id: note_id.to_owned(),
+    }
+}
+
 fn reference_track_name(path: &Path) -> String {
     path.file_name()
         .and_then(|name| name.to_str())
         .map_or_else(|| path.to_string_lossy().into_owned(), ToOwned::to_owned)
 }
 
-fn note_ratio_for_id(
+fn note_ratio_for_address(
     state: &AppState,
     track: &storage::Track,
-    note_id: Option<&str>,
+    address: Option<&NoteAddress>,
 ) -> Option<f32> {
-    let note = note_id.and_then(|id| track.notes.iter().find(|note| note.id == id))?;
+    if track.source_provenance().is_unknown() {
+        return None;
+    }
+    let address = address.filter(
+        |address| matches!(&address.owner, NoteOwner::MainTrack(track_id) if track_id == &track.id),
+    )?;
+    let note = track.notes.iter().find(|note| note.id == address.note_id)?;
     let waveform = state
         .waveform
         .as_ref()
@@ -11582,16 +12534,36 @@ fn note_ratio_for_id(
     waveform::ratio_for_millis(note.time_millis, waveform.duration_millis)
 }
 
-fn reference_note_ratio_for_id(
+#[cfg(test)]
+fn note_ratio_for_id(
     state: &AppState,
     track: &storage::Track,
     note_id: Option<&str>,
 ) -> Option<f32> {
-    let note = note_id.and_then(|id| {
-        reference_notes_for_track(&state.library, track)
-            .iter()
-            .find(|note| note.id == id)
+    let address = note_id.map(|note_id| NoteAddress::main(track.id.clone(), note_id));
+    note_ratio_for_address(state, track, address.as_ref())
+}
+
+fn reference_note_ratio_for_address(
+    state: &AppState,
+    track: &storage::Track,
+    address: Option<&NoteAddress>,
+) -> Option<f32> {
+    let reference_path = track.reference_path.as_ref()?;
+    let address = address.filter(|address| {
+        matches!(&address.owner, NoteOwner::ReferenceTrack(path) if path == reference_path)
     })?;
+    let reference = state
+        .library
+        .reference_tracks
+        .iter()
+        .find(|reference| &reference.path == reference_path)?;
+    if reference.source_provenance().is_unknown() {
+        return None;
+    }
+    let note = reference_notes_for_track(&state.library, track)
+        .iter()
+        .find(|note| note.id == address.note_id)?;
     let waveform = state
         .reference_waveform
         .as_ref()
@@ -11679,9 +12651,9 @@ mod tests {
         APP_VERSION_LABEL, AppState, AudioImportRequest, AudioImportTarget, AuditionSource,
         DEFAULT_LIVE_SPECTROGRAM_DISPLAY_SAMPLE_RATE, FavoriteMarkerWidget, ImportBatchProgress,
         LibraryLoadState, LibrarySaveAttempt, LiveSpectrogramMode, LoopBounds, LoopSelection,
-        LoopSelections, MAIN_SOURCE_MISMATCH_STATUS, Message, NoteDraft, PairedPlaybackGuard,
-        PendingImportCommit, PlannerInsertionTarget, REFERENCE_MENU_WIDTH, ReferenceUnloadState,
-        ResumeTransportCommand, SETTINGS_REFERENCE_ROW_METADATA_HEIGHT,
+        LoopSelections, MAIN_SOURCE_MISMATCH_STATUS, Message, NoteAddress, NoteDraft, NoteOwner,
+        PairedPlaybackGuard, PendingImportCommit, PlannerInsertionTarget, REFERENCE_MENU_WIDTH,
+        ReferenceUnloadState, ResumeTransportCommand, SETTINGS_REFERENCE_ROW_METADATA_HEIGHT,
         SETTINGS_REFERENCE_ROW_TEXT_HEIGHT, SETTINGS_REFERENCE_ROW_TEXT_SPACING,
         SETTINGS_REFERENCE_ROW_TITLE_HEIGHT, STATUS_BAR_VERSION_WIDTH, StatusMenuHost,
         TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER, TRACK_CARD_SELECTED_CORAL, WAVEFORM_HEIGHT,
@@ -11695,17 +12667,18 @@ mod tests {
         live_spectrogram_display_sample_rate, loop_bounds, main_output_gain, native_launch_options,
         note_editor, note_ratio_for_id, owned_tracks_in_stage, paint_live_playback_overlay,
         planner_insertion_target_is_valid, planner_tracks_with_status, playback_shortcut,
-        progress_paired_playback_cleanup, project_surface, rebuild_audition_queue,
-        reconcile_audition_queue, reference_decode_result_is_current, reference_output_gain,
-        reference_settings_auxiliary_windows, reference_settings_window_view,
-        refresh_live_spectrogram, refresh_live_spectrograms, resume_transport_command,
-        review_spectrogram_source, review_status_filter_message, schedule_import,
-        schedule_library_save, schedule_reference_catalog_import, schedule_reference_import,
-        schedule_reference_waveform_decode, schedule_replace, schedule_waveform_decode,
-        seek_synchronized_positions, selected_reference_notes, selected_track, stage_dropdown,
-        stage_menu_anchor_from_pointer, stage_menu_popover, start_source_alongside_active,
-        status_dropdown_for_host, status_filter_dropdown, sync_audition_queue_after_status_change,
-        tracks_with_status, transport_command_is_confirmed, update,
+        progress_paired_playback_cleanup, project_surface, qualified_note_identity_key,
+        rebuild_audition_queue, reconcile_audition_queue, reference_decode_result_is_current,
+        reference_output_gain, reference_settings_auxiliary_windows,
+        reference_settings_window_view, refresh_live_spectrogram, refresh_live_spectrograms,
+        resume_transport_command, review_spectrogram_source, review_status_filter_message,
+        schedule_import, schedule_library_save, schedule_reference_catalog_import,
+        schedule_reference_import, schedule_reference_waveform_decode, schedule_replace,
+        schedule_waveform_decode, seek_synchronized_positions, selected_reference_notes,
+        selected_track, stage_dropdown, stage_menu_anchor_from_pointer, stage_menu_popover,
+        start_source_alongside_active, status_dropdown_for_host, status_filter_dropdown,
+        sync_audition_queue_after_status_change, tracks_with_status,
+        transport_command_is_confirmed, update,
     };
     use crate::transport::{LiveFrameState, Snapshot};
     use crate::{
@@ -11819,7 +12792,7 @@ mod tests {
             title: String::from("Preview me"),
             original_name: String::from("preview.wav"),
             path: PathBuf::from("/external/preview.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             reference_path: None,
             size: 0,
             favorite: false,
@@ -11914,6 +12887,13 @@ mod tests {
             .expect("a visible Planner card title should be painted")
     }
 
+    fn fixture_source_proof() -> crate::source::AudioSourceProof {
+        crate::source::AudioSourceProof {
+            sha256: "0".repeat(64),
+            byte_len: 0,
+        }
+    }
+
     fn assert_rect_close(actual: Rect, expected: Rect, tolerance: f32) {
         assert!(
             (actual.min.x - expected.min.x).abs() <= tolerance
@@ -11930,7 +12910,7 @@ mod tests {
             title: String::from(id),
             original_name: format!("{id}.wav"),
             path: PathBuf::from(format!("/external/{id}.wav")),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             reference_path: Some(PathBuf::from(format!("/external/{id}-reference.wav"))),
             size: 0,
             favorite: false,
@@ -11956,7 +12936,7 @@ mod tests {
         state.library.reference_tracks = vec![
             ReferenceTrack {
                 path: first_path,
-                source_proof: None,
+                source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
                 notes: vec![Note {
                     id: String::from("shared-reference-note"),
                     time_millis: 500,
@@ -11966,7 +12946,7 @@ mod tests {
             },
             ReferenceTrack {
                 path: second_path,
-                source_proof: None,
+                source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
                 notes: vec![Note {
                     id: String::from("shared-reference-note"),
                     time_millis: 750,
@@ -12026,7 +13006,7 @@ mod tests {
         state.library.selected_track_id = selected_track_id.map(String::from);
         state.library.reference_tracks.push(ReferenceTrack {
             path: catalog_path,
-            source_proof: catalog_proof,
+            source_proof: crate::source::SourceProvenance::from_optional(catalog_proof),
             notes: Vec::new(),
         });
         state
@@ -12057,7 +13037,7 @@ mod tests {
             .iter_mut()
             .find(|reference| reference.path == path)
             .expect("reference selection fixture should contain its catalog path")
-            .source_proof = Some(proof.clone());
+            .source_proof = crate::source::SourceProvenance::Verified(proof.clone());
         library
     }
 
@@ -12120,6 +13100,49 @@ mod tests {
         verified_audition_waveform_for(Path::new("/external/audition.wav"))
     }
 
+    fn historical_main_binding_state() -> (
+        AppState,
+        PathBuf,
+        crate::source::AudioSourceProof,
+        Vec<Note>,
+    ) {
+        let track_id = String::from("historical-binding");
+        let path = PathBuf::from("/external/historical-binding.wav");
+        let notes = vec![
+            Note {
+                id: String::from("historical-note-1"),
+                time_millis: 125,
+                body: String::from("preserve this exact body"),
+                done: false,
+            },
+            Note {
+                id: String::from("historical-note-2"),
+                time_millis: 875,
+                body: String::from("and this completed note"),
+                done: true,
+            },
+        ];
+        let verified = verified_audition_waveform_for(&path);
+        let ticket = verified.ticket().clone();
+        let proof = ticket.proof().clone();
+        let mut track = audition_track(&track_id);
+        track.path = path.clone();
+        track.reference_path = None;
+        track.source_proof = crate::source::SourceProvenance::Unknown;
+        track.notes = notes.clone();
+        let mut state = AppState {
+            busy: false,
+            waveform: Some(verified.into_waveform()),
+            waveform_source_ticket: Some(ticket),
+            waveform_track_id: Some(track_id.clone()),
+            waveform_generation: 7,
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(track_id);
+        state.library.tracks.push(track);
+        (state, path, proof, notes)
+    }
+
     fn audition_volume_edit(
         start: f32,
         value: f32,
@@ -12169,6 +13192,10 @@ mod tests {
         state
     }
 
+    fn note_id_from_address(address: Option<&NoteAddress>) -> Option<&str> {
+        address.map(|address| address.note_id.as_str())
+    }
+
     fn live_frame(
         generation: u64,
         epoch: u64,
@@ -12186,6 +13213,50 @@ mod tests {
             )
             .expect("valid live spectrogram test frame"),
         )
+    }
+
+    #[test]
+    fn qualified_note_identity_keys_separate_owner_kind_and_note_bytes() {
+        let main_track_a = NoteAddress::main("track-a", "shared-note");
+        let main_track_b = NoteAddress::main("track-b", "shared-note");
+        let reference = NoteAddress::reference(PathBuf::from("/refs/reference.wav"), "shared-note");
+        let delimiter_ambiguous_left = NoteAddress::main("ab", "c");
+        let delimiter_ambiguous_right = NoteAddress::main("a", "bc");
+
+        assert_ne!(
+            qualified_note_identity_key(&main_track_a),
+            qualified_note_identity_key(&main_track_b)
+        );
+        assert_ne!(
+            qualified_note_identity_key(&main_track_a),
+            qualified_note_identity_key(&reference)
+        );
+        assert_ne!(
+            qualified_note_identity_key(&delimiter_ambiguous_left),
+            qualified_note_identity_key(&delimiter_ambiguous_right)
+        );
+    }
+
+    #[test]
+    fn reference_note_identity_continues_across_main_tracks_for_the_same_path() {
+        let reference_path = PathBuf::from("/refs/shared-reference.wav");
+        let first_track_identity = NoteAddress {
+            owner: NoteOwner::ReferenceTrack(reference_path.clone()),
+            note_id: String::from("shared-note"),
+        };
+        let second_track_identity = NoteAddress {
+            owner: NoteOwner::ReferenceTrack(reference_path),
+            note_id: String::from("shared-note"),
+        };
+
+        assert_eq!(
+            qualified_note_identity_key(&first_track_identity),
+            qualified_note_identity_key(&second_track_identity)
+        );
+        assert_eq!(
+            super::reference_inline_comment_editor_id(&first_track_identity),
+            super::reference_inline_comment_editor_id(&second_track_identity)
+        );
     }
 
     #[test]
@@ -13288,13 +14359,20 @@ mod tests {
             done: false,
         });
         state.draft_note = Some(NoteDraft {
+            owner: NoteOwner::MainTrack(String::from("main-comment-id-track")),
             note_id: None,
+            nonce: 1,
             time_millis: 500,
             body: String::from("New main comment"),
         });
         let mut context = ui::UiUpdateContext::default();
+        let identity = state
+            .draft_note
+            .as_ref()
+            .expect("the test draft should be active")
+            .identity();
 
-        update(&mut state, Message::SaveDraftNote, &mut context);
+        update(&mut state, Message::SaveDraftNote(identity), &mut context);
 
         assert!(state.draft_note.is_none());
         assert_eq!(state.library.tracks[0].notes.len(), 2);
@@ -13318,8 +14396,8 @@ mod tests {
             .clone()
             .expect("the test track should have a reference path");
         state.library.reference_tracks.push(ReferenceTrack {
-            path: reference_path,
-            source_proof: None,
+            path: reference_path.clone(),
+            source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             notes: vec![Note {
                 id: String::from("existing-reference-note"),
                 time_millis: 500,
@@ -13328,13 +14406,29 @@ mod tests {
             }],
         });
         state.reference_draft_note = Some(NoteDraft {
+            owner: NoteOwner::ReferenceTrack(
+                state.library.tracks[0]
+                    .reference_path
+                    .clone()
+                    .expect("the test track should have a reference path"),
+            ),
             note_id: None,
+            nonce: 1,
             time_millis: 1_000,
             body: String::from("New reference comment"),
         });
         let mut context = ui::UiUpdateContext::default();
+        let identity = state
+            .reference_draft_note
+            .as_ref()
+            .expect("the test draft should be active")
+            .identity();
 
-        update(&mut state, Message::SaveReferenceDraftNote, &mut context);
+        update(
+            &mut state,
+            Message::SaveReferenceDraftNote(identity),
+            &mut context,
+        );
 
         assert!(state.reference_draft_note.is_none());
         assert_eq!(state.library.reference_tracks[0].notes.len(), 2);
@@ -13351,6 +14445,176 @@ mod tests {
     }
 
     #[test]
+    fn stale_main_editor_events_do_not_touch_a_replacement_draft() {
+        let mut state = audition_state(&["stale-editor-track"]);
+        state.review_cursor_millis = 125;
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut state, Message::NewNoteAtCurrentTime, &mut context);
+        let stale_identity = state
+            .draft_note
+            .as_ref()
+            .expect("the first draft should be active")
+            .identity();
+
+        state.review_cursor_millis = 875;
+        update(&mut state, Message::NewNoteAtCurrentTime, &mut context);
+        let active_identity = state
+            .draft_note
+            .as_ref()
+            .expect("the replacement draft should be active")
+            .identity();
+        assert_ne!(stale_identity, active_identity);
+        assert!(active_identity.nonce > stale_identity.nonce);
+        assert_eq!(
+            &active_identity.owner,
+            &NoteOwner::MainTrack(String::from("stale-editor-track"))
+        );
+
+        update(
+            &mut state,
+            Message::DraftNoteChanged {
+                identity: stale_identity.clone(),
+                body: String::from("stale body"),
+            },
+            &mut context,
+        );
+        update(
+            &mut state,
+            Message::SaveDraftNote(stale_identity.clone()),
+            &mut context,
+        );
+        update(
+            &mut state,
+            Message::CancelDraftNote(stale_identity),
+            &mut context,
+        );
+
+        let draft = state
+            .draft_note
+            .as_ref()
+            .expect("stale editor events must leave the replacement draft active");
+        assert_eq!(draft.identity(), active_identity);
+        assert_eq!(draft.body, "");
+        assert!(state.library.tracks[0].notes.is_empty());
+
+        update(
+            &mut state,
+            Message::DraftNoteChanged {
+                identity: active_identity.clone(),
+                body: String::from("active body"),
+            },
+            &mut context,
+        );
+        update(
+            &mut state,
+            Message::SaveDraftNote(active_identity),
+            &mut context,
+        );
+
+        assert!(state.draft_note.is_none());
+        assert_eq!(state.library.tracks[0].notes[0].body, "active body");
+    }
+
+    #[test]
+    fn stale_reference_editor_events_do_not_touch_a_replacement_draft() {
+        let mut state = shared_reference_playback_state();
+        let reference_path = state.library.tracks[0]
+            .reference_path
+            .clone()
+            .expect("the test track should have a reference path");
+        state.library.reference_tracks.push(ReferenceTrack {
+            path: reference_path.clone(),
+            source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
+            notes: Vec::new(),
+        });
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::ReferenceCommentClicked { ratio: 0.25 },
+            &mut context,
+        );
+        let stale_identity = state
+            .reference_draft_note
+            .as_ref()
+            .expect("the first reference draft should be active")
+            .identity();
+
+        update(
+            &mut state,
+            Message::ReferenceCommentClicked { ratio: 0.75 },
+            &mut context,
+        );
+        let active_identity = state
+            .reference_draft_note
+            .as_ref()
+            .expect("the replacement reference draft should be active")
+            .identity();
+        let active_time_millis = state
+            .reference_draft_note
+            .as_ref()
+            .expect("the replacement reference draft should be active")
+            .time_millis;
+        assert_ne!(stale_identity, active_identity);
+        assert!(active_identity.nonce > stale_identity.nonce);
+        assert_eq!(
+            &active_identity.owner,
+            &NoteOwner::ReferenceTrack(reference_path)
+        );
+
+        update(
+            &mut state,
+            Message::ReferenceDraftNoteChanged {
+                identity: stale_identity.clone(),
+                body: String::from("stale body"),
+            },
+            &mut context,
+        );
+        update(
+            &mut state,
+            Message::SaveReferenceDraftNote(stale_identity.clone()),
+            &mut context,
+        );
+        update(
+            &mut state,
+            Message::CancelReferenceDraftNote(stale_identity),
+            &mut context,
+        );
+
+        let draft = state
+            .reference_draft_note
+            .as_ref()
+            .expect("stale editor events must leave the replacement draft active");
+        assert_eq!(draft.identity(), active_identity);
+        assert_eq!(draft.body, "");
+        assert_eq!(draft.time_millis, active_time_millis);
+        assert!(state.library.reference_tracks[0].notes.is_empty());
+        assert!(state.save_in_flight.is_none());
+
+        update(
+            &mut state,
+            Message::ReferenceDraftNoteChanged {
+                identity: active_identity.clone(),
+                body: String::from("active body"),
+            },
+            &mut context,
+        );
+        update(
+            &mut state,
+            Message::SaveReferenceDraftNote(active_identity),
+            &mut context,
+        );
+
+        assert!(state.reference_draft_note.is_none());
+        assert_eq!(state.library.reference_tracks[0].notes.len(), 1);
+        assert_eq!(
+            state.library.reference_tracks[0].notes[0].body,
+            "active body"
+        );
+    }
+
+    #[test]
     fn editing_existing_comment_populates_draft_and_focuses_main_editor() {
         let track_id = String::from("edit-track");
         let note_id = String::from("edit-note");
@@ -13361,11 +14625,11 @@ mod tests {
         };
         state.library.selected_track_id = Some(track_id.clone());
         state.library.tracks.push(Track {
-            id: track_id,
+            id: track_id.clone(),
             title: String::from("Edit track"),
             original_name: String::from("edit-track.wav"),
             path: PathBuf::from("/external/edit-track.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             reference_path: None,
             size: 0,
             favorite: false,
@@ -13380,9 +14644,10 @@ mod tests {
         });
         let mut context = ui::UiUpdateContext::default();
 
-        update(&mut state, Message::EditNote(note_id.clone()), &mut context);
+        let address = NoteAddress::main(track_id.clone(), note_id.clone());
+        update(&mut state, Message::EditNote(address.clone()), &mut context);
 
-        assert_eq!(state.selected_note_id.as_deref(), Some(note_id.as_str()));
+        assert_eq!(state.selected_note_id.as_ref(), Some(&address));
         assert_eq!(state.review_cursor_millis, 1_250);
         let draft = state
             .draft_note
@@ -13398,7 +14663,7 @@ mod tests {
             matches!(
                 primitive,
                 PaintPrimitive::TextInput(input)
-                    if input.widget_id == super::main_inline_comment_editor_id(&note_id)
+                    if input.widget_id == super::main_inline_comment_editor_id(&address)
                         && input.state.value.as_str() == "Existing comment body"
             )
         }));
@@ -13414,7 +14679,7 @@ mod tests {
                 if commands.iter().any(|command| matches!(
                     command,
                     radiant::runtime::Command::Focus(id)
-                        if *id == super::main_inline_comment_editor_id(&note_id)
+                        if *id == super::main_inline_comment_editor_id(&address)
                 ))
         ));
     }
@@ -13434,7 +14699,7 @@ mod tests {
             title: String::from("Reference edit track"),
             original_name: String::from("reference-edit-main.wav"),
             path: PathBuf::from("/external/reference-edit-main.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             reference_path: Some(reference_path.clone()),
             size: 0,
             favorite: false,
@@ -13443,8 +14708,8 @@ mod tests {
             notes: Vec::new(),
         });
         state.library.reference_tracks.push(ReferenceTrack {
-            path: reference_path,
-            source_proof: None,
+            path: reference_path.clone(),
+            source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             notes: vec![Note {
                 id: note_id.clone(),
                 time_millis: 875,
@@ -13454,16 +14719,14 @@ mod tests {
         });
         let mut context = ui::UiUpdateContext::default();
 
+        let address = NoteAddress::reference(reference_path.clone(), note_id.clone());
         update(
             &mut state,
-            Message::EditReferenceNote(note_id.clone()),
+            Message::EditReferenceNote(address.clone()),
             &mut context,
         );
 
-        assert_eq!(
-            state.selected_reference_note_id.as_deref(),
-            Some(note_id.as_str())
-        );
+        assert_eq!(state.selected_reference_note_id.as_ref(), Some(&address));
         let draft = state
             .reference_draft_note
             .as_ref()
@@ -13478,7 +14741,7 @@ mod tests {
             matches!(
                 primitive,
                 PaintPrimitive::TextInput(input)
-                    if input.widget_id == super::reference_inline_comment_editor_id(&note_id)
+                    if input.widget_id == super::reference_inline_comment_editor_id(&address)
                         && input.state.value.as_str() == "Existing reference body"
             )
         }));
@@ -13498,7 +14761,7 @@ mod tests {
                 if commands.iter().any(|command| matches!(
                     command,
                     radiant::runtime::Command::Focus(id)
-                        if *id == super::reference_inline_comment_editor_id(&note_id)
+                        if *id == super::reference_inline_comment_editor_id(&address)
                 ))
         ));
     }
@@ -13650,7 +14913,7 @@ mod tests {
             title: String::from("Selected"),
             original_name: String::from("selected.wav"),
             path: PathBuf::from("/external/selected.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             reference_path: Some(second_path.clone()),
             size: 0,
             favorite: false,
@@ -13663,7 +14926,7 @@ mod tests {
             title: String::from("Assigned"),
             original_name: String::from("assigned.wav"),
             path: PathBuf::from("/external/assigned.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path: Some(first_path.clone()),
             size: 0,
             favorite: false,
@@ -13674,12 +14937,12 @@ mod tests {
         state.library.reference_tracks = vec![
             ReferenceTrack {
                 path: first_path,
-                source_proof: None,
+                source_proof: crate::source::SourceProvenance::Unknown,
                 notes: Vec::new(),
             },
             ReferenceTrack {
                 path: second_path,
-                source_proof: None,
+                source_proof: crate::source::SourceProvenance::Unknown,
                 notes: Vec::new(),
             },
         ];
@@ -13725,7 +14988,7 @@ mod tests {
         let mut state = AppState::default();
         state.library.reference_tracks.push(ReferenceTrack {
             path,
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             notes: Vec::new(),
         });
 
@@ -13832,7 +15095,7 @@ mod tests {
                 title: String::from("Main track"),
                 original_name: String::from("main-track.wav"),
                 path: PathBuf::from("/external/main-track.wav"),
-                source_proof: None,
+                source_proof: crate::source::SourceProvenance::Unknown,
                 reference_path: None,
                 size: 0,
                 favorite: false,
@@ -13843,7 +15106,7 @@ mod tests {
             selected_track_id: Some(String::from("main-track")),
             reference_tracks: vec![ReferenceTrack {
                 path: path.clone(),
-                source_proof: None,
+                source_proof: crate::source::SourceProvenance::Unknown,
                 notes: Vec::new(),
             }],
             planner_order: Vec::new(),
@@ -13884,7 +15147,9 @@ mod tests {
             reference_transport_loaded: true,
             reference_match_enabled: true,
             reference_draft_note: Some(NoteDraft {
+                owner: NoteOwner::ReferenceTrack(reference_path.clone()),
                 note_id: None,
+                nonce: 1,
                 time_millis: 200,
                 body: String::from("stale"),
             }),
@@ -13896,7 +15161,7 @@ mod tests {
             title: String::from("Selected"),
             original_name: String::from("selected.wav"),
             path: PathBuf::from("/external/selected.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path: Some(reference_path.clone()),
             size: 0,
             favorite: false,
@@ -13906,7 +15171,7 @@ mod tests {
         });
         state.library.reference_tracks.push(ReferenceTrack {
             path: reference_path.clone(),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             notes: Vec::new(),
         });
         let previous_generation = state.reference_waveform_generation;
@@ -13960,7 +15225,9 @@ mod tests {
                 ),
             }),
             draft_note: Some(NoteDraft {
+                owner: NoteOwner::MainTrack(String::from("playhead-drag")),
                 note_id: None,
+                nonce: 1,
                 time_millis: 100,
                 body: String::from("old draft"),
             }),
@@ -14091,7 +15358,7 @@ mod tests {
             title: String::from("Comment drag track"),
             original_name: String::from("comment-drag-track.wav"),
             path: PathBuf::from("/external/comment-drag-track.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             reference_path: None,
             size: 0,
             favorite: false,
@@ -14117,18 +15384,19 @@ mod tests {
 
     #[test]
     fn persisted_comment_drag_moves_and_saves_the_selected_note() {
-        let (mut state, _track_id, note_id) = persisted_comment_drag_state();
+        let (mut state, track_id, note_id) = persisted_comment_drag_state();
+        let address = NoteAddress::main(track_id, note_id.clone());
         let mut context = ui::UiUpdateContext::default();
 
         update(
             &mut state,
             Message::CommentDragStarted {
                 ratio: 0.25,
-                note_index: Some(0),
+                address: Some(address.clone()),
             },
             &mut context,
         );
-        assert_eq!(state.selected_note_id.as_deref(), Some(note_id.as_str()));
+        assert_eq!(state.selected_note_id.as_ref(), Some(&address));
         assert!(state.draft_note.is_none());
         assert!(state.persisted_note_drag.is_some());
 
@@ -14163,7 +15431,9 @@ mod tests {
     fn persisted_comment_drag_cancellation_rolls_back_without_saving() {
         let (mut state, track_id, note_id) = persisted_comment_drag_state();
         state.draft_note = Some(NoteDraft {
+            owner: NoteOwner::MainTrack(track_id.clone()),
             note_id: Some(note_id.clone()),
+            nonce: 1,
             time_millis: 500,
             body: String::from("edit this"),
         });
@@ -14173,7 +15443,7 @@ mod tests {
             &mut state,
             Message::CommentDragStarted {
                 ratio: 0.25,
-                note_index: Some(0),
+                address: Some(NoteAddress::main(track_id.clone(), note_id.clone())),
             },
             &mut context,
         );
@@ -14263,7 +15533,9 @@ mod tests {
     fn draft_note_space_is_unhandled() {
         let state = AppState {
             draft_note: Some(NoteDraft {
+                owner: NoteOwner::MainTrack(String::from("draft")),
                 note_id: None,
+                nonce: 1,
                 time_millis: 0,
                 body: String::new(),
             }),
@@ -14288,7 +15560,9 @@ mod tests {
     fn reference_draft_note_shortcuts_are_unhandled() {
         let state = AppState {
             reference_draft_note: Some(NoteDraft {
+                owner: NoteOwner::ReferenceTrack(PathBuf::from("/external/reference.wav")),
                 note_id: None,
+                nonce: 1,
                 time_millis: 0,
                 body: String::new(),
             }),
@@ -14318,7 +15592,9 @@ mod tests {
         let bridge = DeclarativeOwnedRuntimeBridge::new(
             NoteEditorState {
                 draft: NoteDraft {
+                    owner: NoteOwner::MainTrack(String::from("note-editor")),
                     note_id: None,
+                    nonce: 1,
                     time_millis: 1_000,
                     body: String::from("Submit me"),
                 },
@@ -14330,7 +15606,7 @@ mod tests {
                     .into_surface()
             },
             |state, message| {
-                if message == Message::SaveDraftNote {
+                if matches!(message, Message::SaveDraftNote(_)) {
                     state.submitted = true;
                 }
             },
@@ -14601,7 +15877,7 @@ mod tests {
             title: String::from("Match track"),
             original_name: String::from("match-track.wav"),
             path: PathBuf::from("/external/match-track.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path: Some(PathBuf::from("/external/reference.wav")),
             size: 0,
             favorite: false,
@@ -14669,7 +15945,7 @@ mod tests {
             title: String::from("Match unavailable track"),
             original_name: String::from("match-unavailable-track.wav"),
             path: PathBuf::from("/external/match-unavailable-track.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path: Some(PathBuf::from("/external/reference.wav")),
             size: 0,
             favorite: false,
@@ -14730,7 +16006,7 @@ mod tests {
             title: String::from("Audition track"),
             original_name: String::from("audition.wav"),
             path: PathBuf::from("/external/audition.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path: Some(PathBuf::from("/external/reference.wav")),
             size: 0,
             favorite: false,
@@ -15020,7 +16296,7 @@ mod tests {
             title: String::from("Reference click track"),
             original_name: String::from("reference-click.wav"),
             path: PathBuf::from("/external/reference-click.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path: Some(PathBuf::from("/external/reference.wav")),
             size: 0,
             favorite: false,
@@ -15138,7 +16414,7 @@ mod tests {
             title: String::from("Active reference click track"),
             original_name: String::from("active-reference-click.wav"),
             path: PathBuf::from("/external/active-reference-click.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path: Some(PathBuf::from("/external/reference.wav")),
             size: 0,
             favorite: false,
@@ -15237,7 +16513,7 @@ mod tests {
             title: String::from("Main seek track"),
             original_name: String::from("main-seek.wav"),
             path: PathBuf::from("/external/main-seek.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path: Some(PathBuf::from("/external/reference.wav")),
             size: 0,
             favorite: false,
@@ -15321,7 +16597,7 @@ mod tests {
             title: String::from("Paired admission track"),
             original_name: String::from("paired-admission.wav"),
             path: PathBuf::from("/external/paired-admission.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             reference_path: Some(PathBuf::from("/external/paired-reference.wav")),
             size: 0,
             favorite: false,
@@ -15375,8 +16651,8 @@ mod tests {
             .clone()
             .expect("the paired state should have a reference path");
         state.library.reference_tracks.push(ReferenceTrack {
-            path: reference_path,
-            source_proof: None,
+            path: reference_path.clone(),
+            source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             notes: vec![
                 Note {
                     id: note_id.clone(),
@@ -15443,6 +16719,15 @@ mod tests {
     #[test]
     fn reference_draft_comment_drag_updates_reference_timestamp_without_main_cursor() {
         let mut state = shared_reference_playback_state();
+        let reference_path = state.library.tracks[0]
+            .reference_path
+            .clone()
+            .expect("the paired state should have a reference path");
+        state.library.reference_tracks.push(ReferenceTrack {
+            path: reference_path,
+            source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
+            notes: Vec::new(),
+        });
         let mut context = ui::UiUpdateContext::default();
 
         update(
@@ -15462,7 +16747,7 @@ mod tests {
             &mut state,
             Message::ReferenceCommentDragStarted {
                 ratio: 0.25,
-                note_index: None,
+                address: None,
             },
             &mut context,
         );
@@ -15495,20 +16780,22 @@ mod tests {
     #[test]
     fn reference_persisted_comment_drag_moves_and_saves_reference_note() {
         let (mut state, note_id) = reference_comment_drag_state();
+        let reference_path = state.library.tracks[0]
+            .reference_path
+            .clone()
+            .expect("the test track should have a reference path");
+        let address = NoteAddress::reference(reference_path, note_id.clone());
         let mut context = ui::UiUpdateContext::default();
 
         update(
             &mut state,
             Message::ReferenceCommentDragStarted {
                 ratio: 0.125,
-                note_index: Some(0),
+                address: Some(address.clone()),
             },
             &mut context,
         );
-        assert_eq!(
-            state.selected_reference_note_id.as_deref(),
-            Some(note_id.as_str())
-        );
+        assert_eq!(state.selected_reference_note_id.as_ref(), Some(&address));
         assert!(state.reference_persisted_note_drag.is_some());
         assert_eq!(state.reference_transport_position_millis, 500);
 
@@ -15539,8 +16826,14 @@ mod tests {
     #[test]
     fn reference_persisted_comment_drag_cancellation_rolls_back_without_saving() {
         let (mut state, note_id) = reference_comment_drag_state();
+        let reference_path = state.library.tracks[0]
+            .reference_path
+            .clone()
+            .expect("the test track should have a reference path");
         state.reference_draft_note = Some(NoteDraft {
+            owner: NoteOwner::ReferenceTrack(reference_path.clone()),
             note_id: Some(note_id.clone()),
+            nonce: 1,
             time_millis: 500,
             body: String::from("edit this reference comment"),
         });
@@ -15550,7 +16843,7 @@ mod tests {
             &mut state,
             Message::ReferenceCommentDragStarted {
                 ratio: 0.125,
-                note_index: Some(0),
+                address: Some(NoteAddress::reference(reference_path, note_id.clone())),
             },
             &mut context,
         );
@@ -15935,7 +17228,7 @@ mod tests {
             title: String::from("Resume reference track"),
             original_name: String::from("resume-reference.wav"),
             path: PathBuf::from("/external/resume-reference.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path: Some(PathBuf::from("/external/reference.wav")),
             size: 0,
             favorite: false,
@@ -16016,7 +17309,7 @@ mod tests {
             title: String::from("Loop track"),
             original_name: String::from("loop.wav"),
             path: PathBuf::from("/external/loop.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path: Some(PathBuf::from("/external/reference.wav")),
             size: 0,
             favorite: false,
@@ -17508,7 +18801,7 @@ mod tests {
             title: String::from("Review track"),
             original_name: String::from("review-track.wav"),
             path: PathBuf::from("/external/review-track.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             reference_path: None,
             size: 0,
             favorite: false,
@@ -17670,7 +18963,7 @@ mod tests {
             title: String::from("Review track"),
             original_name: String::from("review-track.wav"),
             path: PathBuf::from("/external/review-track.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path: Some(PathBuf::from("/external/reference.wav")),
             size: 0,
             favorite: false,
@@ -17802,7 +19095,7 @@ mod tests {
             title: String::from("Active playback comments"),
             original_name: String::from("active-playback-comments.wav"),
             path: PathBuf::from("/external/active-playback-comments.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             reference_path: Some(reference_path.clone()),
             size: 0,
             favorite: false,
@@ -17817,7 +19110,7 @@ mod tests {
         });
         state.library.reference_tracks.push(ReferenceTrack {
             path: reference_path,
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             notes: vec![Note {
                 id: String::from("reference-persisted-note"),
                 time_millis: 500,
@@ -18082,7 +19375,7 @@ mod tests {
             title: String::from("Reference loop header track"),
             original_name: String::from("reference-loop-header.wav"),
             path: PathBuf::from("/external/reference-loop-header.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path: Some(PathBuf::from("/external/reference-header.wav")),
             size: 0,
             favorite: false,
@@ -18106,7 +19399,7 @@ mod tests {
     #[test]
     fn reference_comment_draft_saves_to_its_catalog_entry_and_switching_keeps_comments_separate() {
         let track_id = String::from("reference-comment-track");
-        let (first_path, _first_decoded, first_root) = decoded_replacement_fixture();
+        let (first_path, first_decoded, first_root) = decoded_replacement_fixture();
         let (second_path, second_decoded, second_root) = decoded_replacement_fixture();
         let waveform = audition_waveform();
         let mut state = AppState {
@@ -18123,7 +19416,7 @@ mod tests {
             title: String::from("Reference comment track"),
             original_name: String::from("reference-comment.wav"),
             path: PathBuf::from("/external/reference-comment.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             reference_path: Some(first_path.clone()),
             size: 0,
             favorite: false,
@@ -18139,12 +19432,16 @@ mod tests {
         state.library.reference_tracks = vec![
             ReferenceTrack {
                 path: first_path.clone(),
-                source_proof: None,
+                source_proof: crate::source::SourceProvenance::Verified(
+                    first_decoded.source_proof().clone(),
+                ),
                 notes: Vec::new(),
             },
             ReferenceTrack {
                 path: second_path.clone(),
-                source_proof: None,
+                source_proof: crate::source::SourceProvenance::Verified(
+                    second_decoded.source_proof().clone(),
+                ),
                 notes: vec![Note {
                     id: String::from("second-reference-note"),
                     time_millis: 700,
@@ -18178,12 +19475,24 @@ mod tests {
                 .map(|draft| draft.time_millis),
             Some(250)
         );
+        let identity = state
+            .reference_draft_note
+            .as_ref()
+            .expect("the reference draft should be active")
+            .identity();
         update(
             &mut state,
-            Message::ReferenceDraftNoteChanged(String::from("Check the reference kick.")),
+            Message::ReferenceDraftNoteChanged {
+                identity: identity.clone(),
+                body: String::from("Check the reference kick."),
+            },
             &mut context,
         );
-        update(&mut state, Message::SaveReferenceDraftNote, &mut context);
+        update(
+            &mut state,
+            Message::SaveReferenceDraftNote(identity),
+            &mut context,
+        );
 
         assert!(state.reference_draft_note.is_none());
         assert_eq!(state.library.tracks[0].notes[0].body, "Main track note");
@@ -18226,7 +19535,8 @@ mod tests {
         let committed = {
             let mut library = state.library.clone();
             library.tracks[0].reference_path = Some(second_path.clone());
-            library.reference_tracks[1].source_proof = Some(second_decoded.source_proof().clone());
+            library.reference_tracks[1].source_proof =
+                crate::source::SourceProvenance::Verified(second_decoded.source_proof().clone());
             library
         };
         let request_id = match state.pending_import_commit.as_ref() {
@@ -18258,17 +19568,22 @@ mod tests {
     fn removing_selected_track_clears_reference_drafts_before_successor_save() {
         for draft in [
             NoteDraft {
+                owner: NoteOwner::ReferenceTrack(PathBuf::from("/external/track-a-reference.wav")),
                 note_id: None,
+                nonce: 1,
                 time_millis: 1_250,
                 body: String::from("unsaved new A comment"),
             },
             NoteDraft {
+                owner: NoteOwner::ReferenceTrack(PathBuf::from("/external/track-a-reference.wav")),
                 note_id: Some(String::from("shared-reference-note")),
+                nonce: 1,
                 time_millis: 500,
                 body: String::from("edited A comment"),
             },
         ] {
             let mut state = reference_removal_state();
+            let identity = draft.identity();
             state.reference_draft_note = Some(draft);
             state.remove_confirmation_track_id = Some(String::from("track-a"));
             let mut context = ui::UiUpdateContext::default();
@@ -18283,7 +19598,7 @@ mod tests {
             assert!(state.reference_draft_note.is_none());
             update(
                 &mut state,
-                Message::SaveReferenceDraftNote,
+                Message::SaveReferenceDraftNote(identity),
                 &mut ui::UiUpdateContext::default(),
             );
             let successor_reference = state
@@ -18304,23 +19619,34 @@ mod tests {
     fn removing_selected_track_clears_reference_transient_state() {
         let mut state = reference_removal_state();
         state.reference_draft_note = Some(NoteDraft {
+            owner: NoteOwner::ReferenceTrack(PathBuf::from("/external/track-a-reference.wav")),
             note_id: Some(String::from("shared-reference-note")),
+            nonce: 1,
             time_millis: 500,
             body: String::from("editing A"),
         });
-        state.selected_reference_note_id = Some(String::from("shared-reference-note"));
-        state.hovered_reference_note_id = Some(String::from("shared-reference-note"));
+        state.selected_reference_note_id = Some(NoteAddress::reference(
+            "/external/track-a-reference.wav",
+            "shared-reference-note",
+        ));
+        state.hovered_reference_note_id = Some(NoteAddress::reference(
+            "/external/track-a-reference.wav",
+            "shared-reference-note",
+        ));
         state.reference_persisted_note_drag = Some(super::PersistedNoteDrag {
-            track_id: String::from("track-a"),
-            note_id: String::from("shared-reference-note"),
+            address: NoteAddress::reference(
+                "/external/track-a-reference.wav",
+                "shared-reference-note",
+            ),
             original_time_millis: 500,
         });
         state.reference_playhead_drag_active = true;
         state.pending_reference_seek_intent = Some(1_500);
         state.pending_comment_playback = Some(super::PendingCommentPlayback {
-            track_id: String::from("track-a"),
-            source: super::CommentSource::Reference,
-            note_id: String::from("shared-reference-note"),
+            address: NoteAddress::reference(
+                "/external/track-a-reference.wav",
+                "shared-reference-note",
+            ),
         });
         state.comment_source = super::CommentSource::Reference;
         state.comment_source_explicit = true;
@@ -18353,12 +19679,20 @@ mod tests {
         let mut state = reference_removal_state();
         state.library.selected_track_id = Some(String::from("track-b"));
         state.reference_draft_note = Some(NoteDraft {
+            owner: NoteOwner::ReferenceTrack(PathBuf::from("/external/track-b-reference.wav")),
             note_id: Some(String::from("shared-reference-note")),
+            nonce: 1,
             time_millis: 750,
             body: String::from("editing B"),
         });
-        state.selected_reference_note_id = Some(String::from("shared-reference-note"));
-        state.hovered_reference_note_id = Some(String::from("shared-reference-note"));
+        state.selected_reference_note_id = Some(NoteAddress::reference(
+            "/external/track-b-reference.wav",
+            "shared-reference-note",
+        ));
+        state.hovered_reference_note_id = Some(NoteAddress::reference(
+            "/external/track-b-reference.wav",
+            "shared-reference-note",
+        ));
         state.pending_reference_seek_intent = Some(2_000);
         state.comment_source = super::CommentSource::Reference;
         state.comment_source_explicit = true;
@@ -18379,11 +19713,11 @@ mod tests {
             Some("editing B")
         );
         assert_eq!(
-            state.selected_reference_note_id.as_deref(),
+            note_id_from_address(state.selected_reference_note_id.as_ref()),
             Some("shared-reference-note")
         );
         assert_eq!(
-            state.hovered_reference_note_id.as_deref(),
+            note_id_from_address(state.hovered_reference_note_id.as_ref()),
             Some("shared-reference-note")
         );
         assert_eq!(state.pending_reference_seek_intent, Some(2_000));
@@ -18397,7 +19731,9 @@ mod tests {
         let mut state = AppState {
             busy: false,
             draft_note: Some(NoteDraft {
+                owner: NoteOwner::MainTrack(track_id.clone()),
                 note_id: Some(String::from("target-note")),
+                nonce: 1,
                 time_millis: 1_000,
                 body: String::from("edit this"),
             }),
@@ -18409,7 +19745,7 @@ mod tests {
             title: String::from("Review track"),
             original_name: String::from("review-track.wav"),
             path: PathBuf::from("/external/review-track.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             reference_path: None,
             size: 0,
             favorite: false,
@@ -18434,7 +19770,7 @@ mod tests {
 
         update(
             &mut state,
-            Message::DeleteNote(String::from("target-note")),
+            Message::DeleteNote(NoteAddress::main("review-track", "target-note")),
             &mut context,
         );
 
@@ -18469,7 +19805,7 @@ mod tests {
             title: String::from("Main draft track"),
             original_name: String::from("main-draft.wav"),
             path: PathBuf::from("/external/main-draft.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             reference_path: Some(reference_path.clone()),
             size: 0,
             favorite: false,
@@ -18479,7 +19815,7 @@ mod tests {
         });
         state.library.reference_tracks.push(ReferenceTrack {
             path: reference_path,
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             notes: vec![Note {
                 id: String::from("reference-note"),
                 time_millis: 250,
@@ -18523,7 +19859,7 @@ mod tests {
         let track_id = String::from("review-track");
         let mut state = AppState {
             busy: false,
-            selected_note_id: Some(String::from("open-note")),
+            selected_note_id: Some(NoteAddress::main("review-track", "open-note")),
             ..AppState::default()
         };
         state.library.selected_track_id = Some(track_id.clone());
@@ -18532,7 +19868,7 @@ mod tests {
             title: String::from("Review track"),
             original_name: String::from("review-track.wav"),
             path: PathBuf::from("/external/review-track.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             reference_path: None,
             size: 0,
             favorite: false,
@@ -18592,7 +19928,10 @@ mod tests {
                 "comment rows should not render the {obsolete_action} action"
             );
         }
-        let selected_row_id = ui::stable_widget_id(0xCAD3_0002, "open-note");
+        let selected_row_id = ui::stable_widget_id(
+            0xCAD3_0002,
+            qualified_note_identity_key(&NoteAddress::main("review-track", "open-note")),
+        );
         let unselected_row_id = ui::stable_widget_id(0xCAD3_0002, "done-note");
         let selected_accent_color = theme.accent_mint.with_alpha(150);
         let selected_accent_rect = frame
@@ -18650,7 +19989,7 @@ mod tests {
             "unselected main comment should not paint the orange selection marker"
         );
 
-        state.hovered_note_id = Some(String::from("open-note"));
+        state.hovered_note_id = Some(NoteAddress::main("review-track", "open-note"));
         let hovered_frame = project_surface(&state)
             .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1000.0));
         assert!(
@@ -18670,7 +20009,10 @@ mod tests {
             busy: false,
             comment_source: super::CommentSource::Reference,
             comment_source_explicit: true,
-            selected_reference_note_id: Some(String::from("selected-reference-note")),
+            selected_reference_note_id: Some(NoteAddress::reference(
+                reference_path.clone(),
+                "selected-reference-note",
+            )),
             ..AppState::default()
         };
         state.library.selected_track_id = Some(track_id.clone());
@@ -18679,7 +20021,7 @@ mod tests {
             title: String::from("Reference comment selection track"),
             original_name: String::from("reference-comment-selection.wav"),
             path: PathBuf::from("/external/main-reference-comment-selection.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             reference_path: Some(reference_path.clone()),
             size: 0,
             favorite: false,
@@ -18688,8 +20030,8 @@ mod tests {
             notes: Vec::new(),
         });
         state.library.reference_tracks.push(ReferenceTrack {
-            path: reference_path,
-            source_proof: None,
+            path: reference_path.clone(),
+            source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             notes: vec![Note {
                 id: String::from("selected-reference-note"),
                 time_millis: 1_000,
@@ -18719,7 +20061,13 @@ mod tests {
             ),
             "reference comment rows should expose an icon-only play control"
         );
-        let selected_row_id = ui::stable_widget_id(0xCAD3_0003, "selected-reference-note");
+        let selected_row_id = ui::stable_widget_id(
+            0xCAD3_0003,
+            qualified_note_identity_key(&NoteAddress::reference(
+                reference_path.clone(),
+                "selected-reference-note",
+            )),
+        );
         let selected_accent_color = theme.accent_mint.with_alpha(150);
         let selected_accent_rect = frame
             .paint_plan
@@ -18769,7 +20117,10 @@ mod tests {
             "selected reference comment should paint an orange leading marker"
         );
 
-        state.hovered_reference_note_id = Some(String::from("selected-reference-note"));
+        state.hovered_reference_note_id = Some(NoteAddress::reference(
+            reference_path,
+            "selected-reference-note",
+        ));
         let hovered_frame = project_surface(&state)
             .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1000.0));
         assert!(
@@ -18839,7 +20190,7 @@ mod tests {
             title: String::from("Hover track"),
             original_name: String::from("hover-track.wav"),
             path: PathBuf::from("/external/hover-track.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             reference_path: None,
             size: 0,
             favorite: false,
@@ -18856,10 +20207,13 @@ mod tests {
 
         update(
             &mut state,
-            Message::CommentHoverStarted(String::from("hover-note")),
+            Message::CommentHoverStarted(NoteAddress::main("hover-track", "hover-note")),
             &mut context,
         );
-        assert_eq!(state.hovered_note_id.as_deref(), Some("hover-note"));
+        assert_eq!(
+            note_id_from_address(state.hovered_note_id.as_ref()),
+            Some("hover-note")
+        );
         assert_eq!(
             note_ratio_for_id(
                 &state,
@@ -18868,14 +20222,17 @@ mod tests {
                     .tracks
                     .first()
                     .expect("the track should exist"),
-                state.hovered_note_id.as_deref(),
+                state
+                    .hovered_note_id
+                    .as_ref()
+                    .map(|address| address.note_id.as_str()),
             ),
             Some(0.5)
         );
 
         update(
             &mut state,
-            Message::CommentHoverEnded(String::from("hover-note")),
+            Message::CommentHoverEnded(NoteAddress::main("hover-track", "hover-note")),
             &mut context,
         );
         assert_eq!(state.hovered_note_id, None);
@@ -18898,7 +20255,7 @@ mod tests {
             title: String::from("Reference hover track"),
             original_name: String::from("reference-hover.wav"),
             path: PathBuf::from("/external/reference-hover-main.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             reference_path: Some(reference_path.clone()),
             size: 0,
             favorite: false,
@@ -18908,7 +20265,7 @@ mod tests {
         });
         state.library.reference_tracks.push(ReferenceTrack {
             path: reference_path,
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             notes: vec![Note {
                 id: note_id.clone(),
                 time_millis: 500,
@@ -18943,7 +20300,8 @@ mod tests {
                 .bridge()
                 .state()
                 .hovered_reference_note_id
-                .as_deref(),
+                .as_ref()
+                .map(|address| address.note_id.as_str()),
             Some(note_id.as_str())
         );
         runtime.dispatch_primary_click(comment_point);
@@ -18952,7 +20310,8 @@ mod tests {
                 .bridge()
                 .state()
                 .selected_reference_note_id
-                .as_deref(),
+                .as_ref()
+                .map(|address| address.note_id.as_str()),
             Some(note_id.as_str())
         );
         assert!(
@@ -18994,7 +20353,7 @@ mod tests {
             title: String::from("Reference rail track"),
             original_name: String::from("reference-rail-main.wav"),
             path: PathBuf::from("/external/reference-rail-main.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             reference_path: Some(reference_path.clone()),
             size: 0,
             favorite: false,
@@ -19004,7 +20363,7 @@ mod tests {
         });
         state.library.reference_tracks.push(ReferenceTrack {
             path: reference_path,
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             notes: Vec::new(),
         });
 
@@ -19164,13 +20523,14 @@ mod tests {
             waveform_track_id: Some(track_id.clone()),
             ..AppState::default()
         };
+        let address = NoteAddress::main(track_id.clone(), note_id.clone());
         state.library.selected_track_id = Some(track_id.clone());
         state.library.tracks.push(Track {
             id: track_id,
             title: String::from("Composed comment track"),
             original_name: String::from("composed-comment-track.wav"),
             path: PathBuf::from("/external/composed-comment-track.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             reference_path: None,
             size: 0,
             favorite: false,
@@ -19270,7 +20630,7 @@ mod tests {
         assert!(runtime.widget_at(comment_point).is_some());
         runtime.dispatch_event(Event::pointer_move(comment_point));
         assert_eq!(
-            runtime.bridge().state().hovered_note_id.as_deref(),
+            note_id_from_address(runtime.bridge().state().hovered_note_id.as_ref()),
             Some(note_id.as_str()),
             "a live comment-row pointer move should reach CommentHoverStarted"
         );
@@ -19283,7 +20643,7 @@ mod tests {
 
         runtime.dispatch_primary_click(comment_point);
         assert_eq!(
-            runtime.bridge().state().selected_note_id.as_deref(),
+            note_id_from_address(runtime.bridge().state().selected_note_id.as_ref()),
             Some(note_id.as_str())
         );
         assert!(
@@ -19306,7 +20666,7 @@ mod tests {
             matches!(
                 primitive,
                 PaintPrimitive::TextInput(input)
-                    if input.widget_id == super::main_inline_comment_editor_id(&note_id)
+                    if input.widget_id == super::main_inline_comment_editor_id(&address)
                         && input.state.value.as_str() == "hover and select me"
             )
         }));
@@ -19326,7 +20686,7 @@ mod tests {
         runtime.dispatch_event(Event::pointer_move(waveform_away_point));
         assert_eq!(runtime.bridge().state().hovered_note_id, None);
         assert_eq!(
-            runtime.bridge().state().selected_note_id.as_deref(),
+            note_id_from_address(runtime.bridge().state().selected_note_id.as_ref()),
             Some(note_id.as_str())
         );
         assert_eq!(
@@ -19355,7 +20715,7 @@ mod tests {
             title: String::from("Comment row play track"),
             original_name: String::from("comment-row-play-track.wav"),
             path: PathBuf::from("/external/comment-row-play-track.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             reference_path: None,
             size: 0,
             favorite: false,
@@ -19398,7 +20758,7 @@ mod tests {
         runtime.dispatch_primary_click(play_point);
 
         assert_eq!(
-            runtime.bridge().state().selected_note_id.as_deref(),
+            note_id_from_address(runtime.bridge().state().selected_note_id.as_ref()),
             Some("comment-row-play-note")
         );
         assert_eq!(runtime.bridge().state().transport_position_millis, 0);
@@ -19434,7 +20794,7 @@ mod tests {
             title: String::from("Selected track"),
             original_name: String::from("selected-track.wav"),
             path: PathBuf::from("/external/selected-track.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             reference_path: None,
             size: 0,
             favorite: false,
@@ -19451,11 +20811,14 @@ mod tests {
 
         update(
             &mut state,
-            Message::SelectNote(String::from("selected-note")),
+            Message::SelectNote(NoteAddress::main("selected-track", "selected-note")),
             &mut context,
         );
 
-        assert_eq!(state.selected_note_id.as_deref(), Some("selected-note"));
+        assert_eq!(
+            note_id_from_address(state.selected_note_id.as_ref()),
+            Some("selected-note")
+        );
         assert_eq!(
             note_ratio_for_id(
                 &state,
@@ -19464,7 +20827,10 @@ mod tests {
                     .tracks
                     .first()
                     .expect("the track should exist"),
-                state.selected_note_id.as_deref(),
+                state
+                    .selected_note_id
+                    .as_ref()
+                    .map(|address| address.note_id.as_str()),
             ),
             Some(0.5)
         );
@@ -19487,7 +20853,7 @@ mod tests {
             title: String::from("Comment playback track"),
             original_name: String::from("comment-playback-track.wav"),
             path: PathBuf::from("/external/comment-playback-track.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             reference_path: None,
             size: 0,
             favorite: false,
@@ -19503,14 +20869,15 @@ mod tests {
         let mut context = ui::UiUpdateContext::default();
 
         state.pending_comment_playback = Some(super::PendingCommentPlayback {
-            track_id: track_id.clone(),
-            source: super::CommentSource::Main,
-            note_id: String::from("deferred-comment"),
+            address: NoteAddress::main(track_id.clone(), "deferred-comment"),
         });
 
         update(
             &mut state,
-            Message::SelectNote(String::from("play-from-main-comment")),
+            Message::SelectNote(NoteAddress::main(
+                track_id.clone(),
+                "play-from-main-comment",
+            )),
             &mut context,
         );
         assert_eq!(state.review_cursor_millis, 750);
@@ -19537,8 +20904,8 @@ mod tests {
             .clone()
             .expect("the shared state should have a reference path");
         state.library.reference_tracks.push(ReferenceTrack {
-            path: reference_path,
-            source_proof: None,
+            path: reference_path.clone(),
+            source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             notes: vec![Note {
                 id: String::from("play-from-reference-comment"),
                 time_millis: 2_500,
@@ -19550,18 +20917,15 @@ mod tests {
         let mut context = ui::UiUpdateContext::default();
 
         state.pending_comment_playback = Some(super::PendingCommentPlayback {
-            track_id: state
-                .library
-                .selected_track_id
-                .clone()
-                .expect("the shared state should have a selected track"),
-            source: super::CommentSource::Reference,
-            note_id: String::from("deferred-reference-comment"),
+            address: NoteAddress::reference(reference_path.clone(), "deferred-reference-comment"),
         });
 
         update(
             &mut state,
-            Message::SelectReferenceNote(String::from("play-from-reference-comment")),
+            Message::SelectReferenceNote(NoteAddress::reference(
+                reference_path,
+                "play-from-reference-comment",
+            )),
             &mut context,
         );
         assert_eq!(state.reference_transport_position_millis, 2_500);
@@ -19620,13 +20984,14 @@ mod tests {
     fn paused_scrub_supersedes_pending_main_comment_seek() {
         let mut state = main_only_loop_state();
         state.pending_comment_playback = Some(super::PendingCommentPlayback {
-            track_id: state
-                .library
-                .selected_track_id
-                .clone()
-                .expect("the main-only state should have a selected track"),
-            source: super::CommentSource::Main,
-            note_id: String::from("deferred-comment"),
+            address: NoteAddress::main(
+                state
+                    .library
+                    .selected_track_id
+                    .clone()
+                    .expect("the main-only state should have a selected track"),
+                "deferred-comment",
+            ),
         });
         state.pending_main_seek_intent = Some(750);
         let mut context = ui::UiUpdateContext::default();
@@ -19646,9 +21011,7 @@ mod tests {
     fn mismatched_pending_comment_is_cleared_on_frame_and_stops_animation() {
         let mut state = main_only_loop_state();
         state.pending_comment_playback = Some(super::PendingCommentPlayback {
-            track_id: String::from("another-track"),
-            source: super::CommentSource::Main,
-            note_id: String::from("deferred-comment"),
+            address: NoteAddress::main("another-track", "deferred-comment"),
         });
         assert!(animation_requested(&state));
 
@@ -19666,9 +21029,7 @@ mod tests {
     fn audition_navigation_cancels_deferred_comment_playback() {
         let mut state = audition_state(&["a", "b"]);
         state.pending_comment_playback = Some(super::PendingCommentPlayback {
-            track_id: String::from("a"),
-            source: super::CommentSource::Main,
-            note_id: String::from("deferred-comment"),
+            address: NoteAddress::main("a", "deferred-comment"),
         });
         let mut context = ui::UiUpdateContext::default();
 
@@ -19683,9 +21044,7 @@ mod tests {
         let mut state = audition_state(&["inbox", "refine"]);
         state.library.tracks[1].status = TrackStatus::Refine;
         state.pending_comment_playback = Some(super::PendingCommentPlayback {
-            track_id: String::from("inbox"),
-            source: super::CommentSource::Main,
-            note_id: String::from("deferred-comment"),
+            address: NoteAddress::main("inbox", "deferred-comment"),
         });
         let mut context = ui::UiUpdateContext::default();
 
@@ -19703,13 +21062,14 @@ mod tests {
     fn waveform_seek_and_scrub_supersede_deferred_comment_playback() {
         let mut main_state = main_only_loop_state();
         main_state.pending_comment_playback = Some(super::PendingCommentPlayback {
-            track_id: main_state
-                .library
-                .selected_track_id
-                .clone()
-                .expect("the main-only state should have a selected track"),
-            source: super::CommentSource::Main,
-            note_id: String::from("deferred-main-comment"),
+            address: NoteAddress::main(
+                main_state
+                    .library
+                    .selected_track_id
+                    .clone()
+                    .expect("the main-only state should have a selected track"),
+                "deferred-main-comment",
+            ),
         });
         main_state.transport.force_command_queue_full_for_test();
 
@@ -19727,13 +21087,13 @@ mod tests {
 
         let mut reference_state = shared_reference_playback_state();
         reference_state.pending_comment_playback = Some(super::PendingCommentPlayback {
-            track_id: reference_state
-                .library
-                .selected_track_id
-                .clone()
-                .expect("the shared state should have a selected track"),
-            source: super::CommentSource::Reference,
-            note_id: String::from("deferred-reference-comment"),
+            address: NoteAddress::reference(
+                reference_state.library.tracks[0]
+                    .reference_path
+                    .clone()
+                    .expect("the shared state should have a reference path"),
+                "deferred-reference-comment",
+            ),
         });
 
         update(
@@ -19747,13 +21107,13 @@ mod tests {
 
         let mut reference_click_state = shared_reference_playback_state();
         reference_click_state.pending_comment_playback = Some(super::PendingCommentPlayback {
-            track_id: reference_click_state
-                .library
-                .selected_track_id
-                .clone()
-                .expect("the shared state should have a selected track"),
-            source: super::CommentSource::Reference,
-            note_id: String::from("deferred-reference-comment"),
+            address: NoteAddress::reference(
+                reference_click_state.library.tracks[0]
+                    .reference_path
+                    .clone()
+                    .expect("the shared state should have a reference path"),
+                "deferred-reference-comment",
+            ),
         });
 
         update(
@@ -19989,7 +21349,7 @@ mod tests {
             title: String::from("Play main comment track"),
             original_name: String::from("play-main-comment.wav"),
             path: PathBuf::from("/external/play-main-comment.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             reference_path: None,
             size: 0,
             favorite: false,
@@ -20003,19 +21363,15 @@ mod tests {
             }],
         });
         let mut context = ui::UiUpdateContext::default();
+        let address = NoteAddress::main(track_id.clone(), note_id.clone());
 
-        update(
-            &mut state,
-            Message::PlayComment {
-                track_id,
-                source: super::CommentSource::Main,
-                note_id,
-            },
-            &mut context,
-        );
+        update(&mut state, Message::PlayComment { address }, &mut context);
 
         assert_eq!(state.comment_source, super::CommentSource::Main);
-        assert_eq!(state.selected_note_id.as_deref(), Some("play-main-comment"));
+        assert_eq!(
+            note_id_from_address(state.selected_note_id.as_ref()),
+            Some("play-main-comment")
+        );
         assert_eq!(state.review_cursor_millis, 1_250);
         assert_eq!(state.transport_position_millis, 1_250);
         assert_eq!(state.status, "Playing comment from 00:01.");
@@ -20037,17 +21393,13 @@ mod tests {
             done: false,
         });
         let track_id = state.library.tracks[0].id.clone();
+        let address = NoteAddress::main(
+            track_id.clone(),
+            "main-only-comment-after-reference-mismatch",
+        );
         let mut context = ui::UiUpdateContext::default();
 
-        update(
-            &mut state,
-            Message::PlayComment {
-                track_id,
-                source: super::CommentSource::Main,
-                note_id: String::from("main-only-comment-after-reference-mismatch"),
-            },
-            &mut context,
-        );
+        update(&mut state, Message::PlayComment { address }, &mut context);
 
         assert_eq!(state.transport_position_millis, 750);
         assert!(state.transport_polling);
@@ -20079,14 +21431,13 @@ mod tests {
         };
         state.library.selected_track_id = Some(current_id.clone());
         state.library.tracks = vec![audition_track(&current_id), target];
+        let address = NoteAddress::main(target_id.clone(), note_id.clone());
         let mut context = ui::UiUpdateContext::default();
 
         update(
             &mut state,
             Message::PlayComment {
-                track_id: target_id.clone(),
-                source: super::CommentSource::Main,
-                note_id: note_id.clone(),
+                address: address.clone(),
             },
             &mut context,
         );
@@ -20098,11 +21449,7 @@ mod tests {
         assert!(state.waveform.is_none());
         assert_eq!(
             state.pending_comment_playback,
-            Some(super::PendingCommentPlayback {
-                track_id: target_id.clone(),
-                source: super::CommentSource::Main,
-                note_id,
-            })
+            Some(super::PendingCommentPlayback { address })
         );
         assert!(state.status.contains("Loading comment"));
 
@@ -20143,18 +21490,13 @@ mod tests {
     #[test]
     fn playing_a_reference_comment_selects_reference_and_restarts_active_transport() {
         let mut state = shared_reference_playback_state();
-        let track_id = state
-            .library
-            .selected_track_id
-            .clone()
-            .expect("paired playback state should select a track");
         let reference_path = state.library.tracks[0]
             .reference_path
             .clone()
             .expect("paired playback state should have a reference path");
         state.library.reference_tracks.push(ReferenceTrack {
-            path: reference_path,
-            source_proof: None,
+            path: reference_path.clone(),
+            source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             notes: vec![Note {
                 id: String::from("play-reference-comment"),
                 time_millis: 2_500,
@@ -20164,21 +21506,14 @@ mod tests {
         });
         state.transport_playing = true;
         state.reference_transport_playing = true;
+        let address = NoteAddress::reference(reference_path, "play-reference-comment");
         let mut context = ui::UiUpdateContext::default();
 
-        update(
-            &mut state,
-            Message::PlayComment {
-                track_id,
-                source: super::CommentSource::Reference,
-                note_id: String::from("play-reference-comment"),
-            },
-            &mut context,
-        );
+        update(&mut state, Message::PlayComment { address }, &mut context);
 
         assert_eq!(state.comment_source, super::CommentSource::Reference);
         assert_eq!(
-            state.selected_reference_note_id.as_deref(),
+            note_id_from_address(state.selected_reference_note_id.as_ref()),
             Some("play-reference-comment")
         );
         assert_eq!(state.reference_transport_position_millis, 2_500);
@@ -20220,8 +21555,8 @@ mod tests {
                     .clone()
                     .expect("the paired state should have a reference path");
                 state.library.reference_tracks.push(ReferenceTrack {
-                    path: reference_path,
-                    source_proof: None,
+                    path: reference_path.clone(),
+                    source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
                     notes: vec![Note {
                         id: note_id.clone(),
                         time_millis,
@@ -20231,13 +21566,19 @@ mod tests {
                 });
             }
 
+            let address = match source {
+                super::CommentSource::Main => NoteAddress::main(track_id.clone(), note_id.clone()),
+                super::CommentSource::Reference => NoteAddress::reference(
+                    state.library.tracks[0]
+                        .reference_path
+                        .clone()
+                        .expect("the paired state should have a reference path"),
+                    note_id.clone(),
+                ),
+            };
             update(
                 &mut state,
-                Message::PlayComment {
-                    track_id,
-                    source,
-                    note_id: note_id.clone(),
-                },
+                Message::PlayComment { address },
                 &mut ui::UiUpdateContext::default(),
             );
 
@@ -20248,12 +21589,15 @@ mod tests {
             assert!(state.reference_transport_polling);
             match source {
                 super::CommentSource::Main => {
-                    assert_eq!(state.selected_note_id.as_deref(), Some(note_id.as_str()));
+                    assert_eq!(
+                        note_id_from_address(state.selected_note_id.as_ref()),
+                        Some(note_id.as_str())
+                    );
                     assert_eq!(state.status, "Playing comment from 00:00.");
                 }
                 super::CommentSource::Reference => {
                     assert_eq!(
-                        state.selected_reference_note_id.as_deref(),
+                        note_id_from_address(state.selected_reference_note_id.as_ref()),
                         Some(note_id.as_str())
                     );
                     assert_eq!(state.status, "Playing reference comment from 00:00.");
@@ -20278,9 +21622,7 @@ mod tests {
             done: false,
         });
         state.pending_comment_playback = Some(super::PendingCommentPlayback {
-            track_id,
-            source: super::CommentSource::Main,
-            note_id,
+            address: NoteAddress::main(track_id, note_id),
         });
         state.transport.force_command_queue_full_for_test();
 
@@ -20398,13 +21740,14 @@ mod tests {
     }
 
     #[test]
-    fn legacy_main_decode_adopts_ticket_and_warns_once() {
+    fn legacy_main_decode_keeps_ticket_ephemeral_and_leaves_provenance_unknown() {
         let path = PathBuf::from("/external/legacy-adopt.wav");
         let mut state = AppState::default();
         state.library.selected_track_id = Some(String::from("legacy-adopt"));
         let mut track = audition_track("legacy-adopt");
         track.reference_path = None;
         track.path = path.clone();
+        track.source_proof = crate::source::SourceProvenance::Unknown;
         state.library.tracks.push(track);
         state.waveform_generation = 1;
         state.waveform_busy = true;
@@ -20425,13 +21768,549 @@ mod tests {
             &mut ui::UiUpdateContext::default(),
         );
 
-        assert!(state.library.tracks[0].source_proof.is_some());
+        assert_eq!(
+            state.library.tracks[0].source_proof,
+            crate::source::SourceProvenance::Unknown
+        );
+        assert!(state.library.tracks[0].source_provenance().is_unknown());
+        assert!(state.save_in_flight.is_none());
+        assert!(state.waveform_source_ticket.is_some());
+    }
+
+    #[test]
+    fn legacy_reference_decode_keeps_ticket_ephemeral_and_leaves_provenance_unknown() {
+        let track_id = String::from("legacy-reference-decode");
+        let path = PathBuf::from("/external/legacy-reference-decode.wav");
+        let mut track = audition_track(&track_id);
+        track.reference_path = Some(path.clone());
+        let mut state = AppState::default();
+        state.library.selected_track_id = Some(track_id.clone());
+        state.library.tracks.push(track);
+        state.library.reference_tracks.push(ReferenceTrack {
+            path: path.clone(),
+            source_proof: crate::source::SourceProvenance::Unknown,
+            notes: vec![Note {
+                id: String::from("legacy-reference-note"),
+                time_millis: 250,
+                body: String::from("keep reference note"),
+                done: false,
+            }],
+        });
+        state.reference_waveform_generation = 1;
+        state.reference_waveform_busy = true;
+        state.reference_waveform_in_flight = Some(WaveformDecodeRequest {
+            track_id: track_id.clone(),
+            path: path.clone(),
+            generation: 1,
+            expected_proof: None,
+        });
+
+        update(
+            &mut state,
+            Message::ReferenceDecodeCompleted {
+                track_id,
+                generation: 1,
+                result: Ok(verified_audition_waveform_for(&path)),
+            },
+            &mut ui::UiUpdateContext::default(),
+        );
+
+        assert_eq!(
+            state.library.reference_tracks[0].source_proof,
+            crate::source::SourceProvenance::Unknown
+        );
+        assert!(
+            state.library.reference_tracks[0]
+                .source_provenance()
+                .is_unknown()
+        );
+        assert!(state.save_in_flight.is_none());
+        assert!(state.reference_waveform_source_ticket.is_some());
+        assert_eq!(
+            state.library.reference_tracks[0].notes[0].body,
+            "keep reference note"
+        );
+    }
+
+    #[test]
+    fn binding_historical_main_comments_requires_confirmation_and_preserves_notes() {
+        let (mut state, path, proof, notes) = historical_main_binding_state();
+        let owner = super::HistoricalBindingOwner::Main {
+            track_id: String::from("historical-binding"),
+        };
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::RequestBindHistoricalComments(owner),
+            &mut context,
+        );
+
+        let candidate = state
+            .historical_binding_confirmation
+            .as_ref()
+            .expect("binding should require an explicit confirmation")
+            .clone();
+        assert_eq!(candidate.path, path);
+        assert_eq!(candidate.note_count, notes.len());
+        assert!(state.status.contains("2 historical comments"));
+        assert!(state.status.contains(path.to_string_lossy().as_ref()));
+        assert_eq!(
+            state.library.tracks[0].source_proof,
+            crate::source::SourceProvenance::Unknown
+        );
+
+        update(
+            &mut state,
+            Message::ConfirmBindHistoricalComments(candidate.clone()),
+            &mut context,
+        );
+        let request = state
+            .historical_binding_in_flight
+            .clone()
+            .expect("confirmed binding should start a background request");
+        assert!(state.busy);
+
+        update(
+            &mut state,
+            Message::HistoricalBindingCompleted {
+                request,
+                result: Ok(proof.clone()),
+            },
+            &mut context,
+        );
+
+        assert_eq!(
+            state.library.tracks[0].source_proof,
+            crate::source::SourceProvenance::Verified(proof)
+        );
+        assert_eq!(state.library.tracks[0].notes, notes);
+        assert!(state.save_in_flight.is_some());
+        assert!(state.status.contains("Notes were preserved"));
+    }
+
+    #[test]
+    fn stale_main_binding_confirmation_cannot_consume_replaced_reference_candidate() {
+        let (mut state, main_path, _main_proof, notes) = historical_main_binding_state();
+        let reference_path = PathBuf::from("/external/replacement-reference.wav");
+        let reference_ticket = verified_audition_waveform_for(&reference_path)
+            .ticket()
+            .clone();
+        state.library.tracks[0].reference_path = Some(reference_path.clone());
+        state.library.reference_tracks.push(ReferenceTrack {
+            path: reference_path.clone(),
+            source_proof: crate::source::SourceProvenance::Unknown,
+            notes: Vec::new(),
+        });
+        state.reference_waveform_source_ticket = Some(reference_ticket);
+        state.reference_waveform_track_id = state.library.selected_track_id.clone();
+        state.reference_waveform_generation = 3;
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::RequestBindHistoricalComments(super::HistoricalBindingOwner::Main {
+                track_id: String::from("historical-binding"),
+            }),
+            &mut context,
+        );
+        let main_candidate = state
+            .historical_binding_confirmation
+            .clone()
+            .expect("main binding should require confirmation");
+        assert_eq!(main_candidate.path, main_path);
+
+        update(
+            &mut state,
+            Message::RequestBindHistoricalComments(super::HistoricalBindingOwner::Reference {
+                path: reference_path.clone(),
+            }),
+            &mut context,
+        );
+        let reference_candidate = state
+            .historical_binding_confirmation
+            .clone()
+            .expect("reference binding should replace the pending candidate");
+        assert_eq!(reference_candidate.path, reference_path);
+        assert_ne!(main_candidate, reference_candidate);
+
+        update(
+            &mut state,
+            Message::ConfirmBindHistoricalComments(main_candidate),
+            &mut context,
+        );
+
+        assert_eq!(
+            state.historical_binding_confirmation,
+            Some(reference_candidate)
+        );
+        assert!(state.historical_binding_in_flight.is_none());
+        assert!(!state.busy);
+        assert_eq!(
+            state.library.tracks[0].source_proof,
+            crate::source::SourceProvenance::Unknown
+        );
+        assert_eq!(state.library.tracks[0].notes, notes);
+        assert_eq!(
+            state.library.reference_tracks[0].source_proof,
+            crate::source::SourceProvenance::Unknown
+        );
+    }
+
+    #[test]
+    fn stale_main_binding_cancellation_preserves_replaced_reference_candidate() {
+        let (mut state, main_path, _main_proof, notes) = historical_main_binding_state();
+        let reference_path = PathBuf::from("/external/replacement-reference.wav");
+        let reference_ticket = verified_audition_waveform_for(&reference_path)
+            .ticket()
+            .clone();
+        state.library.tracks[0].reference_path = Some(reference_path.clone());
+        state.library.reference_tracks.push(ReferenceTrack {
+            path: reference_path.clone(),
+            source_proof: crate::source::SourceProvenance::Unknown,
+            notes: Vec::new(),
+        });
+        state.reference_waveform_source_ticket = Some(reference_ticket);
+        state.reference_waveform_track_id = state.library.selected_track_id.clone();
+        state.reference_waveform_generation = 3;
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::RequestBindHistoricalComments(super::HistoricalBindingOwner::Main {
+                track_id: String::from("historical-binding"),
+            }),
+            &mut context,
+        );
+        let main_candidate = state
+            .historical_binding_confirmation
+            .clone()
+            .expect("main binding should require confirmation");
+        assert_eq!(main_candidate.path, main_path);
+
+        update(
+            &mut state,
+            Message::RequestBindHistoricalComments(super::HistoricalBindingOwner::Reference {
+                path: reference_path.clone(),
+            }),
+            &mut context,
+        );
+        let reference_candidate = state
+            .historical_binding_confirmation
+            .clone()
+            .expect("reference binding should replace the pending candidate");
+        assert_eq!(reference_candidate.path, reference_path);
+        assert_ne!(main_candidate, reference_candidate);
+
+        update(
+            &mut state,
+            Message::CancelBindHistoricalComments(main_candidate),
+            &mut context,
+        );
+
+        assert_eq!(
+            state.historical_binding_confirmation,
+            Some(reference_candidate.clone())
+        );
+        assert!(state.historical_binding_in_flight.is_none());
+        assert!(state.historical_binding_cancellation.is_none());
+        assert!(!state.busy);
+        assert_eq!(state.next_historical_binding_request_id, 0);
+        assert_eq!(
+            state.library.tracks[0].source_proof,
+            crate::source::SourceProvenance::Unknown
+        );
+        assert_eq!(state.library.tracks[0].notes, notes);
+        assert_eq!(
+            state.library.reference_tracks[0].source_proof,
+            crate::source::SourceProvenance::Unknown
+        );
+
+        update(
+            &mut state,
+            Message::CancelBindHistoricalComments(reference_candidate),
+            &mut context,
+        );
+
+        assert!(state.historical_binding_confirmation.is_none());
+        assert!(state.historical_binding_in_flight.is_none());
+        assert!(!state.busy);
+    }
+
+    #[test]
+    fn binding_historical_reference_comments_preserves_notes() {
+        let track_id = String::from("historical-reference-binding");
+        let path = PathBuf::from("/external/historical-reference-binding.wav");
+        let notes = vec![Note {
+            id: String::from("historical-reference-note"),
+            time_millis: 375,
+            body: String::from("preserve reference bytes"),
+            done: false,
+        }];
+        let verified = verified_audition_waveform_for(&path);
+        let proof = verified.ticket().proof().clone();
+        let mut track = audition_track(&track_id);
+        track.reference_path = Some(path.clone());
+        let mut state = AppState {
+            busy: false,
+            reference_waveform: Some(verified.into_waveform()),
+            reference_waveform_source_ticket: Some(
+                verified_audition_waveform_for(&path).ticket().clone(),
+            ),
+            reference_waveform_track_id: Some(track_id.clone()),
+            reference_waveform_generation: 11,
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(track_id);
+        state.library.tracks.push(track);
+        state.library.reference_tracks.push(ReferenceTrack {
+            path: path.clone(),
+            source_proof: crate::source::SourceProvenance::Unknown,
+            notes: notes.clone(),
+        });
+
+        let owner = super::HistoricalBindingOwner::Reference { path: path.clone() };
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::RequestBindHistoricalComments(owner),
+            &mut context,
+        );
+        let candidate = state
+            .historical_binding_confirmation
+            .clone()
+            .expect("reference binding should require confirmation");
+        update(
+            &mut state,
+            Message::ConfirmBindHistoricalComments(candidate),
+            &mut context,
+        );
+        let request = state
+            .historical_binding_in_flight
+            .clone()
+            .expect("confirmed reference binding should start a request");
+        update(
+            &mut state,
+            Message::HistoricalBindingCompleted {
+                request,
+                result: Ok(proof.clone()),
+            },
+            &mut context,
+        );
+
+        assert_eq!(
+            state.library.reference_tracks[0].source_proof,
+            crate::source::SourceProvenance::Verified(proof)
+        );
+        assert_eq!(state.library.reference_tracks[0].notes, notes);
+        assert!(state.save_in_flight.is_some());
+    }
+
+    #[test]
+    fn stale_historical_binding_completion_does_not_bind_or_save() {
+        let (mut state, _path, proof, notes) = historical_main_binding_state();
+        update(
+            &mut state,
+            Message::RequestBindHistoricalComments(super::HistoricalBindingOwner::Main {
+                track_id: String::from("historical-binding"),
+            }),
+            &mut ui::UiUpdateContext::default(),
+        );
+        let candidate = state
+            .historical_binding_confirmation
+            .clone()
+            .expect("binding should require confirmation");
+        update(
+            &mut state,
+            Message::ConfirmBindHistoricalComments(candidate),
+            &mut ui::UiUpdateContext::default(),
+        );
+        let request = state
+            .historical_binding_in_flight
+            .clone()
+            .expect("binding should be in flight");
+        state.waveform_generation = state.waveform_generation.wrapping_add(1);
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::HistoricalBindingCompleted {
+                request,
+                result: Ok(proof),
+            },
+            &mut context,
+        );
+
+        assert_eq!(
+            state.library.tracks[0].source_proof,
+            crate::source::SourceProvenance::Unknown
+        );
+        assert_eq!(state.library.tracks[0].notes, notes);
+        assert!(state.save_in_flight.is_none());
         assert!(
             state
                 .status
-                .contains("Historical source bytes could not be verified")
+                .contains("displayed source changed before binding")
         );
-        assert!(state.waveform_source_ticket.is_some());
+    }
+
+    #[test]
+    fn canceled_historical_binding_completion_is_ignored() {
+        let (mut state, _path, proof, notes) = historical_main_binding_state();
+        update(
+            &mut state,
+            Message::RequestBindHistoricalComments(super::HistoricalBindingOwner::Main {
+                track_id: String::from("historical-binding"),
+            }),
+            &mut ui::UiUpdateContext::default(),
+        );
+        let candidate = state
+            .historical_binding_confirmation
+            .clone()
+            .expect("binding should require confirmation");
+        update(
+            &mut state,
+            Message::ConfirmBindHistoricalComments(candidate.clone()),
+            &mut ui::UiUpdateContext::default(),
+        );
+        let request = state
+            .historical_binding_in_flight
+            .clone()
+            .expect("binding should be in flight");
+        update(
+            &mut state,
+            Message::CancelBindHistoricalComments(candidate),
+            &mut ui::UiUpdateContext::default(),
+        );
+        assert!(!state.busy);
+        assert!(state.historical_binding_in_flight.is_none());
+
+        update(
+            &mut state,
+            Message::HistoricalBindingCompleted {
+                request,
+                result: Ok(proof),
+            },
+            &mut ui::UiUpdateContext::default(),
+        );
+
+        assert_eq!(
+            state.library.tracks[0].source_proof,
+            crate::source::SourceProvenance::Unknown
+        );
+        assert_eq!(state.library.tracks[0].notes, notes);
+        assert!(state.save_in_flight.is_none());
+        assert!(state.status.contains("binding canceled"));
+    }
+
+    #[test]
+    fn changed_source_rejects_historical_binding_and_keeps_notes() {
+        let (mut state, path, _proof, notes) = historical_main_binding_state();
+        update(
+            &mut state,
+            Message::RequestBindHistoricalComments(super::HistoricalBindingOwner::Main {
+                track_id: String::from("historical-binding"),
+            }),
+            &mut ui::UiUpdateContext::default(),
+        );
+        let candidate = state
+            .historical_binding_confirmation
+            .clone()
+            .expect("binding should require confirmation");
+        update(
+            &mut state,
+            Message::ConfirmBindHistoricalComments(candidate),
+            &mut ui::UiUpdateContext::default(),
+        );
+        let request = state
+            .historical_binding_in_flight
+            .clone()
+            .expect("binding should be in flight");
+        let changed_proof = crate::source::AudioSourceProof {
+            sha256: "1".repeat(64),
+            byte_len: 1,
+        };
+        update(
+            &mut state,
+            Message::HistoricalBindingCompleted {
+                request,
+                result: Ok(changed_proof),
+            },
+            &mut ui::UiUpdateContext::default(),
+        );
+
+        assert_eq!(state.main_source_mismatch, Some(path));
+        assert_eq!(state.status, MAIN_SOURCE_MISMATCH_STATUS);
+        assert_eq!(
+            state.library.tracks[0].source_proof,
+            crate::source::SourceProvenance::Unknown
+        );
+        assert_eq!(state.library.tracks[0].notes, notes);
+        assert!(state.save_in_flight.is_none());
+    }
+
+    #[test]
+    fn unknown_historical_comments_are_hidden_and_annotation_messages_are_rejected() {
+        let (mut state, path, _proof, notes) = historical_main_binding_state();
+        let track = state.library.tracks[0].clone();
+        assert!(note_ratio_for_id(&state, &track, Some("historical-note-1")).is_none());
+
+        let frame = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1100.0));
+        let labels = frame.paint_plan.text_label_strings();
+        assert!(labels.iter().any(|label| label.contains("2 comments")));
+        assert!(
+            labels
+                .iter()
+                .any(|label| label == "Bind historical comments to this file…")
+        );
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.contains(path.to_string_lossy().as_ref()))
+        );
+        assert!(
+            !labels
+                .iter()
+                .any(|label| label.contains("preserve this exact body"))
+        );
+        assert!(
+            !labels
+                .iter()
+                .any(|label| label.contains("and this completed note"))
+        );
+
+        for message in [
+            Message::SelectNote(NoteAddress::main("historical-binding", "historical-note-1")),
+            Message::EditNote(NoteAddress::main("historical-binding", "historical-note-1")),
+            Message::DeleteNote(NoteAddress::main("historical-binding", "historical-note-1")),
+            Message::CommentHoverStarted(NoteAddress::main(
+                "historical-binding",
+                "historical-note-1",
+            )),
+            Message::PlayComment {
+                address: NoteAddress::main("historical-binding", "historical-note-1"),
+            },
+            Message::WaveformClicked {
+                ratio: 0.5,
+                lower: true,
+            },
+            Message::CommentDragStarted {
+                ratio: 0.5,
+                address: Some(NoteAddress::main("historical-binding", "historical-note-1")),
+            },
+            Message::CommentDragEnded { ratio: 0.5 },
+            Message::NewNoteAtCurrentTime,
+        ] {
+            update(&mut state, message, &mut ui::UiUpdateContext::default());
+        }
+
+        assert_eq!(state.library.tracks[0].notes, notes);
+        assert!(state.draft_note.is_none());
+        assert!(state.selected_note_id.is_none());
+        assert!(state.hovered_note_id.is_none());
+        assert!(state.persisted_note_drag.is_none());
+        assert!(state.status.contains("retained"));
     }
 
     #[test]
@@ -20965,7 +22844,7 @@ mod tests {
             title: String::from(id),
             original_name: format!("{id}.wav"),
             path: PathBuf::from(format!("/external/{id}.wav")),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -20994,7 +22873,7 @@ mod tests {
             title: format!("{id} track"),
             original_name: format!("{id}.wav"),
             path: PathBuf::from(format!("/external/{id}.wav")),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -21429,7 +23308,7 @@ mod tests {
             title: format!("{id} track"),
             original_name: format!("{id}.wav"),
             path: PathBuf::from(format!("/external/{id}.wav")),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -21513,7 +23392,7 @@ mod tests {
             title: format!("{id} planner card"),
             original_name: format!("{id}.wav"),
             path: PathBuf::from(format!("/external/{id}.wav")),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -21656,7 +23535,7 @@ mod tests {
             title: format!("{id} track"),
             original_name: format!("{id}.wav"),
             path: PathBuf::from(format!("/external/{id}.wav")),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path: None,
             size: 0,
             favorite,
@@ -21719,7 +23598,7 @@ mod tests {
             title: String::from("Hidden track"),
             original_name: String::from("hidden-track.wav"),
             path: PathBuf::from("/external/hidden-track.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -21812,7 +23691,7 @@ mod tests {
             title: format!("{id} track"),
             original_name: format!("{id}.wav"),
             path: PathBuf::from(format!("/external/{id}.wav")),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -21904,7 +23783,7 @@ mod tests {
             title: format!("{id} track"),
             original_name: format!("{id}.wav"),
             path: PathBuf::from(format!("/external/{id}.wav")),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -22085,7 +23964,7 @@ mod tests {
             title: format!("{id} track"),
             original_name: format!("{id}.wav"),
             path: PathBuf::from(format!("/external/{id}.wav")),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -22381,7 +24260,7 @@ mod tests {
             title: String::from("Stage menu"),
             original_name: String::from("stage-menu.wav"),
             path: PathBuf::from("/external/stage-menu.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -22417,7 +24296,7 @@ mod tests {
             title: String::from("Stage trigger"),
             original_name: String::from("stage-trigger.wav"),
             path: PathBuf::from("/external/stage-trigger.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -22484,7 +24363,7 @@ mod tests {
             title: String::from("Keyboard stage"),
             original_name: String::from("keyboard-stage.wav"),
             path: PathBuf::from("/external/keyboard-stage.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -22523,7 +24402,7 @@ mod tests {
             title: String::from("Focused stage"),
             original_name: String::from("focused-stage.wav"),
             path: PathBuf::from("/external/focused-stage.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -22589,7 +24468,7 @@ mod tests {
             title: String::from("Context stage"),
             original_name: String::from("context-stage.wav"),
             path: PathBuf::from("/external/context-stage.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -22704,7 +24583,7 @@ mod tests {
             title: String::from("Stage popover"),
             original_name: String::from("stage-popover.wav"),
             path: PathBuf::from("/external/stage-popover.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -22800,7 +24679,7 @@ mod tests {
             title: String::from("Stage context"),
             original_name: String::from("stage-context.wav"),
             path: PathBuf::from("/external/stage-context.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -22869,7 +24748,7 @@ mod tests {
             title: String::from("Reference selector track"),
             original_name: String::from("main.wav"),
             path: PathBuf::from("/external/main.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path: Some(first_path.clone()),
             size: 0,
             favorite: false,
@@ -22880,12 +24759,12 @@ mod tests {
         state.library.reference_tracks = vec![
             ReferenceTrack {
                 path: first_path,
-                source_proof: None,
+                source_proof: crate::source::SourceProvenance::Unknown,
                 notes: Vec::new(),
             },
             ReferenceTrack {
                 path: second_path.clone(),
-                source_proof: None,
+                source_proof: crate::source::SourceProvenance::Unknown,
                 notes: Vec::new(),
             },
         ];
@@ -22955,7 +24834,7 @@ mod tests {
             title: String::from("Status menu"),
             original_name: String::from("status-menu.wav"),
             path: PathBuf::from("/external/status-menu.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -22994,7 +24873,7 @@ mod tests {
             title: String::from("Status track"),
             original_name: String::from("status-track.wav"),
             path: PathBuf::from("/external/status-track.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path: Some(PathBuf::from("/external/reference.wav")),
             size: 42,
             favorite: true,
@@ -23040,7 +24919,7 @@ mod tests {
             title: String::from("Status track"),
             original_name: String::from("status-track.wav"),
             path: PathBuf::from("/external/status-track.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -23076,7 +24955,7 @@ mod tests {
             title: String::from("Menu track"),
             original_name: String::from("menu-track.wav"),
             path: PathBuf::from("/external/menu-track.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -23119,7 +24998,7 @@ mod tests {
             title: String::from("Selected header"),
             original_name: String::from("selected-header.wav"),
             path: PathBuf::from("/external/selected-header.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -23197,7 +25076,7 @@ mod tests {
             title: String::from(id),
             original_name: format!("{id}.wav"),
             path: PathBuf::from(format!("/external/{id}.wav")),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -23772,7 +25651,7 @@ mod tests {
             title: String::from(id),
             original_name: format!("{id}.wav"),
             path: PathBuf::from(format!("/external/{id}.wav")),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -23828,7 +25707,7 @@ mod tests {
             title: String::from(id),
             original_name: format!("{id}.wav"),
             path: PathBuf::from(format!("/external/{id}.wav")),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -24004,7 +25883,7 @@ mod tests {
             title: String::from(id),
             original_name: format!("{id}.wav"),
             path,
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -24064,7 +25943,7 @@ mod tests {
             title: String::from(id),
             original_name: format!("{id}.wav"),
             path: PathBuf::from(format!("/external/{id}.wav")),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path: Some(PathBuf::from(format!("/external/{id}-reference.wav"))),
             size: 0,
             favorite: false,
@@ -24219,7 +26098,7 @@ mod tests {
             title: String::from("Titlebar layout track"),
             original_name: String::from("titlebar-layout-track.wav"),
             path: PathBuf::from("/external/titlebar-layout-track.wav"),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -24302,7 +26181,7 @@ mod tests {
             title: String::from(id),
             original_name: format!("{id}.wav"),
             path: PathBuf::from(format!("/external/{id}.wav")),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -26799,7 +28678,10 @@ mod tests {
         );
 
         assert_eq!(state.library.tracks[0].reference_path, Some(path));
-        assert_eq!(state.library.reference_tracks[0].source_proof, Some(proof));
+        assert_eq!(
+            state.library.reference_tracks[0].source_proof,
+            crate::source::SourceProvenance::Verified(proof)
+        );
         assert!(!state.busy);
         assert!(state.pending_import_commit.is_none());
         assert_eq!(state.library_revision, state.persisted_library_revision);
@@ -26848,7 +28730,7 @@ mod tests {
         assert_eq!(state.persisted_library_revision, revision_before);
         assert_eq!(
             state.library.reference_tracks[0].source_proof,
-            Some(original_proof)
+            crate::source::SourceProvenance::Verified(original_proof)
         );
         assert!(state.pending_import_commit.is_none());
         assert!(!state.busy);
@@ -26875,7 +28757,7 @@ mod tests {
         let changed_decoded = crate::audio::decode_audio_file(&path)
             .expect("changed reference fixture should remain decodable");
         state.library.reference_tracks[0].source_proof =
-            Some(changed_decoded.source_proof().clone());
+            crate::source::SourceProvenance::Verified(changed_decoded.source_proof().clone());
 
         let mut context = ui::UiUpdateContext::default();
         update(
@@ -26916,12 +28798,14 @@ mod tests {
             done: false,
         });
         state.reference_draft_note = Some(NoteDraft {
+            owner: NoteOwner::ReferenceTrack(path.clone()),
             note_id: Some(String::from("draft")),
+            nonce: 1,
             time_millis: 99,
             body: String::from("keep this draft"),
         });
-        state.selected_reference_note_id = Some(String::from("keep-note"));
-        state.hovered_reference_note_id = Some(String::from("keep-note"));
+        state.selected_reference_note_id = Some(NoteAddress::reference(path.clone(), "keep-note"));
+        state.hovered_reference_note_id = Some(NoteAddress::reference(path.clone(), "keep-note"));
         state.reference_match_enabled = true;
         state.reference_transport_generation = 7;
         let mut context = ui::UiUpdateContext::default();
@@ -26962,11 +28846,11 @@ mod tests {
             Some("keep this draft")
         );
         assert_eq!(
-            state.selected_reference_note_id.as_deref(),
+            note_id_from_address(state.selected_reference_note_id.as_ref()),
             Some("keep-note")
         );
         assert_eq!(
-            state.hovered_reference_note_id.as_deref(),
+            note_id_from_address(state.hovered_reference_note_id.as_ref()),
             Some("keep-note")
         );
         assert_eq!(state.reference_transport_generation, 7);
@@ -26975,7 +28859,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_reference_selection_adopts_proof_without_resetting_same_path_state() {
+    fn legacy_reference_selection_keeps_proof_ephemeral_without_resetting_same_path_state() {
         let track_id = "reference-selection-legacy";
         let (path, decoded, root) = decoded_replacement_fixture();
         let proof = decoded.source_proof().clone();
@@ -26993,7 +28877,9 @@ mod tests {
             done: false,
         });
         state.reference_draft_note = Some(NoteDraft {
+            owner: NoteOwner::ReferenceTrack(path.clone()),
             note_id: None,
+            nonce: 1,
             time_millis: 12,
             body: String::from("legacy draft"),
         });
@@ -27010,7 +28896,8 @@ mod tests {
             &mut context,
         );
         let request_id = reference_selection_request_id(&request);
-        let committed = reference_selection_library(&state, track_id, &path, &proof);
+        let mut committed = reference_selection_library(&state, track_id, &path, &proof);
+        committed.reference_tracks[0].source_proof = crate::source::SourceProvenance::Unknown;
         let mut context = ui::UiUpdateContext::default();
         update(
             &mut state,
@@ -27023,7 +28910,15 @@ mod tests {
             &mut context,
         );
 
-        assert_eq!(state.library.reference_tracks[0].source_proof, Some(proof));
+        assert_eq!(
+            state.library.reference_tracks[0].source_proof,
+            crate::source::SourceProvenance::Unknown
+        );
+        assert!(
+            state.library.reference_tracks[0]
+                .source_provenance()
+                .is_unknown()
+        );
         assert_eq!(
             state.library.reference_tracks[0].notes[0].body,
             "legacy note"
@@ -27174,12 +29069,14 @@ mod tests {
             Some(proof.clone()),
         );
         state.reference_draft_note = Some(NoteDraft {
+            owner: NoteOwner::ReferenceTrack(path.clone()),
             note_id: Some(String::from("reset-draft")),
+            nonce: 1,
             time_millis: 1,
             body: String::from("reset"),
         });
-        state.selected_reference_note_id = Some(String::from("reset-note"));
-        state.hovered_reference_note_id = Some(String::from("reset-note"));
+        state.selected_reference_note_id = Some(NoteAddress::reference(path.clone(), "reset-note"));
+        state.hovered_reference_note_id = Some(NoteAddress::reference(path.clone(), "reset-note"));
         state.reference_match_enabled = true;
         state.reference_transport_generation = 3;
         let mut context = ui::UiUpdateContext::default();
@@ -27227,12 +29124,16 @@ mod tests {
             Some(other_proof.clone()),
         );
         other.reference_draft_note = Some(NoteDraft {
+            owner: NoteOwner::ReferenceTrack(other_path.clone()),
             note_id: None,
+            nonce: 1,
             time_millis: 2,
             body: String::from("preserve"),
         });
-        other.selected_reference_note_id = Some(String::from("preserve-note"));
-        other.hovered_reference_note_id = Some(String::from("preserve-note"));
+        other.selected_reference_note_id =
+            Some(NoteAddress::reference(other_path.clone(), "preserve-note"));
+        other.hovered_reference_note_id =
+            Some(NoteAddress::reference(other_path.clone(), "preserve-note"));
         other.reference_match_enabled = true;
         other.reference_transport_generation = 8;
         other.reference_waveform = Some(audition_waveform());
@@ -27272,11 +29173,11 @@ mod tests {
             Some("preserve")
         );
         assert_eq!(
-            other.selected_reference_note_id.as_deref(),
+            note_id_from_address(other.selected_reference_note_id.as_ref()),
             Some("preserve-note")
         );
         assert_eq!(
-            other.hovered_reference_note_id.as_deref(),
+            note_id_from_address(other.hovered_reference_note_id.as_ref()),
             Some("preserve-note")
         );
         assert_eq!(other.reference_transport_generation, 8);
@@ -27776,7 +29677,7 @@ mod tests {
             title: String::from(id),
             original_name: format!("{id}.wav"),
             path: PathBuf::from(format!("/external/{id}.wav")),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path: None,
             size: 0,
             favorite: false,
