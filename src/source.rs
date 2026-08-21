@@ -94,13 +94,93 @@ impl<'de> Deserialize<'de> for AudioSourceProof {
 /// time, and change time.  Other targets retain length and portable clock
 /// values while leaving device/inode at zero; the proof hash remains the
 /// authoritative fallback when those filesystem identities are unavailable.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceFileStamp {
     pub dev: u64,
     pub inode: u64,
     pub len: u64,
     pub mtime_nanos: i128,
     pub ctime_nanos: i128,
+}
+
+/// Runtime proof that one path was observed with one encoded-byte digest and
+/// filesystem stamp.  A ticket is cloneable so the background decoder can
+/// return the same verified identity to the UI without reopening or hashing
+/// the source again.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct VerifiedSourceTicket {
+    path: PathBuf,
+    proof: AudioSourceProof,
+    stamp: SourceFileStamp,
+}
+
+impl<'de> Deserialize<'de> for VerifiedSourceTicket {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            path: PathBuf,
+            proof: AudioSourceProof,
+            stamp: SourceFileStamp,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        Self::new(wire.path, wire.proof, wire.stamp).map_err(D::Error::custom)
+    }
+}
+
+impl VerifiedSourceTicket {
+    /// Build a ticket from proof material that has already been verified by a
+    /// source worker.  Reject malformed proofs so cache records and runtime
+    /// state cannot carry a weak identity.
+    pub fn new(
+        path: PathBuf,
+        proof: AudioSourceProof,
+        stamp: SourceFileStamp,
+    ) -> Result<Self, String> {
+        proof.validate()?;
+        if path.as_os_str().is_empty() {
+            return Err(String::from("source ticket path must not be empty"));
+        }
+        if proof.byte_len != stamp.len {
+            return Err(String::from(
+                "source ticket proof length must match its filesystem stamp",
+            ));
+        }
+        Ok(Self { path, proof, stamp })
+    }
+
+    pub fn from_verified_file(verified: &VerifiedSourceFile) -> Self {
+        Self {
+            path: verified.path.clone(),
+            proof: verified.proof.clone(),
+            stamp: verified.stamp,
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn proof(&self) -> &AudioSourceProof {
+        &self.proof
+    }
+
+    #[allow(dead_code)]
+    pub fn stamp(&self) -> SourceFileStamp {
+        self.stamp
+    }
+
+    /// Validate only the current filesystem stamp.  Callers that already
+    /// possess the ticket deliberately avoid re-reading encoded bytes here.
+    pub fn validate_current(
+        &self,
+        should_cancel: impl Fn() -> bool,
+    ) -> Result<(), SourceProofError> {
+        validate_path_stamp(&self.path, self.stamp, should_cancel)
+    }
 }
 
 impl SourceFileStamp {
@@ -202,8 +282,13 @@ impl VerifiedSourceFile {
         &self.proof
     }
 
+    #[allow(dead_code)]
     pub fn stamp(&self) -> SourceFileStamp {
         self.stamp
+    }
+
+    pub fn ticket(&self) -> VerifiedSourceTicket {
+        VerifiedSourceTicket::from_verified_file(self)
     }
 
     /// Clone the already-opened source handle for a decoder.  The original

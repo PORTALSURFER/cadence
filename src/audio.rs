@@ -23,7 +23,9 @@ use symphonia::core::{
     probe::Hint,
 };
 
-use crate::source::{self, AudioSourceProof, SourceFileStamp};
+use crate::source::{
+    self, AudioSourceProof, SourceFileStamp, VerifiedSourceFile, VerifiedSourceTicket,
+};
 
 const PEAK_WINDOW_FRAMES: usize = 1024;
 const MAX_DISPLAY_BUCKETS: usize = 4096;
@@ -47,6 +49,32 @@ pub struct WaveformData {
     pub summary: Arc<GpuSignalSummary>,
 }
 
+/// A bounded waveform analysis result whose encoded source identity was
+/// verified before the payload was published to the UI.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VerifiedWaveform {
+    waveform: WaveformData,
+    ticket: VerifiedSourceTicket,
+}
+
+impl VerifiedWaveform {
+    pub fn new(waveform: WaveformData, ticket: VerifiedSourceTicket) -> Self {
+        Self { waveform, ticket }
+    }
+
+    pub fn waveform(&self) -> &WaveformData {
+        &self.waveform
+    }
+
+    pub fn into_waveform(self) -> WaveformData {
+        self.waveform
+    }
+
+    pub fn ticket(&self) -> &VerifiedSourceTicket {
+        &self.ticket
+    }
+}
+
 /// A fully decoded audio source together with the source identity observed
 /// before and after decoding. Storage commits consume this proof rather than
 /// trusting a path that may have been replaced while analysis was running.
@@ -64,12 +92,22 @@ impl DecodedAudioFile {
         &self.path
     }
 
+    #[allow(dead_code)]
     pub fn fingerprint(&self) -> WaveformCacheFingerprint {
         self.fingerprint
     }
 
     pub fn source_proof(&self) -> &AudioSourceProof {
         &self.source_proof
+    }
+
+    pub fn source_ticket(&self) -> VerifiedSourceTicket {
+        VerifiedSourceTicket::new(
+            self.path.clone(),
+            self.source_proof.clone(),
+            self.source_stamp,
+        )
+        .expect("decoded audio carries a verified source proof")
     }
 
     #[allow(dead_code)]
@@ -112,7 +150,7 @@ pub struct LoudnessPoint {
     pub lufs: f32,
 }
 
-const WAVEFORM_CACHE_VERSION: u32 = 1;
+const WAVEFORM_CACHE_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WaveformCacheFingerprint {
@@ -124,8 +162,7 @@ pub struct WaveformCacheFingerprint {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CachedWaveform {
     version: u32,
-    source_path: PathBuf,
-    source: WaveformCacheFingerprint,
+    ticket: VerifiedSourceTicket,
     sample_rate: u32,
     channels: usize,
     duration_millis: u64,
@@ -154,17 +191,29 @@ struct CachedSummaryBucket {
     max: f32,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct CachedWaveformHit {
+    waveform: WaveformData,
+    ticket: VerifiedSourceTicket,
+}
+
+impl CachedWaveformHit {
+    pub fn waveform(&self) -> &WaveformData {
+        &self.waveform
+    }
+
+    pub fn ticket(&self) -> &VerifiedSourceTicket {
+        &self.ticket
+    }
+}
+
 /// Load a decoded waveform when the cache entry still describes the current
 /// source file. Cache failures are treated as misses so a corrupt or old
 /// entry never prevents the source from being decoded again.
-pub fn load_waveform_cache(path: &Path, cache_path: &Path) -> Option<WaveformData> {
-    let source = waveform_cache_fingerprint(path)?;
+pub fn load_waveform_cache(path: &Path, cache_path: &Path) -> Option<CachedWaveformHit> {
     let contents = fs::read(cache_path).ok()?;
     let cached = serde_json::from_slice::<CachedWaveform>(&contents).ok()?;
-    if waveform_cache_fingerprint(path) != Some(source) {
-        return None;
-    }
-    cached.into_waveform(path, source)
+    cached.into_waveform(path)
 }
 
 pub fn waveform_cache_fingerprint(path: &Path) -> Option<WaveformCacheFingerprint> {
@@ -192,17 +241,9 @@ pub fn decode_audio_file_with_cancellation(
     path: &Path,
     should_cancel: impl Fn() -> bool,
 ) -> Result<DecodedAudioFile, String> {
-    let mut verified =
+    let verified =
         source::open_and_hash(path, &should_cancel).map_err(|error| error.to_string())?;
-    let source_stamp = verified.stamp();
-    let source_proof = verified.proof().clone();
-    let decode_file = verified
-        .try_clone_for_decode()
-        .map_err(|error| error.to_string())?;
-    let waveform = decode_waveform_from_open_file(path, decode_file, &should_cancel, |_| {})?;
-    verified
-        .validate_after_decode(&should_cancel)
-        .map_err(|error| error.to_string())?;
+    let verified_waveform = decode_waveform_from_verified_source(verified, &should_cancel, |_| {})?;
     let fingerprint = waveform_cache_fingerprint(path).ok_or_else(|| {
         format!(
             "Could not inspect {} after waveform analysis",
@@ -212,25 +253,50 @@ pub fn decode_audio_file_with_cancellation(
     Ok(DecodedAudioFile {
         path: path.to_path_buf(),
         fingerprint,
-        source_proof,
-        source_stamp,
-        waveform,
+        source_proof: verified_waveform.ticket().proof().clone(),
+        source_stamp: verified_waveform.ticket().stamp(),
+        waveform: verified_waveform.into_waveform(),
     })
+}
+
+/// Decode from an already hashed, retained source handle.  The ticket is
+/// returned only after the same handle and path pass the post-decode stamp
+/// fence.
+pub fn decode_waveform_from_verified_source(
+    mut verified: VerifiedSourceFile,
+    should_cancel: impl Fn() -> bool,
+    on_progress: impl FnMut(WaveformProgress),
+) -> Result<VerifiedWaveform, String> {
+    let path = verified.path().to_path_buf();
+    let decode_file = verified
+        .try_clone_for_decode()
+        .map_err(|error| error.to_string())?;
+    let waveform = decode_waveform_from_open_file(&path, decode_file, &should_cancel, on_progress)?;
+    verified
+        .validate_after_decode(&should_cancel)
+        .map_err(|error| error.to_string())?;
+    Ok(VerifiedWaveform::new(waveform, verified.ticket()))
 }
 
 pub fn write_waveform_cache_if_unchanged(
     path: &Path,
     cache_path: &Path,
-    source: WaveformCacheFingerprint,
+    ticket: &VerifiedSourceTicket,
     waveform: &WaveformData,
 ) -> Result<(), String> {
-    if waveform_cache_fingerprint(path) != Some(source) {
+    if ticket.path() != path {
+        return Err(format!(
+            "Source ticket path does not match waveform cache path {}",
+            path.display()
+        ));
+    }
+    if ticket.validate_current(|| false).is_err() {
         return Err(format!(
             "Source changed while decoding {}; skipping waveform cache",
             path.display()
         ));
     }
-    let cached = CachedWaveform::from_waveform(path, source, waveform);
+    let cached = CachedWaveform::from_waveform(path, ticket.clone(), waveform);
     let encoded = serde_json::to_vec(&cached)
         .map_err(|error| format!("Could not encode waveform cache: {error}"))?;
     let directory = cache_path
@@ -255,7 +321,7 @@ pub fn write_waveform_cache_if_unchanged(
             temporary_path.display()
         ));
     }
-    if waveform_cache_fingerprint(path) != Some(source) {
+    if ticket.validate_current(|| false).is_err() {
         let _ = fs::remove_file(&temporary_path);
         return Err(format!(
             "Source changed while writing {}; skipping waveform cache",
@@ -279,15 +345,15 @@ fn unique_timestamp() -> u128 {
 }
 
 impl CachedWaveform {
-    fn from_waveform(
-        path: &Path,
-        source: WaveformCacheFingerprint,
-        waveform: &WaveformData,
-    ) -> Self {
+    fn from_waveform(path: &Path, ticket: VerifiedSourceTicket, waveform: &WaveformData) -> Self {
         Self {
             version: WAVEFORM_CACHE_VERSION,
-            source_path: path.to_path_buf(),
-            source,
+            ticket: VerifiedSourceTicket::new(
+                path.to_path_buf(),
+                ticket.proof().clone(),
+                ticket.stamp(),
+            )
+            .expect("cache writer receives a verified source ticket"),
             sample_rate: waveform.sample_rate,
             channels: waveform.channels,
             duration_millis: waveform.duration_millis,
@@ -317,10 +383,11 @@ impl CachedWaveform {
         }
     }
 
-    fn into_waveform(self, path: &Path, source: WaveformCacheFingerprint) -> Option<WaveformData> {
+    fn into_waveform(self, path: &Path) -> Option<CachedWaveformHit> {
         if self.version != WAVEFORM_CACHE_VERSION
-            || self.source_path != path
-            || self.source != source
+            || self.ticket.path() != path
+            || self.ticket.proof().validate().is_err()
+            || self.ticket.proof().byte_len != self.ticket.stamp().len
             || self.sample_rate == 0
             || self.channels == 0
             || self.render_frames == 0
@@ -377,18 +444,21 @@ impl CachedWaveform {
             })
             .collect::<Option<Vec<_>>>()?;
 
-        Some(WaveformData {
-            sample_rate: self.sample_rate,
-            channels: self.channels,
-            duration_millis: self.duration_millis,
-            render_frames: self.render_frames,
-            integrated_lufs: self.integrated_lufs,
-            loudness_profile: Arc::from(self.loudness_profile.into_boxed_slice()),
-            summary: Arc::new(GpuSignalSummary {
-                frames,
-                band_count,
-                levels,
-            }),
+        Some(CachedWaveformHit {
+            ticket: self.ticket,
+            waveform: WaveformData {
+                sample_rate: self.sample_rate,
+                channels: self.channels,
+                duration_millis: self.duration_millis,
+                render_frames: self.render_frames,
+                integrated_lufs: self.integrated_lufs,
+                loudness_profile: Arc::from(self.loudness_profile.into_boxed_slice()),
+                summary: Arc::new(GpuSignalSummary {
+                    frames,
+                    band_count,
+                    levels,
+                }),
+            },
         })
     }
 }
@@ -1326,7 +1396,7 @@ mod tests {
         PeakMeasurement, PeakReducer, PeakWindow, WaveformData, decode_audio_file,
         decode_waveform_with_progress_and_cancellation, linear_gain_for_db, load_waveform_cache,
         loudness_at_position, loudness_channel_map, loudness_match_gain_db, preview_progress,
-        preview_waveform, progressive_preview, summary_from_peaks, waveform_cache_fingerprint,
+        preview_waveform, progressive_preview, summary_from_peaks,
         write_waveform_cache_if_unchanged,
     };
     use radiant::runtime::GpuSignalSummary;
@@ -1374,32 +1444,41 @@ mod tests {
             summary: Arc::new(summary_from_peaks(&[rms_peak(0.5), rms_peak(0.25)])),
         };
 
-        let source_fingerprint =
-            waveform_cache_fingerprint(&source).expect("source fingerprint should exist");
-        write_waveform_cache_if_unchanged(&source, &cache, source_fingerprint, &waveform)
+        let ticket = crate::source::open_and_hash(&source, || false)
+            .expect("source should hash")
+            .ticket();
+        write_waveform_cache_if_unchanged(&source, &cache, &ticket, &waveform)
             .expect("write waveform cache");
         let encoded = fs::read_to_string(&cache).expect("read waveform cache");
+        assert!(encoded.contains("\"version\":2"));
+        assert!(encoded.contains("\"ticket\""));
         assert!(
             !encoded.contains("spectrogram"),
             "waveform cache must not retain the removed passive spectrogram"
         );
-        assert_eq!(load_waveform_cache(&source, &cache), Some(waveform.clone()));
+        assert_eq!(
+            load_waveform_cache(&source, &cache).map(|hit| hit.waveform().clone()),
+            Some(waveform.clone())
+        );
+
+        fs::write(
+            &cache,
+            br#"{"version":1,"source_path":"/external/source.wav","source":{"size":6,"modified_seconds":0,"modified_nanos":0}}"#,
+        )
+        .expect("write legacy cache fixture");
+        assert_eq!(load_waveform_cache(&source, &cache), None);
 
         fs::write(&cache, b"not a waveform cache").expect("corrupt waveform cache");
         assert_eq!(load_waveform_cache(&source, &cache), None);
 
-        let source_fingerprint =
-            waveform_cache_fingerprint(&source).expect("source fingerprint should exist");
-        write_waveform_cache_if_unchanged(&source, &cache, source_fingerprint, &waveform)
+        let ticket = crate::source::open_and_hash(&source, || false)
+            .expect("source should hash")
+            .ticket();
+        write_waveform_cache_if_unchanged(&source, &cache, &ticket, &waveform)
             .expect("rewrite waveform cache");
-        let source_fingerprint =
-            waveform_cache_fingerprint(&source).expect("source fingerprint should exist");
         fs::write(&source, b"changed source").expect("change source fixture");
-        assert!(
-            write_waveform_cache_if_unchanged(&source, &cache, source_fingerprint, &waveform)
-                .is_err()
-        );
-        assert_eq!(load_waveform_cache(&source, &cache), None);
+        assert!(write_waveform_cache_if_unchanged(&source, &cache, &ticket, &waveform).is_err());
+        assert!(load_waveform_cache(&source, &cache).is_some());
 
         fs::remove_dir_all(root).expect("remove cache test directory");
     }
