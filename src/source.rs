@@ -94,13 +94,119 @@ impl<'de> Deserialize<'de> for AudioSourceProof {
 /// time, and change time.  Other targets retain length and portable clock
 /// values while leaving device/inode at zero; the proof hash remains the
 /// authoritative fallback when those filesystem identities are unavailable.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceFileStamp {
     pub dev: u64,
     pub inode: u64,
     pub len: u64,
     pub mtime_nanos: i128,
     pub ctime_nanos: i128,
+}
+
+/// Runtime proof that one path was observed with one encoded-byte digest and
+/// filesystem stamp.  A ticket is cloneable so the background decoder can
+/// return the same verified identity to the UI without reopening or hashing
+/// the source again.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct VerifiedSourceTicket {
+    path: PathBuf,
+    proof: AudioSourceProof,
+    stamp: SourceFileStamp,
+}
+
+impl<'de> Deserialize<'de> for VerifiedSourceTicket {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            path: PathBuf,
+            proof: AudioSourceProof,
+            stamp: SourceFileStamp,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        Self::new(wire.path, wire.proof, wire.stamp).map_err(D::Error::custom)
+    }
+}
+
+impl VerifiedSourceTicket {
+    /// Build a ticket from proof material that has already been verified by a
+    /// source worker.  Reject malformed proofs so cache records and runtime
+    /// state cannot carry a weak identity.
+    pub fn new(
+        path: PathBuf,
+        proof: AudioSourceProof,
+        stamp: SourceFileStamp,
+    ) -> Result<Self, String> {
+        proof.validate()?;
+        if path.as_os_str().is_empty() {
+            return Err(String::from("source ticket path must not be empty"));
+        }
+        if proof.byte_len != stamp.len {
+            return Err(String::from(
+                "source ticket proof length must match its filesystem stamp",
+            ));
+        }
+        Ok(Self { path, proof, stamp })
+    }
+
+    pub fn from_verified_file(verified: &VerifiedSourceFile) -> Self {
+        Self {
+            path: verified.path.clone(),
+            proof: verified.proof.clone(),
+            stamp: verified.stamp,
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn proof(&self) -> &AudioSourceProof {
+        &self.proof
+    }
+
+    #[allow(dead_code)]
+    pub fn stamp(&self) -> SourceFileStamp {
+        self.stamp
+    }
+
+    /// Validate only the current filesystem stamp.  Callers that already
+    /// possess the ticket deliberately avoid re-reading encoded bytes here.
+    pub fn validate_current(
+        &self,
+        should_cancel: impl Fn() -> bool,
+    ) -> Result<(), SourceProofError> {
+        validate_path_stamp(&self.path, self.stamp, should_cancel)
+    }
+}
+
+/// Open the path named by a verified ticket and validate the metadata on that
+/// exact handle before handing it to a decoder.
+///
+/// The handle metadata is the authority here.  Do not add a path-level stat
+/// before opening: an atomic replacement can otherwise land between the stat
+/// and open and silently bind playback to a different inode.  Once the handle
+/// matches the ticket, later path replacement does not affect the bytes read
+/// by that playback session; a future reload opens a fresh handle and must
+/// match the ticket again.
+pub fn open_for_ticket(ticket: &VerifiedSourceTicket) -> Result<File, SourceProofError> {
+    let file = File::open(ticket.path()).map_err(|error| open_failure(ticket.path(), error))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| io_failure(ticket.path(), error))?;
+    if !metadata.is_file() {
+        return Err(SourceProofError::Changed {
+            path: ticket.path().to_path_buf(),
+            detail: String::from("opened source is no longer a regular file"),
+        });
+    }
+    if SourceFileStamp::from_metadata(&metadata) != ticket.stamp() {
+        return Err(changed_ticket_stamp(ticket.path()));
+    }
+    Ok(file)
 }
 
 impl SourceFileStamp {
@@ -202,8 +308,13 @@ impl VerifiedSourceFile {
         &self.proof
     }
 
+    #[allow(dead_code)]
     pub fn stamp(&self) -> SourceFileStamp {
         self.stamp
+    }
+
+    pub fn ticket(&self) -> VerifiedSourceTicket {
+        VerifiedSourceTicket::from_verified_file(self)
     }
 
     /// Clone the already-opened source handle for a decoder.  The original
@@ -413,6 +524,13 @@ fn changed_stamp(path: &Path) -> SourceProofError {
     }
 }
 
+fn changed_ticket_stamp(path: &Path) -> SourceProofError {
+    SourceProofError::Changed {
+        path: path.to_path_buf(),
+        detail: String::from("opened handle stamp no longer matches verified source"),
+    }
+}
+
 #[allow(dead_code)]
 fn changed_digest(path: &Path) -> SourceProofError {
     SourceProofError::Changed {
@@ -523,7 +641,7 @@ mod tests {
     use super::*;
     use std::{
         fs::{self, OpenOptions},
-        io::Write,
+        io::{Read, Write},
         sync::{
             Arc,
             atomic::{AtomicBool, AtomicU32, Ordering},
@@ -625,5 +743,47 @@ mod tests {
             .expect_err("changed bytes must fail even when metadata could be restored");
         assert!(matches!(error, SourceProofError::Changed { .. }));
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn open_for_ticket_rejects_replacement_before_transport_load() {
+        let path = temp_path("ticket-replacement");
+        fs::write(&path, b"original").expect("fixture should write");
+        let verified = open_and_hash(&path, || false).expect("source should hash");
+        let ticket = verified.ticket();
+        drop(verified);
+
+        // Keep the replacement the same size so this exercises the identity
+        // fence rather than a decoder byte-length mismatch.
+        fs::write(&path, b"replaced").expect("replacement should write");
+        let error = open_for_ticket(&ticket).expect_err("replacement must not load");
+        assert!(matches!(error, SourceProofError::Changed { .. }));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn open_for_ticket_keeps_the_verified_inode_after_atomic_replacement() {
+        let path = temp_path("ticket-open-handle");
+        let replacement = temp_path("ticket-open-handle-replacement");
+        fs::write(&path, b"original").expect("fixture should write");
+        let verified = open_and_hash(&path, || false).expect("source should hash");
+        let ticket = verified.ticket();
+        drop(verified);
+        let mut opened = open_for_ticket(&ticket).expect("unchanged ticket should open");
+
+        fs::write(&replacement, b"replacement").expect("replacement should write");
+        fs::rename(&replacement, &path).expect("replacement should be atomic");
+
+        let mut bytes = Vec::new();
+        opened
+            .read_to_end(&mut bytes)
+            .expect("the already-open handle should remain readable");
+        assert_eq!(bytes, b"original");
+        assert!(matches!(
+            open_for_ticket(&ticket),
+            Err(SourceProofError::Changed { .. })
+        ));
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(replacement);
     }
 }

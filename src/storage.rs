@@ -994,15 +994,23 @@ pub fn library_path() -> PathBuf {
     app_data_directory().join("library.json")
 }
 
-pub fn waveform_cache_path(source: &Path) -> PathBuf {
+pub fn waveform_cache_path(source: &Path, proof: &crate::source::AudioSourceProof) -> PathBuf {
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in source.to_string_lossy().as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
+    // The proof type validates this value at every persistence boundary. Keep
+    // the fallback deliberately fixed as an additional path-traversal guard
+    // for callers constructing a malformed runtime value.
+    let digest = if proof.validate().is_ok() {
+        proof.sha256.as_str()
+    } else {
+        "invalid-proof"
+    };
     app_data_directory()
-        .join("waveform-cache")
-        .join(format!("{hash:016x}.json"))
+        .join("waveform-cache-v2")
+        .join(format!("{hash:016x}-{digest}.json"))
 }
 
 fn app_data_directory() -> PathBuf {
@@ -1308,13 +1316,28 @@ mod tests {
 
     #[test]
     fn waveform_cache_paths_are_stable_and_source_specific() {
-        let first = waveform_cache_path(Path::new("/external/first.wav"));
-        assert_eq!(first, waveform_cache_path(Path::new("/external/first.wav")));
+        let proof = crate::source::AudioSourceProof {
+            sha256: "a".repeat(64),
+            byte_len: 42,
+        };
+        let first = waveform_cache_path(Path::new("/external/first.wav"), &proof);
+        assert_eq!(
+            first,
+            waveform_cache_path(Path::new("/external/first.wav"), &proof)
+        );
         assert_ne!(
             first,
-            waveform_cache_path(Path::new("/external/second.wav"))
+            waveform_cache_path(Path::new("/external/second.wav"), &proof)
         );
-        assert!(first.to_string_lossy().contains("waveform-cache"));
+        assert!(first.to_string_lossy().contains("waveform-cache-v2"));
+        let other = crate::source::AudioSourceProof {
+            sha256: "b".repeat(64),
+            byte_len: 42,
+        };
+        assert_ne!(
+            first,
+            waveform_cache_path(Path::new("/external/first.wav"), &other)
+        );
     }
 
     #[test]
