@@ -14,9 +14,11 @@ const releaseDirectory = path.dirname(fileURLToPath(import.meta.url));
 const projectDirectory = path.resolve(releaseDirectory, "../..");
 const allocatorScript = path.join(releaseDirectory, "allocate_nightly_version.sh");
 const buildScript = path.join(releaseDirectory, "build_macos_release.sh");
+const tagVerifierScript = path.join(releaseDirectory, "verify_tag_target.sh");
 const manifestScript = path.join(releaseDirectory, "create_manifest.mjs");
 const workflowPath = path.join(releaseDirectory, "..", "..", ".github", "workflows", "release.yml");
 const gitSha = "a".repeat(40);
+const cargoPackageVersion = "0.1.9";
 const notarySubmissionId = "00000000-0000-4000-8000-000000000000";
 const png = Buffer.from("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489", "hex");
 
@@ -63,6 +65,48 @@ function parseTeamId(identity) {
     buildScript,
     identity,
   ]);
+}
+
+async function runTagVerifierFixture(responses, tag, sourceSha, maxPeelDepth) {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cadence-tag-verifier-test-"));
+  const fixturePath = path.join(root, "responses.json");
+  const ghPath = path.join(root, "gh");
+  await fs.writeFile(fixturePath, JSON.stringify(responses));
+  await fs.writeFile(ghPath, `#!/usr/bin/env node
+const fs = require("node:fs");
+
+const args = process.argv.slice(2);
+const endpoint = args.find((argument) => argument.startsWith("repos/"));
+const responses = JSON.parse(fs.readFileSync(process.env.FAKE_GH_FIXTURE, "utf8"));
+const response = endpoint ? responses[endpoint] : undefined;
+if (!response) process.exit(1);
+if (response.exit) process.exit(response.exit);
+if (Object.hasOwn(response, "stdout")) {
+  process.stdout.write(response.stdout);
+  process.exit(0);
+}
+if (!response.object || typeof response.object.type !== "string" || typeof response.object.sha !== "string") process.exit(1);
+process.stdout.write(\`\${response.object.type}\\t\${response.object.sha}\\n\`);
+`);
+  await fs.chmod(ghPath, 0o755);
+  const env = {
+    ...process.env,
+    PATH: `${root}${path.delimiter}${path.dirname(process.execPath)}${path.delimiter}${process.env.PATH || ""}`,
+    FAKE_GH_FIXTURE: fixturePath,
+    GH_TOKEN: "fixture-token-that-must-not-be-printed",
+  };
+  const args = [
+    tagVerifierScript,
+    "--repository", "example/cadence",
+    "--tag", tag,
+    "--source-sha", sourceSha,
+  ];
+  if (maxPeelDepth !== undefined) args.push("--max-peel-depth", String(maxPeelDepth));
+  try {
+    return await execFileAsync(tagVerifierScript, args.slice(1), { env });
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
 }
 
 function validateOutputDirectory(requested, callerDirectory) {
@@ -171,7 +215,7 @@ test("release output directory helpers enforce safe, caller-relative targets", a
       await assertRejectedOutputDirectory(label, requested, root);
     }
     await assert.rejects(
-      execFileAsync(buildScript, ["--version", "0.1.0", "--output-dir", visibleNonemptyDirectory]),
+      execFileAsync(buildScript, ["--version", cargoPackageVersion, "--output-dir", visibleNonemptyDirectory]),
       (error) => error.code === 2
         && error.stderr.includes("target must be empty")
         && !error.stderr.includes("missing required production signing secret"),
@@ -234,15 +278,172 @@ test("release build rejects malformed and mismatched provenance before output or
   }
 });
 
+test("release version validation accepts every channel only at the locked package base", async () => {
+  const validateVersion = (channel, requestedVersion) => execFileAsync("bash", [
+    "-c",
+    'source "$1"; channel="$2"; version="$3"; validate_release_version_against_cargo "$(resolve_root_cargo_package_version)" "$(resolve_locked_cargo_package_version)"',
+    "cadence-version-validation-test",
+    buildScript,
+    channel,
+    requestedVersion,
+  ]);
+
+  for (const [channel, requestedVersion] of [
+    ["stable", cargoPackageVersion],
+    ["rc", `${cargoPackageVersion}-rc.1`],
+    ["nightly", `${cargoPackageVersion}-nightly.1`],
+  ]) {
+    await assert.doesNotReject(validateVersion(channel, requestedVersion));
+  }
+  await assert.rejects(
+    validateVersion("stable", "0.1.8"),
+    (error) => error.code === 1 && error.stderr.includes("does not match root cadence-native package version"),
+  );
+  await assert.rejects(
+    validateVersion("nightly", "0.1.8-nightly.1"),
+    (error) => error.code === 1 && error.stderr.includes("does not match root cadence-native package base version"),
+  );
+  await assert.rejects(
+    execFileAsync("bash", [
+      "-c",
+      'source "$1"; channel=stable; version="$2"; validate_release_version_against_cargo "$3" "$4"',
+      "cadence-lock-version-validation-test",
+      buildScript,
+      cargoPackageVersion,
+      cargoPackageVersion,
+      "0.1.8",
+    ]),
+    (error) => error.code === 1 && error.stderr.includes("Cargo.toml and Cargo.lock cadence-native package versions differ"),
+  );
+});
+
+test("direct release builder rejects a package-version mismatch before platform, credentials, or output work", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cadence-version-mismatch-test-"));
+  try {
+    const outputDirectory = path.join(root, "release-output");
+    const { stdout: headOutput } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: projectDirectory });
+    await assert.rejects(
+      execFileAsync(
+        buildScript,
+        ["--version", "0.1.8", "--channel", "stable", "--output-dir", outputDirectory],
+        { cwd: projectDirectory, env: { ...process.env, GITHUB_SHA: headOutput.trim() } },
+      ),
+      (error) => error.code === 1
+        && error.stderr.includes("does not match root cadence-native package version")
+        && !error.stderr.includes("Cadence production releases must be built on macOS")
+        && !error.stderr.includes("missing required production signing secret")
+        && !error.stderr.includes("invalid release output directory"),
+    );
+    await assert.rejects(fs.lstat(outputDirectory), { code: "ENOENT" });
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("tag target verifier resolves lightweight and annotated tags and rejects unsafe targets", async (t) => {
+  const sourceSha = "b".repeat(40);
+  const lightweightTag = "v0.1.9";
+  const annotatedTag = "v0.1.9-annotated";
+  const annotatedObjectSha = "c".repeat(40);
+  const endpoint = (suffix) => `repos/example/cadence/${suffix}`;
+
+  await t.test("lightweight tag match", async () => {
+    const { stdout } = await runTagVerifierFixture(
+      { [endpoint(`git/ref/tags/${lightweightTag}`)]: { object: { type: "commit", sha: sourceSha } } },
+      lightweightTag,
+      sourceSha,
+    );
+    assert.match(stdout, new RegExp(`${lightweightTag} -> ${sourceSha}`));
+  });
+
+  await t.test("annotated tag match", async () => {
+    const { stdout } = await runTagVerifierFixture(
+      {
+        [endpoint(`git/ref/tags/${annotatedTag}`)]: { object: { type: "tag", sha: annotatedObjectSha } },
+        [endpoint(`git/tags/${annotatedObjectSha}`)]: { object: { type: "commit", sha: sourceSha.toUpperCase() } },
+      },
+      annotatedTag,
+      sourceSha,
+    );
+    assert.match(stdout, new RegExp(`${annotatedTag} -> ${sourceSha}`));
+  });
+
+  await t.test("mismatched commit", async () => {
+    const mismatchedSha = "d".repeat(40);
+    await assert.rejects(
+      runTagVerifierFixture(
+        { [endpoint(`git/ref/tags/${lightweightTag}`)]: { object: { type: "commit", sha: mismatchedSha } } },
+        lightweightTag,
+        sourceSha,
+      ),
+      (error) => error.code === 1
+        && error.stderr.includes("does not resolve to SOURCE_SHA")
+        && !error.stderr.includes("fixture-token-that-must-not-be-printed"),
+    );
+  });
+
+  await t.test("malformed target", async () => {
+    await assert.rejects(
+      runTagVerifierFixture(
+        { [endpoint(`git/ref/tags/${lightweightTag}`)]: { stdout: "tag\\tnot-a-sha\\n" } },
+        lightweightTag,
+        sourceSha,
+      ),
+      (error) => error.code === 1 && error.stderr.includes("tag target API response is malformed"),
+    );
+  });
+
+  await t.test("annotated target cycle", async () => {
+    const cycleSha = "e".repeat(40);
+    await assert.rejects(
+      runTagVerifierFixture(
+        {
+          [endpoint(`git/ref/tags/${annotatedTag}`)]: { object: { type: "tag", sha: cycleSha } },
+          [endpoint(`git/tags/${cycleSha}`)]: { object: { type: "tag", sha: cycleSha } },
+        },
+        annotatedTag,
+        sourceSha,
+      ),
+      (error) => error.code === 1 && error.stderr.includes("cycle detected"),
+    );
+  });
+
+  await t.test("excessive annotated target peel", async () => {
+    const peelShas = ["f", "1", "2", "3"].map((digit) => digit.repeat(40));
+    const responses = {
+      [endpoint(`git/ref/tags/${annotatedTag}`)]: { object: { type: "tag", sha: peelShas[0] } },
+    };
+    for (let index = 0; index < peelShas.length - 1; index += 1) {
+      responses[endpoint(`git/tags/${peelShas[index]}`)] = {
+        object: { type: "tag", sha: peelShas[index + 1] },
+      };
+    }
+    responses[endpoint(`git/tags/${peelShas.at(-1)}`)] = { object: { type: "commit", sha: sourceSha } };
+    await assert.rejects(
+      runTagVerifierFixture(responses, annotatedTag, sourceSha, 2),
+      (error) => error.code === 1 && error.stderr.includes("peel depth exceeds"),
+    );
+  });
+});
+
 test("release build uses verified HEAD and isolates Apple credentials from Cargo and bundle helpers", async () => {
   const script = await fs.readFile(buildScript, "utf8");
   const provenanceIndex = script.indexOf("if ! source_git_sha=\"$(resolve_verified_source_sha)\"; then");
+  const metadataIndex = script.indexOf("if ! root_cargo_package_version=\"$(resolve_root_cargo_package_version)\"; then");
+  const lockVersionIndex = script.indexOf("if ! locked_cargo_package_version=\"$(resolve_locked_cargo_package_version)\"; then");
+  const packageValidationIndex = script.indexOf("validate_release_version_against_cargo \"$root_cargo_package_version\"");
   const outputValidationIndex = script.indexOf('if ! output_dir="$(validate_release_output_dir "$output_dir" "$caller_cwd")"; then');
+  const platformCheckIndex = script.indexOf('if [[ "$(uname -s)" != "Darwin" ]]; then');
   const cargoIndex = script.indexOf("cargo build --target");
   const decodeIndex = script.indexOf('decode_base64 "$apple_developer_id_application_cert_base64"');
   const keychainImportIndex = script.indexOf('security import "$certificate_path"');
   const outputPreparationIndex = script.indexOf('if ! output_dir="$(prepare_release_output_dir "$output_dir" "$caller_cwd")"; then');
   assert.ok(provenanceIndex >= 0, "the build must resolve a verified source SHA");
+  assert.ok(metadataIndex > provenanceIndex, "package metadata must follow source provenance");
+  assert.ok(lockVersionIndex > metadataIndex, "the lockfile version must be checked after metadata");
+  assert.ok(packageValidationIndex > lockVersionIndex, "the requested version must be checked against Cargo versions");
+  assert.ok(outputValidationIndex > packageValidationIndex, "version validation must precede output validation");
+  assert.ok(platformCheckIndex > packageValidationIndex, "version validation must precede the macOS platform check");
   assert.ok(outputValidationIndex > provenanceIndex, "provenance must precede output validation");
   assert.ok(cargoIndex > provenanceIndex, "Cargo must use verified provenance");
   assert.ok(decodeIndex > cargoIndex, "Cargo must precede certificate decoding");
@@ -256,6 +457,7 @@ test("release build uses verified HEAD and isolates Apple credentials from Cargo
   assert.match(script, /apple_developer_id_application_cert_base64="\$\{APPLE_DEVELOPER_ID_APPLICATION_CERT_BASE64:-\}"/);
   assert.match(script, /apple_developer_id_application_cert_password="\$\{APPLE_DEVELOPER_ID_APPLICATION_CERT_PASSWORD:-\}"/);
   assert.match(script, /unset \\\n(?:.*\\\n){5}/);
+  assert.match(script, /env \\\n(?:        -u APPLE_[^\n]+ \\\n){6}        cargo metadata/);
   assert.match(script, /env \\\n(?:    -u APPLE_[^\n]+ \\\n){6}    cargo build --target/);
   assert.match(script, /--executable "\$executable_path"/);
 });
@@ -500,14 +702,21 @@ test("release workflow reserves nightly versions before immutable builds", async
     "PortalSurfer upload credentials must not be job-scoped",
   );
 
+  const tagVerificationStep = workflowRunBlock(workflow, "Verify release tag target");
+  const tagVerificationStepIndex = publishJob.indexOf("Verify release tag target");
+  const githubReleaseIndex = publishJob.indexOf("Create or verify GitHub release idempotently");
+  assert.ok(tagVerificationStepIndex >= 0 && tagVerificationStepIndex < githubReleaseIndex);
+  assert.match(tagVerificationStep, /verify_tag_target\.sh/);
+  assert.match(tagVerificationStep, /--repository "\$GITHUB_REPOSITORY"/);
+  assert.match(tagVerificationStep, /--tag "\$RELEASE_TAG"/);
+  assert.match(tagVerificationStep, /--source-sha "\$SOURCE_SHA"/);
   assert.match(publishJob, /gh release view/);
   assert.match(publishJob, /gh release create/);
-  assert.match(publishJob, /git\/ref\/tags\/\$RELEASE_TAG/);
+  assert.doesNotMatch(publishJob, /git\/ref\/tags\/\$RELEASE_TAG/);
   assert.match(publishJob, /--verify-tag/);
   assert.match(publishJob, /gh release download/);
   assert.doesNotMatch(publishJob, /build_macos_release\.sh|cargo \+stable|cargo build/);
 
-  const githubReleaseIndex = publishJob.indexOf("Create or verify GitHub release idempotently");
   const portalSurferIndex = publishJob.indexOf("Publish exact release to PortalSurfer");
   assert.ok(githubReleaseIndex >= 0 && githubReleaseIndex < portalSurferIndex, "PortalSurfer publication must be last");
   const publisherStepEnd = publishJob.indexOf("\n      - name: ", portalSurferIndex);
@@ -586,4 +795,23 @@ test("automatic nightly IDs use final source while reservation tags retain origi
     stdout.trim(),
     `cadence-nightly-${runNumber}-${finalSourceSha.slice(0, 12)}\tcadence-nightly-${runNumber}-${originalSourceSha.slice(0, 12)}`,
   );
+});
+
+test("release tag verification is universal across stable, rc, and nightly tag paths", async () => {
+  const workflow = await fs.readFile(workflowPath, "utf8");
+  const prepareRun = workflowRunBlock(workflow, "Select and reserve release metadata");
+  const publishJob = workflow.slice(workflow.indexOf("\n  publish:\n"));
+  const verifierIndex = publishJob.indexOf("Verify release tag target");
+  const releaseIndex = publishJob.indexOf("Create or verify GitHub release idempotently");
+
+  assert.ok(verifierIndex >= 0 && verifierIndex < releaseIndex, "tag verification must precede release view/create");
+  assert.match(publishJob.slice(verifierIndex, releaseIndex), /if: needs\.build\.outputs\.create_github_release == 'true'/);
+  assert.match(prepareRun, /channel=stable/);
+  assert.match(prepareRun, /channel=rc/);
+  assert.match(prepareRun, /channel=nightly/);
+  assert.match(prepareRun, /tag_release=true/);
+  assert.match(prepareRun, /automatic_nightly=true/);
+  assert.match(prepareRun, /reservation_tag="cadence-nightly-/);
+  assert.match(prepareRun, /release_tag="\$reservation_tag"/);
+  assert.match(prepareRun, /create_github_release=true/);
 });

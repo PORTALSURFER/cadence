@@ -455,6 +455,18 @@ jobs:
             '.version == $version and .channel == $channel and .build_id == $build_id and .source.git_sha == $git_sha' \
             "$manifest_path" >/dev/null
 
+      - name: Verify release tag target
+        if: needs.build.outputs.create_github_release == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ./scripts/release/verify_tag_target.sh \
+            --repository "$GITHUB_REPOSITORY" \
+            --tag "$RELEASE_TAG" \
+            --source-sha "$SOURCE_SHA"
+
       - name: Create or verify GitHub release idempotently
         if: needs.build.outputs.create_github_release == 'true'
         shell: bash
@@ -471,16 +483,6 @@ jobs:
           for asset in "${release_assets[@]}"; do
             [[ -s "$asset" ]] || { echo "release asset is missing: $asset" >&2; exit 1; }
           done
-
-          if [[ "$RELEASE_CHANNEL" == nightly && "$RELEASE_TAG" == cadence-nightly-* && "$RELEASE_TAG_EXISTS" == true ]]; then
-            reservation_tag_info="$(gh api \
-              "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" \
-              --jq '[.object.type, .object.sha] | @tsv')"
-            [[ "$reservation_tag_info" == "commit	$SOURCE_SHA" ]] || {
-              echo "automatic nightly reservation tag does not resolve to the built commit: $RELEASE_TAG" >&2
-              exit 1
-            }
-          fi
 
           if ! gh release view "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
