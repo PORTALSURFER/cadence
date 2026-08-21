@@ -2933,14 +2933,21 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 reconcile_audition_queue(state);
             }
             if selected {
+                cancel_pending_comment_playback(state);
                 state.draft_note = None;
+                state.reference_draft_note = None;
                 rollback_persisted_note_drag(state);
                 rollback_reference_persisted_note_drag(state);
                 state.reference_playhead_drag_active = false;
                 state.selected_note_id = None;
                 state.hovered_note_id = None;
+                state.selected_reference_note_id = None;
+                state.hovered_reference_note_id = None;
+                state.comment_source = CommentSource::Main;
+                state.comment_source_explicit = false;
                 state.library.selected_track_id =
                     storage::selection_after_removal(&state.library, removed.0);
+                close_reference_menu(state);
                 reset_waveform_decode(state);
                 reset_reference_waveform_decode(state);
                 reset_transport(state);
@@ -11123,6 +11130,42 @@ mod tests {
         }
     }
 
+    fn reference_removal_state() -> AppState {
+        let first_path = PathBuf::from("/external/track-a-reference.wav");
+        let second_path = PathBuf::from("/external/track-b-reference.wav");
+        let mut first_track = audition_track("track-a");
+        first_track.reference_path = Some(first_path.clone());
+        let mut second_track = audition_track("track-b");
+        second_track.reference_path = Some(second_path.clone());
+        let mut state = AppState {
+            busy: false,
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(String::from("track-a"));
+        state.library.tracks = vec![first_track, second_track];
+        state.library.reference_tracks = vec![
+            ReferenceTrack {
+                path: first_path,
+                notes: vec![Note {
+                    id: String::from("shared-reference-note"),
+                    time_millis: 500,
+                    body: String::from("A reference comment"),
+                    done: false,
+                }],
+            },
+            ReferenceTrack {
+                path: second_path,
+                notes: vec![Note {
+                    id: String::from("shared-reference-note"),
+                    time_millis: 750,
+                    body: String::from("B reference comment"),
+                    done: false,
+                }],
+            },
+        ];
+        state
+    }
+
     fn tiny_pcm_wav() -> Vec<u8> {
         let mut bytes = Vec::from(*b"RIFF");
         bytes.extend_from_slice(&38_u32.to_le_bytes());
@@ -17109,6 +17152,143 @@ mod tests {
             selected_reference_notes(&state)[0].body,
             "Only on the second reference."
         );
+    }
+
+    #[test]
+    fn removing_selected_track_clears_reference_drafts_before_successor_save() {
+        for draft in [
+            NoteDraft {
+                note_id: None,
+                time_millis: 1_250,
+                body: String::from("unsaved new A comment"),
+            },
+            NoteDraft {
+                note_id: Some(String::from("shared-reference-note")),
+                time_millis: 500,
+                body: String::from("edited A comment"),
+            },
+        ] {
+            let mut state = reference_removal_state();
+            state.reference_draft_note = Some(draft);
+            state.remove_confirmation_track_id = Some(String::from("track-a"));
+            let mut context = ui::UiUpdateContext::default();
+
+            update(
+                &mut state,
+                Message::ConfirmRemoveTrack(String::from("track-a")),
+                &mut context,
+            );
+
+            assert_eq!(state.library.selected_track_id.as_deref(), Some("track-b"));
+            assert!(state.reference_draft_note.is_none());
+            update(
+                &mut state,
+                Message::SaveReferenceDraftNote,
+                &mut ui::UiUpdateContext::default(),
+            );
+            let successor_reference = state
+                .library
+                .reference_tracks
+                .get(1)
+                .expect("successor reference should remain in the catalog");
+            assert_eq!(
+                successor_reference.path,
+                PathBuf::from("/external/track-b-reference.wav")
+            );
+            assert_eq!(successor_reference.notes.len(), 1);
+            assert_eq!(successor_reference.notes[0].body, "B reference comment");
+        }
+    }
+
+    #[test]
+    fn removing_selected_track_clears_reference_transient_state() {
+        let mut state = reference_removal_state();
+        state.reference_draft_note = Some(NoteDraft {
+            note_id: Some(String::from("shared-reference-note")),
+            time_millis: 500,
+            body: String::from("editing A"),
+        });
+        state.selected_reference_note_id = Some(String::from("shared-reference-note"));
+        state.hovered_reference_note_id = Some(String::from("shared-reference-note"));
+        state.reference_persisted_note_drag = Some(super::PersistedNoteDrag {
+            track_id: String::from("track-a"),
+            note_id: String::from("shared-reference-note"),
+            original_time_millis: 500,
+        });
+        state.reference_playhead_drag_active = true;
+        state.pending_reference_seek_intent = Some(1_500);
+        state.pending_comment_playback = Some(super::PendingCommentPlayback {
+            track_id: String::from("track-a"),
+            source: super::CommentSource::Reference,
+            note_id: String::from("shared-reference-note"),
+        });
+        state.comment_source = super::CommentSource::Reference;
+        state.comment_source_explicit = true;
+        state.reference_menu_track_id = Some(String::from("track-a"));
+        state.reference_menu_anchor = Some(Point::new(10.0, 20.0));
+        state.remove_confirmation_track_id = Some(String::from("track-a"));
+
+        update(
+            &mut state,
+            Message::ConfirmRemoveTrack(String::from("track-a")),
+            &mut ui::UiUpdateContext::default(),
+        );
+
+        assert_eq!(state.library.selected_track_id.as_deref(), Some("track-b"));
+        assert!(state.reference_draft_note.is_none());
+        assert!(state.reference_persisted_note_drag.is_none());
+        assert!(!state.reference_playhead_drag_active);
+        assert!(state.selected_reference_note_id.is_none());
+        assert!(state.hovered_reference_note_id.is_none());
+        assert!(state.pending_reference_seek_intent.is_none());
+        assert!(state.pending_comment_playback.is_none());
+        assert_eq!(state.comment_source, super::CommentSource::Main);
+        assert!(!state.comment_source_explicit);
+        assert!(state.reference_menu_track_id.is_none());
+        assert!(state.reference_menu_anchor.is_none());
+    }
+
+    #[test]
+    fn removing_non_selected_track_preserves_reference_editing_state() {
+        let mut state = reference_removal_state();
+        state.library.selected_track_id = Some(String::from("track-b"));
+        state.reference_draft_note = Some(NoteDraft {
+            note_id: Some(String::from("shared-reference-note")),
+            time_millis: 750,
+            body: String::from("editing B"),
+        });
+        state.selected_reference_note_id = Some(String::from("shared-reference-note"));
+        state.hovered_reference_note_id = Some(String::from("shared-reference-note"));
+        state.pending_reference_seek_intent = Some(2_000);
+        state.comment_source = super::CommentSource::Reference;
+        state.comment_source_explicit = true;
+        state.remove_confirmation_track_id = Some(String::from("track-a"));
+
+        update(
+            &mut state,
+            Message::ConfirmRemoveTrack(String::from("track-a")),
+            &mut ui::UiUpdateContext::default(),
+        );
+
+        assert_eq!(state.library.selected_track_id.as_deref(), Some("track-b"));
+        assert_eq!(
+            state
+                .reference_draft_note
+                .as_ref()
+                .map(|draft| draft.body.as_str()),
+            Some("editing B")
+        );
+        assert_eq!(
+            state.selected_reference_note_id.as_deref(),
+            Some("shared-reference-note")
+        );
+        assert_eq!(
+            state.hovered_reference_note_id.as_deref(),
+            Some("shared-reference-note")
+        );
+        assert_eq!(state.pending_reference_seek_intent, Some(2_000));
+        assert_eq!(state.comment_source, super::CommentSource::Reference);
+        assert!(state.comment_source_explicit);
     }
 
     #[test]
