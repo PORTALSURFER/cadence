@@ -1725,6 +1725,105 @@ fn preserve_source_mismatch_status(state: &mut AppState) {
     }
 }
 
+fn mark_main_transport_source_mismatch(state: &mut AppState) {
+    let path = state
+        .waveform_source_ticket
+        .as_ref()
+        .map(|ticket| ticket.path().to_owned())
+        .or_else(|| selected_track(state).map(|track| track.path.clone()))
+        .or_else(|| state.main_source_mismatch.clone())
+        .unwrap_or_default();
+    state.main_source_mismatch = Some(path);
+    state.waveform_generation = state.waveform_generation.wrapping_add(1);
+    state.waveform = None;
+    state.waveform_source_ticket = None;
+    state.waveform_track_id = None;
+    state.waveform_busy = false;
+    state.waveform_pending = None;
+    state.waveform_progress = None;
+    state.waveform_in_flight = None;
+    if let Some(cancellation) = state.waveform_cancellation.take() {
+        cancellation.cancel();
+    }
+    clear_pending_seek_intent(state, AuditionSource::Main);
+    clear_live_spectrogram(state, AuditionSource::Main);
+    state.loop_selections.clear(AuditionSource::Main);
+    state.playhead_drag_active = false;
+    state.transport_playing = false;
+    state.transport_polling = false;
+    state.transport_waiting_token = None;
+    state.audition_auto_advance = false;
+    state.audition_play_token = None;
+    state.audition_pending_play_track_id = None;
+    state.reference_match_enabled = false;
+    if state
+        .pending_comment_playback
+        .as_ref()
+        .is_some_and(|pending| matches!(&pending.address.owner, NoteOwner::MainTrack(_)))
+    {
+        cancel_pending_comment_playback(state);
+    }
+}
+
+fn mark_reference_transport_source_mismatch(state: &mut AppState) {
+    let path = state
+        .reference_waveform_source_ticket
+        .as_ref()
+        .map(|ticket| ticket.path().to_owned())
+        .or_else(|| selected_track(state).and_then(|track| track.reference_path.clone()))
+        .or_else(|| state.reference_source_mismatch.clone())
+        .unwrap_or_default();
+    state.reference_source_mismatch = Some(path);
+    state.reference_waveform_generation = state.reference_waveform_generation.wrapping_add(1);
+    state.reference_waveform = None;
+    state.reference_waveform_source_ticket = None;
+    state.reference_waveform_track_id = None;
+    state.reference_waveform_busy = false;
+    state.reference_waveform_pending = None;
+    state.reference_waveform_progress = None;
+    state.reference_waveform_in_flight = None;
+    if let Some(cancellation) = state.reference_waveform_cancellation.take() {
+        cancellation.cancel();
+    }
+    clear_pending_seek_intent(state, AuditionSource::Reference);
+    clear_live_spectrogram(state, AuditionSource::Reference);
+    state.loop_selections.clear(AuditionSource::Reference);
+    state.reference_playhead_drag_active = false;
+    state.reference_transport_playing = false;
+    state.reference_transport_polling = false;
+    state.reference_transport_waiting_token = None;
+    state.reference_transport_loaded = false;
+    state.reference_only_playback = false;
+    state.reference_match_enabled = false;
+    if state
+        .pending_comment_playback
+        .as_ref()
+        .is_some_and(|pending| matches!(&pending.address.owner, NoteOwner::ReferenceTrack(_)))
+    {
+        cancel_pending_comment_playback(state);
+    }
+}
+
+fn handle_main_transport_source_mismatch(state: &mut AppState) {
+    mark_main_transport_source_mismatch(state);
+    if paired_playback_intended(state) {
+        cleanup_transport_failure(state, String::from(MAIN_SOURCE_MISMATCH_STATUS), None);
+    } else {
+        reset_transport(state);
+        state.status = String::from(MAIN_SOURCE_MISMATCH_STATUS);
+    }
+}
+
+fn handle_reference_transport_source_mismatch(state: &mut AppState) {
+    mark_reference_transport_source_mismatch(state);
+    if paired_playback_intended(state) {
+        cleanup_reference_transport_failure(state, String::from(REFERENCE_SOURCE_MISMATCH_STATUS));
+    } else {
+        reset_reference_transport(state);
+        state.status = String::from(REFERENCE_SOURCE_MISMATCH_STATUS);
+    }
+}
+
 fn main_annotations_available(state: &AppState) -> bool {
     selected_track(state).is_some_and(|track| track.source_provenance().verified_proof().is_some())
 }
@@ -3132,6 +3231,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 && state.audition_pending_play_track_id.is_some();
             let mut main_snapshot_applied = false;
             let mut block_main_snapshot = cleanup_was_owning_main || cleanup_owns_main(state);
+            let mut main_transport_source_mismatch = false;
             if snapshot.generation == state.transport_generation {
                 if let Some(warning) = state
                     .transport
@@ -3141,7 +3241,12 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     state.status = format!("Live spectrogram unavailable: {warning}");
                 }
                 if let Some(error) = state.transport.take_error(state.transport_generation) {
-                    if paired_playback_intended(state) {
+                    if source_error_is_mismatch(&error) {
+                        let paired = paired_playback_intended(state);
+                        handle_main_transport_source_mismatch(state);
+                        main_transport_source_mismatch = true;
+                        block_main_snapshot = paired;
+                    } else if paired_playback_intended(state) {
                         state.playhead_drag_active = false;
                         state.transport_playing = false;
                         state.transport_polling = false;
@@ -3164,7 +3269,11 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                         state.audition_pending_play_track_id = None;
                         state.status = error;
                     }
-                    if !block_main_snapshot && !cleanup_any_active(state) && pending_audition {
+                    if !block_main_snapshot
+                        && !main_transport_source_mismatch
+                        && !cleanup_any_active(state)
+                        && pending_audition
+                    {
                         advance_audition(state, context);
                     }
                 } else if !block_main_snapshot
@@ -7900,7 +8009,11 @@ fn update_reference_transport(state: &mut AppState) {
             reference_transport.take_error(state.reference_transport_generation)
         })
     {
-        cleanup_reference_transport_failure(state, error);
+        if source_error_is_mismatch(&error) {
+            handle_reference_transport_source_mismatch(state);
+        } else {
+            cleanup_reference_transport_failure(state, error);
+        }
         return;
     }
     if !paired_playback_cleanup_active(state)
@@ -12653,13 +12766,13 @@ mod tests {
         LibraryLoadState, LibrarySaveAttempt, LiveSpectrogramMode, LoopBounds, LoopSelection,
         LoopSelections, MAIN_SOURCE_MISMATCH_STATUS, Message, NoteAddress, NoteDraft, NoteOwner,
         PairedPlaybackGuard, PendingImportCommit, PlannerInsertionTarget, REFERENCE_MENU_WIDTH,
-        ReferenceUnloadState, ResumeTransportCommand, SETTINGS_REFERENCE_ROW_METADATA_HEIGHT,
-        SETTINGS_REFERENCE_ROW_TEXT_HEIGHT, SETTINGS_REFERENCE_ROW_TEXT_SPACING,
-        SETTINGS_REFERENCE_ROW_TITLE_HEIGHT, STATUS_BAR_VERSION_WIDTH, StatusMenuHost,
-        TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER, TRACK_CARD_SELECTED_CORAL, WAVEFORM_HEIGHT,
-        WaveformDecodeRequest, WorkspaceMode, animation_requested, apply_transport_snapshot,
-        audition_panel, audition_shuffle_seed, audition_statuses,
-        cleanup_reference_transport_failure, current_live_frame_for_source,
+        REFERENCE_SOURCE_MISMATCH_STATUS, ReferenceUnloadState, ResumeTransportCommand,
+        SETTINGS_REFERENCE_ROW_METADATA_HEIGHT, SETTINGS_REFERENCE_ROW_TEXT_HEIGHT,
+        SETTINGS_REFERENCE_ROW_TEXT_SPACING, SETTINGS_REFERENCE_ROW_TITLE_HEIGHT,
+        STATUS_BAR_VERSION_WIDTH, StatusMenuHost, TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER,
+        TRACK_CARD_SELECTED_CORAL, WAVEFORM_HEIGHT, WaveformDecodeRequest, WorkspaceMode,
+        animation_requested, apply_transport_snapshot, audition_panel, audition_shuffle_seed,
+        audition_statuses, cleanup_reference_transport_failure, current_live_frame_for_source,
         current_loudness_match_gain_db, current_lufs_meter_value,
         current_reference_lufs_meter_value, decode_result_is_current, deterministic_shuffle,
         enforce_loop, favorite_toggle, frame_surface_revisions, library_dirty,
@@ -17872,6 +17985,100 @@ mod tests {
             state.paired_playback_guard,
             PairedPlaybackGuard::StoppingMain { .. }
         ));
+    }
+
+    #[test]
+    fn async_main_source_mismatch_clears_waveform_and_main_playback_state() {
+        let mut state = shared_reference_playback_state();
+        state.transport_playing = true;
+        state.transport_polling = true;
+        state.transport_waiting_token = Some(7);
+        state.audition_auto_advance = true;
+        state.audition_play_token = Some(9);
+        state.audition_pending_play_track_id = Some(String::from("paired-admission-track"));
+        state.reference_match_enabled = true;
+        let transport_generation = state.transport_generation;
+        state.transport.set_snapshot_for_test(Snapshot {
+            generation: transport_generation,
+            acknowledged_token: 0,
+            position_millis: 720,
+            playing: true,
+            ready: true,
+        });
+        state.transport.set_error_for_test(
+            transport_generation,
+            String::from("Audio source changed while playing."),
+        );
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut state, Message::Frame, &mut context);
+
+        assert_eq!(state.status, MAIN_SOURCE_MISMATCH_STATUS);
+        assert_eq!(
+            state.main_source_mismatch,
+            Some(PathBuf::from("/external/paired-admission.wav"))
+        );
+        assert!(state.waveform.is_none());
+        assert!(state.waveform_source_ticket.is_none());
+        assert!(state.waveform_track_id.is_none());
+        assert_eq!(state.waveform_generation, 1);
+        assert!(!state.transport_playing);
+        assert!(!state.transport_polling);
+        assert!(state.transport_waiting_token.is_none());
+        assert!(!state.audition_auto_advance);
+        assert!(state.audition_play_token.is_none());
+        assert!(state.audition_pending_play_track_id.is_none());
+        assert!(!state.reference_match_enabled);
+        assert!(state.reference_waveform.is_some());
+        assert!(state.reference_waveform_source_ticket.is_some());
+    }
+
+    #[test]
+    fn async_reference_source_mismatch_clears_reference_waveform_and_match_state() {
+        let mut state = shared_reference_playback_state();
+        state.reference_transport_playing = true;
+        state.reference_transport_polling = true;
+        state.reference_transport_waiting_token = Some(11);
+        state.reference_match_enabled = true;
+        let reference_generation = state.reference_transport_generation;
+        let reference_transport = state
+            .reference_transport
+            .as_ref()
+            .expect("reference transport should be available")
+            .clone();
+        reference_transport.set_snapshot_for_test(Snapshot {
+            generation: reference_generation,
+            acknowledged_token: 0,
+            position_millis: 2_640,
+            playing: true,
+            ready: true,
+        });
+        reference_transport.set_error_for_test(
+            reference_generation,
+            String::from("Audio source changed while seeking."),
+        );
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut state, Message::Frame, &mut context);
+
+        assert_eq!(state.status, REFERENCE_SOURCE_MISMATCH_STATUS);
+        assert_eq!(
+            state.reference_source_mismatch,
+            Some(PathBuf::from("/external/paired-reference.wav"))
+        );
+        assert!(state.reference_waveform.is_none());
+        assert!(state.reference_waveform_source_ticket.is_none());
+        assert!(state.reference_waveform_track_id.is_none());
+        assert_eq!(state.reference_waveform_generation, 1);
+        assert!(!state.reference_transport_playing);
+        assert!(!state.reference_transport_polling);
+        assert!(state.reference_transport_waiting_token.is_none());
+        assert!(!state.reference_transport_loaded);
+        assert!(!state.reference_only_playback);
+        assert!(!state.reference_match_enabled);
+        assert!(state.waveform.is_some());
+        assert!(state.waveform_source_ticket.is_some());
+        assert_eq!(state.transport_generation, 0);
     }
 
     #[test]

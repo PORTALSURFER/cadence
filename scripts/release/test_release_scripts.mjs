@@ -597,30 +597,52 @@ test("release workflow rejects untrusted manual stable sources", async () => {
 
 test("release workflow reserves nightly versions before immutable builds", async () => {
   const workflow = await fs.readFile(workflowPath, "utf8");
+  const reservationMatch = workflow.match(/\n  reserve_nightly:\n([\s\S]*?)\n  prepare:\n/);
   const prepareMatch = workflow.match(/\n  prepare:\n([\s\S]*?)\n  build:\n/);
   const buildMatch = workflow.match(/\n  build:\n([\s\S]*?)\n  publish:\n/);
+  assert.ok(reservationMatch, "workflow must define a nightly reservation job");
   assert.ok(prepareMatch, "workflow must define a preparation job");
   assert.ok(buildMatch, "workflow must define build and publish jobs");
+  const reservationJob = reservationMatch[1];
   const prepareJob = prepareMatch[1];
   const buildJob = buildMatch[1];
   const publishJob = workflow.slice(buildMatch.index + buildMatch[0].length - "  publish:\n".length);
 
-  assert.match(prepareJob, /runs-on: ubuntu-latest/);
-  assert.match(prepareJob, /\n    permissions:\n      contents: write\n/);
-  assert.doesNotMatch(prepareJob, /actions: read/);
-  assert.match(prepareJob, /ref: \$\{\{ github\.sha \}\}/);
-  assert.match(prepareJob, /gh api --paginate/);
-  assert.match(prepareJob, /select\(\.draft == false and \.published_at != null\)/);
-  assert.match(prepareJob, /allocate_nightly_version\.sh/);
-  assert.match(prepareJob, /original_lock_version/);
-  assert.match(prepareJob, /Cargo\.toml and Cargo\.lock Cadence package versions differ/);
-  assert.match(prepareJob, /cadence-nightly-\$\{RUN_NUMBER\}-\$\{original_source_sha:0:12\}/);
-  assert.match(prepareJob, /refs\/heads\/main/);
-  assert.match(prepareJob, /write_reserved_package_version/);
-  assert.match(prepareJob, /git push --atomic origin HEAD:refs\/heads\/main "refs\/tags\/\$reservation_tag"/);
-  assert.match(prepareJob, /git add Cargo\.toml Cargo\.lock/);
-  assert.match(prepareJob, /git diff --cached --name-only/);
+  assert.match(reservationJob, /runs-on: ubuntu-latest/);
+  assert.match(reservationJob, /environment: cadence-production/);
+  assert.match(reservationJob, /\n    if: \$\{\{ \(github\.event_name == 'schedule' \|\| \(github\.event_name == 'workflow_dispatch' && inputs\.channel == 'nightly'\)\) && github\.ref == 'refs\/heads\/main' \}\}\n/);
+  assert.match(reservationJob, /\n    permissions:\n      contents: write\n/);
+  assert.doesNotMatch(reservationJob, /github\.event_name == 'push'/);
+  assert.match(reservationJob, /ref: \$\{\{ github\.sha \}\}/);
+  assert.match(reservationJob, /gh api --paginate/);
+  assert.match(reservationJob, /select\(\.draft == false and \.published_at != null\)/);
+  assert.match(reservationJob, /allocate_nightly_version\.sh/);
+  assert.match(reservationJob, /original_lock_version/);
+  assert.match(reservationJob, /Cargo\.toml and Cargo\.lock Cadence package versions differ/);
+  assert.match(reservationJob, /cadence-nightly-\$\{RUN_NUMBER\}-\$\{original_source_sha:0:12\}/);
+  assert.match(reservationJob, /refs\/heads\/main/);
+  assert.match(reservationJob, /write_reserved_package_version/);
+  assert.match(reservationJob, /git push --atomic origin HEAD:refs\/heads\/main "refs\/tags\/\$reservation_tag"/);
+  assert.match(reservationJob, /git add Cargo\.toml Cargo\.lock/);
+  assert.match(reservationJob, /git diff --cached --name-only/);
 
+  assert.match(prepareJob, /needs: reserve_nightly/);
+  assert.match(prepareJob, /if: \$\{\{ always\(\) && \(needs\.reserve_nightly\.result == 'success' \|\| needs\.reserve_nightly\.result == 'skipped'\) \}\}/);
+  assert.match(prepareJob, /\n    permissions:\n      contents: read\n/);
+  assert.doesNotMatch(prepareJob, /contents: write/);
+  assert.doesNotMatch(
+    prepareJob,
+    /git (add|commit|tag|push)|write_reserved_package_version|gh api --paginate|allocate_nightly_version\.sh/,
+    "metadata preparation must not mutate the repository or reserve a nightly version",
+  );
+  assert.match(prepareJob, /ref: \$\{\{ needs\.reserve_nightly\.outputs\.source_sha \|\| github\.sha \}\}/);
+  assert.match(prepareJob, /RESERVED_SOURCE_SHA: \$\{\{ needs\.reserve_nightly\.outputs\.source_sha \|\| '' \}\}/);
+  assert.match(prepareJob, /RESERVED_BASE_VERSION: \$\{\{ needs\.reserve_nightly\.outputs\.reserved_base_version \|\| '' \}\}/);
+  assert.match(prepareJob, /RESERVATION_TAG: \$\{\{ needs\.reserve_nightly\.outputs\.reservation_tag \|\| '' \}\}/);
+  assert.match(prepareJob, /reserved_base_version="\$RESERVED_BASE_VERSION"/);
+  assert.match(prepareJob, /reservation_tag="\$RESERVATION_TAG"/);
+  assert.match(prepareJob, /refs\/heads\/main/);
+  assert.match(prepareJob, /Cargo\.toml and Cargo\.lock Cadence package versions differ/);
   for (const output of ["channel", "version", "build_id", "release_tag", "tag_release", "create_github_release", "artifact_upload_name", "source_sha"]) {
     assert.match(prepareJob, new RegExp(`${output}: \\$\\{\\{ steps\\.release\\.outputs\\.${output} \\}\\}`));
     assert.match(buildJob, new RegExp(`${output}: \\$\\{\\{ needs\\.prepare\\.outputs\\.${output} \\}\\}`));
@@ -763,13 +785,20 @@ test("release workflow reserves nightly versions before immutable builds", async
 
 test("automatic nightly IDs use final source while reservation tags retain original source", async () => {
   const workflow = await fs.readFile(workflowPath, "utf8");
-  const prepareRun = workflowRunBlock(workflow, "Select and reserve release metadata");
+  const reservationRun = workflowRunBlock(workflow, "Reserve nightly source");
+  const prepareRun = workflowRunBlock(workflow, "Select release metadata");
   const newReservationSourceAssignment = 'source_sha="$(git rev-parse HEAD)"';
+  const preparedSourceAssignment = 'source_sha="$(printf \x27%s\x27 "$RESERVED_SOURCE_SHA"';
   const buildIdDerivation = 'short_sha="${source_sha:0:12}"';
-  const sourceAssignmentIndex = prepareRun.indexOf(newReservationSourceAssignment);
+  const sourceAssignmentIndex = reservationRun.indexOf(newReservationSourceAssignment);
+  const pushIndex = reservationRun.indexOf('git push --atomic origin HEAD:refs/heads/main');
+  const preparedSourceIndex = prepareRun.indexOf(preparedSourceAssignment);
   const buildIdIndex = prepareRun.indexOf(buildIdDerivation);
   assert.ok(sourceAssignmentIndex >= 0, "new nightly reservations must assign the final source SHA");
-  assert.ok(buildIdIndex > sourceAssignmentIndex, "final source SHA must be assigned before build ID derivation");
+  assert.ok(pushIndex >= 0 && sourceAssignmentIndex > pushIndex, "the final source SHA must follow the reservation push");
+  assert.ok(preparedSourceIndex >= 0, "metadata preparation must consume the reserved source SHA");
+  assert.ok(buildIdIndex > preparedSourceIndex, "final source SHA must be assigned before build ID derivation");
+  assert.match(reservationRun, /reservation_tag="cadence-nightly-\${RUN_NUMBER}-\${original_source_sha:0:12}"/);
 
   const buildIdBlockEnd = prepareRun.indexOf("\n\n", buildIdIndex);
   assert.ok(buildIdBlockEnd > buildIdIndex, "workflow must contain a bounded build ID derivation block");
@@ -799,7 +828,8 @@ test("automatic nightly IDs use final source while reservation tags retain origi
 
 test("release tag verification is universal across stable, rc, and nightly tag paths", async () => {
   const workflow = await fs.readFile(workflowPath, "utf8");
-  const prepareRun = workflowRunBlock(workflow, "Select and reserve release metadata");
+  const prepareRun = workflowRunBlock(workflow, "Select release metadata");
+  const reservationRun = workflowRunBlock(workflow, "Reserve nightly source");
   const publishJob = workflow.slice(workflow.indexOf("\n  publish:\n"));
   const verifierIndex = publishJob.indexOf("Verify release tag target");
   const releaseIndex = publishJob.indexOf("Create or verify GitHub release idempotently");
@@ -811,7 +841,7 @@ test("release tag verification is universal across stable, rc, and nightly tag p
   assert.match(prepareRun, /channel=nightly/);
   assert.match(prepareRun, /tag_release=true/);
   assert.match(prepareRun, /automatic_nightly=true/);
-  assert.match(prepareRun, /reservation_tag="cadence-nightly-/);
   assert.match(prepareRun, /release_tag="\$reservation_tag"/);
+  assert.match(reservationRun, /reservation_tag="cadence-nightly-/);
   assert.match(prepareRun, /create_github_release=true/);
 });
