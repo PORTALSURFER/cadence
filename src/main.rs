@@ -28,7 +28,7 @@ use radiant::{
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -5820,8 +5820,9 @@ fn save_draft_note(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
             return;
         }
     } else {
+        let note_id = storage::allocate_note_id(&track.notes);
         track.notes.push(storage::Note {
-            id: unique_note_id(),
+            id: note_id,
             time_millis: draft.time_millis,
             body,
             done: false,
@@ -5916,8 +5917,9 @@ fn save_reference_draft_note(state: &mut AppState, context: &mut ui::UiUpdateCon
             return;
         }
     } else {
+        let note_id = storage::allocate_note_id(&reference.notes);
         reference.notes.push(storage::Note {
-            id: unique_note_id(),
+            id: note_id,
             time_millis: draft.time_millis,
             body,
             done: false,
@@ -11662,13 +11664,6 @@ fn transport_command_is_confirmed(snapshot: transport::Snapshot, token: u64) -> 
     snapshot.acknowledged_token >= token
 }
 
-fn unique_note_id() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos());
-    format!("note-{nanos}")
-}
-
 fn format_timestamp(time_millis: u64) -> String {
     let total_seconds = time_millis / 1_000;
     format!("{:02}:{:02}", total_seconds / 60, total_seconds % 60)
@@ -13281,6 +13276,78 @@ mod tests {
             Some(640)
         );
         assert_eq!(state.status, "Comment at 00:00 — type a note below.");
+    }
+
+    #[test]
+    fn saving_a_main_comment_allocates_an_owner_scoped_storage_id() {
+        let mut state = audition_state(&["main-comment-id-track"]);
+        state.library.tracks[0].notes.push(Note {
+            id: String::from("existing-main-note"),
+            time_millis: 100,
+            body: String::from("Existing main comment"),
+            done: false,
+        });
+        state.draft_note = Some(NoteDraft {
+            note_id: None,
+            time_millis: 500,
+            body: String::from("New main comment"),
+        });
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut state, Message::SaveDraftNote, &mut context);
+
+        assert!(state.draft_note.is_none());
+        assert_eq!(state.library.tracks[0].notes.len(), 2);
+        let created_id = &state.library.tracks[0].notes[1].id;
+        assert!(created_id.starts_with("note-"));
+        assert_eq!(
+            state.library.tracks[0]
+                .notes
+                .iter()
+                .filter(|note| note.id == *created_id)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn saving_a_reference_comment_allocates_an_owner_scoped_storage_id() {
+        let mut state = shared_reference_playback_state();
+        let reference_path = state.library.tracks[0]
+            .reference_path
+            .clone()
+            .expect("the test track should have a reference path");
+        state.library.reference_tracks.push(ReferenceTrack {
+            path: reference_path,
+            source_proof: None,
+            notes: vec![Note {
+                id: String::from("existing-reference-note"),
+                time_millis: 500,
+                body: String::from("Existing reference comment"),
+                done: false,
+            }],
+        });
+        state.reference_draft_note = Some(NoteDraft {
+            note_id: None,
+            time_millis: 1_000,
+            body: String::from("New reference comment"),
+        });
+        let mut context = ui::UiUpdateContext::default();
+
+        update(&mut state, Message::SaveReferenceDraftNote, &mut context);
+
+        assert!(state.reference_draft_note.is_none());
+        assert_eq!(state.library.reference_tracks[0].notes.len(), 2);
+        let created_id = &state.library.reference_tracks[0].notes[1].id;
+        assert!(created_id.starts_with("note-"));
+        assert_eq!(
+            state.library.reference_tracks[0]
+                .notes
+                .iter()
+                .filter(|note| note.id == *created_id)
+                .count(),
+            1
+        );
     }
 
     #[test]

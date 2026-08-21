@@ -111,6 +111,85 @@ pub struct Note {
     pub done: bool,
 }
 
+/// Validate the identity keys that are used to address persisted library data.
+///
+/// Track IDs are library-wide. Note IDs are scoped to their owning track, so
+/// the same note ID may appear on a main track and a reference track (or on
+/// two different owners) without becoming ambiguous.
+pub fn validate_library_identity(library: &Library) -> Result<(), String> {
+    let mut track_ids = HashSet::with_capacity(library.tracks.len());
+    for track in &library.tracks {
+        if !track_ids.insert(track.id.as_str()) {
+            return Err(format!(
+                "duplicate track ID '{}' across the library; remove or rename one of the duplicates before continuing",
+                track.id
+            ));
+        }
+        validate_note_ids(&format!("track '{}'", track.id), &track.notes)?;
+    }
+
+    let mut reference_paths = HashSet::with_capacity(library.reference_tracks.len());
+    for reference in &library.reference_tracks {
+        if !reference_paths.insert(reference.path.as_path()) {
+            return Err(format!(
+                "duplicate reference path '{}' across the library; remove or rename one of the duplicates before continuing",
+                reference.path.display()
+            ));
+        }
+        validate_note_ids(
+            &format!("reference track '{}'", reference.path.display()),
+            &reference.notes,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn validate_note_ids(owner: &str, notes: &[Note]) -> Result<(), String> {
+    let mut note_ids = HashSet::with_capacity(notes.len());
+    for note in notes {
+        if !note_ids.insert(note.id.as_str()) {
+            return Err(format!(
+                "duplicate note ID '{}' in {owner}; remove or rename one of the duplicates before continuing",
+                note.id
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Allocate a new track ID without changing any existing IDs.
+pub fn allocate_track_id(library: &Library) -> String {
+    allocate_id("track", unique_id(), |candidate| {
+        library.tracks.iter().any(|track| track.id == candidate)
+    })
+}
+
+/// Allocate a new note ID within one note owner without changing any existing
+/// IDs. Callers provide only the owning note collection so note IDs remain
+/// valid to reuse under different owners.
+pub fn allocate_note_id(notes: &[Note]) -> String {
+    allocate_id("note", unique_id(), |candidate| {
+        notes.iter().any(|note| note.id == candidate)
+    })
+}
+
+fn allocate_id(prefix: &str, epoch_nanos: u128, is_occupied: impl Fn(&str) -> bool) -> String {
+    let base = format!("{prefix}-{epoch_nanos}");
+    if !is_occupied(&base) {
+        return base;
+    }
+
+    let mut suffix = 1_u128;
+    loop {
+        let candidate = format!("{base}-{suffix}");
+        if !is_occupied(&candidate) {
+            return candidate;
+        }
+        suffix += 1;
+    }
+}
+
 pub struct InstanceLock {
     #[cfg(not(unix))]
     path: PathBuf,
@@ -190,6 +269,8 @@ pub fn load_library_at(path: &Path) -> Result<Library, String> {
         Ok(contents) => {
             let mut library: Library = serde_json::from_str(&contents)
                 .map_err(|error| format!("Could not parse {}: {error}", path.display()))?;
+            validate_library_identity(&library)
+                .map_err(|error| format!("Could not validate {}: {error}", path.display()))?;
             normalize_reference_tracks(&mut library);
             normalize_planner_order(&mut library);
             Ok(library)
@@ -275,7 +356,7 @@ fn import_into_library_at(
         .and_then(|name| name.to_str())
         .unwrap_or("Untitled track")
         .replace(['_', '-'], " ");
-    let id = format!("track-{}", unique_id());
+    let id = allocate_track_id(&library);
     library.tracks.push(Track {
         id: id.clone(),
         title: if title.trim().is_empty() {
@@ -865,6 +946,8 @@ pub fn persist_library(library: &Library) -> Result<(), String> {
 }
 
 fn persist_library_at(library: &Library, path: &Path) -> Result<(), String> {
+    validate_library_identity(library)
+        .map_err(|error| format!("Could not validate library before saving: {error}"))?;
     let encoded = serde_json::to_vec_pretty(library)
         .map_err(|error| format!("Could not encode library: {error}"))?;
     let directory = path
@@ -1167,6 +1250,158 @@ mod tests {
         let decoded = crate::audio::decode_audio_file(&source)
             .expect("valid audio fixture should pass preflight");
         (source, decoded)
+    }
+
+    #[test]
+    fn identity_allocator_preserves_base_shape_and_uses_deterministic_suffixes() {
+        let occupied = ["track-42", "track-42-1", "track-42-2"];
+        assert_eq!(
+            allocate_id("track", 42, |candidate| occupied.contains(&candidate)),
+            "track-42-3"
+        );
+        assert_eq!(allocate_id("note", 900, |_| false), "note-900");
+    }
+
+    #[test]
+    fn duplicate_track_ids_are_rejected_on_load_without_rewriting_bytes() {
+        let directory = TestDirectory::new();
+        let path = directory.path.join("library.json");
+        let mut duplicate = persistence_fixture();
+        duplicate.tracks.push(duplicate.tracks[0].clone());
+        let bytes = serde_json::to_vec_pretty(&duplicate).expect("duplicate library should encode");
+        fs::write(&path, &bytes).expect("duplicate library should be writable");
+
+        let error = load_library_at(&path).expect_err("duplicate track IDs should fail to load");
+
+        assert!(error.contains("duplicate track ID"));
+        assert_eq!(
+            fs::read(&path).expect("library should remain readable"),
+            bytes
+        );
+        assert!(temporary_paths(&directory.path).is_empty());
+    }
+
+    #[test]
+    fn duplicate_note_ids_are_rejected_on_load_without_rewriting_bytes() {
+        let directory = TestDirectory::new();
+        let path = directory.path.join("library.json");
+        let mut duplicate = persistence_fixture();
+        let note = duplicate.tracks[0].notes[0].clone();
+        duplicate.tracks[0].notes.push(note);
+        let bytes = serde_json::to_vec_pretty(&duplicate).expect("duplicate library should encode");
+        fs::write(&path, &bytes).expect("duplicate library should be writable");
+
+        let error = load_library_at(&path).expect_err("duplicate note IDs should fail to load");
+
+        assert!(error.contains("duplicate note ID"));
+        assert_eq!(
+            fs::read(&path).expect("library should remain readable"),
+            bytes
+        );
+        assert!(temporary_paths(&directory.path).is_empty());
+    }
+
+    #[test]
+    fn duplicate_note_ids_in_reference_track_are_rejected_on_load_without_rewriting_bytes() {
+        let directory = TestDirectory::new();
+        let path = directory.path.join("library.json");
+        let mut duplicate = persistence_fixture();
+        let note = duplicate.reference_tracks[0].notes[0].clone();
+        duplicate.reference_tracks[0].notes.push(note);
+        let bytes = serde_json::to_vec_pretty(&duplicate).expect("duplicate library should encode");
+        fs::write(&path, &bytes).expect("duplicate library should be writable");
+
+        let error =
+            load_library_at(&path).expect_err("duplicate reference note IDs should fail to load");
+
+        assert!(error.contains("duplicate note ID"));
+        assert_eq!(
+            fs::read(&path).expect("library should remain readable"),
+            bytes
+        );
+        assert!(temporary_paths(&directory.path).is_empty());
+    }
+
+    #[test]
+    fn duplicate_reference_paths_are_rejected_on_load_before_normalization() {
+        let directory = TestDirectory::new();
+        let path = directory.path.join("library.json");
+        let mut duplicate = persistence_fixture();
+        duplicate
+            .reference_tracks
+            .push(duplicate.reference_tracks[0].clone());
+        let bytes = serde_json::to_vec_pretty(&duplicate).expect("duplicate library should encode");
+        fs::write(&path, &bytes).expect("duplicate library should be writable");
+
+        let error =
+            load_library_at(&path).expect_err("duplicate reference paths should fail to load");
+
+        assert!(error.contains("duplicate reference path"));
+        assert!(error.contains("remove or rename"));
+        assert_eq!(
+            fs::read(&path).expect("library should remain readable"),
+            bytes
+        );
+        assert!(temporary_paths(&directory.path).is_empty());
+    }
+
+    #[test]
+    fn duplicate_note_ids_are_rejected_before_save_and_temp_creation() {
+        let directory = TestDirectory::new();
+        let path = directory.path.join("library.json");
+        let original = persistence_fixture();
+        persist_library_at(&original, &path).expect("valid library should persist");
+        let original_bytes = fs::read(&path).expect("original library should be readable");
+
+        let mut duplicate = original.clone();
+        let note = duplicate.tracks[0].notes[0].clone();
+        duplicate.tracks[0].notes.push(note);
+        let error = persist_library_at(&duplicate, &path)
+            .expect_err("duplicate note IDs should fail before saving");
+
+        assert!(error.contains("duplicate note ID"));
+        assert_eq!(
+            fs::read(&path).expect("original library should remain readable"),
+            original_bytes
+        );
+        assert!(temporary_paths(&directory.path).is_empty());
+    }
+
+    #[test]
+    fn duplicate_reference_paths_are_rejected_before_save_and_temp_creation() {
+        let directory = TestDirectory::new();
+        let path = directory.path.join("library.json");
+        let original = persistence_fixture();
+        persist_library_at(&original, &path).expect("valid library should persist");
+        let original_bytes = fs::read(&path).expect("original library should be readable");
+
+        let mut duplicate = original.clone();
+        duplicate
+            .reference_tracks
+            .push(duplicate.reference_tracks[0].clone());
+        let error = persist_library_at(&duplicate, &path)
+            .expect_err("duplicate reference paths should fail before saving");
+
+        assert!(error.contains("duplicate reference path"));
+        assert!(error.contains("remove or rename"));
+        assert_eq!(
+            fs::read(&path).expect("original library should remain readable"),
+            original_bytes
+        );
+        assert!(temporary_paths(&directory.path).is_empty());
+    }
+
+    #[test]
+    fn identical_note_ids_in_different_owners_are_valid() {
+        let mut library = persistence_fixture();
+        let note_id = library.tracks[0].notes[0].id.clone();
+        library.reference_tracks[0].notes[0].id = note_id.clone();
+        let mut second_reference = library.reference_tracks[0].clone();
+        second_reference.path = PathBuf::from("/external/second-reference.wav");
+        second_reference.notes[0].id = note_id;
+        library.reference_tracks.push(second_reference);
+
+        validate_library_identity(&library).expect("note IDs may be reused by different owners");
     }
 
     #[test]
