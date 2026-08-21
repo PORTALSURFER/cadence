@@ -7,7 +7,7 @@ description = "Native Cadence track review workspace built with Radiant"
 
 [dependencies]
 ebur128 = "0.1.10"
-radiant = { git = "https://github.com/PORTALSURFER/radiant", rev = "8f05f3a6f7c2511d89dc603aab8e0dd33923fab0" }
+radiant = { git = "https://github.com/PORTALSURFER/radiant", rev = "bc699ff711154dbce255e2d4a047a59d16d53450" }
 libc = "0.2.189"
 rfd = "0.16.0"
 rodio = { version = "0.22.2", features = ["symphonia-all"] }
