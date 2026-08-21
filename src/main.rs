@@ -11961,6 +11961,7 @@ mod tests {
         state.library.reference_tracks = vec![
             ReferenceTrack {
                 path: first_path,
+                source_proof: None,
                 notes: vec![Note {
                     id: String::from("shared-reference-note"),
                     time_millis: 500,
@@ -11970,6 +11971,7 @@ mod tests {
             },
             ReferenceTrack {
                 path: second_path,
+                source_proof: None,
                 notes: vec![Note {
                     id: String::from("shared-reference-note"),
                     time_millis: 750,
