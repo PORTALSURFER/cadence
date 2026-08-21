@@ -128,7 +128,14 @@ pub fn validate_library_identity(library: &Library) -> Result<(), String> {
         validate_note_ids(&format!("track '{}'", track.id), &track.notes)?;
     }
 
+    let mut reference_paths = HashSet::with_capacity(library.reference_tracks.len());
     for reference in &library.reference_tracks {
+        if !reference_paths.insert(reference.path.as_path()) {
+            return Err(format!(
+                "duplicate reference path '{}' across the library; remove or rename one of the duplicates before continuing",
+                reference.path.display()
+            ));
+        }
         validate_note_ids(
             &format!("reference track '{}'", reference.path.display()),
             &reference.notes,
@@ -1316,6 +1323,29 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_reference_paths_are_rejected_on_load_before_normalization() {
+        let directory = TestDirectory::new();
+        let path = directory.path.join("library.json");
+        let mut duplicate = persistence_fixture();
+        duplicate
+            .reference_tracks
+            .push(duplicate.reference_tracks[0].clone());
+        let bytes = serde_json::to_vec_pretty(&duplicate).expect("duplicate library should encode");
+        fs::write(&path, &bytes).expect("duplicate library should be writable");
+
+        let error =
+            load_library_at(&path).expect_err("duplicate reference paths should fail to load");
+
+        assert!(error.contains("duplicate reference path"));
+        assert!(error.contains("remove or rename"));
+        assert_eq!(
+            fs::read(&path).expect("library should remain readable"),
+            bytes
+        );
+        assert!(temporary_paths(&directory.path).is_empty());
+    }
+
+    #[test]
     fn duplicate_note_ids_are_rejected_before_save_and_temp_creation() {
         let directory = TestDirectory::new();
         let path = directory.path.join("library.json");
@@ -1338,9 +1368,38 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_reference_paths_are_rejected_before_save_and_temp_creation() {
+        let directory = TestDirectory::new();
+        let path = directory.path.join("library.json");
+        let original = persistence_fixture();
+        persist_library_at(&original, &path).expect("valid library should persist");
+        let original_bytes = fs::read(&path).expect("original library should be readable");
+
+        let mut duplicate = original.clone();
+        duplicate
+            .reference_tracks
+            .push(duplicate.reference_tracks[0].clone());
+        let error = persist_library_at(&duplicate, &path)
+            .expect_err("duplicate reference paths should fail before saving");
+
+        assert!(error.contains("duplicate reference path"));
+        assert!(error.contains("remove or rename"));
+        assert_eq!(
+            fs::read(&path).expect("original library should remain readable"),
+            original_bytes
+        );
+        assert!(temporary_paths(&directory.path).is_empty());
+    }
+
+    #[test]
     fn identical_note_ids_in_different_owners_are_valid() {
         let mut library = persistence_fixture();
-        library.reference_tracks[0].notes[0].id = library.tracks[0].notes[0].id.clone();
+        let note_id = library.tracks[0].notes[0].id.clone();
+        library.reference_tracks[0].notes[0].id = note_id.clone();
+        let mut second_reference = library.reference_tracks[0].clone();
+        second_reference.path = PathBuf::from("/external/second-reference.wav");
+        second_reference.notes[0].id = note_id;
+        library.reference_tracks.push(second_reference);
 
         validate_library_identity(&library).expect("note IDs may be reused by different owners");
     }
