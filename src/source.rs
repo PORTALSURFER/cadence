@@ -36,6 +36,59 @@ pub struct AudioSourceProof {
     pub byte_len: u64,
 }
 
+/// The persisted provenance state for an audio owner.
+///
+/// The wire representation remains the historical `source_proof` field: an
+/// object for a verified owner and `null` for an unknown legacy owner. This
+/// keeps old snapshots compatible while making the unknown state explicit in
+/// memory so a decode ticket cannot be mistaken for durable ownership.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum SourceProvenance {
+    #[default]
+    Unknown,
+    Verified(AudioSourceProof),
+}
+
+impl Serialize for SourceProvenance {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Unknown => serializer.serialize_none(),
+            Self::Verified(proof) => proof.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SourceProvenance {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<AudioSourceProof>::deserialize(deserializer)
+            .map(Self::from_optional)
+            .map_err(D::Error::custom)
+    }
+}
+
+impl SourceProvenance {
+    pub fn from_optional(proof: Option<AudioSourceProof>) -> Self {
+        proof.map_or(Self::Unknown, Self::Verified)
+    }
+
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, Self::Unknown)
+    }
+
+    pub fn verified_proof(&self) -> Option<&AudioSourceProof> {
+        match self {
+            Self::Unknown => None,
+            Self::Verified(proof) => Some(proof),
+        }
+    }
+}
+
 impl AudioSourceProof {
     pub fn from_digest(digest: [u8; 32], byte_len: u64) -> Self {
         Self {

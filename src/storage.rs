@@ -29,8 +29,8 @@ pub struct Library {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReferenceTrack {
     pub path: PathBuf,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_proof: Option<crate::source::AudioSourceProof>,
+    #[serde(default)]
+    pub source_proof: crate::source::SourceProvenance,
     #[serde(default)]
     pub notes: Vec<Note>,
 }
@@ -41,8 +41,8 @@ pub struct Track {
     pub title: String,
     pub original_name: String,
     pub path: PathBuf,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_proof: Option<crate::source::AudioSourceProof>,
+    #[serde(default)]
+    pub source_proof: crate::source::SourceProvenance,
     #[serde(default)]
     pub reference_path: Option<PathBuf>,
     pub size: u64,
@@ -51,6 +51,18 @@ pub struct Track {
     #[serde(default)]
     pub status: TrackStatus,
     pub notes: Vec<Note>,
+}
+
+impl Track {
+    pub fn source_provenance(&self) -> &crate::source::SourceProvenance {
+        &self.source_proof
+    }
+}
+
+impl ReferenceTrack {
+    pub fn source_provenance(&self) -> &crate::source::SourceProvenance {
+        &self.source_proof
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -366,7 +378,7 @@ fn import_into_library_at(
         },
         original_name,
         path,
-        source_proof: Some(decoded.source_proof().clone()),
+        source_proof: crate::source::SourceProvenance::Verified(decoded.source_proof().clone()),
         reference_path: None,
         size: metadata.len(),
         favorite: false,
@@ -545,7 +557,7 @@ fn ensure_reference_track(library: &mut Library, path: PathBuf) {
     {
         library.reference_tracks.push(ReferenceTrack {
             path,
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             notes: Vec::new(),
         });
     }
@@ -561,25 +573,75 @@ fn ensure_reference_track_with_proof(
         .iter_mut()
         .find(|reference| reference.path == path)
     {
-        match reference.source_proof.as_ref() {
-            Some(existing) if existing != &source_proof => Err(format!(
-                "Reference source changed for {}. Please remove it from the reference catalog and re-import it.",
-                path.display()
-            )),
-            Some(_) => Ok(()),
-            None => {
-                reference.source_proof = Some(source_proof);
-                Ok(())
+        match &reference.source_proof {
+            crate::source::SourceProvenance::Verified(existing) if existing != &source_proof => {
+                Err(format!(
+                    "Reference source changed for {}. Please remove it from the reference catalog and re-import it.",
+                    path.display()
+                ))
             }
+            crate::source::SourceProvenance::Verified(_) => Ok(()),
+            // A legacy catalog entry owns historical notes without a proof.
+            // Import/selection may use the decoded proof ephemerally, but only
+            // explicit binding may promote this persisted owner.
+            crate::source::SourceProvenance::Unknown => Ok(()),
         }
     } else {
         library.reference_tracks.push(ReferenceTrack {
             path,
-            source_proof: Some(source_proof),
+            source_proof: crate::source::SourceProvenance::Verified(source_proof),
             notes: Vec::new(),
         });
         Ok(())
     }
+}
+
+/// Bind a legacy main owner to a freshly verified source without touching any
+/// of its historical note fields.
+pub fn bind_main_source_proof(
+    library: &mut Library,
+    track_id: &str,
+    path: &Path,
+    source_proof: crate::source::AudioSourceProof,
+) -> Result<(), String> {
+    source_proof.validate()?;
+    let track = library
+        .tracks
+        .iter_mut()
+        .find(|track| track.id == track_id)
+        .ok_or_else(|| String::from("That track is no longer in the library."))?;
+    if track.path != path {
+        return Err(String::from(
+            "The main source path changed while binding comments.",
+        ));
+    }
+    if track.source_provenance().verified_proof().is_some() {
+        return Err(String::from("The main source is already bound to a proof."));
+    }
+    track.source_proof = crate::source::SourceProvenance::Verified(source_proof);
+    Ok(())
+}
+
+/// Bind a legacy reference owner to a freshly verified source without
+/// touching any of its historical note fields.
+pub fn bind_reference_source_proof(
+    library: &mut Library,
+    path: &Path,
+    source_proof: crate::source::AudioSourceProof,
+) -> Result<(), String> {
+    source_proof.validate()?;
+    let reference = library
+        .reference_tracks
+        .iter_mut()
+        .find(|reference| reference.path == path)
+        .ok_or_else(|| String::from("That reference is no longer in the catalog."))?;
+    if reference.source_provenance().verified_proof().is_some() {
+        return Err(String::from(
+            "The reference source is already bound to a proof.",
+        ));
+    }
+    reference.source_proof = crate::source::SourceProvenance::Verified(source_proof);
+    Ok(())
 }
 
 fn normalize_reference_tracks(library: &mut Library) {
@@ -632,7 +694,7 @@ fn replace_track_metadata_with_proof(
     };
     track.original_name = original_name;
     track.path = path;
-    track.source_proof = source_proof;
+    track.source_proof = crate::source::SourceProvenance::from_optional(source_proof);
     track.size = size;
     track.notes.clear();
     Ok(())
@@ -1199,7 +1261,7 @@ mod tests {
                 title: String::from("Night Drive"),
                 original_name: String::from("night-drive.wav"),
                 path: PathBuf::from("/external/night-drive.wav"),
-                source_proof: None,
+                source_proof: crate::source::SourceProvenance::Unknown,
                 reference_path: Some(reference_path.clone()),
                 size: 42,
                 favorite: true,
@@ -1215,7 +1277,7 @@ mod tests {
             selected_track_id: Some(String::from("track-1")),
             reference_tracks: vec![ReferenceTrack {
                 path: reference_path,
-                source_proof: None,
+                source_proof: crate::source::SourceProvenance::Unknown,
                 notes: vec![Note {
                     id: String::from("reference-note-1"),
                     time_millis: 1_100,
@@ -1583,7 +1645,7 @@ mod tests {
                 title: String::from("Night Drive"),
                 original_name: String::from("night-drive.wav"),
                 path: PathBuf::from("/external/night-drive.wav"),
-                source_proof: None,
+                source_proof: crate::source::SourceProvenance::Unknown,
                 reference_path: None,
                 size: 42,
                 favorite: false,
@@ -1594,7 +1656,7 @@ mod tests {
             selected_track_id: Some(String::from("track-1")),
             reference_tracks: vec![ReferenceTrack {
                 path: PathBuf::from("/tmp/reference.wav"),
-                source_proof: None,
+                source_proof: crate::source::SourceProvenance::Unknown,
                 notes: vec![Note {
                     id: String::from("reference-note-1"),
                     time_millis: 900,
@@ -1620,7 +1682,7 @@ mod tests {
             title: id.to_string(),
             original_name: format!("{id}.wav"),
             path: PathBuf::from(format!("/external/{id}.wav")),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path: None,
             size: 0,
             favorite: false,
@@ -1654,7 +1716,7 @@ mod tests {
                 title: String::from("Night Drive"),
                 original_name: String::from("night-drive.wav"),
                 path: PathBuf::from("/external/night-drive.wav"),
-                source_proof: None,
+                source_proof: crate::source::SourceProvenance::Unknown,
                 reference_path: None,
                 size: 42,
                 favorite: false,
@@ -1689,7 +1751,7 @@ mod tests {
             title: String::from(id),
             original_name: format!("{id}.wav"),
             path: PathBuf::from(format!("/external/{id}.wav")),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path: None,
             size: 0,
             favorite,
@@ -1928,7 +1990,7 @@ mod tests {
                 title: String::from("Night Drive"),
                 original_name: String::from("night-drive.wav"),
                 path: PathBuf::from("/external/night-drive.wav"),
-                source_proof: None,
+                source_proof: crate::source::SourceProvenance::Unknown,
                 reference_path: None,
                 size: 42,
                 favorite: true,
@@ -2057,8 +2119,9 @@ mod tests {
         let imported = import_into_library_at(Library::default(), decoded, &library_path)
             .expect("main import should persist");
         let proof = imported.tracks[0]
-            .source_proof
-            .clone()
+            .source_provenance()
+            .verified_proof()
+            .cloned()
             .expect("new main imports should carry a proof");
         assert_eq!(proof.byte_len, tiny_pcm_wav().len() as u64);
         assert_eq!(imported.tracks[0].path, source);
@@ -2073,16 +2136,19 @@ mod tests {
             r#"{"tracks":[{"id":"legacy","title":"Legacy","original_name":"legacy.wav","path":"/tmp/legacy.wav","reference_path":null,"size":0,"favorite":false,"stage":"sound-design","status":"inbox","notes":[]}],"selected_track_id":null}"#,
         )
         .expect("legacy JSON without a proof should load");
-        assert_eq!(legacy.tracks[0].source_proof, None);
+        assert_eq!(
+            legacy.tracks[0].source_proof,
+            crate::source::SourceProvenance::Unknown
+        );
         assert!(
-            !serde_json::to_string(&legacy)
+            serde_json::to_string(&legacy)
                 .expect("legacy library should encode")
-                .contains("source_proof")
+                .contains(r#""source_proof":null"#)
         );
     }
 
     #[test]
-    fn reference_proof_is_idempotent_and_legacy_records_adopt_without_losing_notes() {
+    fn legacy_reference_records_remain_unknown_through_selection_and_import() {
         let directory = TestDirectory::new();
         let library_path = directory.path.join("library.json");
         let (source, decoded) = decoded_audio_fixture(&directory.path);
@@ -2098,7 +2164,7 @@ mod tests {
                 title: String::from("Owner"),
                 original_name: String::from("owner.wav"),
                 path: PathBuf::from("/tmp/owner.wav"),
-                source_proof: None,
+                source_proof: crate::source::SourceProvenance::Unknown,
                 reference_path: Some(source.clone()),
                 size: 0,
                 favorite: false,
@@ -2109,27 +2175,143 @@ mod tests {
             selected_track_id: Some(String::from("owner")),
             reference_tracks: vec![ReferenceTrack {
                 path: source.clone(),
-                source_proof: None,
+                source_proof: crate::source::SourceProvenance::Unknown,
                 notes: notes.clone(),
             }],
             planner_order: vec![String::from("owner")],
         };
 
-        let adopted =
+        let selected =
             set_reference_track_at(library.clone(), "owner", decoded.clone(), &library_path)
-                .expect("legacy reference proof should be adopted");
-        assert_eq!(adopted.tracks[0].reference_path, Some(source.clone()));
-        assert_eq!(adopted.reference_tracks[0].notes, notes);
+                .expect("legacy reference selection should remain usable");
+        assert_eq!(selected.tracks[0].reference_path, Some(source.clone()));
+        assert_eq!(selected.reference_tracks[0].notes, notes);
         assert_eq!(
-            adopted.reference_tracks[0].source_proof,
-            Some(decoded.source_proof().clone())
+            selected.reference_tracks[0].source_proof,
+            crate::source::SourceProvenance::Unknown
+        );
+        assert!(
+            selected.reference_tracks[0]
+                .source_provenance()
+                .is_unknown()
         );
 
-        library = adopted.clone();
+        library = selected.clone();
         let persisted = add_reference_track_at(library.clone(), decoded, &library_path)
-            .expect("same path and proof should be idempotent");
+            .expect("same path and proof should remain idempotent");
         assert_eq!(persisted, library);
         assert_eq!(persisted.reference_tracks[0].notes, notes);
+        assert!(
+            persisted.reference_tracks[0]
+                .source_provenance()
+                .is_unknown()
+        );
+    }
+
+    #[test]
+    fn source_provenance_migrates_missing_null_and_verified_proofs_and_rejects_malformed_data() {
+        let missing: Library = serde_json::from_str(
+            r#"{"tracks":[{"id":"legacy-missing","title":"Legacy","original_name":"legacy.wav","path":"/tmp/legacy.wav","reference_path":null,"size":0,"favorite":false,"stage":"sound-design","status":"inbox","notes":[]}],"selected_track_id":null}"#,
+        )
+        .expect("missing source proof should load");
+        assert!(missing.tracks[0].source_provenance().is_unknown());
+
+        let null: Library = serde_json::from_str(
+            r#"{"tracks":[{"id":"legacy-null","title":"Legacy","original_name":"legacy.wav","path":"/tmp/legacy.wav","source_proof":null,"reference_path":null,"size":0,"favorite":false,"stage":"sound-design","status":"inbox","notes":[]}],"selected_track_id":null}"#,
+        )
+        .expect("null source proof should load");
+        assert!(null.tracks[0].source_provenance().is_unknown());
+        assert!(
+            serde_json::to_string(&null)
+                .expect("unknown provenance should encode")
+                .contains(r#""source_proof":null"#)
+        );
+
+        let verified: Library = serde_json::from_str(
+            r#"{"tracks":[{"id":"verified","title":"Verified","original_name":"verified.wav","path":"/tmp/verified.wav","source_proof":{"sha256":"0000000000000000000000000000000000000000000000000000000000000000","byte_len":12},"reference_path":null,"size":12,"favorite":false,"stage":"sound-design","status":"inbox","notes":[]}],"selected_track_id":null}"#,
+        )
+        .expect("proof object should load");
+        assert!(matches!(
+            verified.tracks[0].source_provenance(),
+            crate::source::SourceProvenance::Verified(_)
+        ));
+        let verified_json = serde_json::to_string(&verified).expect("verified should encode");
+        assert!(verified_json.contains(
+            r#""source_proof":{"sha256":"0000000000000000000000000000000000000000000000000000000000000000","byte_len":12}"#
+        ));
+
+        let malformed: Result<Library, _> = serde_json::from_str(
+            r#"{"tracks":[{"id":"malformed","title":"Malformed","original_name":"bad.wav","path":"/tmp/bad.wav","source_proof":{"sha256":"not-a-proof","byte_len":12},"reference_path":null,"size":12,"favorite":false,"stage":"sound-design","status":"inbox","notes":[]}],"selected_track_id":null}"#,
+        );
+        assert!(malformed.is_err(), "malformed proof data must fail closed");
+    }
+
+    #[test]
+    fn explicit_source_binding_changes_only_provenance_and_persists_notes() {
+        let directory = TestDirectory::new();
+        let library_path = directory.path.join("library.json");
+        let main_path = directory.path.join("main.wav");
+        let reference_path = directory.path.join("reference.wav");
+        let proof = crate::source::AudioSourceProof {
+            sha256: "1".repeat(64),
+            byte_len: 46,
+        };
+        let main_note = Note {
+            id: String::from("main-note"),
+            time_millis: 10,
+            body: String::from("preserve main bytes"),
+            done: true,
+        };
+        let reference_note = Note {
+            id: String::from("reference-note"),
+            time_millis: 20,
+            body: String::from("preserve reference bytes"),
+            done: false,
+        };
+        let mut library = Library {
+            tracks: vec![Track {
+                id: String::from("owner"),
+                title: String::from("Owner"),
+                original_name: String::from("owner.wav"),
+                path: main_path.clone(),
+                source_proof: crate::source::SourceProvenance::Unknown,
+                reference_path: Some(reference_path.clone()),
+                size: 46,
+                favorite: true,
+                stage: TrackStage::Mixdown,
+                status: TrackStatus::Release,
+                notes: vec![main_note.clone()],
+            }],
+            selected_track_id: Some(String::from("owner")),
+            reference_tracks: vec![ReferenceTrack {
+                path: reference_path.clone(),
+                source_proof: crate::source::SourceProvenance::Unknown,
+                notes: vec![reference_note.clone()],
+            }],
+            planner_order: vec![String::from("owner")],
+        };
+        persist_library_at(&library, &library_path).expect("unknown library should persist");
+
+        bind_main_source_proof(&mut library, "owner", &main_path, proof.clone())
+            .expect("main binding should succeed");
+        bind_reference_source_proof(&mut library, &reference_path, proof.clone())
+            .expect("reference binding should succeed");
+
+        assert_eq!(library.tracks[0].notes, vec![main_note]);
+        assert_eq!(library.reference_tracks[0].notes, vec![reference_note]);
+        assert_eq!(
+            library.tracks[0].source_proof,
+            crate::source::SourceProvenance::Verified(proof.clone())
+        );
+        assert_eq!(
+            library.reference_tracks[0].source_proof,
+            crate::source::SourceProvenance::Verified(proof)
+        );
+        persist_library_at(&library, &library_path).expect("bound library should persist");
+        assert_eq!(
+            load_library_at(&library_path).expect("bound library should reload"),
+            library
+        );
     }
 
     #[test]
@@ -2145,7 +2327,7 @@ mod tests {
                 title: String::from("Owner"),
                 original_name: String::from("owner.wav"),
                 path: PathBuf::from("/tmp/owner.wav"),
-                source_proof: None,
+                source_proof: crate::source::SourceProvenance::Unknown,
                 reference_path: Some(source.clone()),
                 size: 0,
                 favorite: false,
@@ -2156,7 +2338,9 @@ mod tests {
             selected_track_id: Some(String::from("owner")),
             reference_tracks: vec![ReferenceTrack {
                 path: source.clone(),
-                source_proof: Some(first.source_proof().clone()),
+                source_proof: crate::source::SourceProvenance::Verified(
+                    first.source_proof().clone(),
+                ),
                 notes: vec![Note {
                     id: String::from("keep"),
                     time_millis: 1,
@@ -2179,7 +2363,7 @@ mod tests {
         assert!(error.contains("remove") && error.contains("re-import"));
         assert_eq!(
             library.reference_tracks[0].source_proof,
-            Some(first.source_proof().clone())
+            crate::source::SourceProvenance::Verified(first.source_proof().clone())
         );
         assert_eq!(library.tracks[0].reference_path, Some(source));
         assert_eq!(
@@ -2274,7 +2458,7 @@ mod tests {
                 title: String::from("Night Drive"),
                 original_name: String::from("night-drive.wav"),
                 path: PathBuf::from("/tmp/night-drive.wav"),
-                source_proof: None,
+                source_proof: crate::source::SourceProvenance::Unknown,
                 reference_path: Some(PathBuf::from("/tmp/reference.wav")),
                 size: 42,
                 favorite: true,
@@ -2342,7 +2526,7 @@ mod tests {
                 title: String::from("Night Drive"),
                 original_name: String::from("night-drive.wav"),
                 path: PathBuf::from("/external/night-drive.wav"),
-                source_proof: None,
+                source_proof: crate::source::SourceProvenance::Unknown,
                 reference_path: Some(PathBuf::from("/external/reference.wav")),
                 size: 0,
                 favorite: false,
@@ -2375,7 +2559,7 @@ mod tests {
                 title: String::from("Primary"),
                 original_name: String::from("primary.wav"),
                 path: primary_path.clone(),
-                source_proof: None,
+                source_proof: crate::source::SourceProvenance::Unknown,
                 reference_path: None,
                 size: 42,
                 favorite: false,
@@ -2405,7 +2589,7 @@ mod tests {
             title: id.to_string(),
             original_name: format!("{id}.wav"),
             path: PathBuf::from(format!("/external/{id}.wav")),
-            source_proof: None,
+            source_proof: crate::source::SourceProvenance::Unknown,
             reference_path,
             size: 0,
             favorite: false,
@@ -2423,7 +2607,7 @@ mod tests {
             reference_tracks: vec![
                 ReferenceTrack {
                     path: removed_path.clone(),
-                    source_proof: None,
+                    source_proof: crate::source::SourceProvenance::Unknown,
                     notes: vec![Note {
                         id: String::from("removed-note"),
                         time_millis: 100,
@@ -2433,7 +2617,7 @@ mod tests {
                 },
                 ReferenceTrack {
                     path: retained_path.clone(),
-                    source_proof: None,
+                    source_proof: crate::source::SourceProvenance::Unknown,
                     notes: Vec::new(),
                 },
             ],
@@ -2467,7 +2651,7 @@ mod tests {
                 title: String::from("Night Drive"),
                 original_name: String::from("night-drive.wav"),
                 path: PathBuf::from("/external/night-drive.wav"),
-                source_proof: None,
+                source_proof: crate::source::SourceProvenance::Unknown,
                 reference_path: Some(first_path.clone()),
                 size: 0,
                 favorite: false,
@@ -2479,7 +2663,7 @@ mod tests {
             reference_tracks: vec![
                 ReferenceTrack {
                     path: first_path.clone(),
-                    source_proof: None,
+                    source_proof: crate::source::SourceProvenance::Unknown,
                     notes: vec![Note {
                         id: String::from("first-note"),
                         time_millis: 100,
@@ -2489,7 +2673,7 @@ mod tests {
                 },
                 ReferenceTrack {
                     path: second_path.clone(),
-                    source_proof: None,
+                    source_proof: crate::source::SourceProvenance::Unknown,
                     notes: vec![Note {
                         id: String::from("second-note"),
                         time_millis: 200,
@@ -2522,7 +2706,7 @@ mod tests {
                 title: String::from("Night Drive"),
                 original_name: String::from("night-drive.wav"),
                 path: PathBuf::from("/external/night-drive.wav"),
-                source_proof: None,
+                source_proof: crate::source::SourceProvenance::Unknown,
                 reference_path: Some(PathBuf::from("/external/reference.wav")),
                 size: 42,
                 favorite: true,
@@ -2569,7 +2753,7 @@ mod tests {
                 title: String::from("Night Drive"),
                 original_name: String::from("night-drive.wav"),
                 path: PathBuf::from("/external/night-drive.wav"),
-                source_proof: None,
+                source_proof: crate::source::SourceProvenance::Unknown,
                 reference_path: None,
                 size: 42,
                 favorite: true,
