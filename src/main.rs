@@ -14517,6 +14517,104 @@ mod tests {
     }
 
     #[test]
+    fn stale_reference_editor_events_do_not_touch_a_replacement_draft() {
+        let mut state = shared_reference_playback_state();
+        let reference_path = state.library.tracks[0]
+            .reference_path
+            .clone()
+            .expect("the test track should have a reference path");
+        state.library.reference_tracks.push(ReferenceTrack {
+            path: reference_path.clone(),
+            source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
+            notes: Vec::new(),
+        });
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::ReferenceCommentClicked { ratio: 0.25 },
+            &mut context,
+        );
+        let stale_identity = state
+            .reference_draft_note
+            .as_ref()
+            .expect("the first reference draft should be active")
+            .identity();
+
+        update(
+            &mut state,
+            Message::ReferenceCommentClicked { ratio: 0.75 },
+            &mut context,
+        );
+        let active_identity = state
+            .reference_draft_note
+            .as_ref()
+            .expect("the replacement reference draft should be active")
+            .identity();
+        let active_time_millis = state
+            .reference_draft_note
+            .as_ref()
+            .expect("the replacement reference draft should be active")
+            .time_millis;
+        assert_ne!(stale_identity, active_identity);
+        assert!(active_identity.nonce > stale_identity.nonce);
+        assert_eq!(
+            &active_identity.owner,
+            &NoteOwner::ReferenceTrack(reference_path)
+        );
+
+        update(
+            &mut state,
+            Message::ReferenceDraftNoteChanged {
+                identity: stale_identity.clone(),
+                body: String::from("stale body"),
+            },
+            &mut context,
+        );
+        update(
+            &mut state,
+            Message::SaveReferenceDraftNote(stale_identity.clone()),
+            &mut context,
+        );
+        update(
+            &mut state,
+            Message::CancelReferenceDraftNote(stale_identity),
+            &mut context,
+        );
+
+        let draft = state
+            .reference_draft_note
+            .as_ref()
+            .expect("stale editor events must leave the replacement draft active");
+        assert_eq!(draft.identity(), active_identity);
+        assert_eq!(draft.body, "");
+        assert_eq!(draft.time_millis, active_time_millis);
+        assert!(state.library.reference_tracks[0].notes.is_empty());
+        assert!(state.save_in_flight.is_none());
+
+        update(
+            &mut state,
+            Message::ReferenceDraftNoteChanged {
+                identity: active_identity.clone(),
+                body: String::from("active body"),
+            },
+            &mut context,
+        );
+        update(
+            &mut state,
+            Message::SaveReferenceDraftNote(active_identity),
+            &mut context,
+        );
+
+        assert!(state.reference_draft_note.is_none());
+        assert_eq!(state.library.reference_tracks[0].notes.len(), 1);
+        assert_eq!(
+            state.library.reference_tracks[0].notes[0].body,
+            "active body"
+        );
+    }
+
+    #[test]
     fn editing_existing_comment_populates_draft_and_focuses_main_editor() {
         let track_id = String::from("edit-track");
         let note_id = String::from("edit-note");
@@ -21857,6 +21955,86 @@ mod tests {
             state.library.reference_tracks[0].source_proof,
             crate::source::SourceProvenance::Unknown
         );
+    }
+
+    #[test]
+    fn stale_main_binding_cancellation_preserves_replaced_reference_candidate() {
+        let (mut state, main_path, _main_proof, notes) = historical_main_binding_state();
+        let reference_path = PathBuf::from("/external/replacement-reference.wav");
+        let reference_ticket = verified_audition_waveform_for(&reference_path)
+            .ticket()
+            .clone();
+        state.library.tracks[0].reference_path = Some(reference_path.clone());
+        state.library.reference_tracks.push(ReferenceTrack {
+            path: reference_path.clone(),
+            source_proof: crate::source::SourceProvenance::Unknown,
+            notes: Vec::new(),
+        });
+        state.reference_waveform_source_ticket = Some(reference_ticket);
+        state.reference_waveform_track_id = state.library.selected_track_id.clone();
+        state.reference_waveform_generation = 3;
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::RequestBindHistoricalComments(super::HistoricalBindingOwner::Main {
+                track_id: String::from("historical-binding"),
+            }),
+            &mut context,
+        );
+        let main_candidate = state
+            .historical_binding_confirmation
+            .clone()
+            .expect("main binding should require confirmation");
+        assert_eq!(main_candidate.path, main_path);
+
+        update(
+            &mut state,
+            Message::RequestBindHistoricalComments(super::HistoricalBindingOwner::Reference {
+                path: reference_path.clone(),
+            }),
+            &mut context,
+        );
+        let reference_candidate = state
+            .historical_binding_confirmation
+            .clone()
+            .expect("reference binding should replace the pending candidate");
+        assert_eq!(reference_candidate.path, reference_path);
+        assert_ne!(main_candidate, reference_candidate);
+
+        update(
+            &mut state,
+            Message::CancelBindHistoricalComments(main_candidate),
+            &mut context,
+        );
+
+        assert_eq!(
+            state.historical_binding_confirmation,
+            Some(reference_candidate.clone())
+        );
+        assert!(state.historical_binding_in_flight.is_none());
+        assert!(state.historical_binding_cancellation.is_none());
+        assert!(!state.busy);
+        assert_eq!(state.next_historical_binding_request_id, 0);
+        assert_eq!(
+            state.library.tracks[0].source_proof,
+            crate::source::SourceProvenance::Unknown
+        );
+        assert_eq!(state.library.tracks[0].notes, notes);
+        assert_eq!(
+            state.library.reference_tracks[0].source_proof,
+            crate::source::SourceProvenance::Unknown
+        );
+
+        update(
+            &mut state,
+            Message::CancelBindHistoricalComments(reference_candidate),
+            &mut context,
+        );
+
+        assert!(state.historical_binding_confirmation.is_none());
+        assert!(state.historical_binding_in_flight.is_none());
+        assert!(!state.busy);
     }
 
     #[test]
