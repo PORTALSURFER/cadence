@@ -26,62 +26,35 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  prepare:
-    name: Prepare release metadata
+  reserve_nightly:
+    name: Reserve nightly source
+    if: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.channel == 'nightly')) && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
+    environment: cadence-production
     permissions:
       contents: write
     outputs:
-      channel: ${{ steps.release.outputs.channel }}
-      version: ${{ steps.release.outputs.version }}
-      build_id: ${{ steps.release.outputs.build_id }}
-      release_tag: ${{ steps.release.outputs.release_tag }}
-      tag_release: ${{ steps.release.outputs.tag_release }}
-      create_github_release: ${{ steps.release.outputs.create_github_release }}
-      artifact_upload_name: ${{ steps.release.outputs.artifact_upload_name }}
-      source_sha: ${{ steps.release.outputs.source_sha }}
+      source_sha: ${{ steps.reserve.outputs.source_sha }}
+      reserved_base_version: ${{ steps.reserve.outputs.reserved_base_version }}
+      reservation_tag: ${{ steps.reserve.outputs.reservation_tag }}
     steps:
-      - name: Validate manual stable source
-        shell: bash
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          REF: ${{ github.ref }}
-          INPUT_CHANNEL: ${{ inputs.channel || '' }}
-          INPUT_VERSION: ${{ inputs.version || '' }}
-        run: |
-          set -euo pipefail
-
-          if [[ "$EVENT_NAME" == "workflow_dispatch" && "$INPUT_CHANNEL" == "stable" ]]; then
-            [[ "$REF" == "refs/heads/main" || "$REF" == "refs/tags/v${INPUT_VERSION}" ]] || {
-              echo "manual stable releases must run from refs/heads/main or the matching v<version> tag" >&2
-              exit 1
-            }
-          fi
-
-      - name: Check out source
+      - name: Check out source for nightly reservation
         uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
 
-      - name: Select and reserve release metadata
-        id: release
+      - name: Reserve nightly source
+        id: reserve
         shell: bash
         env:
-          EVENT_NAME: ${{ github.event_name }}
           REF: ${{ github.ref }}
-          REF_NAME: ${{ github.ref_name }}
           RUN_NUMBER: ${{ github.run_number }}
           ORIGINAL_SOURCE_SHA: ${{ github.sha }}
-          INPUT_CHANNEL: ${{ inputs.channel || '' }}
-          INPUT_VERSION: ${{ inputs.version || '' }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
           base_version_re='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
-          stable_version_re="^${base_version_re}$"
-          rc_version_re="^${base_version_re}-rc\.[1-9][0-9]*$"
-          nightly_version_re="^${base_version_re}-nightly\.[1-9][0-9]*$"
           cargo_version_from_file() {
             sed -n '/^\[package\]/,/^\[/{ s/^version = "\([^"]*\)"/\1/p; }' "$1" | head -n 1
           }
@@ -131,6 +104,233 @@ jobs:
             lock_version="$(lock_version_from_file Cargo.lock)"
             [[ "$toml_version" == "$expected" ]] || { echo "Cargo.toml Cadence version $toml_version does not match $expected" >&2; exit 1; }
             [[ "$lock_version" == "$expected" ]] || { echo "Cargo.lock Cadence version $lock_version does not match $expected" >&2; exit 1; }
+          }
+          assert_reservation_commit() {
+            local commit="$1"
+            local expected="$2"
+            [[ "$(git rev-list --parents -n 1 "$commit")" == "$commit $original_source_sha" ]] || {
+              echo "nightly reservation tag must point to the original source or a single reservation commit with the original source as its exact parent" >&2
+              exit 1
+            }
+            changed_status="$(git diff-tree --no-commit-id --name-status -r "$commit" | LC_ALL=C sort)"
+            [[ "$changed_status" == $'M\tCargo.lock\nM\tCargo.toml' ]] || {
+              echo "nightly reservation commit must modify only Cargo.toml and Cargo.lock" >&2
+              exit 1
+            }
+            [[ -z "$(git diff --no-ext-diff --summary "$original_source_sha" "$commit" -- Cargo.lock Cargo.toml)" ]] || {
+              echo "nightly reservation commit must not change file modes" >&2
+              exit 1
+            }
+            python3 - "$original_source_sha" "$commit" "$original_cargo_version" "$expected" <<'PY'
+          import re
+          import subprocess
+          import sys
+
+          parent, commit, original, expected = sys.argv[1:]
+          patterns = {
+              "Cargo.toml": re.compile(
+                  r'(?ms)^\[package\]\nname = "cadence-native"\nversion = "([^"]+)"'
+              ),
+              "Cargo.lock": re.compile(
+                  r'(?ms)^\[\[package\]\]\nname = "cadence-native"\nversion = "([^"]+)"'
+              ),
+          }
+
+          def contents(revision, path):
+              return subprocess.check_output(
+                  ["git", "show", f"{revision}:{path}"], text=True
+              )
+
+          def normalize(text, match):
+              return text[:match.start(1)] + expected + text[match.end(1):]
+
+          for path, pattern in patterns.items():
+              before = contents(parent, path)
+              after = contents(commit, path)
+              before_matches = list(pattern.finditer(before))
+              after_matches = list(pattern.finditer(after))
+              if len(before_matches) != 1 or len(after_matches) != 1:
+                  raise SystemExit(f"expected one Cadence package entry in {path}")
+              before_match = before_matches[0]
+              after_match = after_matches[0]
+              if before_match.group(1) != original:
+                  raise SystemExit(f"original Cadence package version drifted in {path}")
+              if after_match.group(1) != expected:
+                  raise SystemExit(f"reservation version mismatch in {path}")
+              if normalize(before, before_match) != normalize(after, after_match):
+                  raise SystemExit(f"reservation commit changed non-version content in {path}")
+          PY
+          }
+          write_output() {
+            printf '%s\n' "$1=$2" >> "$GITHUB_OUTPUT"
+          }
+
+          [[ "$REF" == refs/heads/main ]] || { echo "automatic nightly releases must run from the main branch" >&2; exit 1; }
+          [[ "$ORIGINAL_SOURCE_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || { echo "GitHub did not provide a full commit SHA" >&2; exit 1; }
+          [[ "$RUN_NUMBER" =~ ^[1-9][0-9]*$ ]] || { echo "GitHub run number is not a positive integer" >&2; exit 1; }
+          original_source_sha="$(printf '%s' "$ORIGINAL_SOURCE_SHA" | tr '[:upper:]' '[:lower:]')"
+          original_cargo_version="$(cargo_version_from_file Cargo.toml)"
+          original_lock_version="$(lock_version_from_file Cargo.lock)"
+          original_cargo_base_version="${original_cargo_version%%-*}"
+          [[ "$original_cargo_base_version" =~ ^${base_version_re}$ ]] || { echo "Cargo.toml does not contain a numeric package version" >&2; exit 1; }
+          [[ "$original_lock_version" == "$original_cargo_version" ]] || {
+            echo "Cargo.toml and Cargo.lock Cadence package versions differ: $original_cargo_version vs $original_lock_version" >&2
+            exit 1
+          }
+
+          reservation_tag="cadence-nightly-${RUN_NUMBER}-${original_source_sha:0:12}"
+          existing_tag_ref="$(git ls-remote --refs origin "refs/tags/$reservation_tag" | awk 'NF == 2 { print; found++ } END { if (found > 1) exit 1 }')"
+          if [[ -n "$existing_tag_ref" ]]; then
+            git fetch --no-tags origin "refs/tags/$reservation_tag:refs/tags/$reservation_tag"
+            [[ "$(git cat-file -t "refs/tags/$reservation_tag")" == commit ]] || {
+              echo "nightly reservation tag is not a lightweight commit tag: $reservation_tag" >&2
+              exit 1
+            }
+            source_sha="$(git rev-parse "refs/tags/$reservation_tag^{commit}")"
+            reserved_cargo_version="$(git show "$source_sha:Cargo.toml" | sed -n '/^\[package\]/,/^\[/{ s/^version = "\([^"]*\)"/\1/p; }' | head -n 1)"
+            reserved_lock_version="$(git show "$source_sha:Cargo.lock" | awk '
+              /^\[\[package\]\]$/ { in_package=1; is_cadence=0; next }
+              in_package && /^\[/ { in_package=0 }
+              in_package && $0 == "name = \"cadence-native\"" { is_cadence=1; next }
+              in_package && is_cadence && /^version = / {
+                sub(/^version = "/, "")
+                sub(/"$/, "")
+                print
+                exit
+              }
+            ')"
+            reserved_base_version="${reserved_cargo_version%%-*}"
+            [[ "$reserved_base_version" =~ ^${base_version_re}$ ]] || { echo "reservation tag does not contain a numeric Cadence package version" >&2; exit 1; }
+            [[ "$reserved_cargo_version" == "$reserved_base_version" ]] || { echo "reservation Cargo package version must be numeric: $reserved_cargo_version" >&2; exit 1; }
+            [[ "$reserved_lock_version" == "$reserved_cargo_version" ]] || { echo "reservation Cargo.toml and Cargo.lock versions differ" >&2; exit 1; }
+            if [[ "$source_sha" != "$original_source_sha" ]]; then
+              assert_reservation_commit "$source_sha" "$reserved_cargo_version"
+            fi
+          else
+            git fetch --no-tags origin main
+            [[ "$(git rev-parse origin/main)" == "$original_source_sha" ]] || {
+              echo "main advanced after the nightly source was selected; refusing to reserve a version" >&2
+              exit 1
+            }
+            release_names="$(gh api --paginate \
+              -H 'Accept: application/vnd.github+json' \
+              "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+              --jq '.[] | select(.draft == false and .published_at != null) | .name')"
+            if [[ -n "$release_names" ]]; then
+              reserved_base_version="$(printf '%s' "$release_names" | ./scripts/release/allocate_nightly_version.sh "$original_cargo_base_version")"
+            else
+              reserved_base_version="$(./scripts/release/allocate_nightly_version.sh "$original_cargo_base_version")"
+            fi
+            write_reserved_package_version "$reserved_base_version"
+            assert_package_versions "$reserved_base_version"
+            unexpected_files="$(git diff --name-only | grep -v -E '^(Cargo\.toml|Cargo\.lock)$' || true)"
+            [[ -z "$unexpected_files" ]] || { echo "nightly reservation changed unexpected files: $unexpected_files" >&2; exit 1; }
+            if ! git diff --quiet -- Cargo.toml Cargo.lock; then
+              git config user.name "github-actions[bot]"
+              git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+              git add Cargo.toml Cargo.lock
+              [[ "$(git diff --cached --name-only)" == $'Cargo.lock\nCargo.toml' ]] || {
+                echo "nightly reservation commit must contain only Cargo.toml and Cargo.lock" >&2
+                exit 1
+              }
+              git commit -m "chore(release): reserve Cadence ${reserved_base_version} nightly"
+            fi
+            if git show-ref --verify --quiet "refs/tags/$reservation_tag"; then
+              echo "local nightly reservation tag already exists unexpectedly: $reservation_tag" >&2
+              exit 1
+            fi
+            if git ls-remote --exit-code --refs origin "refs/tags/$reservation_tag" >/dev/null 2>&1; then
+              echo "nightly reservation tag appeared concurrently: $reservation_tag" >&2
+              exit 1
+            fi
+            git tag "$reservation_tag"
+            git push --atomic origin HEAD:refs/heads/main "refs/tags/$reservation_tag"
+            source_sha="$(git rev-parse HEAD)"
+            assert_package_versions "$reserved_base_version"
+          fi
+
+          [[ "$source_sha" =~ ^[0-9a-fA-F]{40}$ ]] || { echo "nightly reservation did not produce a full commit SHA" >&2; exit 1; }
+          [[ "$reserved_base_version" =~ ^${base_version_re}$ ]] || { echo "nightly reservation did not produce a numeric base version" >&2; exit 1; }
+          write_output source_sha "$(printf '%s' "$source_sha" | tr '[:upper:]' '[:lower:]')"
+          write_output reserved_base_version "$reserved_base_version"
+          write_output reservation_tag "$reservation_tag"
+
+  prepare:
+    name: Prepare release metadata
+    needs: reserve_nightly
+    if: ${{ always() && (needs.reserve_nightly.result == 'success' || needs.reserve_nightly.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      channel: ${{ steps.release.outputs.channel }}
+      version: ${{ steps.release.outputs.version }}
+      build_id: ${{ steps.release.outputs.build_id }}
+      release_tag: ${{ steps.release.outputs.release_tag }}
+      tag_release: ${{ steps.release.outputs.tag_release }}
+      create_github_release: ${{ steps.release.outputs.create_github_release }}
+      artifact_upload_name: ${{ steps.release.outputs.artifact_upload_name }}
+      source_sha: ${{ steps.release.outputs.source_sha }}
+    steps:
+      - name: Validate manual stable source
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          INPUT_CHANNEL: ${{ inputs.channel || '' }}
+          INPUT_VERSION: ${{ inputs.version || '' }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" && "$INPUT_CHANNEL" == "stable" ]]; then
+            [[ "$REF" == "refs/heads/main" || "$REF" == "refs/tags/v${INPUT_VERSION}" ]] || {
+              echo "manual stable releases must run from refs/heads/main or the matching v<version> tag" >&2
+              exit 1
+            }
+          fi
+
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.reserve_nightly.outputs.source_sha || github.sha }}
+          persist-credentials: false
+
+      - name: Select release metadata
+        id: release
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          RUN_NUMBER: ${{ github.run_number }}
+          ORIGINAL_SOURCE_SHA: ${{ github.sha }}
+          RESERVED_SOURCE_SHA: ${{ needs.reserve_nightly.outputs.source_sha || '' }}
+          RESERVED_BASE_VERSION: ${{ needs.reserve_nightly.outputs.reserved_base_version || '' }}
+          RESERVATION_TAG: ${{ needs.reserve_nightly.outputs.reservation_tag || '' }}
+          INPUT_CHANNEL: ${{ inputs.channel || '' }}
+          INPUT_VERSION: ${{ inputs.version || '' }}
+        run: |
+          set -euo pipefail
+
+          base_version_re='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
+          stable_version_re="^${base_version_re}$"
+          rc_version_re="^${base_version_re}-rc\.[1-9][0-9]*$"
+          nightly_version_re="^${base_version_re}-nightly\.[1-9][0-9]*$"
+          cargo_version_from_file() {
+            sed -n '/^\[package\]/,/^\[/{ s/^version = "\([^"]*\)"/\1/p; }' "$1" | head -n 1
+          }
+          lock_version_from_file() {
+            awk '
+              /^\[\[package\]\]$/ { in_package=1; is_cadence=0; next }
+              in_package && /^\[/ { in_package=0 }
+              in_package && $0 == "name = \"cadence-native\"" { is_cadence=1; next }
+              in_package && is_cadence && /^version = / {
+                sub(/^version = "/, "")
+                sub(/"$/, "")
+                print
+                exit
+              }
+            ' "$1"
           }
           write_output() {
             printf '%s\n' "$1=$2" >> "$GITHUB_OUTPUT"
@@ -208,73 +408,13 @@ jobs:
 
           if [[ "$automatic_nightly" == true ]]; then
             [[ "$REF" == refs/heads/main ]] || { echo "automatic nightly releases must run from the main branch" >&2; exit 1; }
-            reservation_tag="cadence-nightly-${RUN_NUMBER}-${original_source_sha:0:12}"
-            existing_tag_ref="$(git ls-remote --refs origin "refs/tags/$reservation_tag" | awk 'NF == 2 { print; found++ } END { if (found > 1) exit 1 }')"
-            if [[ -n "$existing_tag_ref" ]]; then
-              git fetch --no-tags origin "refs/tags/$reservation_tag:refs/tags/$reservation_tag"
-              [[ "$(git cat-file -t "refs/tags/$reservation_tag")" == commit ]] || {
-                echo "nightly reservation tag is not a lightweight commit tag: $reservation_tag" >&2
-                exit 1
-              }
-              source_sha="$(git rev-parse "refs/tags/$reservation_tag^{commit}")"
-              reserved_cargo_version="$(git show "$source_sha:Cargo.toml" | sed -n '/^\[package\]/,/^\[/{ s/^version = "\([^"]*\)"/\1/p; }' | head -n 1)"
-              reserved_lock_version="$(git show "$source_sha:Cargo.lock" | awk '
-                /^\[\[package\]\]$/ { in_package=1; is_cadence=0; next }
-                in_package && /^\[/ { in_package=0 }
-                in_package && $0 == "name = \"cadence-native\"" { is_cadence=1; next }
-                in_package && is_cadence && /^version = / {
-                  sub(/^version = "/, "")
-                  sub(/"$/, "")
-                  print
-                  exit
-                }
-              ')"
-              reserved_base_version="${reserved_cargo_version%%-*}"
-              [[ "$reserved_base_version" =~ ^${base_version_re}$ ]] || { echo "reservation tag does not contain a numeric Cadence package version" >&2; exit 1; }
-              [[ "$reserved_cargo_version" == "$reserved_base_version" ]] || { echo "reservation Cargo package version must be numeric: $reserved_cargo_version" >&2; exit 1; }
-              [[ "$reserved_lock_version" == "$reserved_cargo_version" ]] || { echo "reservation Cargo.toml and Cargo.lock versions differ" >&2; exit 1; }
-            else
-              git fetch --no-tags origin main
-              [[ "$(git rev-parse origin/main)" == "$original_source_sha" ]] || {
-                echo "main advanced after the nightly source was selected; refusing to reserve a version" >&2
-                exit 1
-              }
-              release_names="$(gh api --paginate \
-                -H 'Accept: application/vnd.github+json' \
-                "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
-                --jq '.[] | select(.draft == false and .published_at != null) | .name')"
-              if [[ -n "$release_names" ]]; then
-                reserved_base_version="$(printf '%s' "$release_names" | ./scripts/release/allocate_nightly_version.sh "$original_cargo_base_version")"
-              else
-                reserved_base_version="$(./scripts/release/allocate_nightly_version.sh "$original_cargo_base_version")"
-              fi
-              write_reserved_package_version "$reserved_base_version"
-              assert_package_versions "$reserved_base_version"
-              unexpected_files="$(git diff --name-only | grep -v -E '^(Cargo\.toml|Cargo\.lock)$' || true)"
-              [[ -z "$unexpected_files" ]] || { echo "nightly reservation changed unexpected files: $unexpected_files" >&2; exit 1; }
-              if ! git diff --quiet -- Cargo.toml Cargo.lock; then
-                git config user.name "github-actions[bot]"
-                git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-                git add Cargo.toml Cargo.lock
-                [[ "$(git diff --cached --name-only)" == $'Cargo.lock\nCargo.toml' ]] || {
-                  echo "nightly reservation commit must contain only Cargo.toml and Cargo.lock" >&2
-                  exit 1
-                }
-                git commit -m "chore(release): reserve Cadence ${reserved_base_version} nightly"
-              fi
-              if git show-ref --verify --quiet "refs/tags/$reservation_tag"; then
-                echo "local nightly reservation tag already exists unexpectedly: $reservation_tag" >&2
-                exit 1
-              fi
-              if git ls-remote --exit-code --refs origin "refs/tags/$reservation_tag" >/dev/null 2>&1; then
-                echo "nightly reservation tag appeared concurrently: $reservation_tag" >&2
-                exit 1
-              fi
-              git tag "$reservation_tag"
-              git push --atomic origin HEAD:refs/heads/main "refs/tags/$reservation_tag"
-              source_sha="$(git rev-parse HEAD)"
-              assert_package_versions "$reserved_base_version"
-            fi
+            [[ "$RESERVED_SOURCE_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || { echo "nightly reservation did not provide a full source SHA" >&2; exit 1; }
+            [[ "$RESERVED_BASE_VERSION" =~ ^${base_version_re}$ ]] || { echo "nightly reservation did not provide a numeric base version" >&2; exit 1; }
+            [[ "$RESERVATION_TAG" == cadence-nightly-* ]] || { echo "nightly reservation did not provide a reservation tag" >&2; exit 1; }
+            source_sha="$(printf '%s' "$RESERVED_SOURCE_SHA" | tr '[:upper:]' '[:lower:]')"
+            reserved_base_version="$RESERVED_BASE_VERSION"
+            reservation_tag="$RESERVATION_TAG"
+            [[ "$(git rev-parse HEAD)" == "$source_sha" ]] || { echo "prepared source does not match the nightly reservation" >&2; exit 1; }
             version="${reserved_base_version}-nightly.${RUN_NUMBER}"
             release_tag="$reservation_tag"
             tag_release=true
