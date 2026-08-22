@@ -427,6 +427,7 @@ fn replace_track_at(
         metadata.len(),
         Some(decoded.source_proof().clone()),
     )?;
+    library.selected_track_id = Some(track_id.to_owned());
     ensure_decoded_audio_unchanged(&decoded)?;
     persist_library_at(&library, library_path)?;
     Ok(library)
@@ -2088,7 +2089,23 @@ mod tests {
         let directory = TestDirectory::new();
         let library_path = directory.path.join("library.json");
         let (source, decoded) = decoded_audio_fixture(&directory.path);
-        let library = persistence_fixture();
+        let mut library = persistence_fixture();
+        library.tracks.push(Track {
+            id: String::from("track-2"),
+            title: String::from("Other Track"),
+            original_name: String::from("other.wav"),
+            path: PathBuf::from("/external/other.wav"),
+            source_proof: crate::source::SourceProvenance::Unknown,
+            reference_path: None,
+            size: 84,
+            favorite: false,
+            stage: TrackStage::SoundDesign,
+            status: TrackStatus::Inbox,
+            notes: Vec::new(),
+        });
+        library.planner_order.push(String::from("track-2"));
+        library.selected_track_id = Some(String::from("track-2"));
+        assert_eq!(library.selected_track_id.as_deref(), Some("track-2"));
         persist_library_at(&library, &library_path).expect("original library should persist");
 
         let replaced = replace_track_at(library.clone(), "track-1", decoded, &library_path)
@@ -2103,11 +2120,10 @@ mod tests {
         assert!(track.favorite);
         assert_eq!(track.stage, TrackStage::Mixdown);
         assert_eq!(track.status, TrackStatus::Release);
-        assert_eq!(replaced.selected_track_id, Some(String::from("track-1")));
-        assert_eq!(
-            load_library_at(&library_path).expect("replaced library should reload"),
-            replaced
-        );
+        assert_eq!(replaced.selected_track_id.as_deref(), Some("track-1"));
+        let reloaded = load_library_at(&library_path).expect("replaced library should reload");
+        assert_eq!(reloaded.selected_track_id.as_deref(), Some("track-1"));
+        assert_eq!(reloaded, replaced);
     }
 
     #[test]
