@@ -10099,6 +10099,7 @@ fn planner_panel(state: &AppState) -> ui::View<Message> {
                 status_menu_track_id: state.status_menu_track_id.as_deref(),
                 status_menu_host: state.status_menu_host,
                 remove_confirmation_track_id: state.remove_confirmation_track_id.as_deref(),
+                drag_source_track_id,
             },
             state.planner_windows[planner_stage_index(stage)],
             drag_active,
@@ -10152,6 +10153,7 @@ struct PlannerColumnContext<'a> {
     status_menu_track_id: Option<&'a str>,
     status_menu_host: Option<StatusMenuHost>,
     remove_confirmation_track_id: Option<&'a str>,
+    drag_source_track_id: Option<&'a str>,
 }
 
 fn planner_column(
@@ -10169,6 +10171,7 @@ fn planner_column(
         status_menu_track_id,
         status_menu_host,
         remove_confirmation_track_id,
+        drag_source_track_id,
     } = context;
     let count = tracks.len();
     let tone = planner_column_tone(stage);
@@ -10228,25 +10231,19 @@ fn planner_column(
         children.push(empty_content);
     } else {
         let row_height = planner_card_height() + TRACK_CARD_LIST_SPACING;
+        let logical_window = resolved_virtual_list_window(current_window, count, None, false);
         let window = if drag_active {
-            // Active drags mount every keyed row and insertion target, while
-            // retaining the virtual-list shell so the scroll and capture owners
-            // remain compatible with the idle projection.
-            let window_start = current_window.window_start.min(count - 1);
-            let viewport_start = current_window.viewport_start.min(count - 1);
-            let viewport_end = current_window
-                .viewport_end
-                .max(viewport_start + 1)
-                .min(count);
+            let source_index = drag_source_track_id
+                .and_then(|source_id| tracks.iter().position(|track| track.id == source_id));
             ui::VirtualListWindow {
-                total_items: count,
-                viewport_start,
-                viewport_end,
-                window_start,
+                window_start: source_index.map_or(logical_window.window_start, |index| {
+                    logical_window.window_start.min(index)
+                }),
                 window_end: count,
+                ..logical_window
             }
         } else {
-            resolved_virtual_list_window(current_window, count, None, false)
+            logical_window
         };
         let scroll = ui::virtual_list_windowed(|index| {
             let track = tracks[index];
@@ -10275,13 +10272,31 @@ fn planner_column(
         })
         .window(window)
         .row_height(row_height)
-        .overscan_px(row_height * VIRTUAL_LIST_OVERSCAN_ROWS as f32)
-        .on_window_changed(move |change| Message::PlannerColumnWindowChanged { stage, change })
-        .retain_materialized_window()
-        .view()
-        .key(format!("planner-column-scroll-{}", stage.label()))
-        .without_chrome()
-        .fill_height();
+        .overscan_px(row_height * VIRTUAL_LIST_OVERSCAN_ROWS as f32);
+        let scroll = if drag_active {
+            scroll.view().on_scroll_update_opt(move |update| {
+                let change = ui::virtual_list_window_change_for_scroll(
+                    update,
+                    row_height,
+                    logical_window,
+                    VIRTUAL_LIST_OVERSCAN_ROWS,
+                );
+                (change.window != logical_window)
+                    .then_some(Message::PlannerColumnWindowChanged { stage, change })
+            })
+        } else {
+            scroll
+                .on_window_changed(move |change| Message::PlannerColumnWindowChanged {
+                    stage,
+                    change,
+                })
+                .retain_materialized_window()
+                .view()
+        };
+        let scroll = scroll
+            .key(format!("planner-column-scroll-{}", stage.label()))
+            .without_chrome()
+            .fill_height();
         children.push(scroll);
     }
     let column_content = ui::column(children).padding(12.0).spacing(8.0).fill();
@@ -13432,22 +13447,6 @@ mod tests {
                     .then_some(run.rect)
             })
             .unwrap_or_else(|| panic!("visible Planner card title should be painted: {track_id}"))
-    }
-
-    fn first_visible_planner_card_title(
-        frame: &radiant::runtime::SurfaceFrame,
-        viewport: Rect,
-    ) -> (String, Rect) {
-        frame
-            .paint_plan
-            .text_runs()
-            .find_map(|run| {
-                (run.text.starts_with("planner-card-")
-                    && !run.text.ends_with(".wav")
-                    && viewport.contains(run.rect.center()))
-                .then_some((run.text.as_str().to_owned(), run.rect))
-            })
-            .expect("a visible Planner card title should be painted")
     }
 
     fn materialized_planner_card_titles(frame: &radiant::runtime::SurfaceFrame) -> Vec<String> {
@@ -23864,7 +23863,8 @@ mod tests {
 
     #[test]
     fn planner_runtime_preserves_keyed_scroll_across_drag_policy_switch() {
-        let mut state = planner_scroll_state(48);
+        let cards_per_stage = 48;
+        let mut state = planner_scroll_state(cards_per_stage);
         state.remove_confirmation_track_id = Some(String::from("planner-card-47"));
         let bridge = DeclarativeOwnedCommandRuntimeBridge::new(
             state,
@@ -23877,7 +23877,6 @@ mod tests {
         );
         let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1_180.0, 720.0));
         let initial_frame = runtime.frame_with_default_theme();
-        let idle_materialized_nodes = runtime.layout().stats.materialized_nodes;
         let first_card_point = initial_frame
             .paint_plan
             .first_text_run("planner-card-0")
@@ -23895,39 +23894,11 @@ mod tests {
             })
             .expect("the first card should identify the Production scroll container");
 
-        for _ in 0..16 {
-            runtime.dispatch_event(Event::scroll(first_card_point, Vector2::new(0.0, 120.0)));
-            if runtime.bridge().state().planner_windows[planner_stage_index(TrackStage::Production)]
-                .viewport_start
-                > 0
-            {
-                break;
-            }
-        }
-        let scrolled_frame = runtime.frame_with_default_theme();
-        let scrolled_window =
-            runtime.bridge().state().planner_windows[planner_stage_index(TrackStage::Production)];
-        assert!(
-            scrolled_window.viewport_start > 0,
-            "runtime wheel input should produce a nonzero Production scroll offset"
-        );
-        assert_eq!(
-            runtime.bridge().state().planner_windows[planner_stage_index(TrackStage::Mixdown)]
-                .viewport_start,
-            0
-        );
-        let (visible_card_id, scrolled_card_rect) =
-            first_visible_planner_card_title(&scrolled_frame, production_viewport);
-        let visible_slot = visible_card_id
-            .strip_prefix("planner-card-")
-            .expect("fixture card ids should include their Planner slot")
-            .parse::<usize>()
-            .expect("fixture card ids should use numeric Planner slots");
         let handle_point =
-            planner_drag_handle_point_in_viewport(&scrolled_frame, production_viewport);
+            planner_drag_handle_point_in_viewport(&initial_frame, production_viewport);
         assert!(
             production_viewport.contains(handle_point),
-            "the drag should start from a visible handle in the scrolled column"
+            "the Production drag should start from a visible handle"
         );
 
         runtime.dispatch_event(Event::primary_press(handle_point));
@@ -23943,7 +23914,7 @@ mod tests {
                 .state()
                 .planner_drag_source_track_id
                 .as_deref(),
-            Some(visible_card_id.as_str())
+            Some("planner-card-0")
         );
         runtime.refresh();
         assert_eq!(runtime.pointer_capture(), Some(captured_handle));
@@ -23952,12 +23923,33 @@ mod tests {
             Some(started_pointer)
         );
 
-        let active_frame = runtime.frame_with_default_theme();
-        let active_materialized_nodes = runtime.layout().stats.materialized_nodes;
+        let final_slot = cards_per_stage;
+        let mut reached_final_rows = false;
+        for _ in 0..80 {
+            runtime.dispatch_event(Event::scroll(
+                production_viewport.center(),
+                Vector2::new(0.0, 120.0),
+            ));
+            let window = runtime.bridge().state().planner_windows
+                [planner_stage_index(TrackStage::Production)];
+            if window.viewport_end == cards_per_stage {
+                reached_final_rows = true;
+                break;
+            }
+        }
         assert!(
-            active_materialized_nodes > idle_materialized_nodes,
-            "an active 48-card Planner drag should materialize more layout nodes than idle: idle={idle_materialized_nodes}, active={active_materialized_nodes}"
+            reached_final_rows,
+            "active drag scrolling should update the Production window through the final rows"
         );
+        assert_eq!(runtime.pointer_capture(), Some(captured_handle));
+
+        let scrolled_frame = runtime.frame_with_default_theme();
+        let scrolled_window =
+            runtime.bridge().state().planner_windows[planner_stage_index(TrackStage::Production)];
+        assert!(scrolled_window.viewport_start > 0);
+        assert_eq!(scrolled_window.viewport_end, cards_per_stage);
+        assert!(scrolled_window.window_start > 0);
+        assert_eq!(scrolled_window.window_end, cards_per_stage);
         let active_layout = runtime.layout();
         assert!(
             active_layout
@@ -23972,18 +23964,20 @@ mod tests {
             production_viewport,
             0.5,
         );
-        assert_rect_close(
-            planner_card_title_rect(&active_frame, &visible_card_id, production_viewport),
-            scrolled_card_rect,
-            0.5,
-        );
 
-        let insertion_point = Point::new(
-            scrolled_card_rect.center().x,
-            scrolled_card_rect.min.y + scrolled_card_rect.height() * 0.25,
+        let final_card_id = format!("planner-card-{}", cards_per_stage - 1);
+        let final_card_rect =
+            planner_card_title_rect(&scrolled_frame, &final_card_id, production_viewport);
+        let final_target_point = Point::new(
+            final_card_rect.center().x,
+            final_card_rect.min.y + super::planner_card_height() * 0.75,
+        );
+        assert!(
+            production_viewport.contains(final_target_point),
+            "the final card's lower half should remain inside the keyed Production viewport"
         );
         let insertion_move =
-            runtime.dispatch_pointer_move_deferred_refresh_with_outcome(insertion_point);
+            runtime.dispatch_pointer_move_deferred_refresh_with_outcome(final_target_point);
         assert!(insertion_move.pointer_captured);
         runtime.refresh();
         let insertion_target = runtime
@@ -23991,21 +23985,19 @@ mod tests {
             .state()
             .planner_drag_target
             .clone()
-            .expect("a visible card row should expose an insertion target during drag");
-        assert_eq!(insertion_target.stage, TrackStage::Production);
-        assert!(
-            insertion_target.slot == visible_slot || insertion_target.slot == visible_slot + 1,
-            "insertion target should belong to the visible card row: target={insertion_target:?}, visible_slot={visible_slot}"
+            .expect("the final card should expose an insertion target during drag");
+        assert_eq!(
+            insertion_target,
+            PlannerInsertionTarget {
+                stage: TrackStage::Production,
+                slot: final_slot,
+            }
         );
 
-        let invalid_point = active_frame
-            .paint_plan
-            .first_text_run("FINISHING BOARD")
-            .expect("the Planner header should remain visible")
-            .rect
-            .center();
-        runtime.dispatch_pointer_move_deferred_refresh_with_outcome(invalid_point);
-        runtime.dispatch_event(Event::primary_release(invalid_point));
+        let keyed_scroll_identity = production_scroll_id;
+        let keyed_scroll_viewport = production_viewport;
+        let keyed_scroll_anchor = final_card_rect;
+        runtime.dispatch_event(Event::primary_release(final_target_point));
         runtime.refresh();
         assert!(runtime.pointer_capture().is_none());
         assert!(
@@ -24015,40 +24007,55 @@ mod tests {
                 .planner_drag_source_track_id
                 .is_none()
         );
+        assert!(runtime.bridge().state().planner_drag_target.is_none());
+        assert!(runtime.bridge().state().planner_drag_pointer.is_none());
+
+        let production_ids = planner_tracks_with_status(
+            &runtime.bridge().state().library,
+            runtime.bridge().state().planner_status_filter,
+        )
+        .tracks_in_stage(TrackStage::Production)
+        .iter()
+        .map(|track| track.id.clone())
+        .collect::<Vec<_>>();
+        let expected_production_ids = (1..cards_per_stage)
+            .map(|index| format!("planner-card-{index}"))
+            .chain(std::iter::once(String::from("planner-card-0")))
+            .collect::<Vec<_>>();
+        assert_eq!(production_ids, expected_production_ids);
 
         let resumed_frame = runtime.frame_with_default_theme();
         let resumed_layout = runtime.layout();
         let resumed_window =
             runtime.bridge().state().planner_windows[planner_stage_index(TrackStage::Production)];
         assert!(resumed_window.viewport_start > 0);
+        assert!(resumed_window.window_start > 0);
+        assert!(resumed_window.window_len() < cards_per_stage);
+        assert!(resumed_window.contains(cards_per_stage - 1));
+        assert_eq!(resumed_window.window_end, cards_per_stage);
+        let resumed_scroll_viewport = *resumed_layout
+            .viewport_bounds
+            .get(&keyed_scroll_identity)
+            .expect("the keyed virtual scroll viewport should remain mounted");
         assert!(
-            resumed_window.viewport_start == scrolled_window.viewport_start,
-            "the keyed scroll offset should survive drag fallback: before={}, after={}",
-            scrolled_window.viewport_start,
-            resumed_window.viewport_start
+            (resumed_scroll_viewport.min.x - keyed_scroll_viewport.min.x).abs() <= 0.5
+                && (resumed_scroll_viewport.min.y - keyed_scroll_viewport.min.y).abs() <= 0.5
+                && (resumed_scroll_viewport.width() - keyed_scroll_viewport.width()).abs() <= 0.5,
+            "the keyed Production scroll identity should retain its position and width: actual={resumed_scroll_viewport:?}, before={keyed_scroll_viewport:?}"
         );
-        assert_eq!(
-            runtime.bridge().state().planner_windows[planner_stage_index(TrackStage::Mixdown)]
-                .viewport_start,
-            0
-        );
-        assert_rect_close(
-            *resumed_layout
-                .viewport_bounds
-                .get(&production_scroll_id)
-                .expect("the keyed virtual scroll viewport should remain mounted"),
-            production_viewport,
-            0.5,
-        );
-        assert_rect_close(
-            planner_card_title_rect(&resumed_frame, &visible_card_id, production_viewport),
-            scrolled_card_rect,
-            0.5,
+        let moved_source_rect =
+            planner_card_title_rect(&resumed_frame, "planner-card-0", keyed_scroll_viewport);
+        assert!(
+            resumed_frame.paint_plan.contains_text("planner-card-0")
+                && keyed_scroll_viewport.contains(moved_source_rect.center())
+                && (moved_source_rect.min.x - keyed_scroll_anchor.min.x).abs() <= 0.5
+                && (moved_source_rect.min.y - keyed_scroll_anchor.min.y).abs() <= 0.5,
+            "the moved source should paint at the retained keyed scroll position: actual={moved_source_rect:?}, before={keyed_scroll_anchor:?}"
         );
         assert!(
             resumed_layout
                 .viewport_bounds
-                .contains_key(&production_scroll_id)
+                .contains_key(&keyed_scroll_identity)
         );
     }
 
