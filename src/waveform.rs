@@ -188,6 +188,94 @@ struct DisplayBarLevelsCache {
     levels: Arc<[f32]>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PreparedNote {
+    ratio: f32,
+    done: bool,
+    original_index: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PreparedNoteMarker {
+    ratio: f32,
+    done: bool,
+    first_original_index: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+struct NoteMarkerIndex {
+    revision: u64,
+    sorted: Vec<PreparedNote>,
+    coalesced: Vec<PreparedNoteMarker>,
+}
+
+impl NoteMarkerIndex {
+    fn from_note_ratios(note_ratios: &[(f32, bool)]) -> Self {
+        let revision = note_ratios_revision(note_ratios);
+        let mut sorted = note_ratios
+            .iter()
+            .enumerate()
+            .map(|(original_index, (ratio, done))| PreparedNote {
+                ratio: clamp_ratio(*ratio),
+                done: *done,
+                original_index,
+            })
+            .collect::<Vec<_>>();
+        sorted.sort_unstable_by(|left, right| {
+            left.ratio
+                .total_cmp(&right.ratio)
+                .then_with(|| left.original_index.cmp(&right.original_index))
+        });
+
+        let mut coalesced: Vec<PreparedNoteMarker> = Vec::with_capacity(sorted.len());
+        let mut coalescing_start_ratio = None;
+        for note in &sorted {
+            if coalescing_start_ratio
+                .is_some_and(|start| note.ratio - start <= NOTE_RATIO_MATCH_EPSILON)
+            {
+                let marker = coalesced
+                    .last_mut()
+                    .expect("a coalescing start ratio requires a marker");
+                marker.done &= note.done;
+                if note.original_index < marker.first_original_index {
+                    marker.first_original_index = note.original_index;
+                    marker.ratio = note.ratio;
+                }
+            } else {
+                coalescing_start_ratio = Some(note.ratio);
+                coalesced.push(PreparedNoteMarker {
+                    ratio: note.ratio,
+                    done: note.done,
+                    first_original_index: note.original_index,
+                });
+            }
+        }
+        coalesced.sort_unstable_by(|left, right| {
+            left.first_original_index.cmp(&right.first_original_index)
+        });
+
+        Self {
+            revision,
+            sorted,
+            coalesced,
+        }
+    }
+}
+
+fn note_ratios_revision(note_ratios: &[(f32, bool)]) -> u64 {
+    note_ratios.iter().enumerate().fold(
+        0xcbf2_9ce4_8422_2325_u64,
+        |revision, (index, (ratio, done))| {
+            revision
+                .rotate_left(7)
+                .wrapping_mul(0x1000_0000_01b3)
+                .wrapping_add(ratio.to_bits() as u64)
+                .wrapping_add(u64::from(*done))
+                .wrapping_add(index as u64)
+        },
+    ) ^ note_ratios.len() as u64
+}
+
 #[allow(dead_code)]
 pub fn view<Message: 'static>(
     waveform: Arc<WaveformData>,
@@ -365,6 +453,7 @@ struct WaveformWidget {
     cursor_ratio: Option<f32>,
     loop_selection: Option<(f32, f32)>,
     note_ratios: Vec<(f32, bool)>,
+    note_marker_index: NoteMarkerIndex,
     draft_ratio: Option<f32>,
     external_hovered_note_ratio: Option<f32>,
     external_selected_note_ratio: Option<f32>,
@@ -405,6 +494,7 @@ impl WaveformWidget {
         common.paint.bounds = PaintBounds::ClipToRect;
         common.paint.paints_focus = false;
         common.paint.paints_state_layers = false;
+        let note_marker_index = NoteMarkerIndex::from_note_ratios(&note_ratios);
         Self {
             common,
             timeline: TimelineSurface::new(),
@@ -417,6 +507,7 @@ impl WaveformWidget {
             cursor_ratio: cursor_ratio.map(clamp_ratio),
             loop_selection: None,
             note_ratios,
+            note_marker_index,
             draft_ratio: None,
             external_hovered_note_ratio: None,
             external_selected_note_ratio: None,
@@ -463,6 +554,7 @@ impl WaveformWidget {
 
     #[cfg(test)]
     fn with_note_ratios(mut self, note_ratios: Vec<(f32, bool)>) -> Self {
+        self.note_marker_index = NoteMarkerIndex::from_note_ratios(&note_ratios);
         self.note_ratios = note_ratios;
         self
     }
@@ -497,24 +589,44 @@ impl WaveformWidget {
             return None;
         }
 
+        let plot_bounds = self.timeline.plot_bounds(bounds);
+        let plot_width = plot_bounds.width();
+        if !plot_bounds.is_finite() || plot_width <= 0.0 {
+            return None;
+        }
+
+        let pointer_ratio = clamp_ratio((position.x - plot_bounds.min.x) / plot_width);
+        let ratio_radius = NOTE_HOVER_RADIUS / plot_width;
+        let lower_ratio = (pointer_ratio - ratio_radius).max(0.0);
+        let upper_ratio = (pointer_ratio + ratio_radius).min(1.0);
+        let start = self
+            .note_marker_index
+            .sorted
+            .partition_point(|note| note.ratio < lower_ratio);
+        let end = self
+            .note_marker_index
+            .sorted
+            .partition_point(|note| note.ratio <= upper_ratio);
         let rail_y = comment_rail_y(bounds);
         let hover_radius_squared = NOTE_HOVER_RADIUS * NOTE_HOVER_RADIUS;
-        self.note_ratios
-            .iter()
-            .enumerate()
-            .filter_map(|(index, (ratio, _))| {
-                let ratio = clamp_ratio(*ratio);
-                let dx = position.x - self.timeline.x_at(bounds, ratio);
-                let dy = position.y - rail_y;
-                let distance_squared = dx * dx + dy * dy;
-                (distance_squared <= hover_radius_squared).then_some((
-                    distance_squared,
-                    index,
-                    ratio,
-                ))
-            })
-            .min_by(|left, right| left.0.total_cmp(&right.0))
-            .map(|(_, index, ratio)| (index, ratio))
+        let dy = position.y - rail_y;
+        let mut nearest = None;
+        for note in &self.note_marker_index.sorted[start..end] {
+            let dx = position.x - self.timeline.x_at(bounds, note.ratio);
+            let distance_squared = dx * dx + dy * dy;
+            if distance_squared > hover_radius_squared {
+                continue;
+            }
+            let should_replace = nearest.is_none_or(|(best_distance, best_index, _)| {
+                distance_squared.total_cmp(&best_distance).is_lt()
+                    || (distance_squared.total_cmp(&best_distance).is_eq()
+                        && note.original_index < best_index)
+            });
+            if should_replace {
+                nearest = Some((distance_squared, note.original_index, note.ratio));
+            }
+        }
+        nearest.map(|(_, index, ratio)| (index, ratio))
     }
 
     fn persisted_note_near_position(&self, bounds: Rect, position: Point) -> Option<f32> {
@@ -523,11 +635,20 @@ impl WaveformWidget {
     }
 
     fn matching_note_ratio(&self, target: Option<f32>) -> Option<f32> {
-        let target = target?;
-        self.note_ratios.iter().find_map(|(ratio, _)| {
-            let ratio = clamp_ratio(*ratio);
-            ((ratio - target).abs() <= NOTE_RATIO_MATCH_EPSILON).then_some(ratio)
-        })
+        let target = clamp_ratio(target?);
+        let start = self
+            .note_marker_index
+            .sorted
+            .partition_point(|note| note.ratio < target - NOTE_RATIO_MATCH_EPSILON);
+        let end = self
+            .note_marker_index
+            .sorted
+            .partition_point(|note| note.ratio <= target + NOTE_RATIO_MATCH_EPSILON);
+        self.note_marker_index.sorted[start..end]
+            .iter()
+            .filter(|note| (note.ratio - target).abs() <= NOTE_RATIO_MATCH_EPSILON)
+            .min_by(|left, right| left.original_index.cmp(&right.original_index))
+            .map(|note| note.ratio)
     }
 
     fn local_hovered_note_ratio(&self) -> Option<f32> {
@@ -884,12 +1005,7 @@ impl Widget for WaveformWidget {
         self.common.state = previous.common.state;
         self.hover_ratio = previous.hover_ratio;
         self.hover_lower = previous.hover_lower;
-        self.hovered_note_ratio = previous.hovered_note_ratio.and_then(|ratio| {
-            self.note_ratios.iter().find_map(|(candidate, _)| {
-                let candidate = clamp_ratio(*candidate);
-                ((candidate - ratio).abs() <= NOTE_RATIO_MATCH_EPSILON).then_some(candidate)
-            })
-        });
+        self.hovered_note_ratio = self.matching_note_ratio(previous.hovered_note_ratio);
         self.playhead_dragging = previous.playhead_dragging;
         self.playhead_preview_ratio = previous.playhead_preview_ratio;
         self.pending_upper_click = previous.pending_upper_click;
@@ -898,8 +1014,10 @@ impl Widget for WaveformWidget {
         self.loop_drag_start_ratio = previous.loop_drag_start_ratio;
         self.loop_drag_current_ratio = previous.loop_drag_current_ratio;
         self.comment_dragging = previous.comment_dragging;
-        self.comment_drag_note_index = previous
-            .comment_drag_note_index
+        self.comment_drag_note_index = (self.note_marker_index.revision
+            == previous.note_marker_index.revision)
+            .then_some(previous.comment_drag_note_index)
+            .flatten()
             .filter(|index| *index < self.note_ratios.len());
         if self.visible_ratio.is_some() {
             self.clear_pointer_state();
@@ -993,31 +1111,20 @@ impl Widget for WaveformWidget {
             self.current_external_hovered_note_ratio()
         };
         let selected_note_ratio = self.current_selected_note_ratio();
-        let mut coalesced_notes: Vec<(f32, bool)> = Vec::with_capacity(self.note_ratios.len());
-        for (ratio, done) in &self.note_ratios {
-            let ratio = clamp_ratio(*ratio);
-            if let Some((_, coalesced_done)) = coalesced_notes
-                .iter_mut()
-                .find(|(candidate, _)| (ratio - *candidate).abs() <= NOTE_RATIO_MATCH_EPSILON)
-            {
-                // A collocated marker is done only when every note is done, so
-                // an open note always wins regardless of input order.
-                *coalesced_done &= *done;
-            } else {
-                coalesced_notes.push((ratio, *done));
-            }
-        }
-        for (ratio, _) in coalesced_notes {
-            let externally_highlighted = Self::same_note_ratio(external_hovered_note_ratio, ratio)
-                || (Self::same_note_ratio(selected_note_ratio, ratio)
-                    && !Self::same_note_ratio(local_hovered_note_ratio, ratio));
+        for marker in &self.note_marker_index.coalesced {
+            // A collocated marker is done only when every note is done, so an
+            // open note always wins regardless of input order.
+            let externally_highlighted =
+                Self::same_note_ratio(external_hovered_note_ratio, marker.ratio)
+                    || (Self::same_note_ratio(selected_note_ratio, marker.ratio)
+                        && !Self::same_note_ratio(local_hovered_note_ratio, marker.ratio));
             paint_note_marker(
                 primitives,
                 self.common.id,
                 plot_bounds,
                 rail_y,
                 NoteMarkerStyle {
-                    ratio,
+                    ratio: marker.ratio,
                     radius: MARKER_RADIUS,
                     fill_color: if externally_highlighted {
                         colors.note_hover_fill
@@ -2185,6 +2292,43 @@ mod tests {
             "external selection should not duplicate the collocated marker"
         );
         assert_eq!(highlighted_note_marker_count(&selected_paint.primitives), 1);
+    }
+
+    #[test]
+    fn persisted_note_hit_uses_sorted_candidates_but_returns_original_index() {
+        let bounds = Rect::from_min_max(Point::new(10.0, 20.0), Point::new(310.0, 120.0));
+        let widget = WaveformWidget::new(
+            Arc::new(test_waveform()),
+            None,
+            vec![(0.8, false), (0.2, false), (0.5, false)],
+        );
+        let rail_y = comment_rail_y(bounds);
+
+        assert_eq!(
+            widget.persisted_note_hit(
+                bounds,
+                Point::new(timeline_x(bounds, 0.5) + 2.0, rail_y + 2.0),
+            ),
+            Some((2, 0.5))
+        );
+    }
+
+    #[test]
+    fn collocated_note_hit_keeps_the_nearest_original_note_index() {
+        let bounds = Rect::from_min_max(Point::new(10.0, 20.0), Point::new(310.0, 120.0));
+        let second_ratio = 0.4 + NOTE_RATIO_MATCH_EPSILON * 0.5;
+        let widget = WaveformWidget::new(
+            Arc::new(test_waveform()),
+            None,
+            vec![(0.4, true), (second_ratio, false)],
+        );
+        let rail_y = comment_rail_y(bounds);
+
+        assert_eq!(
+            widget
+                .persisted_note_hit(bounds, Point::new(timeline_x(bounds, second_ratio), rail_y),),
+            Some((1, second_ratio))
+        );
     }
 
     #[test]

@@ -26,7 +26,7 @@ use radiant::{
     },
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fmt::Write as _,
     path::{Path, PathBuf},
     sync::Arc,
@@ -64,6 +64,7 @@ enum Message {
     RetryLibraryLoad,
     PreserveLibraryAndStartFresh,
     LibraryRecoveryCompleted(Result<PathBuf, String>),
+    AdmitLibrarySave,
     RetryLibrarySave,
     ImportCompleted(Result<storage::Library, String>),
     ReplaceCompleted {
@@ -123,6 +124,15 @@ enum Message {
     SetPlannerStatusFilter(Option<storage::TrackStatus>),
     ReviewLibraryWindowChanged(ui::VirtualListWindowChange),
     AuditionQueueWindowChanged(ui::VirtualListWindowChange),
+    ReferenceSettingsWindowChanged(ui::VirtualListWindowChange),
+    CommentsWindowChanged {
+        source: CommentSource,
+        change: ui::VirtualListWindowChange,
+    },
+    PlannerColumnWindowChanged {
+        stage: storage::TrackStage,
+        change: ui::VirtualListWindowChange,
+    },
     ShuffleAudition,
     ToggleFavorite(String),
     ToggleStageMenu(String),
@@ -342,7 +352,7 @@ enum WorkspaceMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StatusMenuHost {
     Library,
-    Planner,
+    Planner(storage::TrackStage),
     Audition,
 }
 
@@ -455,8 +465,14 @@ const MAIN_COMMENT_EDITOR_ID: u64 = 0xCAD3_1001;
 const REFERENCE_COMMENT_EDITOR_ID: u64 = 0xCAD3_1002;
 const MAIN_INLINE_COMMENT_EDITOR_SCOPE: u64 = 0xCAD3_1003;
 const REFERENCE_INLINE_COMMENT_EDITOR_SCOPE: u64 = 0xCAD3_1004;
+const MAIN_COMMENTS_SCROLL_VIEWPORT_ID: u64 = 0xCAD3_1005;
+const REFERENCE_COMMENTS_SCROLL_VIEWPORT_ID: u64 = 0xCAD3_1006;
+const COMMENT_ROW_HEIGHT: f32 = 44.0;
 const LIBRARY_TRACK_TITLE_ID_SCOPE: u64 = 0xCAD3_0004;
+const PLANNER_DRAG_HANDLE_ID_SCOPE: u64 = 0xCAD3_0007;
+const PLANNER_SCROLL_VIEWPORT_ID_SCOPE: u64 = 0xCAD3_0008;
 const LIBRARY_SCROLL_VIEWPORT_ID: u64 = 0xCAD3_0005;
+const REFERENCE_SETTINGS_SCROLL_VIEWPORT_ID: u64 = 0xCAD3_0006;
 const LIBRARY_REVEAL_MARGIN: f32 = 12.0;
 const TRACK_CARD_CHAMFER: f32 = 8.0;
 const TRACK_CARD_RAIL_WIDTH: f32 = 4.0;
@@ -466,6 +482,7 @@ const TRACK_CARD_OUTLINE_WIDTH: f32 = 1.5;
 const TRACK_CARD_CONTENT_INSET: f32 = 12.0;
 const TRACK_CARD_CONTENT_SPACING: f32 = 3.0;
 const TRACK_CARD_LIST_SPACING: f32 = 8.0;
+const REMOVAL_CONFIRMATION_ROW_HEIGHT: f32 = 20.0;
 const LIBRARY_LIST_INSET: f32 = 6.0;
 const STATUS_RAIL_WIDTH: f32 = 4.0;
 const STATUS_RAIL_GAP: f32 = 4.0;
@@ -475,10 +492,6 @@ const PLANNER_DRAG_PREVIEW_CARD_WIDTH: f32 = 300.0;
 const PLANNER_DRAG_PREVIEW_CARD_HEIGHT: f32 = 154.0;
 const PLANNER_DROP_MARKER_ORANGE: ui::Rgba8 = ui::Rgba8::new(255, 160, 82, 255);
 const PLANNER_DROP_MARKER_HEIGHT: f32 = 4.0;
-const PLANNER_DROP_SENTINEL_HEIGHT: f32 = 20.0;
-// Bound idle wheel relayout to nearby variable-height rows. Active drags use
-// ordinary scrolling below so every insertion hit target remains mounted.
-const PLANNER_SCROLL_OVERSCAN: f32 = 240.0;
 const APP_FRAME_CLOCK_FPS: u32 = 60;
 
 #[derive(Clone, Debug)]
@@ -787,6 +800,39 @@ impl Widget for PlannerStageRailWidget {
     }
 }
 
+fn planner_drag_handle_id(track_id: &str) -> u64 {
+    ui::stable_widget_id(PLANNER_DRAG_HANDLE_ID_SCOPE, track_id)
+}
+
+fn planner_column_scroll_viewport_id(stage: storage::TrackStage) -> u64 {
+    ui::stable_widget_id(PLANNER_SCROLL_VIEWPORT_ID_SCOPE, stage.label())
+}
+
+fn planner_drag_handle(track_id: &str, input_only: bool) -> ui::View<Message> {
+    let explicit_id = planner_drag_handle_id(track_id);
+    let mapped_track_id = track_id.to_owned();
+    let handle = ui::custom_widget_mapped(
+        PlannerDragHandleWidget::new(),
+        move |message: ui::DragHandleMessage| Message::PlannerCardDrag {
+            track_id: mapped_track_id.clone(),
+            message,
+        },
+    )
+    .id(explicit_id);
+    if input_only {
+        ui::floating_layer_with_input(
+            Point::new(0.0, 0.0),
+            Vector2::new(1.0, 1.0),
+            handle.input_only().size(1.0, 1.0),
+            true,
+        )
+    } else {
+        handle
+            .size(PLANNER_DRAG_HANDLE_SIZE, PLANNER_DRAG_HANDLE_SIZE)
+            .tooltip("Drag to reorder")
+    }
+}
+
 fn planner_stage_rail(stage: storage::TrackStage, height: f32) -> ui::View<Message> {
     ui::custom_widget(PlannerStageRailWidget::new(stage), |_| None)
         .width(STATUS_RAIL_WIDTH)
@@ -988,6 +1034,7 @@ enum PairedPlaybackGuard {
 #[derive(Clone, Debug)]
 struct AppState {
     library: storage::Library,
+    selected_track_index: Option<usize>,
     library_load_state: LibraryLoadState,
     workspace_mode: WorkspaceMode,
     status: String,
@@ -995,6 +1042,7 @@ struct AppState {
     library_revision: u64,
     persisted_library_revision: u64,
     save_in_flight: Option<LibrarySaveAttempt>,
+    save_admission_pending: bool,
     last_save_attempt_id: u64,
     waveform: Option<audio::WaveformData>,
     waveform_source_ticket: Option<crate::source::VerifiedSourceTicket>,
@@ -1071,7 +1119,11 @@ struct AppState {
     review_status_filter: Option<storage::TrackStatus>,
     review_library_window: ui::VirtualListWindow,
     review_filter_menu_open: bool,
+    reference_settings_window: ui::VirtualListWindow,
     planner_status_filter: Option<storage::TrackStatus>,
+    planner_windows: [ui::VirtualListWindow; 4],
+    main_comments_window: ui::VirtualListWindow,
+    reference_comments_window: ui::VirtualListWindow,
     audition_status_filter: storage::TrackStatus,
     audition_queue: Vec<String>,
     audition_queue_window: ui::VirtualListWindow,
@@ -1090,11 +1142,11 @@ struct AppState {
     next_note_draft_nonce: u64,
     next_reference_selection_request_id: u64,
     import_batch: Option<ImportBatchProgress>,
-    pending_import_paths: Vec<PathBuf>,
-    pending_reference_paths: Vec<PathBuf>,
+    pending_import_paths: VecDeque<PathBuf>,
+    pending_reference_paths: VecDeque<PathBuf>,
     pending_reference_track_id: Option<String>,
     reference_import_selected_path: Option<PathBuf>,
-    pending_reference_catalog_paths: Vec<PathBuf>,
+    pending_reference_catalog_paths: VecDeque<PathBuf>,
     reference_catalog_import_total: usize,
     reference_catalog_import_completed: usize,
     reference_catalog_import_failed: usize,
@@ -1143,6 +1195,7 @@ impl Default for AppState {
     fn default() -> Self {
         Self {
             library: storage::Library::default(),
+            selected_track_index: None,
             library_load_state: LibraryLoadState::Ready,
             workspace_mode: WorkspaceMode::Review,
             status: String::from("Ready — import a track to begin."),
@@ -1150,6 +1203,7 @@ impl Default for AppState {
             library_revision: 0,
             persisted_library_revision: 0,
             save_in_flight: None,
+            save_admission_pending: false,
             last_save_attempt_id: 0,
             waveform: None,
             waveform_source_ticket: None,
@@ -1226,7 +1280,11 @@ impl Default for AppState {
             review_status_filter: None,
             review_library_window: ui::VirtualListWindow::default(),
             review_filter_menu_open: false,
+            reference_settings_window: ui::VirtualListWindow::default(),
             planner_status_filter: None,
+            planner_windows: std::array::from_fn(|_| ui::VirtualListWindow::default()),
+            main_comments_window: ui::VirtualListWindow::default(),
+            reference_comments_window: ui::VirtualListWindow::default(),
             audition_status_filter: storage::TrackStatus::Inbox,
             audition_queue: Vec::new(),
             audition_queue_window: ui::VirtualListWindow::default(),
@@ -1245,11 +1303,11 @@ impl Default for AppState {
             next_note_draft_nonce: 0,
             next_reference_selection_request_id: 0,
             import_batch: None,
-            pending_import_paths: Vec::new(),
-            pending_reference_paths: Vec::new(),
+            pending_import_paths: VecDeque::new(),
+            pending_reference_paths: VecDeque::new(),
             pending_reference_track_id: None,
             reference_import_selected_path: None,
-            pending_reference_catalog_paths: Vec::new(),
+            pending_reference_catalog_paths: VecDeque::new(),
             reference_catalog_import_total: 0,
             reference_catalog_import_completed: 0,
             reference_catalog_import_failed: 0,
@@ -1351,17 +1409,7 @@ fn live_spectrogram_presence_revision(state: &AppState) -> u64 {
 }
 
 fn frame_surface_revisions(state: &mut AppState) -> SurfaceRevisions {
-    let selected_track = state
-        .library
-        .selected_track_id
-        .as_deref()
-        .and_then(|track_id| {
-            state
-                .library
-                .tracks
-                .iter()
-                .find(|track| track.id == track_id)
-        });
+    let selected_track = selected_track(state);
     let structure = frame_revision_mix(&[
         workspace_mode_key(state.workspace_mode),
         state.library.tracks.len() as u64,
@@ -1608,12 +1656,15 @@ fn activate_loaded_library(
     state.audio_import_in_flight = None;
     state.pending_import_commit = None;
     state.library = library;
+    reset_comments_windows(state);
     state.library_revision = 0;
     state.persisted_library_revision = 0;
     state.save_in_flight = None;
+    state.save_admission_pending = false;
     storage::normalize_planner_order(&mut state.library);
     let (startup_track_id, startup_selection_changed) =
         normalize_startup_track_selection(&mut state.library);
+    refresh_selected_track_index(state);
     state.status = if state.library.tracks.is_empty() {
         String::from("Ready — import a track to begin.")
     } else {
@@ -2620,6 +2671,8 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             match result {
                 Ok(library) => {
                     state.library = library;
+                    reset_comments_windows(state);
+                    refresh_selected_track_index(state);
                     mark_library_snapshot_persisted(state);
                     state.status = format!(
                         "Added {} to the reference catalog.",
@@ -2765,6 +2818,8 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                         plural(library.tracks.len())
                     );
                     state.library = library;
+                    reset_comments_windows(state);
+                    refresh_selected_track_index(state);
                     mark_library_snapshot_persisted(state);
                     if state.workspace_mode == WorkspaceMode::Audition {
                         reconcile_audition_queue(state);
@@ -2824,6 +2879,8 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                         .map(|track| track.title.clone())
                         .unwrap_or_else(|| String::from("track"));
                     state.library = library;
+                    reset_comments_windows(state);
+                    refresh_selected_track_index(state);
                     mark_library_snapshot_persisted(state);
                     if state.workspace_mode == WorkspaceMode::Audition {
                         reconcile_audition_queue(state);
@@ -2879,6 +2936,8 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             match result {
                 Ok(library) => {
                     state.library = library;
+                    reset_comments_windows(state);
+                    refresh_selected_track_index(state);
                     mark_library_snapshot_persisted(state);
                     if state.reference_import_selected_path.is_none() {
                         state.reference_import_selected_path = Some(path);
@@ -3367,6 +3426,13 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             update_live_spectrogram_resize(state, message);
             context.request_repaint();
         }
+        Message::AdmitLibrarySave => {
+            if !state.save_admission_pending {
+                return;
+            }
+            state.save_admission_pending = false;
+            dispatch_library_save(state, context);
+        }
         Message::RetryLibrarySave => retry_library_save(state, context),
         Message::LibrarySaved { attempt, result } => {
             if state.save_in_flight != Some(attempt) {
@@ -3380,7 +3446,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                         state.status = String::from("All changes saved locally.");
                     }
                     if library_dirty(state) {
-                        dispatch_library_save(state, context);
+                        request_library_save_admission(state, context);
                     } else {
                         schedule_next_pending_library_operation(state, context);
                     }
@@ -3422,6 +3488,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             state.audition_auto_advance = false;
             state.audition_play_token = None;
             state.audition_pending_play_track_id = None;
+            state.audition_queue_window = ui::VirtualListWindow::default();
             rebuild_audition_queue(state);
             if let Some(track_id) = state.audition_queue.first().cloned() {
                 select_track_internal(state, context, track_id, false);
@@ -3450,12 +3517,44 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
         Message::ReviewLibraryWindowChanged(change) => {
             if state.review_library_window != change.window {
                 state.review_library_window = change.window;
+                if state.status_menu_host == Some(StatusMenuHost::Library) {
+                    close_status_menu(state);
+                }
                 context.request_repaint();
             }
         }
         Message::AuditionQueueWindowChanged(change) => {
             if state.audition_queue_window != change.window {
                 state.audition_queue_window = change.window;
+                if state.status_menu_host == Some(StatusMenuHost::Audition) {
+                    close_status_menu(state);
+                }
+                context.request_repaint();
+            }
+        }
+        Message::ReferenceSettingsWindowChanged(change) => {
+            if state.reference_settings_window != change.window {
+                state.reference_settings_window = change.window;
+                context.request_repaint();
+            }
+        }
+        Message::CommentsWindowChanged { source, change } => {
+            let window = match source {
+                CommentSource::Main => &mut state.main_comments_window,
+                CommentSource::Reference => &mut state.reference_comments_window,
+            };
+            if *window != change.window {
+                *window = change.window;
+                context.request_repaint();
+            }
+        }
+        Message::PlannerColumnWindowChanged { stage, change } => {
+            let window = &mut state.planner_windows[planner_stage_index(stage)];
+            if *window != change.window {
+                *window = change.window;
+                if state.status_menu_host == Some(StatusMenuHost::Planner(stage)) {
+                    close_status_menu(state);
+                }
                 context.request_repaint();
             }
         }
@@ -3470,6 +3569,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 close_status_menu(state);
                 context.end_drag();
                 clear_planner_drag(state);
+                state.planner_windows = std::array::from_fn(|_| ui::VirtualListWindow::default());
             }
             context.request_repaint();
         }
@@ -3856,6 +3956,8 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     return;
                 }
             };
+            refresh_selected_track_index(state);
+            reset_comments_windows(state);
             state.remove_confirmation_track_id = None;
             close_stage_menu(state);
             close_status_menu(state);
@@ -3878,6 +3980,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 state.comment_source_explicit = false;
                 state.library.selected_track_id =
                     storage::selection_after_removal(&state.library, removed.0);
+                refresh_selected_track_index(state);
                 close_reference_menu(state);
                 reset_waveform_decode(state);
                 reset_reference_waveform_decode(state);
@@ -4300,11 +4403,12 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 .and_then(|track| track.notes.iter().find(|note| note.id == address.note_id))
                 .cloned();
             if let Some(note) = note {
-                state.selected_note_id = Some(address);
+                state.selected_note_id = Some(address.clone());
                 set_pending_seek_intent(state, AuditionSource::Main, note.time_millis);
                 state.review_cursor_millis = note.time_millis;
                 state.transport_position_millis = note.time_millis;
                 state.draft_note = None;
+                reveal_comment_row(state, context, CommentSource::Main, &address);
                 state.status = format!(
                     "Selected comment at {}.",
                     format_timestamp(note.time_millis)
@@ -4393,12 +4497,13 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 state.transport_position_millis = note.time_millis;
                 state.selected_note_id = Some(address.clone());
                 state.draft_note = Some(NoteDraft {
-                    owner: address.owner,
+                    owner: address.owner.clone(),
                     note_id: Some(note.id),
                     nonce,
                     time_millis: note.time_millis,
                     body: note.body,
                 });
+                reveal_comment_row(state, context, CommentSource::Main, &address);
                 state.status =
                     format!("Editing comment at {}.", format_timestamp(note.time_millis));
                 context.request_repaint();
@@ -4508,10 +4613,11 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 .find(|note| note.id == address.note_id)
                 .cloned();
             if let Some(note) = note {
-                state.selected_reference_note_id = Some(address);
+                state.selected_reference_note_id = Some(address.clone());
                 set_pending_seek_intent(state, AuditionSource::Reference, note.time_millis);
                 state.reference_transport_position_millis = note.time_millis;
                 state.reference_draft_note = None;
+                reveal_comment_row(state, context, CommentSource::Reference, &address);
                 state.status = format!(
                     "Selected reference comment at {}.",
                     format_timestamp(note.time_millis)
@@ -4543,12 +4649,13 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 state.selected_reference_note_id = Some(address.clone());
                 state.reference_transport_position_millis = note.time_millis;
                 state.reference_draft_note = Some(NoteDraft {
-                    owner: address.owner,
+                    owner: address.owner.clone(),
                     note_id: Some(note.id),
                     nonce,
                     time_millis: note.time_millis,
                     body: note.body,
                 });
+                reveal_comment_row(state, context, CommentSource::Reference, &address);
                 state.status = format!(
                     "Editing reference comment at {}.",
                     format_timestamp(note.time_millis)
@@ -7379,6 +7486,8 @@ fn complete_reference_selection_commit(
     match result {
         Ok(library) => {
             state.library = library;
+            reset_comments_windows(state);
+            refresh_selected_track_index(state);
             mark_library_snapshot_persisted(state);
             close_reference_menu(state);
             if selected_path_changed {
@@ -7682,7 +7791,7 @@ fn schedule_import(
         || library_persistence_pending(state)
     {
         let display_name = path.display().to_string();
-        state.pending_import_paths.push(path);
+        state.pending_import_paths.push_back(path);
         state.status = if state.library_load_state == LibraryLoadState::Loading {
             format!(
                 "Queued {} for import while the library loads · {} file{} waiting.",
@@ -7713,22 +7822,17 @@ fn schedule_next_pending_library_operation(
     if !library_is_ready(state) || state.busy || library_persistence_pending(state) {
         return;
     }
-    if let Some(path) =
-        (!state.pending_import_paths.is_empty()).then(|| state.pending_import_paths.remove(0))
-    {
+    if let Some(path) = state.pending_import_paths.pop_front() {
         start_import(state, context, path);
         return;
     }
     if let Some(track_id) = state.pending_reference_track_id.clone()
-        && let Some(path) = (!state.pending_reference_paths.is_empty())
-            .then(|| state.pending_reference_paths.remove(0))
+        && let Some(path) = state.pending_reference_paths.pop_front()
     {
         schedule_reference(state, context, track_id, path);
         return;
     }
-    if let Some(path) = (!state.pending_reference_catalog_paths.is_empty())
-        .then(|| state.pending_reference_catalog_paths.remove(0))
-    {
+    if let Some(path) = state.pending_reference_catalog_paths.pop_front() {
         start_reference_catalog_import(state, context, path);
     }
 }
@@ -7759,7 +7863,7 @@ fn schedule_reference_import(
         context.request_repaint();
         return;
     }
-    state.pending_reference_paths = paths;
+    state.pending_reference_paths = paths.into();
     state.pending_reference_track_id = Some(track_id);
     state.reference_import_selected_path = None;
     state.reference_draft_note = None;
@@ -7782,9 +7886,7 @@ fn schedule_next_pending_reference_import(
     let Some(track_id) = state.pending_reference_track_id.clone() else {
         return;
     };
-    let Some(path) = (!state.pending_reference_paths.is_empty())
-        .then(|| state.pending_reference_paths.remove(0))
-    else {
+    let Some(path) = state.pending_reference_paths.pop_front() else {
         return;
     };
     schedule_reference(state, context, track_id, path);
@@ -7800,7 +7902,7 @@ fn schedule_reference_catalog_import(
         context.request_repaint();
         return;
     }
-    state.pending_reference_catalog_paths = paths;
+    state.pending_reference_catalog_paths = paths.into();
     state.reference_catalog_import_total = state.pending_reference_catalog_paths.len();
     state.reference_catalog_import_completed = 0;
     state.reference_catalog_import_failed = 0;
@@ -7814,9 +7916,7 @@ fn schedule_next_reference_catalog_import(
     if !library_is_ready(state) || state.busy || library_persistence_pending(state) {
         return;
     }
-    let Some(path) = (!state.pending_reference_catalog_paths.is_empty())
-        .then(|| state.pending_reference_catalog_paths.remove(0))
-    else {
+    let Some(path) = state.pending_reference_catalog_paths.pop_front() else {
         return;
     };
     start_reference_catalog_import(state, context, path);
@@ -7931,10 +8031,34 @@ fn library_persistence_pending(state: &AppState) -> bool {
     library_dirty(state) || state.save_in_flight.is_some()
 }
 
+/// Queue one save admission for the current UI turn's dirty revisions.
+///
+/// The admission is intentionally deferred so several mutations can share one
+/// snapshot boundary. The invariant is that this flag is only an admission
+/// request: the eventual handler always reads the current library and
+/// `library_revision`, while `persisted_library_revision` advances only after
+/// the matching durable worker completion. A dirty revision is therefore
+/// never dropped by coalescing.
+fn request_library_save_admission(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+) {
+    if !library_is_ready(state)
+        || !library_dirty(state)
+        || state.save_in_flight.is_some()
+        || state.save_admission_pending
+    {
+        return;
+    }
+    state.save_admission_pending = true;
+    context.after(Duration::ZERO, Message::AdmitLibrarySave);
+}
+
 fn dispatch_library_save(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
     if !library_is_ready(state) || !library_dirty(state) || state.save_in_flight.is_some() {
         return;
     }
+    state.save_admission_pending = false;
     let revision = state.library_revision;
     let id = state
         .last_save_attempt_id
@@ -7955,7 +8079,7 @@ fn schedule_library_save(state: &mut AppState, context: &mut ui::UiUpdateContext
         return;
     }
     state.library_revision = state.library_revision.wrapping_add(1);
-    dispatch_library_save(state, context);
+    request_library_save_admission(state, context);
 }
 
 fn retry_library_save(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
@@ -7969,6 +8093,7 @@ fn mark_library_snapshot_persisted(state: &mut AppState) {
     state.library_revision = state.library_revision.wrapping_add(1);
     state.persisted_library_revision = state.library_revision;
     state.save_in_flight = None;
+    state.save_admission_pending = false;
 }
 
 fn reset_transport(state: &mut AppState) {
@@ -8580,6 +8705,7 @@ fn library_track_card_height() -> f32 {
     26.0 + (ui::dropdown_trigger_height() * 2.0)
         + (TRACK_CARD_CONTENT_SPACING * 4.0)
         + 18.0
+        + REMOVAL_CONFIRMATION_ROW_HEIGHT
         + (TRACK_CARD_CONTENT_INSET * 2.0)
 }
 
@@ -8588,8 +8714,18 @@ const VIRTUAL_LIST_OVERSCAN_ROWS: usize = 4;
 
 fn audition_queue_row_height() -> f32 {
     28.0 + 18.0
+        + REMOVAL_CONFIRMATION_ROW_HEIGHT
         + ui::dropdown_trigger_height()
         + (TRACK_CARD_CONTENT_SPACING * 3.0)
+        + (TRACK_CARD_CONTENT_INSET * 2.0)
+}
+
+fn planner_card_height() -> f32 {
+    28.0 + 20.0
+        + REMOVAL_CONFIRMATION_ROW_HEIGHT
+        + 22.0
+        + (ui::dropdown_trigger_height() * 2.0)
+        + (TRACK_CARD_CONTENT_SPACING * 5.0)
         + (TRACK_CARD_CONTENT_INSET * 2.0)
 }
 
@@ -8630,6 +8766,25 @@ fn resolved_virtual_list_window(
         previous_start: has_usable_current_window.then_some(current.viewport_start),
         guard_band: 1,
     })
+}
+
+fn reset_comments_windows(state: &mut AppState) {
+    state.main_comments_window = ui::VirtualListWindow::default();
+    state.reference_comments_window = ui::VirtualListWindow::default();
+}
+
+fn comments_window(state: &AppState, source: CommentSource) -> ui::VirtualListWindow {
+    match source {
+        CommentSource::Main => state.main_comments_window,
+        CommentSource::Reference => state.reference_comments_window,
+    }
+}
+
+const fn comments_scroll_viewport_id(source: CommentSource) -> u64 {
+    match source {
+        CommentSource::Main => MAIN_COMMENTS_SCROLL_VIEWPORT_ID,
+        CommentSource::Reference => REFERENCE_COMMENTS_SCROLL_VIEWPORT_ID,
+    }
 }
 
 fn virtual_row_with_spacing(row: ui::View<Message>, row_height: f32) -> ui::View<Message> {
@@ -8678,6 +8833,8 @@ fn select_track_internal(
         remove_audition_queue_entry_if_outside_filter(state, previous_id);
     }
     state.library.selected_track_id = Some(id.clone());
+    refresh_selected_track_index(state);
+    reset_comments_windows(state);
     cancel_pending_comment_playback(state);
     state.loop_selections.clear_all();
     if in_audition {
@@ -9575,57 +9732,35 @@ fn audition_panel(state: &AppState) -> ui::View<Message> {
         .spacing(6.0)
         .fill_width()
     } else {
-        let audition_row_is_variable_height = remove_confirmation_track_id.is_some()
-            || (status_menu_host == Some(StatusMenuHost::Audition)
-                && status_menu_track_id.is_some());
-        if audition_row_is_variable_height {
-            // Confirmation controls are intentionally variable-height; use the
-            // existing keyed list for that transient state while normal rows
-            // stay in the bounded fixed-height path below.
-            ui::list(queue_tracks, move |(index, track)| {
+        let row_height = audition_queue_row_height() + TRACK_CARD_LIST_SPACING;
+        let window = resolved_virtual_list_window(
+            state.audition_queue_window,
+            queue_tracks.len(),
+            None,
+            false,
+        );
+        ui::virtual_list_windowed(|index| {
+            let (queue_index, track) = queue_tracks[index];
+            virtual_row_with_spacing(
                 audition_queue_row(
-                    index,
+                    queue_index,
                     track,
                     selected_id,
                     status_menu_track_id,
                     status_menu_host,
                     remove_confirmation_track_id,
-                )
-            })
-            .without_chrome()
-            .spacing(TRACK_CARD_LIST_SPACING)
-            .fill_height()
-        } else {
-            let row_height = audition_queue_row_height() + TRACK_CARD_LIST_SPACING;
-            let window = resolved_virtual_list_window(
-                state.audition_queue_window,
-                queue_tracks.len(),
-                None,
-                false,
-            );
-            ui::virtual_list_windowed(|index| {
-                let (queue_index, track) = queue_tracks[index];
-                virtual_row_with_spacing(
-                    audition_queue_row(
-                        queue_index,
-                        track,
-                        selected_id,
-                        status_menu_track_id,
-                        status_menu_host,
-                        None,
-                    ),
-                    row_height,
-                )
-            })
-            .window(window)
-            .row_height(row_height)
-            .overscan_px(row_height * VIRTUAL_LIST_OVERSCAN_ROWS as f32)
-            .on_window_changed(Message::AuditionQueueWindowChanged)
-            .retain_materialized_window()
-            .view()
-            .without_chrome()
-            .fill_height()
-        }
+                ),
+                row_height,
+            )
+        })
+        .window(window)
+        .row_height(row_height)
+        .overscan_px(row_height * VIRTUAL_LIST_OVERSCAN_ROWS as f32)
+        .on_window_changed(Message::AuditionQueueWindowChanged)
+        .retain_materialized_window()
+        .view()
+        .without_chrome()
+        .fill_height()
     };
     let progress = if queue_count == 0 {
         String::from("0 tracks")
@@ -9756,7 +9891,9 @@ fn audition_queue_row(
         .spacing(4.0)
         .fill_width()
     } else {
-        ui::spacer().fill_width().height(0.0)
+        ui::spacer()
+            .fill_width()
+            .height(REMOVAL_CONFIRMATION_ROW_HEIGHT)
     };
     let input = ui::button(title.clone())
         .selected(selected)
@@ -9997,7 +10134,9 @@ fn planner_panel(state: &AppState) -> ui::View<Message> {
                 status_menu_track_id: state.status_menu_track_id.as_deref(),
                 status_menu_host: state.status_menu_host,
                 remove_confirmation_track_id: state.remove_confirmation_track_id.as_deref(),
+                drag_source_track_id,
             },
+            state.planner_windows[planner_stage_index(stage)],
             drag_active,
             drag_target,
         )
@@ -10037,10 +10176,15 @@ fn planner_panel(state: &AppState) -> ui::View<Message> {
         .spacing(WORKSPACE_PANEL_SPACING)
         .fill();
     let content = planner_board_surface(content);
-    ui::input_underlay(
+    let content = ui::input_underlay(
         content,
         planner_insertion_clear_target(drag_active, "planner-insertion-clear-board"),
-    )
+    );
+    if let Some(source_track_id) = drag_source_track_id {
+        ui::stack([content, planner_drag_handle(source_track_id, true)])
+    } else {
+        content
+    }
 }
 
 struct PlannerColumnContext<'a> {
@@ -10049,6 +10193,7 @@ struct PlannerColumnContext<'a> {
     status_menu_track_id: Option<&'a str>,
     status_menu_host: Option<StatusMenuHost>,
     remove_confirmation_track_id: Option<&'a str>,
+    drag_source_track_id: Option<&'a str>,
 }
 
 fn planner_column(
@@ -10056,6 +10201,7 @@ fn planner_column(
     tracks: &[&storage::Track],
     status_filter: Option<storage::TrackStatus>,
     context: PlannerColumnContext<'_>,
+    current_window: ui::VirtualListWindow,
     drag_active: bool,
     drag_target: Option<&PlannerInsertionTarget>,
 ) -> ui::View<Message> {
@@ -10065,6 +10211,7 @@ fn planner_column(
         status_menu_track_id,
         status_menu_host,
         remove_confirmation_track_id,
+        drag_source_track_id,
     } = context;
     let count = tracks.len();
     let tone = planner_column_tone(stage);
@@ -10123,57 +10270,46 @@ fn planner_column(
         };
         children.push(empty_content);
     } else {
-        let mut rows = Vec::with_capacity(tracks.len() + usize::from(drag_active));
-        for (index, track) in tracks.iter().copied().enumerate() {
-            let card = planner_card(
-                track,
-                selected_id,
-                stage_menu_track_id,
-                status_menu_track_id,
-                status_menu_host,
-                remove_confirmation_track_id,
-            );
-            rows.push(planner_card_drop_row(
-                card,
-                PlannerInsertionTarget { stage, slot: index },
-                PlannerInsertionTarget {
-                    stage,
-                    slot: index + 1,
-                },
-                active_slot,
-                index,
-                index + 1 == count,
-                drag_active,
-            ));
-        }
-        if drag_active {
-            rows.push(planner_drop_slot(
-                ui::spacer()
-                    .fill_width()
-                    .height(PLANNER_DROP_SENTINEL_HEIGHT),
-                PlannerInsertionTarget { stage, slot: count },
-                active_slot == Some(count),
-                "planner-end-drop",
-                false,
-            ));
-        }
-        // Explicit viewport and row keys preserve runtime identity across this
-        // policy-only switch, including scroll offsets and captured handles.
-        let rows = ui::column(rows)
-            .key(format!("planner-column-rows-{}", stage.label()))
-            .spacing(TRACK_CARD_LIST_SPACING)
-            .fill_width();
-        let scroll = if drag_active {
-            ui::scroll(rows)
-        } else {
-            ui::virtual_scroll(rows, PLANNER_SCROLL_OVERSCAN)
-        };
-        children.push(
-            scroll
-                .key(format!("planner-column-scroll-{}", stage.label()))
-                .without_chrome()
-                .fill_height(),
-        );
+        let row_height = planner_card_height() + TRACK_CARD_LIST_SPACING;
+        let logical_window = resolved_virtual_list_window(current_window, count, None, false);
+        let scroll = ui::virtual_list_windowed(|index| {
+            let track = tracks[index];
+            virtual_row_with_spacing(
+                planner_card_drop_row(
+                    planner_card(
+                        track,
+                        selected_id,
+                        stage_menu_track_id,
+                        status_menu_track_id,
+                        status_menu_host,
+                        remove_confirmation_track_id,
+                        drag_source_track_id,
+                    ),
+                    PlannerInsertionTarget { stage, slot: index },
+                    PlannerInsertionTarget {
+                        stage,
+                        slot: index + 1,
+                    },
+                    active_slot,
+                    index,
+                    index + 1 == count,
+                    drag_active,
+                ),
+                row_height,
+            )
+        })
+        .window(logical_window)
+        .row_height(row_height)
+        .overscan_px(row_height * VIRTUAL_LIST_OVERSCAN_ROWS as f32);
+        let scroll = scroll
+            .on_window_changed(move |change| Message::PlannerColumnWindowChanged { stage, change })
+            .retain_materialized_window()
+            .view();
+        let scroll = scroll
+            .id(planner_column_scroll_viewport_id(stage))
+            .without_chrome()
+            .fill_height();
+        children.push(scroll);
     }
     let column_content = ui::column(children).padding(12.0).spacing(8.0).fill();
     let column_content = if count == 0 {
@@ -10255,30 +10391,6 @@ fn planner_card_drop_row(
             index
         ))
         .fill_width()
-}
-
-fn planner_drop_slot(
-    content: ui::View<Message>,
-    target: PlannerInsertionTarget,
-    active: bool,
-    key_prefix: &str,
-    show_marker: bool,
-) -> ui::View<Message> {
-    let visual = ui::stack([
-        content,
-        planner_insertion_marker(active && show_marker, false),
-    ])
-    .fill_width();
-    ui::input_overlay(
-        visual,
-        planner_drop_hit_target(target.clone(), true, active, format!("{key_prefix}-slot")),
-    )
-    .key(format!(
-        "{key_prefix}-{}-{}",
-        target.stage.label(),
-        target.slot
-    ))
-    .fill_width()
 }
 
 fn planner_drop_hit_target(
@@ -10375,6 +10487,7 @@ fn planner_card(
     status_menu_track_id: Option<&str>,
     status_menu_host: Option<StatusMenuHost>,
     remove_confirmation_track_id: Option<&str>,
+    drag_source_track_id: Option<&str>,
 ) -> ui::View<Message> {
     let card_key = format!("planner-card-{}", track.id);
     planner_card_with_key(
@@ -10384,10 +10497,13 @@ fn planner_card(
         status_menu_track_id,
         status_menu_host,
         remove_confirmation_track_id,
+        drag_source_track_id,
         card_key,
     )
 }
 
+// Keep the planner card inputs explicit to preserve the existing call-site contract.
+#[allow(clippy::too_many_arguments)]
 fn planner_card_with_key(
     track: &storage::Track,
     selected_id: Option<&str>,
@@ -10395,15 +10511,15 @@ fn planner_card_with_key(
     status_menu_track_id: Option<&str>,
     status_menu_host: Option<StatusMenuHost>,
     remove_confirmation_track_id: Option<&str>,
+    drag_source_track_id: Option<&str>,
     card_key: String,
 ) -> ui::View<Message> {
     let selected = selected_id == Some(track.id.as_str());
     let stage_menu_open = stage_menu_track_id == Some(track.id.as_str());
-    let status_menu_open = status_menu_host == Some(StatusMenuHost::Planner)
+    let status_menu_open = status_menu_host == Some(StatusMenuHost::Planner(track.stage))
         && status_menu_track_id == Some(track.id.as_str());
     let remove_confirmation_open = remove_confirmation_track_id == Some(track.id.as_str());
     let title_track_id = track.id.clone();
-    let drag_track_id = track.id.clone();
     let review_track_id = track.id.clone();
     let remove_id = track.id.clone();
     let favorite_control =
@@ -10448,26 +10564,22 @@ fn planner_card_with_key(
         .spacing(4.0)
         .fill_width()
     } else {
-        ui::spacer().fill_width().height(0.0)
+        ui::spacer()
+            .fill_width()
+            .height(REMOVAL_CONFIRMATION_ROW_HEIGHT)
+    };
+    let drag_handle = if drag_source_track_id == Some(track.id.as_str()) {
+        ui::spacer()
+            .width(PLANNER_DRAG_HANDLE_SIZE)
+            .height(PLANNER_DRAG_HANDLE_SIZE)
+    } else {
+        planner_drag_handle(track.id.as_str(), false)
     };
     let card_content = ui::column([
         ui::row([
-            card_control(
-                selected,
-                "Drag to reorder",
-                ui::custom_widget_mapped(
-                    PlannerDragHandleWidget::new(),
-                    move |message: ui::DragHandleMessage| Message::PlannerCardDrag {
-                        track_id: drag_track_id.clone(),
-                        message,
-                    },
-                )
-                .key(format!("planner-card-drag-surface-{}", track.id))
-                .size(PLANNER_DRAG_HANDLE_SIZE, PLANNER_DRAG_HANDLE_SIZE)
-                .tooltip("Drag to reorder"),
-            )
-            .width(PLANNER_DRAG_HANDLE_SIZE)
-            .height(PLANNER_DRAG_HANDLE_SIZE),
+            card_control(selected, "Drag to reorder", drag_handle)
+                .width(PLANNER_DRAG_HANDLE_SIZE)
+                .height(PLANNER_DRAG_HANDLE_SIZE),
             card_control(
                 selected,
                 track.title.clone(),
@@ -10501,7 +10613,12 @@ fn planner_card_with_key(
         .fill_width()
         .subtle(),
         stage_dropdown(track, stage_menu_open, selected),
-        status_dropdown_for_host(track, status_menu_open, selected, StatusMenuHost::Planner),
+        status_dropdown_for_host(
+            track,
+            status_menu_open,
+            selected,
+            StatusMenuHost::Planner(track.stage),
+        ),
     ])
     .padding(TRACK_CARD_CONTENT_INSET)
     .spacing(TRACK_CARD_CONTENT_SPACING)
@@ -10509,6 +10626,7 @@ fn planner_card_with_key(
     ui::stack([track_card_chrome(selected, track.favorite), card_content])
         .key(card_key)
         .fill_width()
+        .height(planner_card_height())
 }
 
 fn tracks_with_status(
@@ -10609,6 +10727,7 @@ fn planner_insertion_status(
 }
 
 const STAGE_MENU_WIDTH: f32 = 174.0;
+const STATUS_MENU_WIDTH: f32 = 174.0;
 const REFERENCE_SETTINGS_WINDOW_WIDTH: f32 = 680.0;
 const REFERENCE_SETTINGS_WINDOW_HEIGHT: f32 = 520.0;
 const REFERENCE_SETTINGS_WINDOW_PADDING: f32 = 22.0;
@@ -10744,30 +10863,32 @@ fn stage_menu_popover(track: &storage::Track, anchor: Point) -> ui::View<Message
     ))
 }
 
-fn reference_assignment_count(library: &storage::Library, path: &Path) -> usize {
-    library
-        .tracks
-        .iter()
-        .filter(|track| track.reference_path.as_deref() == Some(path))
-        .count()
+fn reference_assignment_counts(library: &storage::Library) -> HashMap<&Path, usize> {
+    let mut counts = HashMap::with_capacity(library.tracks.len());
+    for track in &library.tracks {
+        if let Some(path) = track.reference_path.as_deref() {
+            *counts.entry(path).or_default() += 1;
+        }
+    }
+    counts
 }
 
 fn settings_reference_row(
-    reference: storage::ReferenceTrack,
+    reference: &storage::ReferenceTrack,
     assignment_count: usize,
     active: bool,
-    index: usize,
 ) -> ui::View<Message> {
-    let path = reference.path;
-    let name = reference_track_name(&path);
+    let path = reference.path.as_path();
+    let name = reference_track_name(path);
     let assignment_label = if active {
         format!("{} assigned · ACTIVE", assignment_count,)
     } else {
         format!("{} assigned", assignment_count)
     };
-    let remove_path = path.clone();
+    let remove_path = path.to_path_buf();
+    let row_key = format!("settings-reference-{}", path.display());
     ui::list_row(
-        index,
+        row_key,
         [
             ui::column([
                 ui::text(name)
@@ -10786,7 +10907,7 @@ fn settings_reference_row(
             ui::close_button()
                 .subtle()
                 .message(Message::RemoveReferenceTrack(remove_path))
-                .key(format!("settings-remove-reference-{index}"))
+                .key(format!("settings-remove-reference-{}", path.display()))
                 .tooltip("Remove reference track")
                 .size(
                     SETTINGS_REFERENCE_REMOVE_BUTTON_SIZE,
@@ -10811,23 +10932,31 @@ fn reference_settings_window_view(state: &AppState) -> ui::View<Message> {
         .fill_height()
     } else {
         let selected_reference_path =
-            selected_track(state).and_then(|track| track.reference_path.clone());
-        let rows = state
-            .library
-            .reference_tracks
-            .iter()
-            .cloned()
-            .enumerate()
-            .map(|(index, reference)| {
-                let assignment_count = reference_assignment_count(&state.library, &reference.path);
-                let active = selected_reference_path.as_ref() == Some(&reference.path);
-                (index, reference, assignment_count, active)
-            })
-            .collect::<Vec<_>>();
-        ui::list(rows, |(index, reference, assignment_count, active)| {
-            settings_reference_row(reference, assignment_count, active, index)
+            selected_track(state).and_then(|track| track.reference_path.as_deref());
+        let assignment_counts = reference_assignment_counts(&state.library);
+        let window = resolved_virtual_list_window(
+            state.reference_settings_window,
+            reference_count,
+            None,
+            false,
+        );
+        ui::virtual_list_windowed(|index| {
+            let reference: &storage::ReferenceTrack = &state.library.reference_tracks[index];
+            let assignment_count = assignment_counts
+                .get(reference.path.as_path())
+                .copied()
+                .unwrap_or_default();
+            let active = selected_reference_path == Some(reference.path.as_path());
+            settings_reference_row(reference, assignment_count, active)
         })
+        .window(window)
+        .row_height(SETTINGS_REFERENCE_ROW_HEIGHT)
+        .overscan_px(SETTINGS_REFERENCE_ROW_HEIGHT * VIRTUAL_LIST_OVERSCAN_ROWS as f32)
+        .on_window_changed(Message::ReferenceSettingsWindowChanged)
+        .retain_materialized_window()
+        .view()
         .without_chrome()
+        .id(REFERENCE_SETTINGS_SCROLL_VIEWPORT_ID)
         .fill_width()
         .fill_height()
     };
@@ -10917,6 +11046,11 @@ fn status_dropdown_trigger(
         .key(format!("status-dropdown-{}", track.id))
         .fill_width()
         .height(ui::dropdown_trigger_height());
+    let trigger = if open {
+        trigger.overlays(ui::overlays().popover(status_menu_popover(track, host)))
+    } else {
+        trigger
+    };
     ui::row([status_dropdown_rail(track.status), trigger])
         .spacing(STATUS_RAIL_GAP)
         .fill_width()
@@ -10929,15 +11063,23 @@ fn status_dropdown_for_host(
     _selected: bool,
     host: StatusMenuHost,
 ) -> ui::View<Message> {
-    let trigger = status_dropdown_trigger(track, open, host);
-    if open {
-        let menu = status_menu(track, host);
-        ui::column([trigger, menu]).spacing(3.0).fill_width()
-    } else {
-        ui::column([trigger])
-            .fill_width()
-            .height(ui::dropdown_trigger_height())
-    }
+    let _ = _selected;
+    ui::column([status_dropdown_trigger(track, open, host)])
+        .fill_width()
+        .height(ui::dropdown_trigger_height())
+}
+
+fn status_menu_popover(track: &storage::Track, host: StatusMenuHost) -> ui::View<Message> {
+    anchored_popover_from_parts(AnchoredPopoverParts::below(
+        status_menu(track, host),
+        ui::AnchoredPopoverAnchor::trigger(
+            0.0,
+            0.0,
+            STATUS_MENU_WIDTH,
+            ui::dropdown_trigger_height(),
+        ),
+        Vector2::new(STATUS_MENU_WIDTH, ui::dropdown_menu_height(5)),
+    ))
 }
 
 fn status_menu(track: &storage::Track, host: StatusMenuHost) -> ui::View<Message> {
@@ -10974,7 +11116,7 @@ fn status_menu(track: &storage::Track, host: StatusMenuHost) -> ui::View<Message
 const fn status_menu_host_key(host: StatusMenuHost) -> &'static str {
     match host {
         StatusMenuHost::Library => "library",
-        StatusMenuHost::Planner => "planner",
+        StatusMenuHost::Planner(_) => "planner",
         StatusMenuHost::Audition => "audition",
     }
 }
@@ -11044,62 +11186,37 @@ fn library_panel(state: &AppState) -> ui::View<Message> {
             let selected_index = selected_id
                 .as_deref()
                 .and_then(|selected_id| tracks.iter().position(|track| track.id == selected_id));
-            let library_row_is_variable_height = state.remove_confirmation_track_id.is_some()
-                || (state.status_menu_host == Some(StatusMenuHost::Library)
-                    && state.status_menu_track_id.is_some());
-            if library_row_is_variable_height {
-                // Confirmation controls add a variable-height row. Keep this
-                // bounded fallback until the fixed-row virtual-list contract
-                // can represent that state without clipping its controls.
-                ui::list(tracks.into_iter().enumerate(), move |(index, track)| {
+            let row_height = library_track_card_height() + TRACK_CARD_LIST_SPACING;
+            let window = resolved_virtual_list_window(
+                state.review_library_window,
+                tracks.len(),
+                selected_index,
+                false,
+            );
+            ui::virtual_list_windowed(|index| {
+                virtual_row_with_spacing(
                     track_row(
                         index,
-                        track,
+                        tracks[index],
                         selected_id.as_deref(),
                         state.stage_menu_track_id.as_deref(),
                         state.status_menu_track_id.as_deref(),
                         state.status_menu_host,
                         state.remove_confirmation_track_id.as_deref(),
-                    )
-                })
-                .without_chrome()
-                .padding_x(LIBRARY_LIST_INSET)
-                .spacing(TRACK_CARD_LIST_SPACING)
-                .id(LIBRARY_SCROLL_VIEWPORT_ID)
-                .fill_height()
-            } else {
-                let row_height = library_track_card_height() + TRACK_CARD_LIST_SPACING;
-                let window = resolved_virtual_list_window(
-                    state.review_library_window,
-                    tracks.len(),
-                    selected_index,
-                    false,
-                );
-                ui::virtual_list_windowed(|index| {
-                    virtual_row_with_spacing(
-                        track_row(
-                            index,
-                            tracks[index],
-                            selected_id.as_deref(),
-                            state.stage_menu_track_id.as_deref(),
-                            state.status_menu_track_id.as_deref(),
-                            state.status_menu_host,
-                            None,
-                        ),
-                        row_height,
-                    )
-                })
-                .window(window)
-                .row_height(row_height)
-                .overscan_px(row_height * VIRTUAL_LIST_OVERSCAN_ROWS as f32)
-                .on_window_changed(Message::ReviewLibraryWindowChanged)
-                .retain_materialized_window()
-                .view()
-                .without_chrome()
-                .padding_x(LIBRARY_LIST_INSET)
-                .id(LIBRARY_SCROLL_VIEWPORT_ID)
-                .fill_height()
-            }
+                    ),
+                    row_height,
+                )
+            })
+            .window(window)
+            .row_height(row_height)
+            .overscan_px(row_height * VIRTUAL_LIST_OVERSCAN_ROWS as f32)
+            .on_window_changed(Message::ReviewLibraryWindowChanged)
+            .retain_materialized_window()
+            .view()
+            .without_chrome()
+            .padding_x(LIBRARY_LIST_INSET)
+            .id(LIBRARY_SCROLL_VIEWPORT_ID)
+            .fill_height()
         },
     ])
     .padding(10.0)
@@ -11165,7 +11282,9 @@ fn track_row(
         .spacing(4.0)
         .fill_width()
     } else {
-        ui::spacer().fill_width().height(0.0)
+        ui::spacer()
+            .fill_width()
+            .height(REMOVAL_CONFIRMATION_ROW_HEIGHT)
     };
     let row_select_id = track.id.clone();
     let row_background = ui::interactive_row_underlay(ui::spacer().fill())
@@ -11466,7 +11585,7 @@ fn live_spectrogram_section(state: &AppState, track: &storage::Track) -> ui::Vie
 }
 
 fn review_panel(state: &AppState) -> ui::View<Message> {
-    let Some(track) = selected_track(state).cloned() else {
+    let Some(track) = selected_track(state) else {
         let content = ui::column([
             ui::text("Your review desk").height(30.0).fill_width(),
             ui::text("Import a track to begin reviewing.")
@@ -11518,9 +11637,8 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let hovered_note_ratio = note_ratio_for_address(state, &track, state.hovered_note_id.as_ref());
-    let selected_note_ratio =
-        note_ratio_for_address(state, &track, state.selected_note_id.as_ref());
+    let hovered_note_ratio = note_ratio_for_address(state, track, state.hovered_note_id.as_ref());
+    let selected_note_ratio = note_ratio_for_address(state, track, state.selected_note_id.as_ref());
     let cursor_ratio = state
         .waveform
         .as_ref()
@@ -11670,14 +11788,14 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
         .spacing(REFERENCE_SECTION_SPACING)
         .fill_width()
         .height(main_section_height);
-    let reference_height = reference_section_height(state, &track);
+    let reference_height = reference_section_height(state, track);
     let waveform_pair_height = main_section_height + WAVEFORM_SECTION_SPACING + reference_height;
     let reference_body_spacing =
         REFERENCE_SECTION_SPACING + MAIN_WAVEFORM_HEADER_HEIGHT + WAVEFORM_SECTION_SPACING;
     let reference_label_area_height = REFERENCE_SECTION_SPACING + REFERENCE_HEADER_HEIGHT;
     let waveform_pair = ui::column([
         main_waveform_section,
-        reference_waveform_section(state, &track),
+        reference_waveform_section(state, track),
     ])
     .spacing(WAVEFORM_SECTION_SPACING)
     .fill_width()
@@ -11722,9 +11840,9 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
         .height(waveform_pair_height);
 
     let content = ui::column([
-        live_spectrogram_section(state, &track),
+        live_spectrogram_section(state, track),
         waveform_with_source,
-        comments_panel(state, &track),
+        comments_panel(state, track),
     ])
     .padding(WORKSPACE_PANEL_PADDING)
     .spacing(WORKSPACE_PANEL_SPACING)
@@ -12118,20 +12236,20 @@ fn comments_panel(state: &AppState, track: &storage::Track) -> ui::View<Message>
     let (notes, selected_note_id, empty_message) = match source {
         CommentSource::Main => (
             if main_unknown {
-                Vec::new()
+                &[]
             } else {
-                track.notes.clone()
+                track.notes.as_slice()
             },
-            state.selected_note_id.clone(),
+            state.selected_note_id.as_ref(),
             "Click the lower main waveform rail to add a comment for this file.",
         ),
         CommentSource::Reference => (
             if reference_unknown {
-                Vec::new()
+                &[]
             } else {
-                reference_notes.to_vec()
+                reference_notes
             },
-            state.selected_reference_note_id.clone(),
+            state.selected_reference_note_id.as_ref(),
             "Click the lower reference waveform rail to add a comment for this file.",
         ),
     };
@@ -12255,52 +12373,84 @@ fn comments_panel(state: &AppState, track: &storage::Track) -> ui::View<Message>
                 .subtle(),
         );
     } else {
-        let selected_note_id = selected_note_id.clone();
         let hovered_note_id = match source {
-            CommentSource::Main => state.hovered_note_id.clone(),
-            CommentSource::Reference => state.hovered_reference_note_id.clone(),
+            CommentSource::Main => state.hovered_note_id.as_ref(),
+            CommentSource::Reference => state.hovered_reference_note_id.as_ref(),
         };
-        let source_for_rows = source;
         let editing_note = match source {
             CommentSource::Main => state
                 .draft_note
-                .clone()
+                .as_ref()
                 .filter(|draft| draft.note_id.is_some()),
             CommentSource::Reference => state
                 .reference_draft_note
-                .clone()
+                .as_ref()
                 .filter(|draft| draft.note_id.is_some()),
         };
-        let track_id = track.id.clone();
-        let reference_path = track.reference_path.clone();
-        let list = ui::list(notes.into_iter().enumerate(), move |(index, note)| {
-            if source_for_rows == CommentSource::Main {
+        let focused_index = comment_note_index(
+            notes,
+            selected_note_id,
+            source,
+            &track.id,
+            track.reference_path.as_deref(),
+        )
+        .or_else(|| {
+            editing_note
+                .and_then(NoteDraft::address)
+                .as_ref()
+                .and_then(|address| {
+                    comment_note_index(
+                        notes,
+                        Some(address),
+                        source,
+                        &track.id,
+                        track.reference_path.as_deref(),
+                    )
+                })
+        });
+        let window = resolved_virtual_list_window(
+            comments_window(state, source),
+            notes.len(),
+            focused_index,
+            true,
+        );
+        let track_id = track.id.as_str();
+        let reference_path = track.reference_path.as_deref();
+        let list = ui::virtual_list_windowed(|index| {
+            let note = &notes[index];
+            if source == CommentSource::Main {
                 note_row(
                     index,
-                    note.clone(),
-                    NoteAddress::main(track_id.clone(), note.id.clone()),
-                    selected_note_id.as_ref(),
-                    hovered_note_id.as_ref(),
-                    editing_note.as_ref(),
+                    note,
+                    NoteAddress::main(track_id, note.id.clone()),
+                    selected_note_id,
+                    hovered_note_id,
+                    editing_note,
                 )
             } else {
-                let note_id = note.id.clone();
                 reference_note_row(
                     index,
                     note,
                     NoteAddress::reference(
                         reference_path
-                            .clone()
-                            .expect("reference rows require a catalog path"),
-                        note_id,
+                            .expect("reference rows require a catalog path")
+                            .to_path_buf(),
+                        note.id.clone(),
                     ),
-                    selected_note_id.as_ref(),
-                    hovered_note_id.as_ref(),
-                    editing_note.as_ref(),
+                    selected_note_id,
+                    hovered_note_id,
+                    editing_note,
                 )
             }
         })
+        .window(window)
+        .row_height(COMMENT_ROW_HEIGHT)
+        .overscan_px(COMMENT_ROW_HEIGHT * VIRTUAL_LIST_OVERSCAN_ROWS as f32)
+        .on_window_changed(move |change| Message::CommentsWindowChanged { source, change })
+        .retain_materialized_window()
+        .view()
         .without_chrome()
+        .id(comments_scroll_viewport_id(source))
         .fill_width()
         .fill_height();
         children.push(list);
@@ -12335,6 +12485,60 @@ fn comments_panel(state: &AppState, track: &storage::Track) -> ui::View<Message>
     ])
     .fill_width()
     .fill_height()
+}
+
+fn comment_note_index(
+    notes: &[storage::Note],
+    address: Option<&NoteAddress>,
+    source: CommentSource,
+    track_id: &str,
+    reference_path: Option<&Path>,
+) -> Option<usize> {
+    let address = address?;
+    let owner_matches = match (&address.owner, source) {
+        (NoteOwner::MainTrack(owner_id), CommentSource::Main) => owner_id == track_id,
+        (NoteOwner::ReferenceTrack(owner_path), CommentSource::Reference) => {
+            reference_path == Some(owner_path.as_path())
+        }
+        _ => false,
+    };
+    owner_matches.then(|| notes.iter().position(|note| note.id == address.note_id))?
+}
+
+fn reveal_comment_row(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    source: CommentSource,
+    address: &NoteAddress,
+) {
+    let Some((index, total_items)) = selected_track(state).and_then(|track| {
+        let notes = match source {
+            CommentSource::Main => track.notes.as_slice(),
+            CommentSource::Reference => reference_notes_for_track(&state.library, track),
+        };
+        comment_note_index(
+            notes,
+            Some(address),
+            source,
+            &track.id,
+            track.reference_path.as_deref(),
+        )
+        .map(|index| (index, notes.len()))
+    }) else {
+        return;
+    };
+    let window = match source {
+        CommentSource::Main => &mut state.main_comments_window,
+        CommentSource::Reference => &mut state.reference_comments_window,
+    };
+    *window = resolved_virtual_list_window(*window, total_items, Some(index), true);
+    context.scroll_into_view(
+        comments_scroll_viewport_id(source),
+        index as f32 * COMMENT_ROW_HEIGHT,
+        COMMENT_ROW_HEIGHT,
+        LIBRARY_REVEAL_MARGIN,
+        LIBRARY_REVEAL_MARGIN,
+    );
 }
 
 fn note_editor(draft: &NoteDraft) -> ui::View<Message> {
@@ -12449,7 +12653,7 @@ fn comment_row_palette(selected: bool, domain_hovered: bool) -> ui::DenseRowPale
 
 fn note_row(
     index: usize,
-    note: storage::Note,
+    note: &storage::Note,
     address: NoteAddress,
     selected_note_id: Option<&NoteAddress>,
     hovered_note_id: Option<&NoteAddress>,
@@ -12577,7 +12781,7 @@ fn note_row(
         .stable_row_identity(0xCAD3_0002, note_key.clone())
         .actions(row_actions)
         .fill_width()
-        .height(44.0);
+        .height(COMMENT_ROW_HEIGHT);
     ui::stack([
         row_surface,
         chrome::comment_hover(
@@ -12588,12 +12792,12 @@ fn note_row(
         .fill(),
     ])
     .fill_width()
-    .height(44.0)
+    .height(COMMENT_ROW_HEIGHT)
 }
 
 fn reference_note_row(
     index: usize,
-    note: storage::Note,
+    note: &storage::Note,
     address: NoteAddress,
     selected_note_id: Option<&NoteAddress>,
     hovered_note_id: Option<&NoteAddress>,
@@ -12721,7 +12925,7 @@ fn reference_note_row(
         .stable_row_identity(0xCAD3_0003, note_key.clone())
         .actions(row_actions)
         .fill_width()
-        .height(44.0);
+        .height(COMMENT_ROW_HEIGHT);
     ui::stack([
         row_surface,
         chrome::comment_hover(
@@ -12732,15 +12936,30 @@ fn reference_note_row(
         .fill(),
     ])
     .fill_width()
-    .height(44.0)
+    .height(COMMENT_ROW_HEIGHT)
+}
+
+fn refresh_selected_track_index(state: &mut AppState) {
+    state.selected_track_index = state
+        .library
+        .selected_track_id
+        .as_deref()
+        .and_then(|id| state.library.tracks.iter().position(|track| track.id == id));
 }
 
 fn selected_track(state: &AppState) -> Option<&storage::Track> {
+    let selected_id = state.library.selected_track_id.as_deref()?;
+    if let Some(index) = state.selected_track_index
+        && let Some(track) = state.library.tracks.get(index)
+        && track.id == selected_id
+    {
+        return Some(track);
+    }
     state
         .library
-        .selected_track_id
-        .as_ref()
-        .and_then(|id| state.library.tracks.iter().find(|track| &track.id == id))
+        .tracks
+        .iter()
+        .find(|track| track.id == selected_id)
 }
 
 fn normalize_startup_track_selection(library: &mut storage::Library) -> (Option<String>, bool) {
@@ -12891,7 +13110,16 @@ fn reference_note_ratio_for_address(
 }
 
 fn selected_track_mut(state: &mut AppState) -> Option<&mut storage::Track> {
-    let selected_id = state.library.selected_track_id.as_ref()?.clone();
+    let selected_id = state.library.selected_track_id.as_deref()?.to_owned();
+    if let Some(index) = state.selected_track_index
+        && state
+            .library
+            .tracks
+            .get(index)
+            .is_some_and(|track| track.id == selected_id)
+    {
+        return state.library.tracks.get_mut(index);
+    }
     state
         .library
         .tracks
@@ -12986,17 +13214,18 @@ mod tests {
         library_track_card_height, library_track_title_id, live_frame_matches_current_session,
         live_spectrogram_display_sample_rate, loop_bounds, main_output_gain, native_launch_options,
         note_editor, note_ratio_for_id, owned_tracks_in_stage, paint_live_playback_overlay,
-        planner_insertion_target_is_valid, planner_tracks_with_status, playback_shortcut,
-        progress_paired_playback_cleanup, project_surface, qualified_note_identity_key,
-        rebuild_audition_queue, reconcile_audition_queue, reference_decode_result_is_current,
-        reference_output_gain, reference_settings_auxiliary_windows,
-        reference_settings_window_view, refresh_live_spectrogram, refresh_live_spectrograms,
-        resume_transport_command, review_spectrogram_source, review_status_filter_message,
-        schedule_import, schedule_library_save, schedule_reference_catalog_import,
-        schedule_reference_import, schedule_reference_waveform_decode, schedule_replace,
-        schedule_waveform_decode, seek_synchronized_positions, selected_reference_notes,
-        selected_track, stage_dropdown, stage_menu_anchor_from_pointer, stage_menu_popover,
-        start_source_alongside_active, status_dropdown_for_host, status_filter_dropdown,
+        planner_insertion_target_is_valid, planner_stage_index, planner_tracks_with_status,
+        playback_shortcut, progress_paired_playback_cleanup, project_surface,
+        qualified_note_identity_key, rebuild_audition_queue, reconcile_audition_queue,
+        reference_assignment_counts, reference_decode_result_is_current, reference_output_gain,
+        reference_settings_auxiliary_windows, reference_settings_window_view,
+        refresh_live_spectrogram, refresh_live_spectrograms, resume_transport_command,
+        review_spectrogram_source, review_status_filter_message, schedule_import,
+        schedule_library_save, schedule_reference_catalog_import, schedule_reference_import,
+        schedule_reference_waveform_decode, schedule_replace, schedule_waveform_decode,
+        seek_synchronized_positions, selected_reference_notes, selected_track, stage_dropdown,
+        stage_menu_anchor_from_pointer, stage_menu_popover, start_source_alongside_active,
+        status_dropdown_for_host, status_filter_dropdown, status_menu,
         sync_audition_queue_after_status_change, tracks_with_status,
         transport_command_is_confirmed, update,
     };
@@ -13176,6 +13405,50 @@ mod tests {
         )
     }
 
+    fn planner_drag_handle_point_in_viewport(
+        frame: &radiant::runtime::SurfaceFrame,
+        viewport: Rect,
+    ) -> Point {
+        let grip_lines = frame
+            .paint_plan
+            .primitives
+            .iter()
+            .filter_map(|primitive| match primitive {
+                PaintPrimitive::StrokePolyline(line) if line.points.len() == 2 => Some(line),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let widget_id = grip_lines
+            .iter()
+            .find_map(|line| {
+                let lines = grip_lines
+                    .iter()
+                    .filter(|candidate| candidate.widget_id == line.widget_id)
+                    .collect::<Vec<_>>();
+                (lines.len() >= 3
+                    && lines.iter().all(|line| {
+                        viewport.contains(Point::new(
+                            (line.points[0].x + line.points[1].x) * 0.5,
+                            (line.points[0].y + line.points[1].y) * 0.5,
+                        ))
+                    }))
+                .then_some(line.widget_id)
+            })
+            .expect("the requested Planner viewport should contain a drag handle");
+        let lines = grip_lines
+            .iter()
+            .filter(|line| line.widget_id == widget_id)
+            .collect::<Vec<_>>();
+        Point::new(
+            (lines[0].points[0].x + lines[0].points[1].x) * 0.5,
+            lines
+                .iter()
+                .map(|line| (line.points[0].y + line.points[1].y) * 0.5)
+                .sum::<f32>()
+                / lines.len() as f32,
+        )
+    }
+
     fn planner_card_title_rect(
         frame: &radiant::runtime::SurfaceFrame,
         track_id: &str,
@@ -13191,20 +13464,13 @@ mod tests {
             .unwrap_or_else(|| panic!("visible Planner card title should be painted: {track_id}"))
     }
 
-    fn first_visible_planner_card_title(
-        frame: &radiant::runtime::SurfaceFrame,
-        viewport: Rect,
-    ) -> (String, Rect) {
+    fn materialized_planner_card_titles(frame: &radiant::runtime::SurfaceFrame) -> Vec<String> {
         frame
             .paint_plan
             .text_runs()
-            .find_map(|run| {
-                (run.text.starts_with("planner-card-")
-                    && !run.text.ends_with(".wav")
-                    && viewport.contains(run.rect.center()))
-                .then_some((run.text.as_str().to_owned(), run.rect))
-            })
-            .expect("a visible Planner card title should be painted")
+            .filter(|run| run.text.starts_with("planner-card-") && !run.text.ends_with(".wav"))
+            .map(|run| run.text.as_str().to_owned())
+            .collect()
     }
 
     fn fixture_source_proof() -> crate::source::AudioSourceProof {
@@ -14421,6 +14687,8 @@ mod tests {
                 state.library.selected_track_id.as_deref(),
                 Some(first_track_id.as_str())
             );
+            assert!(state.save_admission_pending);
+            admit_library_save_for_test(&mut state, &mut context);
             assert!(state.save_in_flight.is_some());
             let command = context.into_command();
             let expected_focus_id = library_track_title_id(&first_track_id);
@@ -15215,6 +15483,30 @@ mod tests {
     }
 
     #[test]
+    fn reference_assignment_counts_are_built_once_per_catalog_path() {
+        let first_path = PathBuf::from("/external/first-reference.wav");
+        let second_path = PathBuf::from("/external/second-reference.wav");
+        let mut first = audition_track("first");
+        first.reference_path = Some(first_path.clone());
+        let mut second = audition_track("second");
+        second.reference_path = Some(first_path.clone());
+        let mut third = audition_track("third");
+        third.reference_path = Some(second_path.clone());
+        let mut unassigned = audition_track("unassigned");
+        unassigned.reference_path = None;
+
+        let library = Library {
+            tracks: vec![first, second, third, unassigned],
+            ..Library::default()
+        };
+        let counts = reference_assignment_counts(&library);
+
+        assert_eq!(counts.get(first_path.as_path()), Some(&2));
+        assert_eq!(counts.get(second_path.as_path()), Some(&1));
+        assert_eq!(counts.get(Path::new("/external/missing.wav")), None);
+    }
+
+    #[test]
     fn reference_settings_window_preserves_catalog_order_and_projects_active_usage() {
         let first_path = PathBuf::from("/external/first-reference.wav");
         let second_path = PathBuf::from("/external/second-reference.wav");
@@ -15295,6 +15587,34 @@ mod tests {
                 "settings content should be limited to the auxiliary window: {label:?}"
             );
         }
+    }
+
+    #[test]
+    fn reference_settings_window_materializes_only_a_bounded_catalog_slice() {
+        let mut state = AppState::default();
+        state.library.reference_tracks = (0..64)
+            .map(|index| ReferenceTrack {
+                path: PathBuf::from(format!("/external/reference-window-{index}.wav")),
+                source_proof: crate::source::SourceProvenance::Unknown,
+                notes: Vec::new(),
+            })
+            .collect();
+
+        let frame = reference_settings_window_view(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(680.0, 520.0));
+        let materialized_rows = frame
+            .paint_plan
+            .text_runs()
+            .filter(|run| run.text.starts_with("reference-window-"))
+            .count();
+
+        assert!(materialized_rows > 0);
+        assert!(
+            materialized_rows < state.library.reference_tracks.len(),
+            "reference settings should materialize a bounded row window"
+        );
+        assert!(frame.paint_plan.contains_text("reference-window-0.wav"));
+        assert!(!frame.paint_plan.contains_text("reference-window-63.wav"));
     }
 
     #[test]
@@ -15508,6 +15828,8 @@ mod tests {
         assert!(state.reference_draft_note.is_none());
         assert!(!state.reference_transport_loaded);
         assert!(state.reference_waveform_generation > previous_generation);
+        assert!(state.save_admission_pending);
+        admit_library_save_for_test(&mut state, &mut context);
         assert!(state.save_in_flight.is_some());
     }
 
@@ -15731,6 +16053,8 @@ mod tests {
             &mut context,
         );
         assert!(state.persisted_note_drag.is_none());
+        assert!(state.save_admission_pending);
+        admit_library_save_for_test(&mut state, &mut context);
         assert!(state.save_in_flight.is_some());
         let note_ids = selected_track(&state).map(|track| {
             track
@@ -17130,6 +17454,8 @@ mod tests {
             &mut context,
         );
         assert!(state.reference_persisted_note_drag.is_none());
+        assert!(state.save_admission_pending);
+        admit_library_save_for_test(&mut state, &mut context);
         assert!(state.save_in_flight.is_some());
         assert_eq!(
             state.status,
@@ -20262,6 +20588,8 @@ mod tests {
         assert_eq!(track.notes.len(), 1);
         assert_eq!(track.notes[0].id, "keep-note");
         assert!(state.draft_note.is_none());
+        assert!(state.save_admission_pending);
+        admit_library_save_for_test(&mut state, &mut context);
         assert!(state.save_in_flight.is_some());
         assert_eq!(state.status, "Comment deleted locally.");
     }
@@ -20754,12 +21082,13 @@ mod tests {
             }],
         });
 
-        let bridge = DeclarativeOwnedRuntimeBridge::new(
+        let bridge = DeclarativeOwnedCommandRuntimeBridge::new(
             state,
             |state| project_surface(state).into_surface(),
             |state, message| {
                 let mut context = ui::UiUpdateContext::default();
                 update(state, message, &mut context);
+                context.into_command()
             },
         );
         let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1_180.0, 1_000.0));
@@ -22365,6 +22694,8 @@ mod tests {
             crate::source::SourceProvenance::Verified(proof)
         );
         assert_eq!(state.library.tracks[0].notes, notes);
+        assert!(state.save_admission_pending);
+        admit_library_save_for_test(&mut state, &mut context);
         assert!(state.save_in_flight.is_some());
         assert!(state.status.contains("Notes were preserved"));
     }
@@ -22583,6 +22914,8 @@ mod tests {
             crate::source::SourceProvenance::Verified(proof)
         );
         assert_eq!(state.library.reference_tracks[0].notes, notes);
+        assert!(state.save_admission_pending);
+        admit_library_save_for_test(&mut state, &mut context);
         assert!(state.save_in_flight.is_some());
     }
 
@@ -23456,8 +23789,31 @@ mod tests {
         state
     }
 
+    fn active_planner_layout_stats(cards_per_stage: usize) -> (usize, usize) {
+        let mut state = planner_scroll_state(cards_per_stage);
+        state.planner_drag_source_track_id = Some(String::from("planner-card-0"));
+        state.planner_drag_pointer = Some(Point::new(320.0, 300.0));
+
+        let bridge = DeclarativeOwnedCommandRuntimeBridge::new(
+            state,
+            |state| project_surface(state).into_surface(),
+            |state, message| {
+                let mut context = ui::UiUpdateContext::default();
+                update(state, message, &mut context);
+                context.into_command()
+            },
+        );
+        let runtime = SurfaceRuntime::new(bridge, Vector2::new(1_180.0, 720.0));
+        let production_window =
+            runtime.bridge().state().planner_windows[planner_stage_index(TrackStage::Production)];
+        (
+            runtime.layout().stats.materialized_nodes,
+            production_window.window_len(),
+        )
+    }
+
     #[test]
-    fn planner_virtual_scroll_is_active_for_idle_variable_height_columns() {
+    fn planner_virtual_projection_is_bounded_for_fixed_height_columns() {
         let cards_per_stage = 48;
         let mut state = planner_scroll_state(cards_per_stage);
         state.remove_confirmation_track_id = Some(String::from("planner-card-0"));
@@ -23473,9 +23829,15 @@ mod tests {
         );
         let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1_180.0, 720.0));
         let frame = runtime.frame_with_default_theme();
+        let initial_card_titles = materialized_planner_card_titles(&frame);
         assert!(
             frame.paint_plan.contains_text("Confirm"),
-            "the measurement fixture should include a variable-height card"
+            "the measurement fixture should include the fixed confirmation slot"
+        );
+        assert!(!initial_card_titles.is_empty());
+        assert!(
+            initial_card_titles.len() < cards_per_stage * 2,
+            "idle Planner projection should materialize only the bounded logical window"
         );
         let scroll_point = frame
             .paint_plan
@@ -23483,64 +23845,44 @@ mod tests {
             .expect("the first Planner card should be visible")
             .rect
             .center();
-        let initial_layout = runtime.layout();
-        let initial_stats = initial_layout.stats;
-        let initial_windows = initial_layout
-            .virtual_windows
-            .values()
-            .copied()
-            .collect::<Vec<_>>();
-        assert_eq!(
-            initial_windows.len(),
-            2,
-            "each populated idle Planner column should expose one virtual window"
-        );
-        assert!(initial_windows.iter().all(|window| {
-            window.total_children == cards_per_stage
-                && (window.culled_before > 0 || window.culled_after > 0)
-        }));
-        assert!(
-            initial_stats.materialized_nodes < initial_stats.measured_nodes,
-            "idle Planner virtualization should reduce layout materialization"
-        );
 
         for _ in 0..8 {
             runtime.dispatch_event(Event::scroll(scroll_point, Vector2::new(0.0, 120.0)));
         }
         let _after_frame = runtime.frame_with_default_theme();
-        let after_layout = runtime.layout();
-        let after_stats = after_layout.stats;
-        let after_windows = after_layout
-            .virtual_windows
-            .values()
-            .copied()
-            .collect::<Vec<_>>();
-        assert_eq!(
-            after_windows.len(),
-            2,
-            "wheel scrolling should retain independent virtual windows"
-        );
         assert!(
-            after_windows
-                .iter()
-                .any(|window| window.viewport_main_start > 0.0),
+            runtime.bridge().state().planner_windows[planner_stage_index(TrackStage::Production)]
+                .viewport_start
+                > 0,
             "the hovered Planner column should advance after wheel input"
         );
         assert!(
-            after_windows
-                .iter()
-                .any(|window| window.viewport_main_start == 0.0),
+            runtime.bridge().state().planner_windows[planner_stage_index(TrackStage::Mixdown)]
+                .viewport_start
+                == 0,
             "the other Planner column should retain its independent scroll offset"
         );
         assert!(
-            after_stats.materialized_nodes < initial_stats.measured_nodes,
+            materialized_planner_card_titles(&runtime.frame_with_default_theme()).len()
+                < cards_per_stage * 2,
             "wheel scrolling should continue to use bounded virtual materialization"
         );
     }
 
     #[test]
-    fn planner_drag_disables_virtualization_for_insertion_targets() {
-        let mut state = planner_scroll_state(48);
+    fn planner_drag_keeps_insertion_targets_bounded_and_logical() {
+        let (small_materialized_nodes, small_window_len) = active_planner_layout_stats(48);
+        let (large_materialized_nodes, large_window_len) = active_planner_layout_stats(2_500);
+        assert_eq!(
+            small_window_len, large_window_len,
+            "an active drag should use the same resolved logical window for small and large boards"
+        );
+        assert_eq!(
+            small_materialized_nodes, large_materialized_nodes,
+            "active Planner materialization must stay bounded as cards per stage grow"
+        );
+        let cards_per_stage = 48;
+        let mut state = planner_scroll_state(cards_per_stage);
         state.planner_drag_source_track_id = Some(String::from("planner-card-0"));
         state.planner_drag_pointer = Some(Point::new(320.0, 300.0));
 
@@ -23554,22 +23896,23 @@ mod tests {
             },
         );
         let runtime = SurfaceRuntime::new(bridge, Vector2::new(1_180.0, 720.0));
-        let _frame = runtime.frame_with_default_theme();
-        let layout = runtime.layout();
-
+        let frame = runtime.frame_with_default_theme();
+        let materialized = materialized_planner_card_titles(&frame);
+        assert!(!materialized.is_empty());
         assert!(
-            layout.virtual_windows.is_empty(),
-            "active Planner drags must use ordinary scrolling so hidden insertion targets stay mounted"
+            materialized.len() < cards_per_stage * 2,
+            "active Planner drags must not project every full card/drop row"
         );
-        assert_eq!(
-            layout.stats.laid_out_nodes, layout.stats.materialized_nodes,
-            "active Planner drags must not cull insertion-row layout nodes"
+        assert!(
+            frame.paint_plan.contains_text("planner-card-0"),
+            "the visible logical insertion row should remain available during drag"
         );
     }
 
     #[test]
     fn planner_runtime_preserves_keyed_scroll_across_drag_policy_switch() {
-        let mut state = planner_scroll_state(48);
+        let cards_per_stage = 48;
+        let mut state = planner_scroll_state(cards_per_stage);
         state.remove_confirmation_track_id = Some(String::from("planner-card-47"));
         let bridge = DeclarativeOwnedCommandRuntimeBridge::new(
             state,
@@ -23580,7 +23923,7 @@ mod tests {
                 context.into_command()
             },
         );
-        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1_180.0, 720.0));
+        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1_180.0, 900.0));
         let initial_frame = runtime.frame_with_default_theme();
         let first_card_point = initial_frame
             .paint_plan
@@ -23588,83 +23931,40 @@ mod tests {
             .expect("the first Planner card should be visible")
             .rect
             .center();
-        let (production_scroll_id, initial_window, production_viewport) = runtime
+        let (production_scroll_id, production_viewport) = runtime
             .layout()
-            .virtual_windows
+            .viewport_bounds
             .iter()
-            .find_map(|(node_id, window)| {
-                runtime
-                    .layout()
-                    .viewport_bounds
-                    .get(node_id)
-                    .filter(|viewport| viewport.contains(first_card_point))
-                    .map(|viewport| (*node_id, *window, *viewport))
+            .find_map(|(node_id, viewport)| {
+                viewport
+                    .contains(first_card_point)
+                    .then_some((*node_id, *viewport))
             })
             .expect("the first card should identify the Production scroll container");
-        let other_window_id = runtime
-            .layout()
-            .virtual_windows
-            .keys()
-            .copied()
-            .find(|node_id| *node_id != production_scroll_id)
-            .expect("the fixture should expose a second populated Planner column");
 
-        for _ in 0..16 {
-            runtime.dispatch_event(Event::scroll(first_card_point, Vector2::new(0.0, 120.0)));
-            if runtime
-                .layout()
-                .virtual_windows
-                .get(&production_scroll_id)
-                .is_some_and(|window| window.viewport_main_start > 0.0)
-            {
-                break;
-            }
-        }
-        let scrolled_frame = runtime.frame_with_default_theme();
-        let scrolled_layout = runtime.layout();
-        let scrolled_window = *scrolled_layout
-            .virtual_windows
-            .get(&production_scroll_id)
-            .expect("the keyed Production virtual window should remain mounted");
-        assert!(
-            scrolled_window.viewport_main_start > 0.0,
-            "runtime wheel input should produce a nonzero Production scroll offset"
-        );
-        assert_eq!(
-            scrolled_layout
-                .virtual_windows
-                .get(&other_window_id)
-                .expect("the other populated Planner column should remain mounted")
-                .viewport_main_start,
-            0.0
-        );
-        let (visible_card_id, scrolled_card_rect) =
-            first_visible_planner_card_title(&scrolled_frame, production_viewport);
-        let visible_slot = visible_card_id
-            .strip_prefix("planner-card-")
-            .expect("fixture card ids should include their Planner slot")
-            .parse::<usize>()
-            .expect("fixture card ids should use numeric Planner slots");
-        let handle_point = planner_drag_handle_point(&scrolled_frame);
+        let handle_point =
+            planner_drag_handle_point_in_viewport(&initial_frame, production_viewport);
         assert!(
             production_viewport.contains(handle_point),
-            "the drag should start from a visible handle in the scrolled column"
+            "the Production drag should start from a visible handle"
         );
 
         runtime.dispatch_event(Event::primary_press(handle_point));
         let started_pointer = Point::new(handle_point.x + 80.0, handle_point.y + 80.0);
         let started = runtime.dispatch_pointer_move_deferred_refresh_with_outcome(started_pointer);
         assert!(started.pointer_captured);
+        let expected_capture_id = super::planner_drag_handle_id("planner-card-0");
         let captured_handle = runtime
             .pointer_capture()
             .expect("the actual drag move should capture the visible handle");
+        assert_eq!(captured_handle, expected_capture_id);
         assert_eq!(
             runtime
                 .bridge()
                 .state()
                 .planner_drag_source_track_id
                 .as_deref(),
-            Some(visible_card_id.as_str())
+            Some("planner-card-0")
         );
         runtime.refresh();
         assert_eq!(runtime.pointer_capture(), Some(captured_handle));
@@ -23673,9 +23973,35 @@ mod tests {
             Some(started_pointer)
         );
 
-        let active_frame = runtime.frame_with_default_theme();
+        let final_slot = cards_per_stage;
+        let mut reached_final_rows = false;
+        for _ in 0..80 {
+            runtime.dispatch_event(Event::scroll(
+                production_viewport.center(),
+                Vector2::new(0.0, 120.0),
+            ));
+            let window = runtime.bridge().state().planner_windows
+                [planner_stage_index(TrackStage::Production)];
+            reached_final_rows |= window.window_end == cards_per_stage;
+        }
+        assert!(
+            reached_final_rows,
+            "active drag scrolling should update the Production window through the final rows"
+        );
+        assert_eq!(runtime.pointer_capture(), Some(captured_handle));
+
+        let scrolled_frame = runtime.frame_with_default_theme();
+        let scrolled_window =
+            runtime.bridge().state().planner_windows[planner_stage_index(TrackStage::Production)];
+        assert!(scrolled_window.viewport_start > 0);
+        assert!(scrolled_window.viewport_end > scrolled_window.viewport_start);
+        assert!(scrolled_window.window_start > 0);
+        assert_eq!(scrolled_window.window_end, cards_per_stage);
+        assert!(
+            scrolled_window.window_len() < cards_per_stage,
+            "the active drag must retain the bounded resolved window at the final rows"
+        );
         let active_layout = runtime.layout();
-        assert!(active_layout.virtual_windows.is_empty());
         assert!(
             active_layout
                 .viewport_bounds
@@ -23689,18 +24015,20 @@ mod tests {
             production_viewport,
             0.5,
         );
-        assert_rect_close(
-            planner_card_title_rect(&active_frame, &visible_card_id, production_viewport),
-            scrolled_card_rect,
-            0.5,
-        );
 
-        let insertion_point = Point::new(
-            scrolled_card_rect.center().x,
-            scrolled_card_rect.min.y + scrolled_card_rect.height() * 0.25,
+        let final_card_id = format!("planner-card-{}", cards_per_stage - 1);
+        let final_card_rect =
+            planner_card_title_rect(&scrolled_frame, &final_card_id, production_viewport);
+        let final_target_point = Point::new(
+            final_card_rect.center().x,
+            final_card_rect.min.y + super::planner_card_height() * 0.75,
+        );
+        assert!(
+            production_viewport.contains(final_target_point),
+            "the final card's lower half should remain inside the keyed Production viewport"
         );
         let insertion_move =
-            runtime.dispatch_pointer_move_deferred_refresh_with_outcome(insertion_point);
+            runtime.dispatch_pointer_move_deferred_refresh_with_outcome(final_target_point);
         assert!(insertion_move.pointer_captured);
         runtime.refresh();
         let insertion_target = runtime
@@ -23708,21 +24036,19 @@ mod tests {
             .state()
             .planner_drag_target
             .clone()
-            .expect("a visible card row should expose an insertion target during drag");
-        assert_eq!(insertion_target.stage, TrackStage::Production);
-        assert!(
-            insertion_target.slot == visible_slot || insertion_target.slot == visible_slot + 1,
-            "insertion target should belong to the visible card row: target={insertion_target:?}, visible_slot={visible_slot}"
+            .expect("the final card should expose an insertion target during drag");
+        assert_eq!(
+            insertion_target,
+            PlannerInsertionTarget {
+                stage: TrackStage::Production,
+                slot: final_slot,
+            }
         );
 
-        let invalid_point = active_frame
-            .paint_plan
-            .first_text_run("FINISHING BOARD")
-            .expect("the Planner header should remain visible")
-            .rect
-            .center();
-        runtime.dispatch_pointer_move_deferred_refresh_with_outcome(invalid_point);
-        runtime.dispatch_event(Event::primary_release(invalid_point));
+        let keyed_scroll_identity = production_scroll_id;
+        let keyed_scroll_viewport = production_viewport;
+        let keyed_scroll_anchor = final_card_rect;
+        runtime.dispatch_event(Event::primary_release(final_target_point));
         runtime.refresh();
         assert!(runtime.pointer_capture().is_none());
         assert!(
@@ -23732,52 +24058,55 @@ mod tests {
                 .planner_drag_source_track_id
                 .is_none()
         );
+        assert!(runtime.bridge().state().planner_drag_target.is_none());
+        assert!(runtime.bridge().state().planner_drag_pointer.is_none());
+
+        let production_ids = planner_tracks_with_status(
+            &runtime.bridge().state().library,
+            runtime.bridge().state().planner_status_filter,
+        )
+        .tracks_in_stage(TrackStage::Production)
+        .iter()
+        .map(|track| track.id.clone())
+        .collect::<Vec<_>>();
+        let expected_production_ids = (1..cards_per_stage)
+            .map(|index| format!("planner-card-{index}"))
+            .chain(std::iter::once(String::from("planner-card-0")))
+            .collect::<Vec<_>>();
+        assert_eq!(production_ids, expected_production_ids);
 
         let resumed_frame = runtime.frame_with_default_theme();
         let resumed_layout = runtime.layout();
-        let resumed_window = *resumed_layout
-            .virtual_windows
-            .get(&production_scroll_id)
-            .expect("virtualization should return under the same keyed scroll node");
-        assert!(resumed_window.viewport_main_start > 0.0);
+        let resumed_window =
+            runtime.bridge().state().planner_windows[planner_stage_index(TrackStage::Production)];
+        assert!(resumed_window.viewport_start > 0);
+        assert!(resumed_window.window_start > 0);
+        assert!(resumed_window.window_len() < cards_per_stage);
+        assert!(resumed_window.contains(cards_per_stage - 1));
+        assert_eq!(resumed_window.window_end, cards_per_stage);
+        let resumed_scroll_viewport = *resumed_layout
+            .viewport_bounds
+            .get(&keyed_scroll_identity)
+            .expect("the keyed virtual scroll viewport should remain mounted");
         assert!(
-            (resumed_window.viewport_main_start - scrolled_window.viewport_main_start).abs() <= 0.5,
-            "the keyed scroll offset should survive drag fallback: before={}, after={}",
-            scrolled_window.viewport_main_start,
-            resumed_window.viewport_main_start
+            (resumed_scroll_viewport.min.x - keyed_scroll_viewport.min.x).abs() <= 0.5
+                && (resumed_scroll_viewport.min.y - keyed_scroll_viewport.min.y).abs() <= 0.5
+                && (resumed_scroll_viewport.width() - keyed_scroll_viewport.width()).abs() <= 0.5,
+            "the keyed Production scroll identity should retain its position and width: actual={resumed_scroll_viewport:?}, before={keyed_scroll_viewport:?}"
         );
-        assert_eq!(
+        let moved_source_rect =
+            planner_card_title_rect(&resumed_frame, "planner-card-0", keyed_scroll_viewport);
+        assert!(
+            resumed_frame.paint_plan.contains_text("planner-card-0")
+                && keyed_scroll_viewport.contains(moved_source_rect.center())
+                && (moved_source_rect.min.x - keyed_scroll_anchor.min.x).abs() <= 0.5
+                && (moved_source_rect.min.y - keyed_scroll_anchor.min.y).abs() <= 0.5,
+            "the moved source should paint at the retained keyed scroll position: actual={moved_source_rect:?}, before={keyed_scroll_anchor:?}"
+        );
+        assert!(
             resumed_layout
-                .virtual_windows
-                .get(&other_window_id)
-                .expect("the other populated Planner column should remain mounted")
-                .viewport_main_start,
-            0.0
-        );
-        assert_rect_close(
-            *resumed_layout
                 .viewport_bounds
-                .get(&production_scroll_id)
-                .expect("the keyed virtual scroll viewport should remain mounted"),
-            production_viewport,
-            0.5,
-        );
-        assert_rect_close(
-            planner_card_title_rect(&resumed_frame, &visible_card_id, production_viewport),
-            scrolled_card_rect,
-            0.5,
-        );
-        assert_eq!(
-            resumed_layout
-                .virtual_windows
-                .keys()
-                .copied()
-                .find(|node_id| *node_id == production_scroll_id),
-            Some(production_scroll_id)
-        );
-        assert_eq!(
-            initial_window.total_children,
-            scrolled_window.total_children
+                .contains_key(&keyed_scroll_identity)
         );
     }
 
@@ -23883,6 +24212,182 @@ mod tests {
 
         let explicit_reveal = super::resolved_virtual_list_window(reported, 64, Some(0), true);
         assert!(explicit_reveal.contains(0));
+    }
+
+    #[test]
+    fn planner_fixed_window_keeps_offscreen_end_insertion_slot_logical() {
+        let total_items = 48;
+        let initial = ui::resolve_virtual_list_window(ui::VirtualListWindowRequest {
+            total_items,
+            viewport_len: 8,
+            requested_start: 0,
+            overscan: 4,
+            ..ui::VirtualListWindowRequest::default()
+        });
+        assert!(initial.window_end < total_items);
+
+        let end = ui::resolve_virtual_list_window(ui::VirtualListWindowRequest {
+            total_items,
+            viewport_len: 8,
+            requested_start: 40,
+            overscan: 4,
+            ..ui::VirtualListWindowRequest::default()
+        });
+        assert!(end.viewport_contains(total_items - 1));
+        assert!(end.contains(total_items - 1));
+        assert_eq!(end.window_end, total_items);
+        let end_target = PlannerInsertionTarget {
+            stage: TrackStage::Production,
+            slot: end.window_end,
+        };
+        assert_eq!(end_target.slot, total_items);
+    }
+
+    #[test]
+    fn review_and_audition_rows_stay_bounded_when_controls_are_open() {
+        let tracks = (0..48)
+            .map(|index| audition_track(&format!("interaction-card-{index}")))
+            .collect::<Vec<_>>();
+        let track_ids = tracks
+            .iter()
+            .map(|track| track.id.clone())
+            .collect::<Vec<_>>();
+
+        let mut review = AppState {
+            busy: false,
+            workspace_mode: WorkspaceMode::Review,
+            ..AppState::default()
+        };
+        review.library.tracks = tracks.clone();
+        review.library.selected_track_id = track_ids.first().cloned();
+        review.remove_confirmation_track_id = track_ids.first().cloned();
+        review.status_menu_track_id = track_ids.first().cloned();
+        review.status_menu_host = Some(StatusMenuHost::Library);
+        let review_frame = project_surface(&review)
+            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 720.0));
+        let review_titles = review_frame
+            .paint_plan
+            .text_runs()
+            .filter(|run| run.text.starts_with("interaction-card-") && !run.text.ends_with(".wav"))
+            .count();
+        assert!(review_titles < tracks.len());
+        assert!(review_frame.paint_plan.contains_text("Confirm"));
+        assert!(
+            review_frame
+                .paint_plan
+                .contains_text(TrackStatus::Release.label())
+        );
+
+        let mut audition = AppState {
+            busy: false,
+            workspace_mode: WorkspaceMode::Audition,
+            audition_status_filter: TrackStatus::Inbox,
+            audition_queue: track_ids,
+            ..AppState::default()
+        };
+        audition.library.tracks = tracks;
+        audition.library.selected_track_id = audition.audition_queue.first().cloned();
+        audition.remove_confirmation_track_id = audition.audition_queue.first().cloned();
+        audition.status_menu_track_id = audition.audition_queue.first().cloned();
+        audition.status_menu_host = Some(StatusMenuHost::Audition);
+        let audition_frame = project_surface(&audition)
+            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 720.0));
+        let audition_titles = audition_frame
+            .paint_plan
+            .text_runs()
+            .filter(|run| run.text.contains("interaction-card-") && !run.text.ends_with(".wav"))
+            .count();
+        assert!(audition_titles < 48);
+        assert!(audition_frame.paint_plan.contains_text("Confirm"));
+        assert!(
+            audition_frame
+                .paint_plan
+                .contains_text(TrackStatus::Release.label())
+        );
+    }
+
+    #[test]
+    fn comment_window_materializes_fewer_rows_and_reveals_selected_and_edited_rows() {
+        let track_id = String::from("comment-window-track");
+        let selected_index = 47;
+        let edited_index = 55;
+        let mut track = audition_track(&track_id);
+        track.reference_path = None;
+        track.notes = (0..64)
+            .map(|index| Note {
+                id: format!("comment-window-note-{index}"),
+                time_millis: index as u64 * 100,
+                body: format!("comment-window-body-{index}"),
+                done: index % 2 == 0,
+            })
+            .collect();
+        let selected_address = NoteAddress::main(
+            track_id.clone(),
+            format!("comment-window-note-{selected_index}"),
+        );
+        let edited_address = NoteAddress::main(
+            track_id.clone(),
+            format!("comment-window-note-{edited_index}"),
+        );
+        let mut state = AppState {
+            busy: false,
+            workspace_mode: WorkspaceMode::Review,
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(track_id.clone());
+        state.library.tracks = vec![track];
+
+        let bridge = DeclarativeOwnedRuntimeBridge::new(
+            state,
+            |state| project_surface(state).into_surface(),
+            |state, message| {
+                let mut context = ui::UiUpdateContext::default();
+                update(state, message, &mut context);
+            },
+        );
+        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1_180.0, 1_100.0));
+        let initial_frame = runtime.frame_with_default_theme();
+        let initial_rows = initial_frame
+            .paint_plan
+            .text_runs()
+            .filter(|run| run.text.starts_with("comment-window-body-"))
+            .count();
+        assert!(
+            initial_rows < 64,
+            "the fixed-height comment list should materialize a bounded row window"
+        );
+
+        runtime.dispatch_message(Message::SelectNote(selected_address));
+        let selected_frame = runtime.frame_with_default_theme();
+        let selected_rows = selected_frame
+            .paint_plan
+            .text_runs()
+            .filter(|run| run.text.starts_with("comment-window-body-"))
+            .count();
+        assert!(selected_rows < 64);
+        assert!(
+            runtime
+                .bridge()
+                .state()
+                .main_comments_window
+                .contains(selected_index)
+        );
+
+        runtime.dispatch_message(Message::EditNote(edited_address));
+        let edited_frame = runtime.frame_with_default_theme();
+        let edited_rows = edited_frame
+            .paint_plan
+            .text_runs()
+            .filter(|run| run.text.starts_with("comment-window-body-"))
+            .count();
+        assert!(edited_rows < 64);
+        assert!(
+            runtime
+                .bridge()
+                .state()
+                .main_comments_window
+                .contains(edited_index)
+        );
     }
 
     #[test]
@@ -24121,7 +24626,7 @@ mod tests {
         state.stage_menu_track_id = Some(String::from("hidden-track"));
         state.stage_menu_anchor = Some(Point::new(40.0, 80.0));
         state.status_menu_track_id = Some(String::from("hidden-track"));
-        state.status_menu_host = Some(StatusMenuHost::Planner);
+        state.status_menu_host = Some(StatusMenuHost::Planner(TrackStage::Production));
         state.planner_drag_source_track_id = Some(String::from("hidden-track"));
         state.planner_drag_target = Some(PlannerInsertionTarget {
             stage: TrackStage::Mixdown,
@@ -24141,6 +24646,56 @@ mod tests {
         assert!(state.planner_drag_source_track_id.is_none());
         assert!(state.planner_drag_target.is_none());
         assert!(state.planner_drag_pointer.is_none());
+    }
+
+    #[test]
+    fn planner_status_menu_closes_only_when_its_stage_window_changes() {
+        let mut state = AppState {
+            busy: false,
+            status_menu_track_id: Some(String::from("production-menu")),
+            status_menu_host: Some(StatusMenuHost::Planner(TrackStage::Production)),
+            ..AppState::default()
+        };
+        let mut context = ui::UiUpdateContext::default();
+        let changed_window = ui::VirtualListWindowChange {
+            offset_y: 120.0,
+            row_height: 32.0,
+            window: ui::VirtualListWindow {
+                total_items: 48,
+                viewport_start: 8,
+                viewport_end: 16,
+                window_start: 4,
+                window_end: 20,
+            },
+        };
+
+        update(
+            &mut state,
+            Message::PlannerColumnWindowChanged {
+                stage: TrackStage::Mixdown,
+                change: changed_window,
+            },
+            &mut context,
+        );
+        assert_eq!(
+            state.status_menu_host,
+            Some(StatusMenuHost::Planner(TrackStage::Production))
+        );
+        assert_eq!(
+            state.status_menu_track_id.as_deref(),
+            Some("production-menu")
+        );
+
+        update(
+            &mut state,
+            Message::PlannerColumnWindowChanged {
+                stage: TrackStage::Production,
+                change: changed_window,
+            },
+            &mut context,
+        );
+        assert!(state.status_menu_host.is_none());
+        assert!(state.status_menu_track_id.is_none());
     }
 
     #[test]
@@ -24723,6 +25278,9 @@ mod tests {
 
         assert_eq!(state.library.tracks[0].stage, TrackStage::Production);
         assert_eq!(state.library.planner_order, ["drag"]);
+        assert!(state.save_admission_pending);
+        admit_library_save_for_test(&mut state, &mut context);
+        assert!(state.save_in_flight.is_some());
         let command = context.into_command();
         assert!(command_has_end_drag(&command));
         assert!(
@@ -25323,20 +25881,14 @@ mod tests {
             notes: Vec::new(),
         };
         let expected = ["Inbox", "Refine", "Release", "Archive", "Maybe"];
-        let actual = ui::scene(status_dropdown_for_host(
-            &track,
-            true,
-            false,
-            StatusMenuHost::Library,
-        ))
-        .into_view()
-        .view_frame_at_size_with_default_theme(Vector2::new(240.0, 220.0))
-        .paint_plan
-        .text_runs()
-        .filter(|run| run.rect.min.y > ui::dropdown_trigger_height())
-        .filter(|run| !run.text.is_empty())
-        .map(|run| run.text.as_str().to_owned())
-        .collect::<Vec<_>>();
+        let actual = ui::scene(status_menu(&track, StatusMenuHost::Library))
+            .into_view()
+            .view_frame_at_size_with_default_theme(Vector2::new(240.0, 220.0))
+            .paint_plan
+            .text_runs()
+            .filter(|run| !run.text.is_empty())
+            .map(|run| run.text.as_str().to_owned())
+            .collect::<Vec<_>>();
 
         assert_eq!(actual, expected.map(String::from).to_vec());
     }
@@ -25383,6 +25935,8 @@ mod tests {
         assert!(track.favorite);
         assert_eq!(track.notes.len(), 1);
         assert!(state.status_menu_track_id.is_none());
+        assert!(state.save_admission_pending);
+        admit_library_save_for_test(&mut state, &mut context);
         assert!(state.save_in_flight.is_some());
         assert_eq!(state.status, "Status set to Release.");
     }
@@ -25497,7 +26051,7 @@ mod tests {
         let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1180.0, 720.0));
         let _ = runtime.frame(&ThemeTokens::default());
         let frame = runtime.frame(&ThemeTokens::default());
-        let (trigger, trigger_rect) = frame
+        let (trigger, _trigger_rect) = frame
             .paint_plan
             .primitives
             .iter()
@@ -25529,16 +26083,13 @@ mod tests {
             .iter()
             .find_map(|primitive| match primitive {
                 PaintPrimitive::Text(text)
-                    if text.text.as_str() == TrackStatus::Release.label()
-                        && text.rect.min.y > trigger_rect.min.y + trigger_rect.height()
-                        && text.rect.min.x >= trigger_rect.min.x
-                        && text.rect.min.x < trigger_rect.min.x + trigger_rect.width() =>
+                    if text.text.as_str() == TrackStatus::Release.label() =>
                 {
                     Some(text.rect)
                 }
                 _ => None,
             })
-            .expect("keyboard activation should project status options below the header trigger");
+            .expect("keyboard activation should project status options in the anchored overlay");
         runtime.dispatch_primary_click(Point::new(
             release_option.min.x + release_option.width() * 0.5,
             release_option.min.y + release_option.height() * 0.5,
@@ -25590,7 +26141,7 @@ mod tests {
         );
         let mut review_runtime = SurfaceRuntime::new(review_bridge, Vector2::new(1180.0, 720.0));
         let review_frame = review_runtime.frame(&ThemeTokens::default());
-        let (review_trigger, review_trigger_rect) = review_frame
+        let (review_trigger, _review_trigger_rect) = review_frame
             .paint_plan
             .primitives
             .iter()
@@ -25625,20 +26176,13 @@ mod tests {
             .iter()
             .find_map(|primitive| match primitive {
                 PaintPrimitive::Text(text)
-                    if text.text.as_str() == TrackStatus::Release.label()
-                        && text.rect.min.y
-                            > review_trigger_rect.min.y + review_trigger_rect.height() =>
+                    if text.text.as_str() == TrackStatus::Release.label() =>
                 {
                     Some(text.rect)
                 }
                 _ => None,
             })
-            .expect("keyboard activation should project status options below the library trigger");
-        assert!(
-            review_option.min.x < review_trigger_rect.max.x
-                && review_option.max.x > review_trigger_rect.min.x,
-            "library status options should remain horizontally attached to their trigger"
-        );
+            .expect("keyboard activation should project status options in the anchored overlay");
         review_runtime.dispatch_primary_click(Point::new(
             review_option.min.x + review_option.width() * 0.5,
             review_option.min.y + review_option.height() * 0.5,
@@ -25672,7 +26216,7 @@ mod tests {
         );
         let mut planner_runtime = SurfaceRuntime::new(planner_bridge, Vector2::new(1180.0, 720.0));
         let planner_frame = planner_runtime.frame(&ThemeTokens::default());
-        let (planner_trigger, planner_trigger_rect) = planner_frame
+        let (planner_trigger, _planner_trigger_rect) = planner_frame
             .paint_plan
             .primitives
             .iter()
@@ -25699,31 +26243,27 @@ mod tests {
                 .as_deref(),
             Some("planner-target")
         );
-        let planner_option = planner_runtime
-            .frame(&ThemeTokens::default())
+        let planner_opened_frame = planner_runtime.frame(&ThemeTokens::default());
+        let planner_option = planner_opened_frame
             .paint_plan
             .primitives
             .iter()
             .find_map(|primitive| match primitive {
                 PaintPrimitive::Text(text)
                     if text.text.as_str() == TrackStatus::Release.label()
-                        && text.rect.min.y
-                            > planner_trigger_rect.min.y + planner_trigger_rect.height() =>
+                        && text.rect.min.x < 400.0 =>
                 {
                     Some(text.rect)
                 }
                 _ => None,
             })
-            .expect("keyboard activation should project status options below the planner trigger");
-        assert!(
-            planner_option.min.x < planner_trigger_rect.max.x
-                && planner_option.max.x > planner_trigger_rect.min.x,
-            "planner status options should remain horizontally attached to their trigger"
-        );
-        planner_runtime.dispatch_primary_click(Point::new(
+            .expect("keyboard activation should project status options in the anchored overlay");
+        let planner_option_point = Point::new(
             planner_option.min.x + planner_option.width() * 0.5,
             planner_option.min.y + planner_option.height() * 0.5,
-        ));
+        );
+        assert!(planner_runtime.widget_at(planner_option_point).is_some());
+        planner_runtime.dispatch_primary_click(planner_option_point);
         assert_eq!(
             planner_runtime.bridge().state().library.tracks[1].status,
             TrackStatus::Release
@@ -26905,10 +27445,14 @@ mod tests {
             .text_runs()
             .find_map(|run| {
                 (run.text.as_str() == TrackStatus::Release.label()
-                    && run.rect.min.y > trigger_rect.max.y)
+                    && run.rect.width() < super::STATUS_MENU_WIDTH)
                     .then_some(run.rect)
             })
             .expect("the open Audition status menu should paint the Release option");
+        assert!(
+            option_rect.min.x < trigger_rect.max.x && option_rect.max.x > trigger_rect.min.x,
+            "the local status popover should remain horizontally associated with its trigger"
+        );
         let option_point = Point::new(
             option_rect.min.x + option_rect.width() * 0.5,
             option_rect.min.y + option_rect.height() * 0.5,
@@ -28175,6 +28719,7 @@ mod tests {
             + (ui::dropdown_trigger_height() * 2.0)
             + (super::TRACK_CARD_CONTENT_SPACING * 4.0)
             + 18.0
+            + super::REMOVAL_CONFIRMATION_ROW_HEIGHT
             + (super::TRACK_CARD_CONTENT_INSET * 2.0);
         assert!(
             (card_bounds.height() - expected_height).abs() < 0.01,
@@ -28492,7 +29037,10 @@ mod tests {
             &mut context,
         );
 
-        assert_eq!(state.pending_import_paths, vec![first, second]);
+        assert_eq!(
+            state.pending_import_paths,
+            std::collections::VecDeque::from([first, second])
+        );
         assert_eq!(
             state.import_batch,
             Some(ImportBatchProgress {
@@ -28513,10 +29061,10 @@ mod tests {
                 failed: 0,
             }),
             pending_import_commit: Some(PendingImportCommit::Main),
-            pending_import_paths: vec![
+            pending_import_paths: std::collections::VecDeque::from([
                 PathBuf::from("/external/second.wav"),
                 PathBuf::from("/external/third.wav"),
-            ],
+            ]),
             ..AppState::default()
         };
         let mut context = ui::UiUpdateContext::default();
@@ -28536,7 +29084,7 @@ mod tests {
         );
         assert_eq!(
             state.pending_import_paths,
-            vec![PathBuf::from("/external/third.wav")]
+            std::collections::VecDeque::from([PathBuf::from("/external/third.wav")])
         );
         assert!(state.busy);
 
@@ -28669,12 +29217,21 @@ mod tests {
         }));
     }
 
+    fn admit_library_save_for_test(
+        state: &mut AppState,
+        context: &mut ui::UiUpdateContext<Message>,
+    ) {
+        update(state, Message::AdmitLibrarySave, context);
+    }
+
     #[test]
     fn failed_library_save_stays_dirty_blocks_import_and_retries_same_revision() {
         let mut state = AppState::default();
         let mut context = ui::UiUpdateContext::default();
 
         schedule_library_save(&mut state, &mut context);
+        assert!(state.save_admission_pending);
+        admit_library_save_for_test(&mut state, &mut context);
         let attempt = state
             .save_in_flight
             .expect("the first mutation should dispatch a save");
@@ -28696,7 +29253,10 @@ mod tests {
 
         let queued_path = PathBuf::from("/external/queued-after-save-failure.wav");
         schedule_import(&mut state, &mut context, queued_path.clone());
-        assert_eq!(state.pending_import_paths, vec![queued_path]);
+        assert_eq!(
+            state.pending_import_paths,
+            std::collections::VecDeque::from([queued_path])
+        );
         assert_eq!(
             context
                 .into_command()
@@ -28727,6 +29287,7 @@ mod tests {
         let mut state = AppState::default();
         let mut context = ui::UiUpdateContext::default();
         schedule_library_save(&mut state, &mut context);
+        admit_library_save_for_test(&mut state, &mut context);
         let attempt_a = state
             .save_in_flight
             .expect("the first mutation should dispatch a save");
@@ -28821,6 +29382,7 @@ mod tests {
         let queued_path = PathBuf::from("/external/queued-after-retry.wav");
         let mut context = ui::UiUpdateContext::default();
         schedule_library_save(&mut state, &mut context);
+        admit_library_save_for_test(&mut state, &mut context);
         let attempt = state
             .save_in_flight
             .expect("the first mutation should dispatch a save");
@@ -28875,6 +29437,7 @@ mod tests {
         let mut context = ui::UiUpdateContext::default();
 
         schedule_library_save(&mut state, &mut context);
+        admit_library_save_for_test(&mut state, &mut context);
         let first_attempt = state
             .save_in_flight
             .expect("first mutation should dispatch");
@@ -28902,6 +29465,8 @@ mod tests {
         );
         let second_revision = first_revision + 1;
         assert_eq!(state.persisted_library_revision, first_revision);
+        assert!(state.save_admission_pending);
+        admit_library_save_for_test(&mut state, &mut context);
         let second_attempt = state
             .save_in_flight
             .expect("newer revision should dispatch after the first success");
@@ -29776,7 +30341,8 @@ mod tests {
             completed: 1,
             failed: 0,
         });
-        state.pending_import_paths = vec![PathBuf::from("/external/queued-main.wav")];
+        state.pending_import_paths =
+            std::collections::VecDeque::from([PathBuf::from("/external/queued-main.wav")]);
         let counters_before = state.import_batch.clone();
         let mut context = ui::UiUpdateContext::default();
         let request = begin_reference_selection(&mut state, &mut context, track_id, &path);
@@ -29927,7 +30493,10 @@ mod tests {
             Message::FileDropped(ui::NativeFileDrop::dropped(queued.clone(), None, None)),
             &mut context,
         );
-        assert_eq!(state.pending_import_paths, vec![queued]);
+        assert_eq!(
+            state.pending_import_paths,
+            std::collections::VecDeque::from([queued])
+        );
         assert_eq!(
             state.import_batch.as_ref().map(|batch| batch.total),
             Some(1)
@@ -30063,10 +30632,13 @@ mod tests {
                 failed: 0,
             })
         );
-        assert_eq!(state.pending_import_paths, vec![main_path.clone()]);
+        assert_eq!(
+            state.pending_import_paths,
+            std::collections::VecDeque::from([main_path.clone()])
+        );
         assert_eq!(
             state.pending_reference_paths,
-            vec![second_reference.clone()]
+            std::collections::VecDeque::from([second_reference.clone()])
         );
         assert!(state.busy, "the first reference import should be active");
 
@@ -30115,7 +30687,12 @@ mod tests {
                 failed: 1,
             })
         );
-        assert_eq!(state.pending_import_paths, vec![main_path]);
+        assert_eq!(
+            state.pending_import_paths,
+            std::collections::VecDeque::from([main_path])
+        );
+        assert!(state.save_admission_pending);
+        admit_library_save_for_test(&mut state, &mut context);
         assert!(
             state.save_in_flight.is_some(),
             "final reference selection should save"
@@ -30174,7 +30751,10 @@ mod tests {
             &mut context,
         );
 
-        assert_eq!(state.pending_import_paths, vec![main_path.clone()]);
+        assert_eq!(
+            state.pending_import_paths,
+            std::collections::VecDeque::from([main_path.clone()])
+        );
         assert_eq!(state.pending_reference_catalog_paths.len(), 1);
         assert_eq!(state.reference_catalog_import_total, 2);
         assert_eq!(state.reference_catalog_import_completed, 0);
