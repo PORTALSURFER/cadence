@@ -453,6 +453,8 @@ const REFERENCE_COMMENT_EDITOR_ID: u64 = 0xCAD3_1002;
 const MAIN_INLINE_COMMENT_EDITOR_SCOPE: u64 = 0xCAD3_1003;
 const REFERENCE_INLINE_COMMENT_EDITOR_SCOPE: u64 = 0xCAD3_1004;
 const LIBRARY_TRACK_TITLE_ID_SCOPE: u64 = 0xCAD3_0004;
+const LIBRARY_SCROLL_VIEWPORT_ID: u64 = 0xCAD3_0005;
+const LIBRARY_REVEAL_MARGIN: f32 = 12.0;
 const TRACK_CARD_CHAMFER: f32 = 8.0;
 const TRACK_CARD_RAIL_WIDTH: f32 = 4.0;
 const TRACK_CARD_RAIL_EDGE_INSET: f32 = 1.0;
@@ -8529,6 +8531,13 @@ fn toggle_settings(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
     context.request_repaint();
 }
 
+fn library_track_card_height() -> f32 {
+    26.0 + (ui::dropdown_trigger_height() * 2.0)
+        + (TRACK_CARD_CONTENT_SPACING * 4.0)
+        + 18.0
+        + (TRACK_CARD_CONTENT_INSET * 2.0)
+}
+
 fn select_track_internal(
     state: &mut AppState,
     context: &mut ui::UiUpdateContext<Message>,
@@ -8542,9 +8551,22 @@ fn select_track_internal(
         return;
     }
     let in_audition = state.workspace_mode == WorkspaceMode::Audition;
+    let entering_review_from_planner = state.workspace_mode == WorkspaceMode::Planner;
+    let reveal_id = id.clone();
     let previous_selected_id = state.library.selected_track_id.clone();
     if !in_audition {
         state.workspace_mode = WorkspaceMode::Review;
+    }
+    if entering_review_from_planner
+        && state.review_status_filter.is_some_and(|status| {
+            state
+                .library
+                .tracks
+                .iter()
+                .any(|track| track.id == id && track.status != status)
+        })
+    {
+        state.review_status_filter = None;
     }
     if in_audition
         && let Some(previous_id) = previous_selected_id.as_deref()
@@ -8611,6 +8633,20 @@ fn select_track_internal(
     schedule_library_save(state, context);
     schedule_selected_waveform_decode(state, context);
     schedule_selected_reference_decode(state, context);
+    if entering_review_from_planner {
+        let tracks = tracks_with_status(&state.library.tracks, state.review_status_filter);
+        if let Some(index) = tracks.iter().position(|track| track.id == reveal_id) {
+            let card_height = library_track_card_height();
+            context.scroll_into_view(
+                LIBRARY_SCROLL_VIEWPORT_ID,
+                index as f32 * (card_height + TRACK_CARD_LIST_SPACING),
+                card_height,
+                LIBRARY_REVEAL_MARGIN,
+                LIBRARY_REVEAL_MARGIN,
+            );
+            context.focus(library_track_title_id(&reveal_id));
+        }
+    }
 }
 
 fn set_workspace_mode(
@@ -10917,6 +10953,7 @@ fn library_panel(state: &AppState) -> ui::View<Message> {
             .without_chrome()
             .padding_x(LIBRARY_LIST_INSET)
             .spacing(TRACK_CARD_LIST_SPACING)
+            .id(LIBRARY_SCROLL_VIEWPORT_ID)
             .fill_height()
         },
     ])
@@ -12787,20 +12824,21 @@ mod tests {
     use super::{
         APP_VERSION_LABEL, AppState, AudioImportRequest, AudioImportTarget, AuditionSource,
         DEFAULT_LIVE_SPECTROGRAM_DISPLAY_SAMPLE_RATE, FavoriteMarkerWidget, ImportBatchProgress,
-        LibraryLoadState, LibrarySaveAttempt, LiveSpectrogramMode, LoopBounds, LoopSelection,
-        LoopSelections, MAIN_SOURCE_MISMATCH_STATUS, Message, NoteAddress, NoteDraft, NoteOwner,
+        LIBRARY_REVEAL_MARGIN, LIBRARY_SCROLL_VIEWPORT_ID, LibraryLoadState, LibrarySaveAttempt,
+        LiveSpectrogramMode, LoopBounds, LoopSelection, LoopSelections,
+        MAIN_SOURCE_MISMATCH_STATUS, Message, NoteAddress, NoteDraft, NoteOwner,
         PairedPlaybackGuard, PendingImportCommit, PlannerInsertionTarget, REFERENCE_MENU_WIDTH,
         REFERENCE_SOURCE_MISMATCH_STATUS, ReferenceUnloadState, ResumeTransportCommand,
         SETTINGS_REFERENCE_ROW_METADATA_HEIGHT, SETTINGS_REFERENCE_ROW_TEXT_HEIGHT,
         SETTINGS_REFERENCE_ROW_TEXT_SPACING, SETTINGS_REFERENCE_ROW_TITLE_HEIGHT,
         STATUS_BAR_VERSION_WIDTH, StatusMenuHost, TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER,
-        TRACK_CARD_SELECTED_CORAL, WAVEFORM_HEIGHT, WaveformDecodeRequest, WorkspaceMode,
-        animation_requested, apply_transport_snapshot, audition_panel, audition_shuffle_seed,
-        audition_statuses, cleanup_reference_transport_failure, current_live_frame_for_source,
-        current_loudness_match_gain_db, current_lufs_meter_value,
+        TRACK_CARD_LIST_SPACING, TRACK_CARD_SELECTED_CORAL, WAVEFORM_HEIGHT, WaveformDecodeRequest,
+        WorkspaceMode, animation_requested, apply_transport_snapshot, audition_panel,
+        audition_shuffle_seed, audition_statuses, cleanup_reference_transport_failure,
+        current_live_frame_for_source, current_loudness_match_gain_db, current_lufs_meter_value,
         current_reference_lufs_meter_value, decode_result_is_current, deterministic_shuffle,
         enforce_loop, favorite_toggle, frame_surface_revisions, library_dirty,
-        library_track_title_id, live_frame_matches_current_session,
+        library_track_card_height, library_track_title_id, live_frame_matches_current_session,
         live_spectrogram_display_sample_rate, loop_bounds, main_output_gain, native_launch_options,
         note_editor, note_ratio_for_id, owned_tracks_in_stage, paint_live_playback_overlay,
         planner_insertion_target_is_valid, planner_tracks_with_status, playback_shortcut,
@@ -14144,6 +14182,31 @@ mod tests {
             radiant::runtime::Command::Focus(id) => Some(*id),
             radiant::runtime::Command::Batch(commands) => {
                 commands.iter().find_map(focus_request_id)
+            }
+            _ => None,
+        }
+    }
+
+    fn scroll_into_view_request(
+        command: &radiant::runtime::Command<Message>,
+    ) -> Option<(u64, f32, f32, f32, f32)> {
+        match command {
+            radiant::runtime::Command::ScrollIntoView {
+                node_id,
+                target_y,
+                target_height,
+                margin_top,
+                margin_bottom,
+                snap_y: None,
+            } => Some((
+                *node_id,
+                *target_y,
+                *target_height,
+                *margin_top,
+                *margin_bottom,
+            )),
+            radiant::runtime::Command::Batch(commands) => {
+                commands.iter().find_map(scroll_into_view_request)
             }
             _ => None,
         }
@@ -26908,6 +26971,101 @@ mod tests {
                 .selected_track_id
                 .as_deref(),
             Some(track_id.as_str())
+        );
+    }
+
+    #[test]
+    fn planner_selection_reveals_middle_library_track_and_focuses_title() {
+        let first_track = audition_track("planner-first-track");
+        let selected_track = audition_track("planner-middle-track");
+        let selected_id = selected_track.id.clone();
+        let mut favorite_track = audition_track("planner-favorite-track");
+        favorite_track.favorite = true;
+        let mut state = AppState {
+            busy: false,
+            workspace_mode: WorkspaceMode::Planner,
+            review_status_filter: Some(TrackStatus::Inbox),
+            ..AppState::default()
+        };
+        state.library.tracks = vec![first_track, selected_track, favorite_track];
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::SelectTrack(selected_id.clone()),
+            &mut context,
+        );
+
+        assert_eq!(state.workspace_mode, WorkspaceMode::Review);
+        assert_eq!(
+            state.library.selected_track_id.as_deref(),
+            Some(selected_id.as_str())
+        );
+        assert_eq!(state.review_status_filter, Some(TrackStatus::Inbox));
+
+        let command = context.into_command();
+        let card_height = library_track_card_height();
+        assert_eq!(
+            scroll_into_view_request(&command),
+            Some((
+                LIBRARY_SCROLL_VIEWPORT_ID,
+                2.0 * (card_height + TRACK_CARD_LIST_SPACING),
+                card_height,
+                LIBRARY_REVEAL_MARGIN,
+                LIBRARY_REVEAL_MARGIN,
+            ))
+        );
+        assert_eq!(
+            focus_request_id(&command),
+            Some(library_track_title_id(&selected_id))
+        );
+    }
+
+    #[test]
+    fn planner_selection_clears_incompatible_review_filter_before_reveal() {
+        let first_track = audition_track("planner-filter-first");
+        let mut selected_track = audition_track("planner-filter-middle");
+        selected_track.status = TrackStatus::Release;
+        let selected_id = selected_track.id.clone();
+        let mut favorite_track = audition_track("planner-filter-favorite");
+        favorite_track.favorite = true;
+        let mut state = AppState {
+            busy: false,
+            workspace_mode: WorkspaceMode::Planner,
+            review_status_filter: Some(TrackStatus::Inbox),
+            ..AppState::default()
+        };
+        state.library.tracks = vec![first_track, selected_track, favorite_track];
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::SelectTrack(selected_id.clone()),
+            &mut context,
+        );
+
+        assert_eq!(state.workspace_mode, WorkspaceMode::Review);
+        assert_eq!(
+            state.library.selected_track_id.as_deref(),
+            Some(selected_id.as_str())
+        );
+        assert_eq!(state.review_status_filter, None);
+
+        let command = context.into_command();
+        let card_height = library_track_card_height();
+        assert_eq!(
+            scroll_into_view_request(&command),
+            Some((
+                LIBRARY_SCROLL_VIEWPORT_ID,
+                2.0 * (card_height + TRACK_CARD_LIST_SPACING),
+                card_height,
+                LIBRARY_REVEAL_MARGIN,
+                LIBRARY_REVEAL_MARGIN,
+            ))
+        );
+        assert_eq!(
+            focus_request_id(&command),
+            Some(library_track_title_id(&selected_id))
         );
     }
 
