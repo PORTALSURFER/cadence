@@ -74,6 +74,93 @@ const SPECTRUM_AREA_ALPHA: u8 = 48;
 const SPECTRUM_AREA_RENDER_KIND: u32 = 0;
 const SPECTRUM_RIBBON_RENDER_KIND: u32 = 1;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OverlayGeometryKey {
+    generation: u64,
+    epoch: u64,
+    revision: u64,
+    gpu_revision: u64,
+    mode: crate::LiveSpectrogramMode,
+    history_scale_bits: u32,
+    bounds: [u32; 4],
+    theme: [[u8; 4]; 5],
+}
+
+/// Reusable shape geometry for the playback-owned live overlay.
+///
+/// The retained spectrogram widget has its own GPU surface cache. This cache is
+/// deliberately separate: it stores only the bounded replayable overlay
+/// primitives and is invalidated whenever the frame, display settings, bounds,
+/// or colors change.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct OverlayGeometryCache {
+    key: Option<OverlayGeometryKey>,
+    primitives: Option<Arc<[PaintPrimitive]>>,
+}
+
+impl OverlayGeometryCache {
+    fn clear(&mut self) {
+        self.key = None;
+        self.primitives = None;
+    }
+
+    fn primitives_for(
+        &mut self,
+        frame: &LiveSpectrogramFrame,
+        mode: crate::LiveSpectrogramMode,
+        history_scale: f32,
+        bounds: Rect,
+        theme: &ThemeTokens,
+    ) -> Option<Arc<[PaintPrimitive]>> {
+        if !frame.is_valid() || !bounds.has_finite_positive_area() {
+            self.clear();
+            return None;
+        }
+
+        let key = OverlayGeometryKey {
+            generation: frame.generation,
+            epoch: frame.epoch,
+            revision: frame.revision,
+            gpu_revision: frame.gpu_revision(),
+            mode,
+            history_scale_bits: clamp_history_scale(history_scale).to_bits(),
+            bounds: [
+                bounds.min.x.to_bits(),
+                bounds.min.y.to_bits(),
+                bounds.max.x.to_bits(),
+                bounds.max.y.to_bits(),
+            ],
+            theme: [
+                color_key(theme.bg_primary),
+                color_key(theme.surface_overlay),
+                color_key(theme.highlight_orange),
+                color_key(theme.border),
+                color_key(theme.border_emphasis),
+            ],
+        };
+        if self.key != Some(key) {
+            self.primitives = Some(Arc::from(
+                build_overlay_primitives(frame, mode, history_scale, bounds, theme)
+                    .into_boxed_slice(),
+            ));
+            self.key = Some(key);
+        }
+        self.primitives.as_ref().map(Arc::clone)
+    }
+
+    #[cfg(test)]
+    fn primitives_ptr(&self) -> Option<*const PaintPrimitive> {
+        self.primitives
+            .as_ref()
+            .and_then(|primitives| primitives.first())
+            .map(std::ptr::from_ref)
+    }
+}
+
+fn color_key(color: Rgba8) -> [u8; 4] {
+    [color.r, color.g, color.b, color.a]
+}
+
 const WATERFALL_SHADER_WGSL: &str = r#"
 struct SurfaceParams {
     dest: vec4<f32>,
@@ -1034,7 +1121,7 @@ fn append_overlay_grid(
 /// The transient overlay cannot replay retained GPU surfaces on all native
 /// backends, so its data path is deliberately bounded and shape-based. The
 /// regular projected widget retains the higher-resolution GPU path.
-pub(crate) fn paint_overlay(
+fn append_overlay_primitives(
     frame: Arc<LiveSpectrogramFrame>,
     mode: crate::LiveSpectrogramMode,
     history_scale: f32,
@@ -1112,17 +1199,77 @@ pub(crate) fn paint_overlay(
     }));
 }
 
+fn build_overlay_primitives(
+    frame: &LiveSpectrogramFrame,
+    mode: crate::LiveSpectrogramMode,
+    history_scale: f32,
+    bounds: Rect,
+    theme: &ThemeTokens,
+) -> Vec<PaintPrimitive> {
+    let mut primitives = Vec::new();
+    append_overlay_primitives(
+        Arc::new(frame.clone()),
+        mode,
+        history_scale,
+        bounds,
+        &mut primitives,
+        theme,
+    );
+    primitives
+}
+
+/// Paint one validated live frame over the retained spectrogram body using a
+/// reusable bounded geometry cache.
+pub(crate) fn paint_overlay_cached(
+    frame: Arc<LiveSpectrogramFrame>,
+    mode: crate::LiveSpectrogramMode,
+    history_scale: f32,
+    bounds: Rect,
+    primitives: &mut Vec<PaintPrimitive>,
+    theme: &ThemeTokens,
+    cache: &mut OverlayGeometryCache,
+) {
+    if let Some(cached) = cache.primitives_for(&frame, mode, history_scale, bounds, theme) {
+        primitives.extend(cached.iter().cloned());
+    }
+}
+
+/// Paint one frame without retaining geometry between calls.
+///
+/// This compatibility wrapper keeps the pure helper convenient for tests and
+/// callers that do not own an overlay lifetime.
+#[cfg(test)]
+pub(crate) fn paint_overlay(
+    frame: Arc<LiveSpectrogramFrame>,
+    mode: crate::LiveSpectrogramMode,
+    history_scale: f32,
+    bounds: Rect,
+    primitives: &mut Vec<PaintPrimitive>,
+    theme: &ThemeTokens,
+) {
+    paint_overlay_cached(
+        frame,
+        mode,
+        history_scale,
+        bounds,
+        primitives,
+        theme,
+        &mut OverlayGeometryCache::default(),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         DEFAULT_HISTORY_SCALE, OVERLAY_MAX_SPECTRUM_POINTS, OVERLAY_MAX_WATERFALL_COLUMNS,
-        OVERLAY_MAX_WATERFALL_ROWS, PALETTE, SPECTRUM_AREA_ALPHA, SPECTRUM_AREA_RENDER_KIND,
-        SPECTRUM_AREA_SURFACE_KEY, SPECTRUM_PLOT_BACKGROUND, SPECTRUM_RIBBON_RENDER_KIND,
-        SPECTRUM_RIBBON_SURFACE_KEY, SPECTRUM_RIBBON_WIDTH, SPECTRUM_SHADER_KEY,
-        SPECTRUM_SHADER_WGSL, SpectrogramWidget, WATERFALL_STORAGE_IDENTITY, clamp_height,
-        clamp_history_scale, history_scale_from_normalized, history_scale_to_normalized,
-        paint_overlay, visible_waterfall_rows, waterfall_row_rect, waterfall_row_y_interval,
-        waterfall_shader_descriptor, waterfall_storage_identity,
+        OVERLAY_MAX_WATERFALL_ROWS, OverlayGeometryCache, PALETTE, SPECTRUM_AREA_ALPHA,
+        SPECTRUM_AREA_RENDER_KIND, SPECTRUM_AREA_SURFACE_KEY, SPECTRUM_PLOT_BACKGROUND,
+        SPECTRUM_RIBBON_RENDER_KIND, SPECTRUM_RIBBON_SURFACE_KEY, SPECTRUM_RIBBON_WIDTH,
+        SPECTRUM_SHADER_KEY, SPECTRUM_SHADER_WGSL, SpectrogramWidget, WATERFALL_STORAGE_IDENTITY,
+        clamp_height, clamp_history_scale, history_scale_from_normalized,
+        history_scale_to_normalized, paint_overlay, paint_overlay_cached, visible_waterfall_rows,
+        waterfall_row_rect, waterfall_row_y_interval, waterfall_shader_descriptor,
+        waterfall_storage_identity,
     };
     use crate::LiveSpectrogramMode;
     use crate::transport::{
@@ -1692,6 +1839,62 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn overlay_geometry_cache_reuses_and_invalidates_by_stable_inputs() {
+        let bounds = bounds();
+        let theme = ThemeTokens::default();
+        let frame = test_frame();
+        let mut cache = OverlayGeometryCache::default();
+        let mut primitives = Vec::new();
+
+        paint_overlay_cached(
+            Arc::clone(&frame),
+            LiveSpectrogramMode::Waterfall,
+            DEFAULT_HISTORY_SCALE,
+            bounds,
+            &mut primitives,
+            &theme,
+            &mut cache,
+        );
+        let first = cache.primitives_ptr().expect("cached overlay geometry");
+        primitives.clear();
+        paint_overlay_cached(
+            Arc::clone(&frame),
+            LiveSpectrogramMode::Waterfall,
+            DEFAULT_HISTORY_SCALE,
+            bounds,
+            &mut primitives,
+            &theme,
+            &mut cache,
+        );
+        assert_eq!(cache.primitives_ptr(), Some(first));
+
+        primitives.clear();
+        paint_overlay_cached(
+            Arc::clone(&frame),
+            LiveSpectrogramMode::Spectrum,
+            DEFAULT_HISTORY_SCALE,
+            bounds,
+            &mut primitives,
+            &theme,
+            &mut cache,
+        );
+        let mode_changed = cache.primitives_ptr().expect("mode cache entry");
+        assert_ne!(mode_changed, first);
+
+        primitives.clear();
+        paint_overlay_cached(
+            test_frame(),
+            LiveSpectrogramMode::Spectrum,
+            DEFAULT_HISTORY_SCALE,
+            bounds,
+            &mut primitives,
+            &theme,
+            &mut cache,
+        );
+        assert_ne!(cache.primitives_ptr(), Some(mode_changed));
     }
 
     #[test]

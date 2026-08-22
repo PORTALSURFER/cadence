@@ -759,6 +759,10 @@ pub fn set_track_stage(
 /// favorite-first projection on first load; newer libraries preserve their
 /// explicit order while removing stale/duplicate IDs and appending imports.
 pub fn normalize_planner_order(library: &mut Library) {
+    library.planner_order = normalized_planner_order(library);
+}
+
+fn normalized_planner_order(library: &Library) -> Vec<String> {
     let legacy_order = library.planner_order.is_empty();
     let known_ids = library
         .tracks
@@ -778,9 +782,9 @@ pub fn normalize_planner_order(library: &mut Library) {
             seen.insert(track.id.clone());
         }
     } else {
-        for id in library.planner_order.drain(..) {
+        for id in &library.planner_order {
             if known_ids.contains(id.as_str()) && seen.insert(id.clone()) {
-                order.push(id);
+                order.push(id.clone());
             }
         }
     }
@@ -790,7 +794,7 @@ pub fn normalize_planner_order(library: &mut Library) {
             order.push(track.id.clone());
         }
     }
-    library.planner_order = order;
+    order
 }
 
 /// Return the effective Planner order without mutating the library.
@@ -860,9 +864,9 @@ pub fn planner_tracks<'a>(library: &'a Library) -> Vec<&'a Track> {
 
 /// Move one track to a visible Planner insertion slot.
 ///
-/// The operation is staged on a clone so invalid source, target, or slot data
-/// leaves the caller's library unchanged. Hidden tracks remain in their
-/// relative order when a status filter is active.
+/// The operation stages only the normalized ID order and the source stage, so
+/// invalid source, target, or slot data leaves the caller's library unchanged.
+/// Hidden tracks remain in their relative order when a status filter is active.
 pub fn move_track_to_planner_slot(
     library: &mut Library,
     source_id: &str,
@@ -870,14 +874,16 @@ pub fn move_track_to_planner_slot(
     target_slot: usize,
     status_filter: Option<TrackStatus>,
 ) -> Result<bool, String> {
-    let mut working = library.clone();
-    normalize_planner_order(&mut working);
-
-    let source = working
-        .tracks
-        .iter()
-        .find(|track| track.id == source_id)
-        .cloned()
+    let first_track_by_id = library.tracks.iter().fold(
+        HashMap::<&str, &Track>::with_capacity(library.tracks.len()),
+        |mut tracks, track| {
+            tracks.entry(track.id.as_str()).or_insert(track);
+            tracks
+        },
+    );
+    let source = first_track_by_id
+        .get(source_id)
+        .copied()
         .ok_or_else(|| String::from("That track is no longer in the library."))?;
     if status_filter.is_some_and(|status| source.status != status) {
         return Err(String::from(
@@ -885,15 +891,21 @@ pub fn move_track_to_planner_slot(
         ));
     }
 
-    let order_before = working.planner_order.clone();
-    let visible_target_ids = planner_visible_ids(&working, target_stage, status_filter);
+    let order_before = normalized_planner_order(library);
+    let visible_target_ids = order_before
+        .iter()
+        .filter_map(|id| first_track_by_id.get(id.as_str()).copied())
+        .filter(|track| track.stage == target_stage)
+        .filter(|track| status_filter.is_none_or(|status| track.status == status))
+        .map(|track| track.id.as_str())
+        .collect::<Vec<_>>();
     if target_slot > visible_target_ids.len() {
         return Err(String::from(
             "That Planner drop target is no longer available.",
         ));
     }
     let source_visible_index = if source.stage == target_stage {
-        visible_target_ids.iter().position(|id| id == source_id)
+        visible_target_ids.iter().position(|id| *id == source_id)
     } else {
         None
     };
@@ -907,8 +919,8 @@ pub fn move_track_to_planner_slot(
 
     let visible_target_ids_after_source = visible_target_ids
         .iter()
-        .filter(|id| *id != source_id)
-        .cloned()
+        .filter(|id| **id != source_id)
+        .copied()
         .collect::<Vec<_>>();
     let adjusted_slot = source_visible_index
         .filter(|source_index| *source_index < target_slot)
@@ -919,59 +931,48 @@ pub fn move_track_to_planner_slot(
         ));
     }
 
+    let order_index = order_after_source.iter().enumerate().fold(
+        HashMap::<&str, usize>::with_capacity(order_after_source.len()),
+        |mut indexes, (index, id)| {
+            indexes.entry(id.as_str()).or_insert(index);
+            indexes
+        },
+    );
     let insertion_index =
         if let Some(anchor_id) = visible_target_ids_after_source.get(adjusted_slot) {
-            order_after_source
-                .iter()
-                .position(|id| id == anchor_id)
+            *order_index
+                .get(anchor_id)
                 .ok_or_else(|| String::from("That Planner drop target is no longer available."))?
         } else if let Some(last_visible_id) = visible_target_ids_after_source.last() {
-            order_after_source
-                .iter()
-                .position(|id| id == last_visible_id)
+            order_index
+                .get(last_visible_id)
                 .map_or(order_after_source.len(), |index| index + 1)
         } else {
             order_after_source
                 .iter()
                 .position(|id| {
-                    working
-                        .tracks
-                        .iter()
-                        .find(|track| track.id == *id)
+                    first_track_by_id
+                        .get(id.as_str())
                         .is_some_and(|track| track.stage == target_stage)
                 })
                 .unwrap_or(order_after_source.len())
         };
     order_after_source.insert(insertion_index, source_id.to_string());
 
-    if let Some(track) = working
-        .tracks
-        .iter_mut()
-        .find(|track| track.id == source_id)
-    {
-        track.stage = target_stage;
+    let order_changed = order_after_source != library.planner_order;
+    let stage_changed = source.stage != target_stage;
+    if order_changed || stage_changed {
+        library.planner_order = order_after_source;
+        if stage_changed
+            && let Some(track) = library
+                .tracks
+                .iter_mut()
+                .find(|track| track.id == source_id)
+        {
+            track.stage = target_stage;
+        }
     }
-    working.planner_order = order_after_source;
-    let changed = working != *library;
-    if changed {
-        *library = working;
-    }
-    Ok(changed)
-}
-
-fn planner_visible_ids(
-    library: &Library,
-    stage: TrackStage,
-    status_filter: Option<TrackStatus>,
-) -> Vec<String> {
-    library
-        .planner_order
-        .iter()
-        .filter_map(|id| library.tracks.iter().find(|track| track.id == *id))
-        .filter(|track| track.stage == stage)
-        .filter(|track| status_filter.is_none_or(|status| track.status == status))
-        .map(|track| track.id.clone())
-        .collect()
+    Ok(order_changed || stage_changed)
 }
 
 pub fn set_track_status(
@@ -1885,6 +1886,32 @@ mod tests {
         );
         assert_eq!(library.planner_order, ["c", "b", "a"]);
         assert_eq!(library.tracks[0].stage, TrackStage::Production);
+    }
+
+    #[test]
+    fn planner_move_keeps_unrelated_track_storage_in_place() {
+        let mut library = Library {
+            tracks: vec![
+                planner_test_track("source", TrackStage::Production, TrackStatus::Inbox, false),
+                planner_test_track(
+                    "unrelated",
+                    TrackStage::Production,
+                    TrackStatus::Inbox,
+                    false,
+                ),
+            ],
+            selected_track_id: None,
+            reference_tracks: Vec::new(),
+            planner_order: vec![String::from("source"), String::from("unrelated")],
+        };
+        let unrelated_pointer = std::ptr::from_ref(&library.tracks[1]);
+
+        assert!(
+            move_track_to_planner_slot(&mut library, "source", TrackStage::Production, 2, None)
+                .expect("same-stage reorder should validate")
+        );
+        assert_eq!(library.planner_order, ["unrelated", "source"]);
+        assert_eq!(std::ptr::from_ref(&library.tracks[1]), unrelated_pointer);
     }
 
     #[test]
