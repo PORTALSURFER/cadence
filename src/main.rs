@@ -2815,7 +2815,6 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                         .unwrap_or_else(|| String::from("track"));
                     state.library = library;
                     mark_library_snapshot_persisted(state);
-                    state.library.selected_track_id = Some(track_id);
                     if state.workspace_mode == WorkspaceMode::Audition {
                         reconcile_audition_queue(state);
                     }
