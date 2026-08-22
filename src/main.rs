@@ -15,9 +15,9 @@ use radiant::{
     layout::LayoutOutput,
     prelude as ui,
     runtime::{
-        FileDialogRequest, NativeRunOptions, PaintFillPolygon, PaintFillRect, PaintPrimitive,
-        PaintStrokePolygon, PaintTextAlign, PaintTextMetrics, PlatformResponse, PlatformResult,
-        SurfaceRevisions, push_text_run_with_metrics,
+        DragPreview, DragRequest, FileDialogRequest, NativeRunOptions, PaintFillPolygon,
+        PaintFillRect, PaintPrimitive, PaintStrokePolygon, PaintTextAlign, PaintTextMetrics,
+        PlatformResponse, PlatformResult, SurfaceRevisions, push_text_run_with_metrics,
     },
     theme::ThemeTokens,
     widgets::{
@@ -26,6 +26,7 @@ use radiant::{
     },
 };
 use std::{
+    collections::HashMap,
     fmt::Write as _,
     path::{Path, PathBuf},
     sync::Arc,
@@ -120,6 +121,8 @@ enum Message {
     SetAuditionFilter(storage::TrackStatus),
     SetReviewStatusFilter(Option<storage::TrackStatus>),
     SetPlannerStatusFilter(Option<storage::TrackStatus>),
+    ReviewLibraryWindowChanged(ui::VirtualListWindowChange),
+    AuditionQueueWindowChanged(ui::VirtualListWindowChange),
     ShuffleAudition,
     ToggleFavorite(String),
     ToggleStageMenu(String),
@@ -468,8 +471,6 @@ const STATUS_RAIL_WIDTH: f32 = 4.0;
 const STATUS_RAIL_GAP: f32 = 4.0;
 const TRACK_CARD_SELECTED_CORAL: ui::Rgba8 = ui::Rgba8::new(233, 88, 67, 255);
 const TRACK_CARD_FAVORITE_FILL_BLEND: f32 = 0.18;
-const PLANNER_DRAG_PREVIEW_OFFSET_X: f32 = 14.0;
-const PLANNER_DRAG_PREVIEW_OFFSET_Y: f32 = 18.0;
 const PLANNER_DRAG_PREVIEW_CARD_WIDTH: f32 = 300.0;
 const PLANNER_DRAG_PREVIEW_CARD_HEIGHT: f32 = 154.0;
 const PLANNER_DROP_MARKER_ORANGE: ui::Rgba8 = ui::Rgba8::new(255, 160, 82, 255);
@@ -1010,6 +1011,7 @@ struct AppState {
     live_spectrogram_mode: LiveSpectrogramMode,
     live_spectrogram_history_scale: f32,
     live_spectrogram_height: f32,
+    live_spectrogram_overlay_cache: spectrogram::OverlayGeometryCache,
     live_spectrogram_resize: Option<LiveSpectrogramResize>,
     reference_waveform: Option<audio::WaveformData>,
     reference_waveform_source_ticket: Option<crate::source::VerifiedSourceTicket>,
@@ -1067,10 +1069,12 @@ struct AppState {
     planner_drag_target: Option<PlannerInsertionTarget>,
     planner_drag_pointer: Option<Point>,
     review_status_filter: Option<storage::TrackStatus>,
+    review_library_window: ui::VirtualListWindow,
     review_filter_menu_open: bool,
     planner_status_filter: Option<storage::TrackStatus>,
     audition_status_filter: storage::TrackStatus,
     audition_queue: Vec<String>,
+    audition_queue_window: ui::VirtualListWindow,
     audition_queue_index: usize,
     audition_heard: Vec<String>,
     audition_shuffle_round: u64,
@@ -1162,6 +1166,7 @@ impl Default for AppState {
             live_spectrogram_mode: LiveSpectrogramMode::Waterfall,
             live_spectrogram_history_scale: spectrogram::DEFAULT_HISTORY_SCALE,
             live_spectrogram_height: spectrogram::HEIGHT,
+            live_spectrogram_overlay_cache: spectrogram::OverlayGeometryCache::default(),
             live_spectrogram_resize: None,
             reference_waveform: None,
             reference_waveform_source_ticket: None,
@@ -1219,10 +1224,12 @@ impl Default for AppState {
             planner_drag_target: None,
             planner_drag_pointer: None,
             review_status_filter: None,
+            review_library_window: ui::VirtualListWindow::default(),
             review_filter_menu_open: false,
             planner_status_filter: None,
             audition_status_filter: storage::TrackStatus::Inbox,
             audition_queue: Vec::new(),
+            audition_queue_window: ui::VirtualListWindow::default(),
             audition_queue_index: 0,
             audition_heard: Vec::new(),
             audition_shuffle_round: 0,
@@ -1494,13 +1501,14 @@ fn paint_live_playback_overlay(
         return;
     };
     if let Some(frame) = frame {
-        spectrogram::paint_overlay(
+        spectrogram::paint_overlay_cached(
             frame,
             state.live_spectrogram_mode,
             state.live_spectrogram_history_scale,
             bounds,
             primitives,
             &theme,
+            &mut state.live_spectrogram_overlay_cache,
         );
     }
 }
@@ -3434,9 +3442,22 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 state.review_status_filter = status;
                 close_stage_menu(state);
                 close_status_menu(state);
+                state.review_library_window = ui::VirtualListWindow::default();
             }
             state.review_filter_menu_open = false;
             context.request_repaint();
+        }
+        Message::ReviewLibraryWindowChanged(change) => {
+            if state.review_library_window != change.window {
+                state.review_library_window = change.window;
+                context.request_repaint();
+            }
+        }
+        Message::AuditionQueueWindowChanged(change) => {
+            if state.audition_queue_window != change.window {
+                state.audition_queue_window = change.window;
+                context.request_repaint();
+            }
         }
         Message::ToggleReviewFilterMenu => {
             state.review_filter_menu_open = !state.review_filter_menu_open;
@@ -3447,6 +3468,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 state.planner_status_filter = status;
                 close_stage_menu(state);
                 close_status_menu(state);
+                context.end_drag();
                 clear_planner_drag(state);
             }
             context.request_repaint();
@@ -3665,6 +3687,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 .iter()
                 .any(|track| track.id == track_id)
             {
+                context.end_drag();
                 clear_planner_drag(state);
                 state.status = String::from("That track is no longer in the library.");
                 context.request_repaint();
@@ -3685,30 +3708,49 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                         .find(|track| track.id == track_id)
                         .map_or_else(|| String::from("track"), |track| track.title.clone());
                     state.status = format!("Dragging {title}…");
+                    if let Some(pointer) = state.planner_drag_pointer {
+                        context.begin_drag(DragRequest::new(
+                            DragPreview::sized(
+                                title,
+                                Vector2::new(
+                                    PLANNER_DRAG_PREVIEW_CARD_WIDTH,
+                                    PLANNER_DRAG_PREVIEW_CARD_HEIGHT,
+                                ),
+                            ),
+                            pointer,
+                        ));
+                    }
+                    context.request_repaint();
                 }
                 ui::DragHandleMessage::Moved { .. } => {
                     if state.planner_drag_source_track_id.as_deref() != Some(track_id.as_str()) {
                         return;
                     }
                     state.planner_drag_pointer = drag_message_position(message);
+                    context.request_paint_only();
                 }
                 ui::DragHandleMessage::Ended { .. } => {
                     if state.planner_drag_source_track_id.as_deref() != Some(track_id.as_str()) {
                         return;
                     }
+                    context.end_drag();
                     clear_planner_drag(state);
                     state.status = String::from("Drag canceled.");
+                    context.request_repaint();
                 }
                 ui::DragHandleMessage::Cancelled { .. } => {
                     if state.planner_drag_source_track_id.as_deref() != Some(track_id.as_str()) {
                         return;
                     }
+                    context.end_drag();
                     clear_planner_drag(state);
                     state.status = String::from("Drag canceled.");
+                    context.request_repaint();
                 }
-                ui::DragHandleMessage::DoubleActivate { .. } => {}
+                ui::DragHandleMessage::DoubleActivate { .. } => {
+                    context.request_repaint();
+                }
             }
-            context.request_repaint();
         }
         Message::PlannerInsertionHovered(target) => {
             let Some(source_id) = state.planner_drag_source_track_id.as_deref() else {
@@ -3720,15 +3762,17 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 &target,
                 state.planner_status_filter,
             ) {
-                state.planner_drag_target = None;
-                context.request_repaint();
+                if state.planner_drag_target.take().is_some() {
+                    context.request_repaint();
+                }
                 return;
             }
-            if state.planner_drag_target.as_ref() != Some(&target) {
-                state.planner_drag_target = Some(target.clone());
-                state.status =
-                    planner_insertion_status(&state.library, &target, state.planner_status_filter);
+            if state.planner_drag_target.as_ref() == Some(&target) {
+                return;
             }
+            state.planner_drag_target = Some(target.clone());
+            state.status =
+                planner_insertion_status(&state.library, &target, state.planner_status_filter);
             context.request_repaint();
         }
         Message::PlannerInsertionHoverCleared(target) => {
@@ -3752,6 +3796,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             let Some(source_id) = state.planner_drag_source_track_id.clone() else {
                 return;
             };
+            context.end_drag();
             clear_planner_drag(state);
             match storage::move_track_to_planner_slot(
                 &mut state.library,
@@ -8538,6 +8583,64 @@ fn library_track_card_height() -> f32 {
         + (TRACK_CARD_CONTENT_INSET * 2.0)
 }
 
+const VIRTUAL_LIST_VIEWPORT_ROWS: usize = 8;
+const VIRTUAL_LIST_OVERSCAN_ROWS: usize = 4;
+
+fn audition_queue_row_height() -> f32 {
+    28.0 + 18.0
+        + ui::dropdown_trigger_height()
+        + (TRACK_CARD_CONTENT_SPACING * 3.0)
+        + (TRACK_CARD_CONTENT_INSET * 2.0)
+}
+
+fn resolved_virtual_list_window(
+    current: ui::VirtualListWindow,
+    total_items: usize,
+    focused_index: Option<usize>,
+    follow_focus_in_existing_window: bool,
+) -> ui::VirtualListWindow {
+    if total_items == 0 {
+        return ui::VirtualListWindow::default();
+    }
+    let has_usable_current_window = current.total_items == total_items
+        && current.viewport_len() > 0
+        && current.window_len() > 0;
+    ui::resolve_virtual_list_window(ui::VirtualListWindowRequest {
+        total_items,
+        viewport_len: if has_usable_current_window {
+            current.viewport_len()
+        } else {
+            VIRTUAL_LIST_VIEWPORT_ROWS.min(total_items)
+        },
+        requested_start: if has_usable_current_window {
+            current.viewport_start
+        } else {
+            0
+        },
+        overscan: if has_usable_current_window {
+            current.overscan()
+        } else {
+            VIRTUAL_LIST_OVERSCAN_ROWS
+        },
+        focused_index: if follow_focus_in_existing_window || !has_usable_current_window {
+            focused_index
+        } else {
+            None
+        },
+        previous_start: has_usable_current_window.then_some(current.viewport_start),
+        guard_band: 1,
+    })
+}
+
+fn virtual_row_with_spacing(row: ui::View<Message>, row_height: f32) -> ui::View<Message> {
+    ui::column([
+        row.height((row_height - TRACK_CARD_LIST_SPACING).max(0.0)),
+        ui::spacer().height(TRACK_CARD_LIST_SPACING),
+    ])
+    .fill_width()
+    .height(row_height)
+}
+
 fn select_track_internal(
     state: &mut AppState,
     context: &mut ui::UiUpdateContext<Message>,
@@ -8636,6 +8739,12 @@ fn select_track_internal(
     if entering_review_from_planner {
         let tracks = tracks_with_status(&state.library.tracks, state.review_status_filter);
         if let Some(index) = tracks.iter().position(|track| track.id == reveal_id) {
+            state.review_library_window = resolved_virtual_list_window(
+                state.review_library_window,
+                tracks.len(),
+                Some(index),
+                true,
+            );
             let card_height = library_track_card_height();
             context.scroll_into_view(
                 LIBRARY_SCROLL_VIEWPORT_ID,
@@ -9216,34 +9325,6 @@ fn planner_board_surface(content: ui::View<Message>) -> ui::View<Message> {
         .fill()
 }
 
-fn planner_drag_preview(
-    track: &storage::Track,
-    selected_id: Option<&str>,
-    pointer: Point,
-) -> ui::View<Message> {
-    ui::floating_layer(
-        Point::new(
-            pointer.x + PLANNER_DRAG_PREVIEW_OFFSET_X,
-            pointer.y + PLANNER_DRAG_PREVIEW_OFFSET_Y,
-        ),
-        Vector2::new(
-            PLANNER_DRAG_PREVIEW_CARD_WIDTH,
-            PLANNER_DRAG_PREVIEW_CARD_HEIGHT,
-        ),
-        planner_card_with_key(
-            track,
-            selected_id,
-            None,
-            None,
-            None,
-            None,
-            format!("planner-card-drag-preview-{}", track.id),
-        ),
-    )
-    .key("planner-card-drag-preview")
-    .fill()
-}
-
 fn project_surface(state: &AppState) -> ui::View<Message> {
     let workspace = match state.workspace_mode {
         WorkspaceMode::Review => ui::row([
@@ -9261,22 +9342,6 @@ fn project_surface(state: &AppState) -> ui::View<Message> {
         .fill(),
     };
 
-    let drag_preview = state
-        .planner_drag_source_track_id
-        .as_deref()
-        .and_then(|track_id| {
-            let track = state
-                .library
-                .tracks
-                .iter()
-                .find(|track| track.id == track_id)?;
-            let pointer = state.planner_drag_pointer?;
-            Some(planner_drag_preview(
-                track,
-                state.library.selected_track_id.as_deref(),
-                pointer,
-            ))
-        });
     let stage_menu = state
         .stage_menu_track_id
         .as_deref()
@@ -9455,8 +9520,7 @@ fn project_surface(state: &AppState) -> ui::View<Message> {
         ui::stack([content]).fill().overlays(
             ui::overlays()
                 .popover_opt(stage_menu)
-                .popover_opt(reference_menu)
-                .drag_preview_opt(drag_preview),
+                .popover_opt(reference_menu),
         ),
     )
     .into_view()
@@ -9467,17 +9531,18 @@ fn audition_panel(state: &AppState) -> ui::View<Message> {
     let status_menu_track_id = state.status_menu_track_id.as_deref();
     let status_menu_host = state.status_menu_host;
     let remove_confirmation_track_id = state.remove_confirmation_track_id.as_deref();
+    let mut tracks_by_id = HashMap::with_capacity(state.library.tracks.len());
+    for track in &state.library.tracks {
+        tracks_by_id.entry(track.id.as_str()).or_insert(track);
+    }
     let queue_tracks = state
         .audition_queue
         .iter()
         .enumerate()
         .filter_map(|(index, track_id)| {
-            state
-                .library
-                .tracks
-                .iter()
-                .find(|track| &track.id == track_id)
-                .cloned()
+            tracks_by_id
+                .get(track_id.as_str())
+                .copied()
                 .map(|track| (index, track))
         })
         .collect::<Vec<_>>();
@@ -9510,19 +9575,57 @@ fn audition_panel(state: &AppState) -> ui::View<Message> {
         .spacing(6.0)
         .fill_width()
     } else {
-        ui::list(queue_tracks, move |(index, track)| {
-            audition_queue_row(
-                index,
-                track,
-                selected_id,
-                status_menu_track_id,
-                status_menu_host,
-                remove_confirmation_track_id,
-            )
-        })
-        .without_chrome()
-        .spacing(TRACK_CARD_LIST_SPACING)
-        .fill_height()
+        let audition_row_is_variable_height = remove_confirmation_track_id.is_some()
+            || (status_menu_host == Some(StatusMenuHost::Audition)
+                && status_menu_track_id.is_some());
+        if audition_row_is_variable_height {
+            // Confirmation controls are intentionally variable-height; use the
+            // existing keyed list for that transient state while normal rows
+            // stay in the bounded fixed-height path below.
+            ui::list(queue_tracks, move |(index, track)| {
+                audition_queue_row(
+                    index,
+                    track,
+                    selected_id,
+                    status_menu_track_id,
+                    status_menu_host,
+                    remove_confirmation_track_id,
+                )
+            })
+            .without_chrome()
+            .spacing(TRACK_CARD_LIST_SPACING)
+            .fill_height()
+        } else {
+            let row_height = audition_queue_row_height() + TRACK_CARD_LIST_SPACING;
+            let window = resolved_virtual_list_window(
+                state.audition_queue_window,
+                queue_tracks.len(),
+                None,
+                false,
+            );
+            ui::virtual_list_windowed(|index| {
+                let (queue_index, track) = queue_tracks[index];
+                virtual_row_with_spacing(
+                    audition_queue_row(
+                        queue_index,
+                        track,
+                        selected_id,
+                        status_menu_track_id,
+                        status_menu_host,
+                        None,
+                    ),
+                    row_height,
+                )
+            })
+            .window(window)
+            .row_height(row_height)
+            .overscan_px(row_height * VIRTUAL_LIST_OVERSCAN_ROWS as f32)
+            .on_window_changed(Message::AuditionQueueWindowChanged)
+            .retain_materialized_window()
+            .view()
+            .without_chrome()
+            .fill_height()
+        }
     };
     let progress = if queue_count == 0 {
         String::from("0 tracks")
@@ -9607,7 +9710,7 @@ fn audition_panel(state: &AppState) -> ui::View<Message> {
 
 fn audition_queue_row(
     index: usize,
-    track: storage::Track,
+    track: &storage::Track,
     selected_id: Option<&str>,
     status_menu_track_id: Option<&str>,
     status_menu_host: Option<StatusMenuHost>,
@@ -9620,8 +9723,8 @@ fn audition_queue_row(
     let remove_confirmation_open = remove_confirmation_track_id == Some(track.id.as_str());
     let title = format!("{:02}  {}", index + 1, track.title);
     let favorite_control =
-        favorite_toggle(&track, selected, format!("audition-favorite-{}", track.id));
-    let replace_control = replace_toggle(&track, format!("audition-replace-{}", track.id));
+        favorite_toggle(track, selected, format!("audition-favorite-{}", track.id));
+    let replace_control = replace_toggle(track, format!("audition-replace-{}", track.id));
     let remove_id = track.id.clone();
     let remove_control = ui::close_button()
         .subtle()
@@ -9630,7 +9733,7 @@ fn audition_queue_row(
         .tooltip("Remove track")
         .size(28.0, 24.0);
     let status_control =
-        status_dropdown_for_host(&track, status_menu_open, selected, StatusMenuHost::Audition);
+        status_dropdown_for_host(track, status_menu_open, selected, StatusMenuHost::Audition);
     let removal_controls = if remove_confirmation_open {
         ui::row([
             card_control(
@@ -9671,7 +9774,7 @@ fn audition_queue_row(
         .fill_width()
         .spacing(TRACK_CARD_CONTENT_SPACING)
         .height(28.0),
-        ui::text(track.original_name)
+        ui::text(track.original_name.clone())
             .truncate()
             .height(18.0)
             .fill_width()
@@ -10411,11 +10514,10 @@ fn planner_card_with_key(
 fn tracks_with_status(
     tracks: &[storage::Track],
     status: Option<storage::TrackStatus>,
-) -> Vec<storage::Track> {
+) -> Vec<&storage::Track> {
     let (favorites, non_favorites): (Vec<_>, Vec<_>) = tracks
         .iter()
         .filter(|track| status.is_none_or(|status| track.status == status))
-        .cloned()
         .partition(|track| track.favorite);
     favorites.into_iter().chain(non_favorites).collect()
 }
@@ -10939,22 +11041,65 @@ fn library_panel(state: &AppState) -> ui::View<Message> {
                 .fill_width()
             }
         } else {
-            ui::list(tracks.into_iter().enumerate(), move |(index, track)| {
-                track_row(
-                    index,
-                    track,
-                    selected_id.as_deref(),
-                    state.stage_menu_track_id.as_deref(),
-                    state.status_menu_track_id.as_deref(),
-                    state.status_menu_host,
-                    state.remove_confirmation_track_id.as_deref(),
-                )
-            })
-            .without_chrome()
-            .padding_x(LIBRARY_LIST_INSET)
-            .spacing(TRACK_CARD_LIST_SPACING)
-            .id(LIBRARY_SCROLL_VIEWPORT_ID)
-            .fill_height()
+            let selected_index = selected_id
+                .as_deref()
+                .and_then(|selected_id| tracks.iter().position(|track| track.id == selected_id));
+            let library_row_is_variable_height = state.remove_confirmation_track_id.is_some()
+                || (state.status_menu_host == Some(StatusMenuHost::Library)
+                    && state.status_menu_track_id.is_some());
+            if library_row_is_variable_height {
+                // Confirmation controls add a variable-height row. Keep this
+                // bounded fallback until the fixed-row virtual-list contract
+                // can represent that state without clipping its controls.
+                ui::list(tracks.into_iter().enumerate(), move |(index, track)| {
+                    track_row(
+                        index,
+                        track,
+                        selected_id.as_deref(),
+                        state.stage_menu_track_id.as_deref(),
+                        state.status_menu_track_id.as_deref(),
+                        state.status_menu_host,
+                        state.remove_confirmation_track_id.as_deref(),
+                    )
+                })
+                .without_chrome()
+                .padding_x(LIBRARY_LIST_INSET)
+                .spacing(TRACK_CARD_LIST_SPACING)
+                .id(LIBRARY_SCROLL_VIEWPORT_ID)
+                .fill_height()
+            } else {
+                let row_height = library_track_card_height() + TRACK_CARD_LIST_SPACING;
+                let window = resolved_virtual_list_window(
+                    state.review_library_window,
+                    tracks.len(),
+                    selected_index,
+                    false,
+                );
+                ui::virtual_list_windowed(|index| {
+                    virtual_row_with_spacing(
+                        track_row(
+                            index,
+                            tracks[index],
+                            selected_id.as_deref(),
+                            state.stage_menu_track_id.as_deref(),
+                            state.status_menu_track_id.as_deref(),
+                            state.status_menu_host,
+                            None,
+                        ),
+                        row_height,
+                    )
+                })
+                .window(window)
+                .row_height(row_height)
+                .overscan_px(row_height * VIRTUAL_LIST_OVERSCAN_ROWS as f32)
+                .on_window_changed(Message::ReviewLibraryWindowChanged)
+                .retain_materialized_window()
+                .view()
+                .without_chrome()
+                .padding_x(LIBRARY_LIST_INSET)
+                .id(LIBRARY_SCROLL_VIEWPORT_ID)
+                .fill_height()
+            }
         },
     ])
     .padding(10.0)
@@ -10971,7 +11116,7 @@ fn library_panel(state: &AppState) -> ui::View<Message> {
 
 fn track_row(
     _index: usize,
-    track: storage::Track,
+    track: &storage::Track,
     selected_id: Option<&str>,
     stage_menu_track_id: Option<&str>,
     status_menu_track_id: Option<&str>,
@@ -10987,17 +11132,17 @@ fn track_row(
     let title_widget_id = library_track_title_id(&track.id);
     let remove_id = track.id.clone();
     let favorite_control =
-        favorite_toggle(&track, selected, format!("library-favorite-{}", track.id));
-    let replace_control = replace_toggle(&track, format!("library-replace-{}", track.id));
+        favorite_toggle(track, selected, format!("library-favorite-{}", track.id));
+    let replace_control = replace_toggle(track, format!("library-replace-{}", track.id));
     let remove_control = ui::close_button()
         .subtle()
         .message(Message::RequestRemoveTrack(remove_id.clone()))
         .key(format!("library-remove-{}", track.id))
         .tooltip("Remove track")
         .size(28.0, 24.0);
-    let stage_control = stage_dropdown(&track, stage_menu_open, selected);
+    let stage_control = stage_dropdown(track, stage_menu_open, selected);
     let status_control =
-        status_dropdown_for_host(&track, status_menu_open, selected, StatusMenuHost::Library);
+        status_dropdown_for_host(track, status_menu_open, selected, StatusMenuHost::Library);
     let removal_controls = if remove_confirmation_open {
         ui::row([
             card_control(
@@ -11038,7 +11183,7 @@ fn track_row(
                 card_control(
                     selected,
                     track.title.clone(),
-                    ui::button(track.title)
+                    ui::button(track.title.clone())
                         .style(ui::WidgetStyle::strong(ui::WidgetTone::Neutral))
                         .selected(selected)
                         .message(Message::SelectTrack(id))
@@ -14459,49 +14604,20 @@ mod tests {
         rects
     }
 
-    fn planner_drag_preview_rect(state: &AppState) -> Option<Rect> {
-        let pointer = state.planner_drag_pointer?;
-        let expected_min = Point::new(
-            pointer.x + super::PLANNER_DRAG_PREVIEW_OFFSET_X,
-            pointer.y + super::PLANNER_DRAG_PREVIEW_OFFSET_Y,
-        );
-        project_surface(state)
-            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 720.0))
-            .paint_plan
-            .primitives
-            .iter()
-            .find_map(|primitive| match primitive {
-                PaintPrimitive::FillPolygon(fill)
-                    if fill.points.first().is_some_and(|point| {
-                        (point.x - expected_min.x).abs() < 0.01
-                            && (point.y - expected_min.y).abs() < 0.01
-                    }) =>
-                {
-                    Some(Rect::from_min_max(
-                        Point::new(
-                            fill.points
-                                .iter()
-                                .map(|point| point.x)
-                                .fold(f32::INFINITY, f32::min),
-                            fill.points
-                                .iter()
-                                .map(|point| point.y)
-                                .fold(f32::INFINITY, f32::min),
-                        ),
-                        Point::new(
-                            fill.points
-                                .iter()
-                                .map(|point| point.x)
-                                .fold(f32::NEG_INFINITY, f32::max),
-                            fill.points
-                                .iter()
-                                .map(|point| point.y)
-                                .fold(f32::NEG_INFINITY, f32::max),
-                        ),
-                    ))
-                }
-                _ => None,
-            })
+    fn command_has_begin_drag(command: &Command<Message>) -> bool {
+        match command {
+            Command::BeginDrag { .. } => true,
+            Command::Batch(commands) => commands.iter().any(command_has_begin_drag),
+            _ => false,
+        }
+    }
+
+    fn command_has_end_drag(command: &Command<Message>) -> bool {
+        match command {
+            Command::EndDrag => true,
+            Command::Batch(commands) => commands.iter().any(command_has_end_drag),
+            _ => false,
+        }
     }
 
     #[test]
@@ -23695,8 +23811,9 @@ mod tests {
             ["refine"]
         );
         assert_eq!(
-            owned_tracks_in_stage(&refined, TrackStage::Production)
+            refined
                 .iter()
+                .filter(|track| track.stage == TrackStage::Production)
                 .map(|track| track.id.as_str())
                 .collect::<Vec<_>>(),
             ["refine"]
@@ -23747,6 +23864,25 @@ mod tests {
                 .iter()
                 .any(|label| label == "No tracks here yet.")
         );
+    }
+
+    #[test]
+    fn review_library_stable_scroll_window_does_not_follow_selected_row() {
+        let reported = ui::resolve_virtual_list_window(ui::VirtualListWindowRequest {
+            total_items: 64,
+            viewport_len: 8,
+            requested_start: 40,
+            overscan: 4,
+            ..ui::VirtualListWindowRequest::default()
+        });
+        assert!(!reported.contains(0));
+
+        let stable = super::resolved_virtual_list_window(reported, 64, Some(0), false);
+        assert_eq!(stable, reported);
+        assert!(!stable.contains(0));
+
+        let explicit_reveal = super::resolved_virtual_list_window(reported, 64, Some(0), true);
+        assert!(explicit_reveal.contains(0));
     }
 
     #[test]
@@ -24418,7 +24554,7 @@ mod tests {
     }
 
     #[test]
-    fn active_planner_drag_projects_a_visible_preview() {
+    fn active_planner_drag_keeps_preview_out_of_board_projection() {
         let state = planner_drag_state(Point::new(120.0, 90.0));
 
         let frame = project_surface(&state)
@@ -24427,18 +24563,18 @@ mod tests {
 
         assert!(
             labels.iter().any(|label| label == "Preview me"),
-            "active planner drags must retain the source card title in the preview"
+            "the active Planner board must retain the source card"
         );
         assert!(labels.iter().any(|label| label == "preview.wav"));
-        assert!(!labels.iter().any(|label| label == "↕ Preview me"));
-        assert!(
-            track_card_paint_snapshots(&frame.paint_plan.primitives).len() >= 2,
-            "active planner drags must paint both the source card and its card-shaped preview"
+        assert_eq!(
+            track_card_paint_snapshots(&frame.paint_plan.primitives).len(),
+            1,
+            "the runtime-owned preview must not duplicate the full Planner board card"
         );
     }
 
     #[test]
-    fn planner_drag_messages_move_preview_without_frame_sync() {
+    fn planner_drag_messages_use_runtime_preview_and_paint_only_moves() {
         let started_pointer = Point::new(120.0, 90.0);
         let first_moved_pointer = Point::new(260.0, 180.0);
         let second_moved_pointer = Point::new(460.0, 310.0);
@@ -24456,24 +24592,9 @@ mod tests {
             &mut context,
         );
         assert_eq!(state.planner_drag_pointer, Some(started_pointer));
-        let started_preview = planner_drag_preview_rect(&state)
-            .expect("a started planner drag should paint its preview");
-        assert_eq!(
-            started_preview.min,
-            Point::new(
-                started_pointer.x + super::PLANNER_DRAG_PREVIEW_OFFSET_X,
-                started_pointer.y + super::PLANNER_DRAG_PREVIEW_OFFSET_Y,
-            )
-        );
-        assert_eq!(
-            started_preview.width(),
-            super::PLANNER_DRAG_PREVIEW_CARD_WIDTH
-        );
-        assert_eq!(
-            started_preview.height(),
-            super::PLANNER_DRAG_PREVIEW_CARD_HEIGHT
-        );
+        assert!(command_has_begin_drag(&context.into_command()));
 
+        let mut context = ui::UiUpdateContext::default();
         update(
             &mut state,
             Message::PlannerCardDrag {
@@ -24483,10 +24604,12 @@ mod tests {
             &mut context,
         );
         assert_eq!(state.planner_drag_pointer, Some(first_moved_pointer));
-        let first_moved_preview = planner_drag_preview_rect(&state)
-            .expect("the first planner drag move should keep its preview visible");
-        assert_ne!(started_preview.min, first_moved_preview.min);
+        assert_eq!(
+            context.into_command().repaint_scope(),
+            Some(RepaintScope::PaintOnly)
+        );
 
+        let mut context = ui::UiUpdateContext::default();
         update(
             &mut state,
             Message::PlannerCardDrag {
@@ -24496,9 +24619,10 @@ mod tests {
             &mut context,
         );
         assert_eq!(state.planner_drag_pointer, Some(second_moved_pointer));
-        let second_moved_preview = planner_drag_preview_rect(&state)
-            .expect("the second planner drag move should keep its preview visible");
-        assert_ne!(first_moved_preview.min, second_moved_preview.min);
+        assert_eq!(
+            context.into_command().repaint_scope(),
+            Some(RepaintScope::PaintOnly)
+        );
     }
 
     #[test]
@@ -24553,7 +24677,7 @@ mod tests {
                 .filter(|run| run.text.as_str() == "Preview me")
                 .count()
                 >= 2,
-            "a captured drag move must refresh the declarative card preview"
+            "a captured drag move must refresh the runtime-owned preview"
         );
     }
 
@@ -24568,7 +24692,6 @@ mod tests {
     fn planner_drag_cancel_removes_the_rendered_preview() {
         let pointer = Point::new(120.0, 90.0);
         let mut state = planner_drag_state(pointer);
-        assert!(planner_drag_preview_rect(&state).is_some());
         let mut context = ui::UiUpdateContext::default();
 
         update(
@@ -24581,16 +24704,12 @@ mod tests {
         );
 
         assert!(state.planner_drag_source_track_id.is_none());
-        assert!(
-            planner_drag_preview_rect(&state).is_none(),
-            "canceling a planner drag must remove its rendered preview"
-        );
+        assert!(command_has_end_drag(&context.into_command()));
     }
 
     #[test]
     fn successful_planner_insertion_drop_removes_the_rendered_preview() {
         let mut state = planner_drag_state(Point::new(120.0, 90.0));
-        assert!(planner_drag_preview_rect(&state).is_some());
         let mut context = ui::UiUpdateContext::default();
 
         update(
@@ -24604,13 +24723,10 @@ mod tests {
 
         assert_eq!(state.library.tracks[0].stage, TrackStage::Production);
         assert_eq!(state.library.planner_order, ["drag"]);
+        let command = context.into_command();
+        assert!(command_has_end_drag(&command));
         assert!(
-            planner_drag_preview_rect(&state).is_none(),
-            "a successful Planner insertion must remove its rendered preview"
-        );
-        assert!(
-            context
-                .into_command()
+            command
                 .business_task_priority("cadence-save-library")
                 .is_some(),
             "a successful Planner insertion must schedule one library save"
