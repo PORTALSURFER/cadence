@@ -3442,6 +3442,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 state.review_status_filter = status;
                 close_stage_menu(state);
                 close_status_menu(state);
+                state.review_library_window = ui::VirtualListWindow::default();
             }
             state.review_filter_menu_open = false;
             context.request_repaint();
@@ -8596,6 +8597,7 @@ fn resolved_virtual_list_window(
     current: ui::VirtualListWindow,
     total_items: usize,
     focused_index: Option<usize>,
+    follow_focus_in_existing_window: bool,
 ) -> ui::VirtualListWindow {
     if total_items == 0 {
         return ui::VirtualListWindow::default();
@@ -8620,7 +8622,11 @@ fn resolved_virtual_list_window(
         } else {
             VIRTUAL_LIST_OVERSCAN_ROWS
         },
-        focused_index,
+        focused_index: if follow_focus_in_existing_window || !has_usable_current_window {
+            focused_index
+        } else {
+            None
+        },
         previous_start: has_usable_current_window.then_some(current.viewport_start),
         guard_band: 1,
     })
@@ -8737,6 +8743,7 @@ fn select_track_internal(
                 state.review_library_window,
                 tracks.len(),
                 Some(index),
+                true,
             );
             let card_height = library_track_card_height();
             context.scroll_into_view(
@@ -9590,8 +9597,12 @@ fn audition_panel(state: &AppState) -> ui::View<Message> {
             .fill_height()
         } else {
             let row_height = audition_queue_row_height() + TRACK_CARD_LIST_SPACING;
-            let window =
-                resolved_virtual_list_window(state.audition_queue_window, queue_tracks.len(), None);
+            let window = resolved_virtual_list_window(
+                state.audition_queue_window,
+                queue_tracks.len(),
+                None,
+                false,
+            );
             ui::virtual_list_windowed(|index| {
                 let (queue_index, track) = queue_tracks[index];
                 virtual_row_with_spacing(
@@ -11062,6 +11073,7 @@ fn library_panel(state: &AppState) -> ui::View<Message> {
                     state.review_library_window,
                     tracks.len(),
                     selected_index,
+                    false,
                 );
                 ui::virtual_list_windowed(|index| {
                     virtual_row_with_spacing(
@@ -23852,6 +23864,25 @@ mod tests {
                 .iter()
                 .any(|label| label == "No tracks here yet.")
         );
+    }
+
+    #[test]
+    fn review_library_stable_scroll_window_does_not_follow_selected_row() {
+        let reported = ui::resolve_virtual_list_window(ui::VirtualListWindowRequest {
+            total_items: 64,
+            viewport_len: 8,
+            requested_start: 40,
+            overscan: 4,
+            ..ui::VirtualListWindowRequest::default()
+        });
+        assert!(!reported.contains(0));
+
+        let stable = super::resolved_virtual_list_window(reported, 64, Some(0), false);
+        assert_eq!(stable, reported);
+        assert!(!stable.contains(0));
+
+        let explicit_reveal = super::resolved_virtual_list_window(reported, 64, Some(0), true);
+        assert!(explicit_reveal.contains(0));
     }
 
     #[test]
