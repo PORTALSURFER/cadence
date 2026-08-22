@@ -144,11 +144,6 @@ enum Message {
         track_id: String,
         host: StatusMenuHost,
     },
-    ToggleStatusMenuAtPointer {
-        track_id: String,
-        host: StatusMenuHost,
-        position: Point,
-    },
     ToggleReferenceMenu(String),
     ToggleReferenceMenuAt {
         track_id: String,
@@ -1082,7 +1077,6 @@ struct AppState {
     stage_menu_anchor: Option<Point>,
     status_menu_track_id: Option<String>,
     status_menu_host: Option<StatusMenuHost>,
-    status_menu_anchor: Option<Point>,
     remove_confirmation_track_id: Option<String>,
     planner_drag_source_track_id: Option<String>,
     planner_drag_target: Option<PlannerInsertionTarget>,
@@ -1244,7 +1238,6 @@ impl Default for AppState {
             stage_menu_anchor: None,
             status_menu_track_id: None,
             status_menu_host: None,
-            status_menu_anchor: None,
             remove_confirmation_track_id: None,
             planner_drag_source_track_id: None,
             planner_drag_target: None,
@@ -3489,12 +3482,18 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
         Message::ReviewLibraryWindowChanged(change) => {
             if state.review_library_window != change.window {
                 state.review_library_window = change.window;
+                if state.status_menu_host == Some(StatusMenuHost::Library) {
+                    close_status_menu(state);
+                }
                 context.request_repaint();
             }
         }
         Message::AuditionQueueWindowChanged(change) => {
             if state.audition_queue_window != change.window {
                 state.audition_queue_window = change.window;
+                if state.status_menu_host == Some(StatusMenuHost::Audition) {
+                    close_status_menu(state);
+                }
                 context.request_repaint();
             }
         }
@@ -3518,6 +3517,9 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             let window = &mut state.planner_windows[planner_stage_index(stage)];
             if *window != change.window {
                 *window = change.window;
+                if state.status_menu_host == Some(StatusMenuHost::Planner) {
+                    close_status_menu(state);
+                }
                 context.request_repaint();
             }
         }
@@ -3603,14 +3605,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
         }
         Message::ToggleStatusMenuAt { track_id, host } => {
-            toggle_status_menu(state, track_id, host, None, context);
-        }
-        Message::ToggleStatusMenuAtPointer {
-            track_id,
-            host,
-            position,
-        } => {
-            toggle_status_menu(state, track_id, host, Some(position), context);
+            toggle_status_menu(state, track_id, host, context);
         }
         Message::RemoveReferenceTrack(path) => {
             if !library_is_ready(state) || state.busy {
@@ -9246,14 +9241,12 @@ fn maybe_start_pending_audition(state: &mut AppState, context: &mut ui::UiUpdate
 fn close_status_menu(state: &mut AppState) {
     state.status_menu_track_id = None;
     state.status_menu_host = None;
-    state.status_menu_anchor = None;
 }
 
 fn toggle_status_menu(
     state: &mut AppState,
     track_id: String,
     host: StatusMenuHost,
-    pointer_position: Option<Point>,
     context: &mut ui::UiUpdateContext<Message>,
 ) {
     if !state.busy
@@ -9271,10 +9264,6 @@ fn toggle_status_menu(
             close_stage_menu(state);
             state.status_menu_track_id = Some(track_id);
             state.status_menu_host = Some(host);
-            state.status_menu_anchor = Some(pointer_position.map_or_else(
-                || keyboard_status_menu_anchor(host),
-                status_menu_anchor_from_pointer,
-            ));
         }
         context.request_repaint();
     }
@@ -9500,19 +9489,6 @@ fn project_surface(state: &AppState) -> ui::View<Message> {
                 .filter(|track| !reference_dropdown_paths(state, track).is_empty())
                 .map(|track| reference_menu_popover(state, track, anchor))
         });
-    let status_menu = state
-        .status_menu_track_id
-        .as_deref()
-        .zip(state.status_menu_host)
-        .zip(state.status_menu_anchor)
-        .and_then(|((track_id, host), anchor)| {
-            state
-                .library
-                .tracks
-                .iter()
-                .find(|track| track.id == track_id)
-                .map(|track| status_menu_popover(track, host, anchor))
-        });
     let workspace_tabs = [
         WorkspaceMode::Review,
         WorkspaceMode::Planner,
@@ -9666,7 +9642,6 @@ fn project_surface(state: &AppState) -> ui::View<Message> {
         ui::stack([content]).fill().overlays(
             ui::overlays()
                 .popover_opt(stage_menu)
-                .popover_opt(status_menu)
                 .popover_opt(reference_menu),
         ),
     )
@@ -10253,11 +10228,26 @@ fn planner_column(
         children.push(empty_content);
     } else {
         let row_height = planner_card_height() + TRACK_CARD_LIST_SPACING;
-        let window = resolved_virtual_list_window(current_window, count, None, false);
-        // Each fixed-height logical row owns the insertion slots immediately
-        // above and below its card. Only the materialized window is projected;
-        // offscreen slots remain in the logical scroll extent and become
-        // available after the user scrolls to that position during a drag.
+        let window = if drag_active {
+            // Active drags mount every keyed row and insertion target, while
+            // retaining the virtual-list shell so the scroll and capture owners
+            // remain compatible with the idle projection.
+            let window_start = current_window.window_start.min(count - 1);
+            let viewport_start = current_window.viewport_start.min(count - 1);
+            let viewport_end = current_window
+                .viewport_end
+                .max(viewport_start + 1)
+                .min(count);
+            ui::VirtualListWindow {
+                total_items: count,
+                viewport_start,
+                viewport_end,
+                window_start,
+                window_end: count,
+            }
+        } else {
+            resolved_virtual_list_window(current_window, count, None, false)
+        };
         let scroll = ui::virtual_list_windowed(|index| {
             let track = tracks[index];
             virtual_row_with_spacing(
@@ -10735,20 +10725,6 @@ fn stage_menu_anchor_from_pointer(position: Point) -> Point {
     )
 }
 
-fn keyboard_status_menu_anchor(host: StatusMenuHost) -> Point {
-    match host {
-        StatusMenuHost::Library | StatusMenuHost::Audition => Point::new(LIBRARY_WIDTH, 150.0),
-        StatusMenuHost::Planner => Point::new(18.0 + STATUS_MENU_WIDTH * 0.5, 96.0),
-    }
-}
-
-fn status_menu_anchor_from_pointer(position: Point) -> Point {
-    Point::new(
-        (position.x - STATUS_MENU_WIDTH * 0.5).floor(),
-        (position.y + ui::dropdown_trigger_height() * 0.5).floor(),
-    )
-}
-
 fn stage_dropdown_options(track: &storage::Track) -> Vec<ui::DropdownOption<Message>> {
     let stage_id = track.id.clone();
     [
@@ -11030,7 +11006,6 @@ fn status_dropdown_trigger(
 ) -> ui::View<Message> {
     let status_id = track.id.clone();
     let label = track.status.label().to_owned();
-    let pointer_track_id = track.id.clone();
     let trigger = ui::dropdown_trigger(label, open)
         .toggle_message(Message::ToggleStatusMenuAt {
             track_id: status_id,
@@ -11040,25 +11015,12 @@ fn status_dropdown_trigger(
         .style(ui::WidgetStyle::strong(ui::WidgetTone::Neutral))
         .key(format!("status-dropdown-{}", track.id))
         .fill_width()
-        .height(ui::dropdown_trigger_height())
-        .pointer_target(
-            ui::pointer_target(true)
-                .pointer_move(false)
-                .pointer_press(true)
-                .pointer_release(false)
-                .pointer_drop(false)
-                .wheel(false)
-                .filter_map(move |message| match message {
-                    ui::PointerShieldMessage::PointerPress { position, .. } => {
-                        Some(Message::ToggleStatusMenuAtPointer {
-                            track_id: pointer_track_id.clone(),
-                            host,
-                            position,
-                        })
-                    }
-                    _ => None,
-                }),
-        );
+        .height(ui::dropdown_trigger_height());
+    let trigger = if open {
+        trigger.overlays(ui::overlays().popover(status_menu_popover(track, host)))
+    } else {
+        trigger
+    };
     ui::row([status_dropdown_rail(track.status), trigger])
         .spacing(STATUS_RAIL_GAP)
         .fill_width()
@@ -11077,14 +11039,15 @@ fn status_dropdown_for_host(
         .height(ui::dropdown_trigger_height())
 }
 
-fn status_menu_popover(
-    track: &storage::Track,
-    host: StatusMenuHost,
-    anchor: Point,
-) -> ui::View<Message> {
+fn status_menu_popover(track: &storage::Track, host: StatusMenuHost) -> ui::View<Message> {
     anchored_popover_from_parts(AnchoredPopoverParts::below(
         status_menu(track, host),
-        ui::AnchoredPopoverAnchor::pointer(anchor),
+        ui::AnchoredPopoverAnchor::trigger(
+            0.0,
+            0.0,
+            STATUS_MENU_WIDTH,
+            ui::dropdown_trigger_height(),
+        ),
         Vector2::new(STATUS_MENU_WIDTH, ui::dropdown_menu_height(5)),
     ))
 }
@@ -13232,7 +13195,7 @@ mod tests {
         schedule_reference_waveform_decode, schedule_replace, schedule_waveform_decode,
         seek_synchronized_positions, selected_reference_notes, selected_track, stage_dropdown,
         stage_menu_anchor_from_pointer, stage_menu_popover, start_source_alongside_active,
-        status_dropdown_for_host, status_filter_dropdown, status_menu_popover,
+        status_dropdown_for_host, status_filter_dropdown, status_menu,
         sync_audition_queue_after_status_change, tracks_with_status,
         transport_command_is_confirmed, update,
     };
@@ -23914,6 +23877,7 @@ mod tests {
         );
         let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1_180.0, 720.0));
         let initial_frame = runtime.frame_with_default_theme();
+        let idle_materialized_nodes = runtime.layout().stats.materialized_nodes;
         let first_card_point = initial_frame
             .paint_plan
             .first_text_run("planner-card-0")
@@ -23989,6 +23953,11 @@ mod tests {
         );
 
         let active_frame = runtime.frame_with_default_theme();
+        let active_materialized_nodes = runtime.layout().stats.materialized_nodes;
+        assert!(
+            active_materialized_nodes > idle_materialized_nodes,
+            "an active 48-card Planner drag should materialize more layout nodes than idle: idle={idle_materialized_nodes}, active={active_materialized_nodes}"
+        );
         let active_layout = runtime.layout();
         assert!(
             active_layout
@@ -24236,7 +24205,6 @@ mod tests {
         review.remove_confirmation_track_id = track_ids.first().cloned();
         review.status_menu_track_id = track_ids.first().cloned();
         review.status_menu_host = Some(StatusMenuHost::Library);
-        review.status_menu_anchor = Some(Point::new(120.0, 120.0));
         let review_frame = project_surface(&review)
             .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 720.0));
         let review_titles = review_frame
@@ -24264,7 +24232,6 @@ mod tests {
         audition.remove_confirmation_track_id = audition.audition_queue.first().cloned();
         audition.status_menu_track_id = audition.audition_queue.first().cloned();
         audition.status_menu_host = Some(StatusMenuHost::Audition);
-        audition.status_menu_anchor = Some(Point::new(120.0, 120.0));
         let audition_frame = project_surface(&audition)
             .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 720.0));
         let audition_titles = audition_frame
@@ -25806,18 +25773,14 @@ mod tests {
             notes: Vec::new(),
         };
         let expected = ["Inbox", "Refine", "Release", "Archive", "Maybe"];
-        let actual = ui::scene(status_menu_popover(
-            &track,
-            StatusMenuHost::Library,
-            Point::new(100.0, 20.0),
-        ))
-        .into_view()
-        .view_frame_at_size_with_default_theme(Vector2::new(240.0, 220.0))
-        .paint_plan
-        .text_runs()
-        .filter(|run| !run.text.is_empty())
-        .map(|run| run.text.as_str().to_owned())
-        .collect::<Vec<_>>();
+        let actual = ui::scene(status_menu(&track, StatusMenuHost::Library))
+            .into_view()
+            .view_frame_at_size_with_default_theme(Vector2::new(240.0, 220.0))
+            .paint_plan
+            .text_runs()
+            .filter(|run| !run.text.is_empty())
+            .map(|run| run.text.as_str().to_owned())
+            .collect::<Vec<_>>();
 
         assert_eq!(actual, expected.map(String::from).to_vec());
     }
@@ -27374,10 +27337,14 @@ mod tests {
             .text_runs()
             .find_map(|run| {
                 (run.text.as_str() == TrackStatus::Release.label()
-                    && run.rect.min.y > trigger_rect.max.y)
+                    && run.rect.width() < super::STATUS_MENU_WIDTH)
                     .then_some(run.rect)
             })
             .expect("the open Audition status menu should paint the Release option");
+        assert!(
+            option_rect.min.x < trigger_rect.max.x && option_rect.max.x > trigger_rect.min.x,
+            "the local status popover should remain horizontally associated with its trigger"
+        );
         let option_point = Point::new(
             option_rect.min.x + option_rect.width() * 0.5,
             option_rect.min.y + option_rect.height() * 0.5,
