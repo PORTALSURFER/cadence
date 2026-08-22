@@ -352,7 +352,7 @@ enum WorkspaceMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StatusMenuHost {
     Library,
-    Planner,
+    Planner(storage::TrackStage),
     Audition,
 }
 
@@ -469,6 +469,8 @@ const MAIN_COMMENTS_SCROLL_VIEWPORT_ID: u64 = 0xCAD3_1005;
 const REFERENCE_COMMENTS_SCROLL_VIEWPORT_ID: u64 = 0xCAD3_1006;
 const COMMENT_ROW_HEIGHT: f32 = 44.0;
 const LIBRARY_TRACK_TITLE_ID_SCOPE: u64 = 0xCAD3_0004;
+const PLANNER_DRAG_HANDLE_ID_SCOPE: u64 = 0xCAD3_0007;
+const PLANNER_SCROLL_VIEWPORT_ID_SCOPE: u64 = 0xCAD3_0008;
 const LIBRARY_SCROLL_VIEWPORT_ID: u64 = 0xCAD3_0005;
 const REFERENCE_SETTINGS_SCROLL_VIEWPORT_ID: u64 = 0xCAD3_0006;
 const LIBRARY_REVEAL_MARGIN: f32 = 12.0;
@@ -795,6 +797,39 @@ impl Widget for PlannerStageRailWidget {
                 color: planner_stage_visual_color(self.stage, theme),
             }));
         }
+    }
+}
+
+fn planner_drag_handle_id(track_id: &str) -> u64 {
+    ui::stable_widget_id(PLANNER_DRAG_HANDLE_ID_SCOPE, track_id)
+}
+
+fn planner_column_scroll_viewport_id(stage: storage::TrackStage) -> u64 {
+    ui::stable_widget_id(PLANNER_SCROLL_VIEWPORT_ID_SCOPE, stage.label())
+}
+
+fn planner_drag_handle(track_id: &str, input_only: bool) -> ui::View<Message> {
+    let explicit_id = planner_drag_handle_id(track_id);
+    let mapped_track_id = track_id.to_owned();
+    let handle = ui::custom_widget_mapped(
+        PlannerDragHandleWidget::new(),
+        move |message: ui::DragHandleMessage| Message::PlannerCardDrag {
+            track_id: mapped_track_id.clone(),
+            message,
+        },
+    )
+    .id(explicit_id);
+    if input_only {
+        ui::floating_layer_with_input(
+            Point::new(0.0, 0.0),
+            Vector2::new(1.0, 1.0),
+            handle.input_only().size(1.0, 1.0),
+            true,
+        )
+    } else {
+        handle
+            .size(PLANNER_DRAG_HANDLE_SIZE, PLANNER_DRAG_HANDLE_SIZE)
+            .tooltip("Drag to reorder")
     }
 }
 
@@ -3517,7 +3552,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             let window = &mut state.planner_windows[planner_stage_index(stage)];
             if *window != change.window {
                 *window = change.window;
-                if state.status_menu_host == Some(StatusMenuHost::Planner) {
+                if state.status_menu_host == Some(StatusMenuHost::Planner(stage)) {
                     close_status_menu(state);
                 }
                 context.request_repaint();
@@ -10141,10 +10176,15 @@ fn planner_panel(state: &AppState) -> ui::View<Message> {
         .spacing(WORKSPACE_PANEL_SPACING)
         .fill();
     let content = planner_board_surface(content);
-    ui::input_underlay(
+    let content = ui::input_underlay(
         content,
         planner_insertion_clear_target(drag_active, "planner-insertion-clear-board"),
-    )
+    );
+    if let Some(source_track_id) = drag_source_track_id {
+        ui::stack([content, planner_drag_handle(source_track_id, true)])
+    } else {
+        content
+    }
 }
 
 struct PlannerColumnContext<'a> {
@@ -10232,19 +10272,6 @@ fn planner_column(
     } else {
         let row_height = planner_card_height() + TRACK_CARD_LIST_SPACING;
         let logical_window = resolved_virtual_list_window(current_window, count, None, false);
-        let window = if drag_active {
-            let source_index = drag_source_track_id
-                .and_then(|source_id| tracks.iter().position(|track| track.id == source_id));
-            ui::VirtualListWindow {
-                window_start: source_index.map_or(logical_window.window_start, |index| {
-                    logical_window.window_start.min(index)
-                }),
-                window_end: count,
-                ..logical_window
-            }
-        } else {
-            logical_window
-        };
         let scroll = ui::virtual_list_windowed(|index| {
             let track = tracks[index];
             virtual_row_with_spacing(
@@ -10256,6 +10283,7 @@ fn planner_column(
                         status_menu_track_id,
                         status_menu_host,
                         remove_confirmation_track_id,
+                        drag_source_track_id,
                     ),
                     PlannerInsertionTarget { stage, slot: index },
                     PlannerInsertionTarget {
@@ -10270,31 +10298,15 @@ fn planner_column(
                 row_height,
             )
         })
-        .window(window)
+        .window(logical_window)
         .row_height(row_height)
         .overscan_px(row_height * VIRTUAL_LIST_OVERSCAN_ROWS as f32);
-        let scroll = if drag_active {
-            scroll.view().on_scroll_update_opt(move |update| {
-                let change = ui::virtual_list_window_change_for_scroll(
-                    update,
-                    row_height,
-                    logical_window,
-                    VIRTUAL_LIST_OVERSCAN_ROWS,
-                );
-                (change.window != logical_window)
-                    .then_some(Message::PlannerColumnWindowChanged { stage, change })
-            })
-        } else {
-            scroll
-                .on_window_changed(move |change| Message::PlannerColumnWindowChanged {
-                    stage,
-                    change,
-                })
-                .retain_materialized_window()
-                .view()
-        };
         let scroll = scroll
-            .key(format!("planner-column-scroll-{}", stage.label()))
+            .on_window_changed(move |change| Message::PlannerColumnWindowChanged { stage, change })
+            .retain_materialized_window()
+            .view();
+        let scroll = scroll
+            .id(planner_column_scroll_viewport_id(stage))
             .without_chrome()
             .fill_height();
         children.push(scroll);
@@ -10475,6 +10487,7 @@ fn planner_card(
     status_menu_track_id: Option<&str>,
     status_menu_host: Option<StatusMenuHost>,
     remove_confirmation_track_id: Option<&str>,
+    drag_source_track_id: Option<&str>,
 ) -> ui::View<Message> {
     let card_key = format!("planner-card-{}", track.id);
     planner_card_with_key(
@@ -10484,10 +10497,13 @@ fn planner_card(
         status_menu_track_id,
         status_menu_host,
         remove_confirmation_track_id,
+        drag_source_track_id,
         card_key,
     )
 }
 
+// Keep the planner card inputs explicit to preserve the existing call-site contract.
+#[allow(clippy::too_many_arguments)]
 fn planner_card_with_key(
     track: &storage::Track,
     selected_id: Option<&str>,
@@ -10495,15 +10511,15 @@ fn planner_card_with_key(
     status_menu_track_id: Option<&str>,
     status_menu_host: Option<StatusMenuHost>,
     remove_confirmation_track_id: Option<&str>,
+    drag_source_track_id: Option<&str>,
     card_key: String,
 ) -> ui::View<Message> {
     let selected = selected_id == Some(track.id.as_str());
     let stage_menu_open = stage_menu_track_id == Some(track.id.as_str());
-    let status_menu_open = status_menu_host == Some(StatusMenuHost::Planner)
+    let status_menu_open = status_menu_host == Some(StatusMenuHost::Planner(track.stage))
         && status_menu_track_id == Some(track.id.as_str());
     let remove_confirmation_open = remove_confirmation_track_id == Some(track.id.as_str());
     let title_track_id = track.id.clone();
-    let drag_track_id = track.id.clone();
     let review_track_id = track.id.clone();
     let remove_id = track.id.clone();
     let favorite_control =
@@ -10552,24 +10568,18 @@ fn planner_card_with_key(
             .fill_width()
             .height(REMOVAL_CONFIRMATION_ROW_HEIGHT)
     };
+    let drag_handle = if drag_source_track_id == Some(track.id.as_str()) {
+        ui::spacer()
+            .width(PLANNER_DRAG_HANDLE_SIZE)
+            .height(PLANNER_DRAG_HANDLE_SIZE)
+    } else {
+        planner_drag_handle(track.id.as_str(), false)
+    };
     let card_content = ui::column([
         ui::row([
-            card_control(
-                selected,
-                "Drag to reorder",
-                ui::custom_widget_mapped(
-                    PlannerDragHandleWidget::new(),
-                    move |message: ui::DragHandleMessage| Message::PlannerCardDrag {
-                        track_id: drag_track_id.clone(),
-                        message,
-                    },
-                )
-                .key(format!("planner-card-drag-surface-{}", track.id))
-                .size(PLANNER_DRAG_HANDLE_SIZE, PLANNER_DRAG_HANDLE_SIZE)
-                .tooltip("Drag to reorder"),
-            )
-            .width(PLANNER_DRAG_HANDLE_SIZE)
-            .height(PLANNER_DRAG_HANDLE_SIZE),
+            card_control(selected, "Drag to reorder", drag_handle)
+                .width(PLANNER_DRAG_HANDLE_SIZE)
+                .height(PLANNER_DRAG_HANDLE_SIZE),
             card_control(
                 selected,
                 track.title.clone(),
@@ -10603,7 +10613,12 @@ fn planner_card_with_key(
         .fill_width()
         .subtle(),
         stage_dropdown(track, stage_menu_open, selected),
-        status_dropdown_for_host(track, status_menu_open, selected, StatusMenuHost::Planner),
+        status_dropdown_for_host(
+            track,
+            status_menu_open,
+            selected,
+            StatusMenuHost::Planner(track.stage),
+        ),
     ])
     .padding(TRACK_CARD_CONTENT_INSET)
     .spacing(TRACK_CARD_CONTENT_SPACING)
@@ -11101,7 +11116,7 @@ fn status_menu(track: &storage::Track, host: StatusMenuHost) -> ui::View<Message
 const fn status_menu_host_key(host: StatusMenuHost) -> &'static str {
     match host {
         StatusMenuHost::Library => "library",
-        StatusMenuHost::Planner => "planner",
+        StatusMenuHost::Planner(_) => "planner",
         StatusMenuHost::Audition => "audition",
     }
 }
@@ -23774,6 +23789,29 @@ mod tests {
         state
     }
 
+    fn active_planner_layout_stats(cards_per_stage: usize) -> (usize, usize) {
+        let mut state = planner_scroll_state(cards_per_stage);
+        state.planner_drag_source_track_id = Some(String::from("planner-card-0"));
+        state.planner_drag_pointer = Some(Point::new(320.0, 300.0));
+
+        let bridge = DeclarativeOwnedCommandRuntimeBridge::new(
+            state,
+            |state| project_surface(state).into_surface(),
+            |state, message| {
+                let mut context = ui::UiUpdateContext::default();
+                update(state, message, &mut context);
+                context.into_command()
+            },
+        );
+        let runtime = SurfaceRuntime::new(bridge, Vector2::new(1_180.0, 720.0));
+        let production_window =
+            runtime.bridge().state().planner_windows[planner_stage_index(TrackStage::Production)];
+        (
+            runtime.layout().stats.materialized_nodes,
+            production_window.window_len(),
+        )
+    }
+
     #[test]
     fn planner_virtual_projection_is_bounded_for_fixed_height_columns() {
         let cards_per_stage = 48;
@@ -23833,6 +23871,16 @@ mod tests {
 
     #[test]
     fn planner_drag_keeps_insertion_targets_bounded_and_logical() {
+        let (small_materialized_nodes, small_window_len) = active_planner_layout_stats(48);
+        let (large_materialized_nodes, large_window_len) = active_planner_layout_stats(2_500);
+        assert_eq!(
+            small_window_len, large_window_len,
+            "an active drag should use the same resolved logical window for small and large boards"
+        );
+        assert_eq!(
+            small_materialized_nodes, large_materialized_nodes,
+            "active Planner materialization must stay bounded as cards per stage grow"
+        );
         let cards_per_stage = 48;
         let mut state = planner_scroll_state(cards_per_stage);
         state.planner_drag_source_track_id = Some(String::from("planner-card-0"));
@@ -23875,7 +23923,7 @@ mod tests {
                 context.into_command()
             },
         );
-        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1_180.0, 720.0));
+        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1_180.0, 900.0));
         let initial_frame = runtime.frame_with_default_theme();
         let first_card_point = initial_frame
             .paint_plan
@@ -23905,9 +23953,11 @@ mod tests {
         let started_pointer = Point::new(handle_point.x + 80.0, handle_point.y + 80.0);
         let started = runtime.dispatch_pointer_move_deferred_refresh_with_outcome(started_pointer);
         assert!(started.pointer_captured);
+        let expected_capture_id = super::planner_drag_handle_id("planner-card-0");
         let captured_handle = runtime
             .pointer_capture()
             .expect("the actual drag move should capture the visible handle");
+        assert_eq!(captured_handle, expected_capture_id);
         assert_eq!(
             runtime
                 .bridge()
@@ -23932,10 +23982,7 @@ mod tests {
             ));
             let window = runtime.bridge().state().planner_windows
                 [planner_stage_index(TrackStage::Production)];
-            if window.viewport_end == cards_per_stage {
-                reached_final_rows = true;
-                break;
-            }
+            reached_final_rows |= window.window_end == cards_per_stage;
         }
         assert!(
             reached_final_rows,
@@ -23947,9 +23994,13 @@ mod tests {
         let scrolled_window =
             runtime.bridge().state().planner_windows[planner_stage_index(TrackStage::Production)];
         assert!(scrolled_window.viewport_start > 0);
-        assert_eq!(scrolled_window.viewport_end, cards_per_stage);
+        assert!(scrolled_window.viewport_end > scrolled_window.viewport_start);
         assert!(scrolled_window.window_start > 0);
         assert_eq!(scrolled_window.window_end, cards_per_stage);
+        assert!(
+            scrolled_window.window_len() < cards_per_stage,
+            "the active drag must retain the bounded resolved window at the final rows"
+        );
         let active_layout = runtime.layout();
         assert!(
             active_layout
@@ -24575,7 +24626,7 @@ mod tests {
         state.stage_menu_track_id = Some(String::from("hidden-track"));
         state.stage_menu_anchor = Some(Point::new(40.0, 80.0));
         state.status_menu_track_id = Some(String::from("hidden-track"));
-        state.status_menu_host = Some(StatusMenuHost::Planner);
+        state.status_menu_host = Some(StatusMenuHost::Planner(TrackStage::Production));
         state.planner_drag_source_track_id = Some(String::from("hidden-track"));
         state.planner_drag_target = Some(PlannerInsertionTarget {
             stage: TrackStage::Mixdown,
@@ -24595,6 +24646,56 @@ mod tests {
         assert!(state.planner_drag_source_track_id.is_none());
         assert!(state.planner_drag_target.is_none());
         assert!(state.planner_drag_pointer.is_none());
+    }
+
+    #[test]
+    fn planner_status_menu_closes_only_when_its_stage_window_changes() {
+        let mut state = AppState {
+            busy: false,
+            status_menu_track_id: Some(String::from("production-menu")),
+            status_menu_host: Some(StatusMenuHost::Planner(TrackStage::Production)),
+            ..AppState::default()
+        };
+        let mut context = ui::UiUpdateContext::default();
+        let changed_window = ui::VirtualListWindowChange {
+            offset_y: 120.0,
+            row_height: 32.0,
+            window: ui::VirtualListWindow {
+                total_items: 48,
+                viewport_start: 8,
+                viewport_end: 16,
+                window_start: 4,
+                window_end: 20,
+            },
+        };
+
+        update(
+            &mut state,
+            Message::PlannerColumnWindowChanged {
+                stage: TrackStage::Mixdown,
+                change: changed_window,
+            },
+            &mut context,
+        );
+        assert_eq!(
+            state.status_menu_host,
+            Some(StatusMenuHost::Planner(TrackStage::Production))
+        );
+        assert_eq!(
+            state.status_menu_track_id.as_deref(),
+            Some("production-menu")
+        );
+
+        update(
+            &mut state,
+            Message::PlannerColumnWindowChanged {
+                stage: TrackStage::Production,
+                change: changed_window,
+            },
+            &mut context,
+        );
+        assert!(state.status_menu_host.is_none());
+        assert!(state.status_menu_track_id.is_none());
     }
 
     #[test]
