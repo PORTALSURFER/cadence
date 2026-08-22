@@ -597,6 +597,18 @@ test("release workflow rejects untrusted manual stable sources", async () => {
 
 test("release workflow reserves nightly versions before immutable builds", async () => {
   const workflow = await fs.readFile(workflowPath, "utf8");
+  const actionReferences = [...workflow.matchAll(
+    /^[ \t]*uses:[ \t]+((?!\.\/|docker:\/\/)[^@\s]+\/[^@\s]+)@([^\s#]*)/gm,
+  )];
+  assert.ok(actionReferences.length > 0, "release workflow must define external repository action references");
+  assert.doesNotMatch(
+    workflow,
+    /^[ \t]*uses:[ \t]+(?!\.\/|docker:\/\/)[^@\s]+\/[^@\s]+@v\d+(?:[ \t]|$)/m,
+    "release workflow must not use mutable major-version external repository action references",
+  );
+  for (const [, action, reference] of actionReferences) {
+    assert.match(reference, /^[0-9a-f]{40}$/, `${action} must use a full 40-hex commit SHA`);
+  }
   const reservationMatch = workflow.match(/\n  reserve_nightly:\n([\s\S]*?)\n  prepare:\n/);
   const prepareMatch = workflow.match(/\n  prepare:\n([\s\S]*?)\n  build:\n/);
   const buildMatch = workflow.match(/\n  build:\n([\s\S]*?)\n  publish:\n/);
@@ -657,11 +669,11 @@ test("release workflow reserves nightly versions before immutable builds", async
   assert.match(buildJob, /runs-on: macos-14/);
   assert.match(buildJob, /environment: cadence-production/);
   assert.match(buildJob, /\n    permissions:\n      contents: read\n      actions: read\n/);
-  assert.match(buildJob, /- name: Check out source\n        uses: actions\/checkout@v4\n        with:\n          ref: \$\{\{ needs\.prepare\.outputs\.source_sha \}\}\n          persist-credentials: false/);
+  assert.match(buildJob, /- name: Check out source\n        uses: actions\/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4\.4\.0\n        with:\n          ref: \$\{\{ needs\.prepare\.outputs\.source_sha \}\}\n          persist-credentials: false/);
   assert.doesNotMatch(buildJob, /Select release metadata|github\.event_name|steps\.release/);
   assert.match(buildJob, /GITHUB_SHA: \$\{\{ needs\.prepare\.outputs\.source_sha \}\}/);
   assert.match(buildJob, /export GITHUB_SHA=/);
-  assert.match(buildJob, /actions\/upload-artifact@v4/);
+  assert.match(buildJob, /actions\/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4\.6\.2/);
   assert.match(buildJob, /path: release-output\//);
   const jobEnvStart = buildJob.indexOf("    env:\n");
   const stepsStart = buildJob.indexOf("    steps:\n");
@@ -692,7 +704,7 @@ test("release workflow reserves nightly versions before immutable builds", async
   const reuseBlock = buildJob.slice(reuseIndex, signingIndex);
   assert.match(reuseBlock, /id: reuse_artifact/);
   assert.match(reuseBlock, /continue-on-error: true/);
-  assert.match(reuseBlock, /actions\/download-artifact@v4/);
+  assert.match(reuseBlock, /actions\/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4\.3\.0/);
   assert.match(reuseBlock, /name: \$\{\{ needs\.prepare\.outputs\.artifact_upload_name \}\}/);
   assert.match(reuseBlock, /path: release-output\n/);
   assert.match(reuseBlock, /github-token: \$\{\{ github\.token \}\}/);
@@ -709,8 +721,8 @@ test("release workflow reserves nightly versions before immutable builds", async
   assert.match(publishJob, /needs: build/);
   assert.match(publishJob, /environment: cadence-production/);
   assert.match(publishJob, /\n    permissions:\n      contents: write\n      actions: read\n/);
-  assert.match(publishJob, /- name: Check out source for release publisher\n        uses: actions\/checkout@v4\n        with:\n          ref: \$\{\{ needs\.build\.outputs\.source_sha \}\}\n          persist-credentials: false/);
-  assert.match(publishJob, /actions\/download-artifact@v4/);
+  assert.match(publishJob, /- name: Check out source for release publisher\n        uses: actions\/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4\.4\.0\n        with:\n          ref: \$\{\{ needs\.build\.outputs\.source_sha \}\}\n          persist-credentials: false/);
+  assert.match(publishJob, /actions\/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4\.3\.0/);
   assert.match(publishJob, /name: \$\{\{ needs\.build\.outputs\.artifact_upload_name \}\}/);
   assert.match(publishJob, /github-token: \$\{\{ github\.token \}\}/);
   assert.match(publishJob, /run-id: \$\{\{ github\.run_id \}\}/);

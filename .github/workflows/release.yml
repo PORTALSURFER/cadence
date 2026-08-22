@@ -39,7 +39,7 @@ jobs:
       reservation_tag: ${{ steps.reserve.outputs.reservation_tag }}
     steps:
       - name: Check out source for nightly reservation
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ github.sha }}
 
@@ -290,7 +290,7 @@ jobs:
           fi
 
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ needs.reserve_nightly.outputs.source_sha || github.sha }}
           persist-credentials: false
@@ -493,7 +493,7 @@ jobs:
       CARGO_TERM_COLOR: always
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ needs.prepare.outputs.source_sha }}
           persist-credentials: false
@@ -512,7 +512,7 @@ jobs:
       - name: Reuse existing release artifact when available
         id: reuse_artifact
         continue-on-error: true
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: ${{ needs.prepare.outputs.artifact_upload_name }}
           path: release-output
@@ -541,7 +541,7 @@ jobs:
 
       - name: Upload immutable release artifact
         if: steps.reuse_artifact.outcome != 'success'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ needs.prepare.outputs.artifact_upload_name }}
           path: release-output/
@@ -566,13 +566,13 @@ jobs:
       SOURCE_SHA: ${{ needs.build.outputs.source_sha }}
     steps:
       - name: Check out source for release publisher
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ needs.build.outputs.source_sha }}
           persist-credentials: false
 
       - name: Download exact release artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: ${{ needs.build.outputs.artifact_upload_name }}
           path: release-output
