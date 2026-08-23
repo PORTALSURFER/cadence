@@ -120,12 +120,9 @@ enum Message {
         progress: audio::WaveformProgress,
     },
     SelectTrack(String),
+    ReviewTrack(String),
     SelectWorkspace(WorkspaceMode),
-    SetAuditionFilter(storage::TrackStatus),
-    SetReviewStatusFilter(Option<storage::TrackStatus>),
-    SetPlannerStatusFilter(Option<storage::TrackStatus>),
     ReviewLibraryWindowChanged(ui::VirtualListWindowChange),
-    AuditionQueueWindowChanged(ui::VirtualListWindowChange),
     ReferenceSettingsWindowChanged(ui::VirtualListWindowChange),
     CommentsWindowChanged {
         source: CommentSource,
@@ -135,16 +132,11 @@ enum Message {
         stage: storage::TrackStage,
         change: ui::VirtualListWindowChange,
     },
-    ShuffleAudition,
     ToggleFavorite(String),
     ToggleStageMenu(String),
     ToggleStageMenuAt {
         track_id: String,
         position: Point,
-    },
-    ToggleStatusMenuAt {
-        track_id: String,
-        host: StatusMenuHost,
     },
     ToggleReferenceMenu(String),
     ToggleReferenceMenuAt {
@@ -161,10 +153,6 @@ enum Message {
     SetStage {
         track_id: String,
         stage: storage::TrackStage,
-    },
-    SetStatus {
-        track_id: String,
-        status: storage::TrackStatus,
     },
     PlannerCardDrag {
         track_id: String,
@@ -183,17 +171,13 @@ enum Message {
     SetLiveSpectrogramHistoryScale(f32),
     ResizeLiveSpectrogram(ui::DragHandleMessage),
     NewNoteAtCurrentTime,
-    AuditionPlay,
-    AuditionPrevious,
-    AuditionNext,
     // Retained for pure source-selection reducer coverage; source circles use activation.
     #[cfg_attr(not(test), allow(dead_code))]
-    SelectAuditionSource(AuditionSource),
-    ActivateAuditionSource(AuditionSource),
+    SelectPlaybackSource(PlaybackSource),
+    ActivatePlaybackSource(PlaybackSource),
     SelectCommentSource(CommentSource),
-    ToggleReviewFilterMenu,
     ToggleReferenceMatch,
-    AuditionVolumeChanged(SliderEditBatch),
+    PlaybackVolumeChanged(SliderEditBatch),
     Frame,
     WaveformLoopDragStarted {
         ratio: f32,
@@ -348,18 +332,10 @@ fn hex_bytes(bytes: &[u8]) -> String {
 enum WorkspaceMode {
     Review,
     Planner,
-    Audition,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StatusMenuHost {
-    Library,
-    Planner(storage::TrackStage),
-    Audition,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum AuditionSource {
+enum PlaybackSource {
     #[default]
     Main,
     Reference,
@@ -401,21 +377,21 @@ struct LoopSelections {
 }
 
 impl LoopSelections {
-    fn get(self, source: AuditionSource) -> Option<LoopSelection> {
+    fn get(self, source: PlaybackSource) -> Option<LoopSelection> {
         match source {
-            AuditionSource::Main => self.main,
-            AuditionSource::Reference => self.reference,
+            PlaybackSource::Main => self.main,
+            PlaybackSource::Reference => self.reference,
         }
     }
 
-    fn set(&mut self, source: AuditionSource, selection: Option<LoopSelection>) {
+    fn set(&mut self, source: PlaybackSource, selection: Option<LoopSelection>) {
         match source {
-            AuditionSource::Main => self.main = selection,
-            AuditionSource::Reference => self.reference = selection,
+            PlaybackSource::Main => self.main = selection,
+            PlaybackSource::Reference => self.reference = selection,
         }
     }
 
-    fn clear(&mut self, source: AuditionSource) {
+    fn clear(&mut self, source: PlaybackSource) {
         self.set(source, None);
     }
 
@@ -460,7 +436,7 @@ const REFERENCE_SECTION_SPACING: f32 = 4.0;
 const WAVEFORM_SECTION_SPACING: f32 = 8.0;
 const WORKSPACE_PANEL_PADDING: f32 = 12.0;
 const WORKSPACE_PANEL_SPACING: f32 = 8.0;
-const AUDITION_SOURCE_SELECTOR_WIDTH: f32 = 28.0;
+const PLAYBACK_SOURCE_SELECTOR_WIDTH: f32 = 28.0;
 const FAVORITE_CONTROL_WIDTH: f32 = 28.0;
 const MIN_LOOP_MILLIS: u64 = 120;
 const MAIN_COMMENT_EDITOR_ID: u64 = 0xCAD3_1001;
@@ -486,8 +462,7 @@ const TRACK_CARD_CONTENT_SPACING: f32 = 3.0;
 const TRACK_CARD_LIST_SPACING: f32 = 8.0;
 const REMOVAL_CONFIRMATION_ROW_HEIGHT: f32 = 20.0;
 const LIBRARY_LIST_INSET: f32 = 6.0;
-const STATUS_RAIL_WIDTH: f32 = 4.0;
-const STATUS_RAIL_GAP: f32 = 4.0;
+const PLANNER_STAGE_RAIL_WIDTH: f32 = 4.0;
 const TRACK_CARD_SELECTED_CORAL: ui::Rgba8 = ui::Rgba8::new(233, 88, 67, 255);
 const TRACK_CARD_FAVORITE_FILL_BLEND: f32 = 0.18;
 const PLANNER_DRAG_PREVIEW_CARD_WIDTH: f32 = 300.0;
@@ -685,71 +660,6 @@ fn track_card_chrome(selected: bool, favorite: bool) -> ui::View<Message> {
 }
 
 #[derive(Clone, Debug)]
-struct StatusDropdownRailWidget {
-    common: WidgetCommon,
-    status: Option<storage::TrackStatus>,
-}
-
-impl StatusDropdownRailWidget {
-    fn new(status: Option<storage::TrackStatus>) -> Self {
-        Self {
-            common: WidgetCommon::fixed(0, STATUS_RAIL_WIDTH, 1.0).without_default_chrome(),
-            status,
-        }
-    }
-}
-
-impl Widget for StatusDropdownRailWidget {
-    fn common(&self) -> &WidgetCommon {
-        &self.common
-    }
-
-    fn common_mut(&mut self) -> &mut WidgetCommon {
-        &mut self.common
-    }
-
-    fn accepts_pointer_move(&self) -> bool {
-        false
-    }
-
-    fn accepts_pointer_input(&self, _input: &WidgetInput) -> bool {
-        false
-    }
-
-    fn handle_input(&mut self, _bounds: Rect, _input: WidgetInput) -> Option<WidgetOutput> {
-        None
-    }
-
-    fn append_paint(
-        &self,
-        primitives: &mut Vec<PaintPrimitive>,
-        bounds: Rect,
-        _layout: &LayoutOutput,
-        theme: &ThemeTokens,
-    ) {
-        if bounds.has_finite_positive_area() {
-            primitives.push(PaintPrimitive::FillRect(PaintFillRect {
-                widget_id: self.common.id,
-                rect: bounds,
-                color: self.status.map_or(theme.grid_strong, |status| {
-                    status_visual_color(status, theme)
-                }),
-            }));
-        }
-    }
-}
-
-fn status_dropdown_rail(status: storage::TrackStatus) -> ui::View<Message> {
-    status_rail(Some(status), ui::dropdown_trigger_height())
-}
-
-fn status_rail(status: Option<storage::TrackStatus>, height: f32) -> ui::View<Message> {
-    ui::custom_widget(StatusDropdownRailWidget::new(status), |_| None)
-        .width(STATUS_RAIL_WIDTH)
-        .height(height)
-}
-
-#[derive(Clone, Debug)]
 struct PlannerStageRailWidget {
     common: WidgetCommon,
     stage: storage::TrackStage,
@@ -758,7 +668,7 @@ struct PlannerStageRailWidget {
 impl PlannerStageRailWidget {
     fn new(stage: storage::TrackStage) -> Self {
         Self {
-            common: WidgetCommon::fixed(0, STATUS_RAIL_WIDTH, 1.0).without_default_chrome(),
+            common: WidgetCommon::fixed(0, PLANNER_STAGE_RAIL_WIDTH, 1.0).without_default_chrome(),
             stage,
         }
     }
@@ -837,7 +747,7 @@ fn planner_drag_handle(track_id: &str, input_only: bool) -> ui::View<Message> {
 
 fn planner_stage_rail(stage: storage::TrackStage, height: f32) -> ui::View<Message> {
     ui::custom_widget(PlannerStageRailWidget::new(stage), |_| None)
-        .width(STATUS_RAIL_WIDTH)
+        .width(PLANNER_STAGE_RAIL_WIDTH)
         .height(height)
 }
 
@@ -1012,8 +922,6 @@ impl SharedLibrary {
 #[derive(Clone, Debug, Default)]
 struct LibraryProjectionCache {
     generation: Option<u64>,
-    review_filter: Option<storage::TrackStatus>,
-    planner_filter: Option<storage::TrackStatus>,
     id_to_library_index: HashMap<String, usize>,
     review_indices: Vec<usize>,
     planner_indices: Vec<usize>,
@@ -1023,23 +931,12 @@ struct LibraryProjectionCache {
 }
 
 impl LibraryProjectionCache {
-    fn ensure(
-        &mut self,
-        generation: u64,
-        library: &storage::Library,
-        review_filter: Option<storage::TrackStatus>,
-        planner_filter: Option<storage::TrackStatus>,
-    ) {
-        if self.generation == Some(generation)
-            && self.review_filter == review_filter
-            && self.planner_filter == planner_filter
-        {
+    fn ensure(&mut self, generation: u64, library: &storage::Library) {
+        if self.generation == Some(generation) {
             return;
         }
 
         self.generation = Some(generation);
-        self.review_filter = review_filter;
-        self.planner_filter = planner_filter;
         self.id_to_library_index.clear();
         self.id_to_library_index.reserve(library.tracks.len());
         for (index, track) in library.tracks.iter().enumerate() {
@@ -1056,10 +953,7 @@ impl LibraryProjectionCache {
                     .tracks
                     .iter()
                     .enumerate()
-                    .filter(|(_, track)| {
-                        track.favorite == favorite
-                            && review_filter.is_none_or(|status| track.status == status)
-                    })
+                    .filter(|(_, track)| track.favorite == favorite)
                     .map(|(index, _)| index),
             );
         }
@@ -1112,9 +1006,6 @@ impl LibraryProjectionCache {
                 continue;
             }
             let track = &library.tracks[index];
-            if planner_filter.is_some_and(|status| track.status != status) {
-                continue;
-            }
             self.planner_indices.push(index);
             self.planner_stage_indices[planner_stage_index(track.stage)].push(index);
         }
@@ -1291,8 +1182,8 @@ struct AppState {
     transport_playing: bool,
     transport_polling: bool,
     transport_waiting_token: Option<u64>,
-    audition_volume: f32,
-    audition_source: AuditionSource,
+    playback_volume: f32,
+    playback_source: PlaybackSource,
     reference_transport: Option<transport::AudioTransport>,
     reference_transport_generation: u64,
     reference_transport_position_millis: u64,
@@ -1318,29 +1209,15 @@ struct AppState {
     hovered_reference_note_id: Option<NoteAddress>,
     stage_menu_track_id: Option<String>,
     stage_menu_anchor: Option<Point>,
-    status_menu_track_id: Option<String>,
-    status_menu_host: Option<StatusMenuHost>,
     remove_confirmation_track_id: Option<String>,
     planner_drag_source_track_id: Option<String>,
     planner_drag_target: Option<PlannerInsertionTarget>,
     planner_drag_pointer: Option<Point>,
-    review_status_filter: Option<storage::TrackStatus>,
     review_library_window: ui::VirtualListWindow,
-    review_filter_menu_open: bool,
     reference_settings_window: ui::VirtualListWindow,
-    planner_status_filter: Option<storage::TrackStatus>,
     planner_windows: [ui::VirtualListWindow; 4],
     main_comments_window: ui::VirtualListWindow,
     reference_comments_window: ui::VirtualListWindow,
-    audition_status_filter: storage::TrackStatus,
-    audition_queue: Vec<String>,
-    audition_queue_window: ui::VirtualListWindow,
-    audition_queue_index: usize,
-    audition_heard: Vec<String>,
-    audition_shuffle_round: u64,
-    audition_auto_advance: bool,
-    audition_play_token: Option<u64>,
-    audition_pending_play_track_id: Option<String>,
     audio_import_in_flight: Option<AudioImportRequest>,
     pending_import_commit: Option<PendingImportCommit>,
     historical_binding_confirmation: Option<HistoricalBindingCandidate>,
@@ -1453,8 +1330,8 @@ impl Default for AppState {
             transport_playing: false,
             transport_polling: false,
             transport_waiting_token: None,
-            audition_volume: transport::DEFAULT_VOLUME,
-            audition_source: AuditionSource::Main,
+            playback_volume: transport::DEFAULT_VOLUME,
+            playback_source: PlaybackSource::Main,
             reference_transport: None,
             reference_transport_generation: 0,
             reference_transport_position_millis: 0,
@@ -1480,29 +1357,15 @@ impl Default for AppState {
             hovered_reference_note_id: None,
             stage_menu_track_id: None,
             stage_menu_anchor: None,
-            status_menu_track_id: None,
-            status_menu_host: None,
             remove_confirmation_track_id: None,
             planner_drag_source_track_id: None,
             planner_drag_target: None,
             planner_drag_pointer: None,
-            review_status_filter: None,
             review_library_window: ui::VirtualListWindow::default(),
-            review_filter_menu_open: false,
             reference_settings_window: ui::VirtualListWindow::default(),
-            planner_status_filter: None,
             planner_windows: std::array::from_fn(|_| ui::VirtualListWindow::default()),
             main_comments_window: ui::VirtualListWindow::default(),
             reference_comments_window: ui::VirtualListWindow::default(),
-            audition_status_filter: storage::TrackStatus::Inbox,
-            audition_queue: Vec::new(),
-            audition_queue_window: ui::VirtualListWindow::default(),
-            audition_queue_index: 0,
-            audition_heard: Vec::new(),
-            audition_shuffle_round: 0,
-            audition_auto_advance: false,
-            audition_play_token: None,
-            audition_pending_play_track_id: None,
             audio_import_in_flight: None,
             pending_import_commit: None,
             historical_binding_confirmation: None,
@@ -1538,12 +1401,10 @@ impl AppState {
 }
 
 fn ensure_library_projection_cache(state: &AppState) {
-    state.library_projection_cache.borrow_mut().ensure(
-        state.library.generation(),
-        &state.library,
-        state.review_status_filter,
-        state.planner_status_filter,
-    );
+    state
+        .library_projection_cache
+        .borrow_mut()
+        .ensure(state.library.generation(), &state.library);
 }
 
 fn allocate_note_draft_nonce(state: &mut AppState) -> u64 {
@@ -1581,7 +1442,6 @@ fn animation_requested(state: &AppState) -> bool {
         || state.reference_transport.as_ref().is_some_and(|transport| {
             live_animation_requested(transport, state.reference_live_spectrogram_revision)
         })
-        || state.audition_pending_play_track_id.is_some()
         || state.pending_comment_playback.is_some()
         || state.playhead_drag_active
         || state.reference_playhead_drag_active
@@ -1604,10 +1464,10 @@ fn retained_live_spectrogram_revision(state: &AppState) -> u64 {
     }
 }
 
-fn live_spectrogram_source_has_frame(state: &AppState, source: AuditionSource) -> bool {
+fn live_spectrogram_source_has_frame(state: &AppState, source: PlaybackSource) -> bool {
     match source {
-        AuditionSource::Main => state.live_spectrogram.is_some(),
-        AuditionSource::Reference => state.reference_live_spectrogram.is_some(),
+        PlaybackSource::Main => state.live_spectrogram.is_some(),
+        PlaybackSource::Reference => state.reference_live_spectrogram.is_some(),
     }
 }
 
@@ -1668,10 +1528,7 @@ fn frame_surface_revisions(state: &mut AppState) -> SurfaceRevisions {
         retained_live_spectrogram_revision(state),
         state.live_spectrogram_mode as u64,
         spectrogram::clamp_history_scale(state.live_spectrogram_history_scale).to_bits() as u64,
-        state.audition_source as u64,
-        state.audition_queue_index as u64,
-        state.audition_auto_advance as u64,
-        state.audition_pending_play_track_id.is_some() as u64,
+        state.playback_source as u64,
         frame_revision_text(Some(&state.status)),
     ]);
     SurfaceRevisions::new(structure, layout, projection)
@@ -1698,10 +1555,10 @@ fn waveform_overlay_bounds(
     bounds.has_finite_positive_area().then_some(bounds)
 }
 
-fn playback_ratio_for_source(state: &AppState, source: AuditionSource) -> Option<f32> {
+fn playback_ratio_for_source(state: &AppState, source: PlaybackSource) -> Option<f32> {
     let selected_track_id = state.library.selected_track_id.as_deref()?;
     match source {
-        AuditionSource::Main => {
+        PlaybackSource::Main => {
             if !state.transport_playing
                 || state.waveform_track_id.as_deref() != Some(selected_track_id)
             {
@@ -1710,7 +1567,7 @@ fn playback_ratio_for_source(state: &AppState, source: AuditionSource) -> Option
             let waveform = state.waveform.as_ref()?;
             waveform::ratio_for_millis(state.transport_position_millis, waveform.duration_millis)
         }
-        AuditionSource::Reference => {
+        PlaybackSource::Reference => {
             if !state.reference_transport_playing
                 || state.reference_waveform_track_id.as_deref() != Some(selected_track_id)
             {
@@ -1731,7 +1588,7 @@ fn paint_live_playback_overlay(
     primitives: &mut Vec<PaintPrimitive>,
 ) {
     let theme = ThemeTokens::default();
-    if let Some(ratio) = playback_ratio_for_source(state, AuditionSource::Main)
+    if let Some(ratio) = playback_ratio_for_source(state, PlaybackSource::Main)
         && let Some(bounds) =
             waveform_overlay_bounds(&context, waveform::MAIN_WAVEFORM_WIDGET_ID, WAVEFORM_HEIGHT)
     {
@@ -1743,7 +1600,7 @@ fn paint_live_playback_overlay(
             &theme,
         );
     }
-    if let Some(ratio) = playback_ratio_for_source(state, AuditionSource::Reference)
+    if let Some(ratio) = playback_ratio_for_source(state, PlaybackSource::Reference)
         && let Some(bounds) = waveform_overlay_bounds(
             &context,
             waveform::REFERENCE_WAVEFORM_WIDGET_ID,
@@ -1783,7 +1640,13 @@ fn workspace_mode_key(mode: WorkspaceMode) -> u64 {
     match mode {
         WorkspaceMode::Review => 0,
         WorkspaceMode::Planner => 1,
-        WorkspaceMode::Audition => 2,
+    }
+}
+
+const fn workspace_mode_label(mode: WorkspaceMode) -> &'static str {
+    match mode {
+        WorkspaceMode::Review => "Review",
+        WorkspaceMode::Planner => "Planner",
     }
 }
 
@@ -1893,9 +1756,6 @@ fn activate_loaded_library(
         )
     };
     state.library_load_state = LibraryLoadState::Ready;
-    if state.workspace_mode == WorkspaceMode::Audition {
-        rebuild_audition_queue(state);
-    }
     state.review_cursor_millis = 0;
     state.draft_note = None;
     state.reference_draft_note = None;
@@ -1909,7 +1769,6 @@ fn activate_loaded_library(
     state.comment_source = CommentSource::Main;
     state.comment_source_explicit = false;
     close_stage_menu(state);
-    close_status_menu(state);
     close_reference_menu(state);
     close_settings(state);
     state.remove_confirmation_track_id = None;
@@ -2024,16 +1883,13 @@ fn mark_main_transport_source_mismatch(state: &mut AppState) {
     if let Some(cancellation) = state.waveform_cancellation.take() {
         cancellation.cancel();
     }
-    clear_pending_seek_intent(state, AuditionSource::Main);
-    clear_live_spectrogram(state, AuditionSource::Main);
-    state.loop_selections.clear(AuditionSource::Main);
+    clear_pending_seek_intent(state, PlaybackSource::Main);
+    clear_live_spectrogram(state, PlaybackSource::Main);
+    state.loop_selections.clear(PlaybackSource::Main);
     state.playhead_drag_active = false;
     state.transport_playing = false;
     state.transport_polling = false;
     state.transport_waiting_token = None;
-    state.audition_auto_advance = false;
-    state.audition_play_token = None;
-    state.audition_pending_play_track_id = None;
     state.reference_match_enabled = false;
     if state
         .pending_comment_playback
@@ -2064,9 +1920,9 @@ fn mark_reference_transport_source_mismatch(state: &mut AppState) {
     if let Some(cancellation) = state.reference_waveform_cancellation.take() {
         cancellation.cancel();
     }
-    clear_pending_seek_intent(state, AuditionSource::Reference);
-    clear_live_spectrogram(state, AuditionSource::Reference);
-    state.loop_selections.clear(AuditionSource::Reference);
+    clear_pending_seek_intent(state, PlaybackSource::Reference);
+    clear_live_spectrogram(state, PlaybackSource::Reference);
+    state.loop_selections.clear(PlaybackSource::Reference);
     state.reference_playhead_drag_active = false;
     state.reference_transport_playing = false;
     state.reference_transport_polling = false;
@@ -2121,7 +1977,7 @@ fn cleanup_reference_transport_source_mismatch(state: &mut AppState, error: Stri
         pending_reset_main: false,
         pending_reset_reference: false,
     };
-    set_audition_source(state, AuditionSource::Main);
+    set_playback_source(state, PlaybackSource::Main);
     state.transport.set_output_gain(main_output_gain(state));
     progress_paired_playback_cleanup_initial(state);
     state.status = error.clone();
@@ -2461,7 +2317,7 @@ fn start_waveform_decode(
     } = request.clone();
     state.waveform_in_flight = Some(request);
     state.waveform_busy = true;
-    state.loop_selections.clear(AuditionSource::Main);
+    state.loop_selections.clear(PlaybackSource::Main);
     if !paired_playback_cleanup_active(state) && !main_source_is_mismatched(state) {
         state.status = format!("Preparing MAIN waveform and loudness · {}…", path.display());
     }
@@ -2526,7 +2382,7 @@ fn schedule_waveform_decode(
     state.waveform_source_ticket = None;
     state.waveform_track_id = None;
     state.waveform_progress = None;
-    state.loop_selections.clear(AuditionSource::Main);
+    state.loop_selections.clear(PlaybackSource::Main);
     if state.waveform_in_flight.is_some() {
         state.waveform_pending = Some(request);
         if let Some(cancellation) = state.waveform_cancellation.as_ref() {
@@ -2561,7 +2417,7 @@ fn reset_waveform_decode(state: &mut AppState) {
     state.main_source_mismatch = None;
     state.waveform_track_id = None;
     state.waveform_progress = None;
-    state.loop_selections.clear(AuditionSource::Main);
+    state.loop_selections.clear(PlaybackSource::Main);
 }
 
 fn schedule_selected_waveform_decode(
@@ -2596,7 +2452,7 @@ fn start_reference_waveform_decode(
     } = request.clone();
     state.reference_waveform_in_flight = Some(request);
     state.reference_waveform_busy = true;
-    state.loop_selections.clear(AuditionSource::Reference);
+    state.loop_selections.clear(PlaybackSource::Reference);
     let progress_track_id = track_id.clone();
     let completion_track_id = track_id;
     let cancellation = ui::CancellationToken::new();
@@ -2658,7 +2514,7 @@ fn schedule_reference_waveform_decode(
     state.reference_waveform_source_ticket = None;
     state.reference_waveform_track_id = None;
     state.reference_waveform_progress = None;
-    state.loop_selections.clear(AuditionSource::Reference);
+    state.loop_selections.clear(PlaybackSource::Reference);
     if state.reference_waveform_in_flight.is_some() {
         state.reference_waveform_pending = Some(request);
         if let Some(cancellation) = state.reference_waveform_cancellation.as_ref() {
@@ -2684,7 +2540,7 @@ fn reset_reference_waveform_decode(state: &mut AppState) {
     state.reference_source_mismatch = None;
     state.reference_waveform_track_id = None;
     state.reference_waveform_progress = None;
-    state.loop_selections.clear(AuditionSource::Reference);
+    state.loop_selections.clear(PlaybackSource::Reference);
 }
 
 fn schedule_selected_reference_decode(
@@ -2748,10 +2604,10 @@ fn current_reference_lufs_meter_value(state: &AppState, track_id: &str) -> Optio
 }
 
 fn reference_output_gain(state: &AppState) -> f32 {
-    reference_output_gain_for_source(state, state.audition_source)
+    reference_output_gain_for_source(state, state.playback_source)
 }
 
-fn reference_output_gain_for_source(state: &AppState, source: AuditionSource) -> f32 {
+fn reference_output_gain_for_source(state: &AppState, source: PlaybackSource) -> f32 {
     if cleanup_any_active(state) {
         return 0.0;
     }
@@ -2760,8 +2616,8 @@ fn reference_output_gain_for_source(state: &AppState, source: AuditionSource) ->
         .then(|| current_loudness_match_gain_db(state))
         .flatten()
         .map_or(1.0, audio::linear_gain_for_db);
-    if source == AuditionSource::Reference {
-        transport::normalize_output_gain(state.audition_volume * match_gain)
+    if source == PlaybackSource::Reference {
+        transport::normalize_output_gain(state.playback_volume * match_gain)
     } else {
         0.0
     }
@@ -2780,15 +2636,15 @@ fn main_output_gain(state: &AppState) -> f32 {
             state.paired_playback_guard,
             PairedPlaybackGuard::StoppingMain { .. }
         ))
-        && state.audition_source == AuditionSource::Main
+        && state.playback_source == PlaybackSource::Main
     {
-        state.audition_volume
+        state.playback_volume
     } else {
         0.0
     }
 }
 
-fn sync_audition_output_gains(state: &AppState) {
+fn sync_playback_output_gains(state: &AppState) {
     if !cleanup_any_active(state) || cleanup_owns_main(state) {
         state.transport.set_output_gain(main_output_gain(state));
     }
@@ -3039,9 +2895,6 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     reset_comments_windows(state);
                     refresh_selected_track_index(state);
                     mark_library_snapshot_persisted(state);
-                    if state.workspace_mode == WorkspaceMode::Audition {
-                        reconcile_audition_queue(state);
-                    }
                     state.review_cursor_millis = 0;
                     state.draft_note = None;
                     state.reference_draft_note = None;
@@ -3055,7 +2908,6 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     state.comment_source = CommentSource::Main;
                     state.comment_source_explicit = false;
                     close_stage_menu(state);
-                    close_status_menu(state);
                     close_reference_menu(state);
                     state.remove_confirmation_track_id = None;
                     reset_transport(state);
@@ -3100,9 +2952,6 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     reset_comments_windows(state);
                     refresh_selected_track_index(state);
                     mark_library_snapshot_persisted(state);
-                    if state.workspace_mode == WorkspaceMode::Audition {
-                        reconcile_audition_queue(state);
-                    }
                     state.review_cursor_millis = 0;
                     state.draft_note = None;
                     state.reference_draft_note = None;
@@ -3114,7 +2963,6 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     state.selected_reference_note_id = None;
                     state.hovered_reference_note_id = None;
                     close_stage_menu(state);
-                    close_status_menu(state);
                     close_reference_menu(state);
                     state.remove_confirmation_track_id = None;
                     reset_transport(state);
@@ -3220,7 +3068,6 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     close_reference_menu(state);
                 } else {
                     close_stage_menu(state);
-                    close_status_menu(state);
                     state.reference_menu_track_id = Some(track_id);
                     state.reference_menu_anchor = Some(keyboard_reference_menu_anchor());
                 }
@@ -3240,7 +3087,6 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     close_reference_menu(state);
                 } else {
                     close_stage_menu(state);
-                    close_status_menu(state);
                     state.reference_menu_track_id = Some(track_id);
                     state.reference_menu_anchor =
                         Some(reference_menu_anchor_from_pointer(position));
@@ -3291,8 +3137,6 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
             state.waveform_progress = None;
             state.waveform_busy = false;
-            let pending_audition = state.workspace_mode == WorkspaceMode::Audition
-                && state.audition_pending_play_track_id.as_deref() == Some(track_id.as_str());
             match result {
                 Ok(verified) => {
                     let ticket = verified.ticket().clone();
@@ -3324,7 +3168,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                             track.id == track_id && track.path == ticket.path()
                         })
                     }) {
-                        clear_live_spectrogram(state, AuditionSource::Main);
+                        clear_live_spectrogram(state, PlaybackSource::Main);
                         match state.transport.load(
                             state.transport_generation,
                             ticket,
@@ -3334,25 +3178,12 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                                 .map_or(0, |waveform| waveform.duration_millis),
                         ) {
                             Ok(token) => begin_transport_polling(state, token),
-                            Err(error) => {
-                                state.status = error;
-                                if pending_audition {
-                                    state.audition_auto_advance = false;
-                                    state.audition_play_token = None;
-                                    state.audition_pending_play_track_id = None;
-                                    advance_audition(state, context);
-                                }
-                            }
+                            Err(error) => state.status = error,
                         }
                     } else {
                         state.status = String::from(
                             "Audio source verification is unavailable; playback is disabled.",
                         );
-                        if pending_audition {
-                            state.audition_auto_advance = false;
-                            state.audition_play_token = None;
-                            state.audition_pending_play_track_id = None;
-                        }
                     }
                 }
                 Err(error) if error == "cancelled" => {
@@ -3395,12 +3226,6 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                         })
                     {
                         cancel_pending_comment_playback(state);
-                    }
-                    if pending_audition {
-                        state.audition_auto_advance = false;
-                        state.audition_play_token = None;
-                        state.audition_pending_play_track_id = None;
-                        advance_audition(state, context);
                     }
                 }
             }
@@ -3513,9 +3338,6 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             context.request_repaint();
         }
         Message::Frame => {
-            let was_audition_playing = state.workspace_mode == WorkspaceMode::Audition
-                && state.audition_auto_advance
-                && state.transport_playing;
             let was_main_playing = !state.reference_only_playback && state.transport_playing;
             let was_reference_playing = state.reference_transport_playing;
             let mut cleanup_was_reference_only = matches!(
@@ -3533,16 +3355,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 progress_paired_playback_cleanup(state);
             }
             let snapshot = state.transport.snapshot();
-            let audition_play_acknowledged = state.workspace_mode == WorkspaceMode::Audition
-                && state.audition_auto_advance
-                && state
-                    .audition_play_token
-                    .is_some_and(|token| transport_command_is_confirmed(snapshot, token));
-            let pending_audition = state.workspace_mode == WorkspaceMode::Audition
-                && state.audition_pending_play_track_id.is_some();
-            let mut main_snapshot_applied = false;
             let mut block_main_snapshot = cleanup_was_owning_main || cleanup_owns_main(state);
-            let mut main_transport_source_mismatch = false;
             if snapshot.generation == state.transport_generation {
                 if let Some(warning) = state
                     .transport
@@ -3555,16 +3368,12 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     if source_error_is_mismatch(&error) {
                         let paired = paired_playback_intended(state);
                         handle_main_transport_source_mismatch(state);
-                        main_transport_source_mismatch = true;
                         block_main_snapshot = paired;
                     } else if paired_playback_intended(state) {
                         state.playhead_drag_active = false;
                         state.transport_playing = false;
                         state.transport_polling = false;
                         state.transport_waiting_token = None;
-                        state.audition_auto_advance = false;
-                        state.audition_play_token = None;
-                        state.audition_pending_play_track_id = None;
                         cleanup_transport_failure(state, error, None);
                         block_main_snapshot = true;
                     } else if cleanup_any_active(state) {
@@ -3575,17 +3384,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                         state.transport_playing = false;
                         state.transport_polling = false;
                         state.transport_waiting_token = None;
-                        state.audition_auto_advance = false;
-                        state.audition_play_token = None;
-                        state.audition_pending_play_track_id = None;
                         state.status = error;
-                    }
-                    if !block_main_snapshot
-                        && !main_transport_source_mismatch
-                        && !cleanup_any_active(state)
-                        && pending_audition
-                    {
-                        advance_audition(state, context);
                     }
                 } else if !block_main_snapshot
                     && state
@@ -3594,7 +3393,6 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 {
                     state.transport_waiting_token = None;
                     apply_transport_snapshot(state, snapshot);
-                    main_snapshot_applied = true;
                 }
             }
             if block_main_snapshot {
@@ -3607,24 +3405,6 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 refresh_live_spectrograms(state);
                 preserve_source_mismatch_status(state);
                 return;
-            }
-            let natural_audition_completion = main_snapshot_applied
-                && (was_audition_playing || audition_play_acknowledged)
-                && state.workspace_mode == WorkspaceMode::Audition
-                && !state.transport_playing
-                && !state.transport_polling
-                && state.transport_waiting_token.is_none()
-                && snapshot.ready
-                && !snapshot.playing
-                && state.waveform_track_id.as_deref() == state.library.selected_track_id.as_deref()
-                && state
-                    .waveform
-                    .as_ref()
-                    .is_some_and(|waveform| snapshot.position_millis >= waveform.duration_millis);
-            if natural_audition_completion && state.loop_selections.main.is_none() {
-                advance_audition(state, context);
-            } else if state.loop_selections.main.is_none() {
-                maybe_start_pending_audition(state, context);
             }
             enforce_loop(state, was_main_playing, was_reference_playing);
             maybe_start_pending_comment_playback(state, context);
@@ -3684,69 +3464,23 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 && !state.busy
                 && state.library.tracks.iter().any(|track| track.id == id)
             {
-                if state.workspace_mode == WorkspaceMode::Audition {
-                    state.audition_heard.retain(|heard_id| heard_id != &id);
-                }
                 select_track_internal(state, context, id, false);
+            }
+        }
+        Message::ReviewTrack(id) => {
+            if library_is_ready(state)
+                && !state.busy
+                && state.library.tracks.iter().any(|track| track.id == id)
+            {
+                select_track_internal(state, context, id, true);
             }
         }
         Message::SelectWorkspace(mode) => {
             set_workspace_mode(state, context, mode);
         }
-        Message::SetAuditionFilter(status) => {
-            if !library_is_ready(state)
-                || state.busy
-                || state.workspace_mode != WorkspaceMode::Audition
-            {
-                return;
-            }
-            state.audition_status_filter = status;
-            close_status_menu(state);
-            state.audition_shuffle_round = 0;
-            state.audition_auto_advance = false;
-            state.audition_play_token = None;
-            state.audition_pending_play_track_id = None;
-            state.audition_queue_window = ui::VirtualListWindow::default();
-            rebuild_audition_queue(state);
-            if let Some(track_id) = state.audition_queue.first().cloned() {
-                select_track_internal(state, context, track_id, false);
-                state.status = format!(
-                    "Auditioning {} tracks in {}.",
-                    state.audition_queue.len(),
-                    status.label()
-                );
-            } else {
-                reset_transport(state);
-                reset_reference_transport(state);
-                state.status = format!("No tracks in {}.", status.label());
-            }
-            context.request_repaint();
-        }
-        Message::SetReviewStatusFilter(status) => {
-            if state.review_status_filter != status {
-                state.review_status_filter = status;
-                close_stage_menu(state);
-                close_status_menu(state);
-                state.review_library_window = ui::VirtualListWindow::default();
-            }
-            state.review_filter_menu_open = false;
-            context.request_repaint();
-        }
         Message::ReviewLibraryWindowChanged(change) => {
             if state.review_library_window != change.window {
                 state.review_library_window = change.window;
-                if state.status_menu_host == Some(StatusMenuHost::Library) {
-                    close_status_menu(state);
-                }
-                context.request_repaint();
-            }
-        }
-        Message::AuditionQueueWindowChanged(change) => {
-            if state.audition_queue_window != change.window {
-                state.audition_queue_window = change.window;
-                if state.status_menu_host == Some(StatusMenuHost::Audition) {
-                    close_status_menu(state);
-                }
                 context.request_repaint();
             }
         }
@@ -3770,29 +3504,8 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             let window = &mut state.planner_windows[planner_stage_index(stage)];
             if *window != change.window {
                 *window = change.window;
-                if state.status_menu_host == Some(StatusMenuHost::Planner(stage)) {
-                    close_status_menu(state);
-                }
                 context.request_repaint();
             }
-        }
-        Message::ToggleReviewFilterMenu => {
-            state.review_filter_menu_open = !state.review_filter_menu_open;
-            context.request_repaint();
-        }
-        Message::SetPlannerStatusFilter(status) => {
-            if state.planner_status_filter != status {
-                state.planner_status_filter = status;
-                close_stage_menu(state);
-                close_status_menu(state);
-                context.end_drag();
-                clear_planner_drag(state);
-                state.planner_windows = std::array::from_fn(|_| ui::VirtualListWindow::default());
-            }
-            context.request_repaint();
-        }
-        Message::ShuffleAudition => {
-            shuffle_audition(state, context);
         }
         Message::ToggleFavorite(id) => {
             if library_is_ready(state)
@@ -3811,7 +3524,6 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 if state.stage_menu_track_id.as_deref() == Some(id.as_str()) {
                     close_stage_menu(state);
                 } else {
-                    close_status_menu(state);
                     state.stage_menu_track_id = Some(id);
                     state.stage_menu_anchor = Some(keyboard_stage_menu_anchor(state));
                 }
@@ -3830,7 +3542,6 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 if state.stage_menu_track_id.as_deref() == Some(track_id.as_str()) {
                     close_stage_menu(state);
                 } else {
-                    close_status_menu(state);
                     state.stage_menu_track_id = Some(track_id);
                     state.stage_menu_anchor = Some(stage_menu_anchor_from_pointer(position));
                 }
@@ -3848,7 +3559,6 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     }
                 };
                 close_stage_menu(state);
-                close_status_menu(state);
                 clear_planner_drag(state);
                 if changed {
                     state.status = format!("Stage set to {}.", stage.label());
@@ -3856,9 +3566,6 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 }
                 context.request_repaint();
             }
-        }
-        Message::ToggleStatusMenuAt { track_id, host } => {
-            toggle_status_menu(state, track_id, host, context);
         }
         Message::RemoveReferenceTrack(path) => {
             if !library_is_ready(state) || state.busy {
@@ -3877,7 +3584,6 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     }
                 };
             close_stage_menu(state);
-            close_status_menu(state);
             close_reference_menu(state);
             if selected_affected {
                 state.reference_draft_note = None;
@@ -3961,37 +3667,6 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             start_audio_import_preflight(context, request);
             context.request_repaint();
         }
-        Message::SetStatus { track_id, status } => {
-            if library_is_ready(state) && !state.busy {
-                let pending_selected_audition = state.workspace_mode == WorkspaceMode::Audition
-                    && state.library.selected_track_id.as_deref() == Some(track_id.as_str())
-                    && state.audition_pending_play_track_id.as_deref() == Some(track_id.as_str())
-                    && status != state.audition_status_filter;
-                let changed = match storage::set_track_status(&mut state.library, &track_id, status)
-                {
-                    Ok(changed) => changed,
-                    Err(error) => {
-                        state.status = error;
-                        close_status_menu(state);
-                        context.request_repaint();
-                        return;
-                    }
-                };
-                close_status_menu(state);
-                if changed {
-                    if state.workspace_mode == WorkspaceMode::Audition {
-                        sync_audition_queue_after_status_change(state, &track_id);
-                        if pending_selected_audition {
-                            disarm_audition_auto_advance(state);
-                            advance_audition(state, context);
-                        }
-                    }
-                    state.status = format!("Status set to {}.", status.label());
-                    schedule_library_save(state, context);
-                }
-                context.request_repaint();
-            }
-        }
         Message::PlannerCardDrag { track_id, message } => {
             if !library_is_ready(state)
                 || state.busy
@@ -4016,7 +3691,6 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     state.planner_drag_source_track_id = Some(track_id.clone());
                     state.planner_drag_target = None;
                     close_stage_menu(state);
-                    close_status_menu(state);
                     state.remove_confirmation_track_id = None;
                     state.planner_drag_pointer = drag_message_position(message);
                     let title = state
@@ -4082,7 +3756,6 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     &projection,
                     source_id,
                     &target,
-                    state.planner_status_filter,
                 );
                 let status = valid
                     .then(|| planner_insertion_status_cached(&state.library, &projection, &target));
@@ -4129,11 +3802,9 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 &source_id,
                 target.stage,
                 target.slot,
-                state.planner_status_filter,
             ) {
                 Ok(true) => {
                     close_stage_menu(state);
-                    close_status_menu(state);
                     let status_target = PlannerInsertionTarget {
                         stage: target.stage,
                         slot: target.slot,
@@ -4158,7 +3829,6 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 && state.library.tracks.iter().any(|track| track.id == id)
             {
                 close_stage_menu(state);
-                close_status_menu(state);
                 state.remove_confirmation_track_id = Some(id);
                 state.status = String::from(
                     "Confirm removal from the library. The source audio file will stay on disk.",
@@ -4187,11 +3857,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             reset_comments_windows(state);
             state.remove_confirmation_track_id = None;
             close_stage_menu(state);
-            close_status_menu(state);
             clear_planner_drag(state);
-            if state.workspace_mode == WorkspaceMode::Audition {
-                reconcile_audition_queue(state);
-            }
             if selected {
                 cancel_pending_comment_playback(state);
                 state.draft_note = None;
@@ -4234,11 +3900,8 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
         Message::TogglePlayback => toggle_playback(state, context),
         Message::StopPlayback => stop_playback(state, context),
         Message::NewNoteAtCurrentTime => start_note_at_current_time(state, context),
-        Message::AuditionPlay => play_audition(state, context),
-        Message::AuditionPrevious => previous_audition(state, context),
-        Message::AuditionNext => next_audition(state, context),
-        Message::SelectAuditionSource(source) => select_audition_source(state, context, source),
-        Message::ActivateAuditionSource(source) => activate_audition_source(state, context, source),
+        Message::SelectPlaybackSource(source) => select_playback_source(state, context, source),
+        Message::ActivatePlaybackSource(source) => activate_playback_source(state, context, source),
         Message::SelectCommentSource(source) => {
             state.comment_source = source;
             state.comment_source_explicit = true;
@@ -4260,7 +3923,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
             if state.reference_match_enabled {
                 state.reference_match_enabled = false;
-                sync_audition_output_gains(state);
+                sync_playback_output_gains(state);
                 state.status = String::from("Reference loudness matching disabled.");
             } else {
                 let Some(gain_db) = current_loudness_match_gain_db(state) else {
@@ -4271,19 +3934,19 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     return;
                 };
                 state.reference_match_enabled = true;
-                sync_audition_output_gains(state);
+                sync_playback_output_gains(state);
                 state.status =
                     format!("Reference matched to the imported track · {gain_db:+.1} dB.");
             }
             context.request_repaint();
         }
-        Message::AuditionVolumeChanged(edit) => {
+        Message::PlaybackVolumeChanged(edit) => {
             if let Some(volume) = edit.value_change() {
                 let volume = transport::normalize_volume(volume);
-                state.audition_volume = volume;
+                state.playback_volume = volume;
                 // This gain is applied only by Rodio's output player. The
                 // decoder's integrated LUFS value is computed from raw samples.
-                sync_audition_output_gains(state);
+                sync_playback_output_gains(state);
             }
             if edit.events().iter().any(|event| event.phase.is_terminal()) {
                 context.repaint(ui::RepaintScope::Projection);
@@ -4302,21 +3965,20 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             if reject_main_source_mismatch(state, context) {
                 return;
             }
-            disarm_audition_auto_advance(state);
-            set_audition_source(state, AuditionSource::Main);
-            state.loop_selections.clear(AuditionSource::Main);
+            set_playback_source(state, PlaybackSource::Main);
+            state.loop_selections.clear(PlaybackSource::Main);
             state.status = String::from("Paint a loop across the main waveform…");
             context.request_repaint();
         }
         Message::WaveformLoopDragEnded {
             start_ratio,
             end_ratio,
-        } => finish_loop_selection(state, context, AuditionSource::Main, start_ratio, end_ratio),
+        } => finish_loop_selection(state, context, PlaybackSource::Main, start_ratio, end_ratio),
         Message::WaveformLoopDragCancelled => {
             if !library_is_ready(state) {
                 return;
             }
-            state.loop_selections.clear(AuditionSource::Main);
+            state.loop_selections.clear(PlaybackSource::Main);
             state.status = String::from("Loop selection canceled.");
             context.request_repaint();
         }
@@ -4336,9 +3998,8 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             if selected_reference_details(state).is_none() {
                 return;
             }
-            disarm_audition_auto_advance(state);
-            set_audition_source(state, AuditionSource::Reference);
-            state.loop_selections.clear(AuditionSource::Reference);
+            set_playback_source(state, PlaybackSource::Reference);
+            state.loop_selections.clear(PlaybackSource::Reference);
             state.status = String::from("Paint a loop across the reference waveform…");
             context.request_repaint();
         }
@@ -4348,7 +4009,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
         } => finish_loop_selection(
             state,
             context,
-            AuditionSource::Reference,
+            PlaybackSource::Reference,
             start_ratio,
             end_ratio,
         ),
@@ -4356,7 +4017,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             if !library_is_ready(state) {
                 return;
             }
-            state.loop_selections.clear(AuditionSource::Reference);
+            state.loop_selections.clear(PlaybackSource::Reference);
             state.status = String::from("Reference loop selection canceled.");
             context.request_repaint();
         }
@@ -4405,11 +4066,10 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             if lower {
                 start_main_note_draft(state, context, time_millis);
             } else {
-                set_audition_source(state, AuditionSource::Main);
-                state.loop_selections.clear(AuditionSource::Main);
+                set_playback_source(state, PlaybackSource::Main);
+                state.loop_selections.clear(PlaybackSource::Main);
                 state.draft_note = None;
                 state.selected_note_id = None;
-                disarm_audition_auto_advance(state);
                 seek_review_position(state, context, ratio, true);
             }
             context.request_repaint();
@@ -4426,8 +4086,8 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 return;
             }
             rollback_persisted_note_drag(state);
-            set_audition_source(state, AuditionSource::Main);
-            state.loop_selections.clear(AuditionSource::Main);
+            set_playback_source(state, PlaybackSource::Main);
+            state.loop_selections.clear(PlaybackSource::Main);
             state.playhead_drag_active = true;
             state.draft_note = None;
             state.hovered_note_id = None;
@@ -4461,8 +4121,8 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 return;
             }
             rollback_reference_persisted_note_drag(state);
-            set_audition_source(state, AuditionSource::Reference);
-            state.loop_selections.clear(AuditionSource::Reference);
+            set_playback_source(state, PlaybackSource::Reference);
+            state.loop_selections.clear(PlaybackSource::Reference);
             state.reference_playhead_drag_active = true;
             state.reference_draft_note = None;
             state.hovered_reference_note_id = None;
@@ -4521,7 +4181,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             } else {
                 state.draft_note = None;
             }
-            clear_pending_seek_intent(state, AuditionSource::Main);
+            clear_pending_seek_intent(state, PlaybackSource::Main);
             state.status = String::from("Comment canceled.");
             context.request_repaint();
         }
@@ -4575,7 +4235,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             } else {
                 state.reference_draft_note = None;
             }
-            clear_pending_seek_intent(state, AuditionSource::Reference);
+            clear_pending_seek_intent(state, PlaybackSource::Reference);
             state.status = String::from("Reference comment canceled.");
             context.request_repaint();
         }
@@ -4609,7 +4269,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
             state.draft_note = None;
             rollback_persisted_note_drag(state);
-            clear_pending_seek_intent(state, AuditionSource::Main);
+            clear_pending_seek_intent(state, PlaybackSource::Main);
             state.status = String::from("Comment canceled.");
             context.request_repaint();
         }
@@ -4631,7 +4291,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 .cloned();
             if let Some(note) = note {
                 state.selected_note_id = Some(address.clone());
-                set_pending_seek_intent(state, AuditionSource::Main, note.time_millis);
+                set_pending_seek_intent(state, PlaybackSource::Main, note.time_millis);
                 state.review_cursor_millis = note.time_millis;
                 state.transport_position_millis = note.time_millis;
                 state.draft_note = None;
@@ -4719,7 +4379,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             if let Some(note) = note {
                 let editor_id = main_inline_comment_editor_id(&address);
                 let nonce = allocate_note_draft_nonce(state);
-                set_pending_seek_intent(state, AuditionSource::Main, note.time_millis);
+                set_pending_seek_intent(state, PlaybackSource::Main, note.time_millis);
                 state.review_cursor_millis = note.time_millis;
                 state.transport_position_millis = note.time_millis;
                 state.selected_note_id = Some(address.clone());
@@ -4769,7 +4429,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     .is_some_and(|selected_address| selected_address == &address)
                 {
                     state.selected_note_id = None;
-                    clear_pending_seek_intent(state, AuditionSource::Main);
+                    clear_pending_seek_intent(state, PlaybackSource::Main);
                 }
                 if state
                     .draft_note
@@ -4818,7 +4478,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 return;
             }
             state.reference_draft_note = None;
-            clear_pending_seek_intent(state, AuditionSource::Reference);
+            clear_pending_seek_intent(state, PlaybackSource::Reference);
             state.status = String::from("Reference comment canceled.");
             context.request_repaint();
         }
@@ -4841,7 +4501,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 .cloned();
             if let Some(note) = note {
                 state.selected_reference_note_id = Some(address.clone());
-                set_pending_seek_intent(state, AuditionSource::Reference, note.time_millis);
+                set_pending_seek_intent(state, PlaybackSource::Reference, note.time_millis);
                 state.reference_transport_position_millis = note.time_millis;
                 state.reference_draft_note = None;
                 reveal_comment_row(state, context, CommentSource::Reference, &address);
@@ -4872,7 +4532,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             if let Some(note) = note {
                 let editor_id = reference_inline_comment_editor_id(&address);
                 let nonce = allocate_note_draft_nonce(state);
-                set_pending_seek_intent(state, AuditionSource::Reference, note.time_millis);
+                set_pending_seek_intent(state, PlaybackSource::Reference, note.time_millis);
                 state.selected_reference_note_id = Some(address.clone());
                 state.reference_transport_position_millis = note.time_millis;
                 state.reference_draft_note = Some(NoteDraft {
@@ -4915,7 +4575,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             if removed.is_some() {
                 if state.selected_reference_note_id.as_ref() == Some(&address) {
                     state.selected_reference_note_id = None;
-                    clear_pending_seek_intent(state, AuditionSource::Reference);
+                    clear_pending_seek_intent(state, PlaybackSource::Reference);
                 }
                 if state.hovered_reference_note_id.as_ref() == Some(&address) {
                     state.hovered_reference_note_id = None;
@@ -4993,10 +4653,10 @@ fn projected_loop_bounds(selection: LoopSelection, duration_millis: u64) -> Opti
     (end_millis > start_millis).then_some((start_millis, end_millis))
 }
 
-fn selected_duration_for_source(state: &AppState, source: AuditionSource) -> Option<u64> {
+fn selected_duration_for_source(state: &AppState, source: PlaybackSource) -> Option<u64> {
     match source {
-        AuditionSource::Main => selected_main_duration(state),
-        AuditionSource::Reference => {
+        PlaybackSource::Main => selected_main_duration(state),
+        PlaybackSource::Reference => {
             selected_reference_details(state).map(|(_, duration)| duration)
         }
     }
@@ -5004,7 +4664,7 @@ fn selected_duration_for_source(state: &AppState, source: AuditionSource) -> Opt
 
 fn loop_bounds_for_selection(
     state: &AppState,
-    source: AuditionSource,
+    source: PlaybackSource,
     selection: LoopSelection,
 ) -> Option<LoopBounds> {
     let (start_millis, end_millis) =
@@ -5015,13 +4675,13 @@ fn loop_bounds_for_selection(
     })
 }
 
-fn loop_bounds_for_source(state: &AppState, source: AuditionSource) -> Option<LoopBounds> {
+fn loop_bounds_for_source(state: &AppState, source: PlaybackSource) -> Option<LoopBounds> {
     loop_bounds_for_selection(state, source, state.loop_selections.get(source)?)
 }
 
 #[cfg(test)]
 fn loop_bounds(state: &AppState) -> Option<LoopBounds> {
-    loop_bounds_for_source(state, state.audition_source)
+    loop_bounds_for_source(state, state.playback_source)
 }
 
 fn loop_bounds_meet_minimum(bounds: LoopBounds) -> bool {
@@ -5095,7 +4755,7 @@ fn invalidate_reference_transport_after_failure(state: &mut AppState) -> Referen
         reference_transport.set_output_gain(0.0);
     }
     state.reference_transport_generation = state.reference_transport_generation.wrapping_add(1);
-    clear_live_spectrogram(state, AuditionSource::Reference);
+    clear_live_spectrogram(state, PlaybackSource::Reference);
     state.reference_transport_playing = false;
     state.reference_transport_polling = false;
     state.reference_transport_waiting_token = None;
@@ -5142,9 +4802,6 @@ fn cleanup_transport_failure(
         return error;
     }
 
-    state.audition_auto_advance = false;
-    state.audition_play_token = None;
-    state.audition_pending_play_track_id = None;
     state.transport_playing = false;
     state.transport_polling = false;
     state.transport.set_output_gain(0.0);
@@ -5238,7 +4895,7 @@ fn progress_paired_playback_cleanup_with_reference_retry(
                 if pending_reset_reference {
                     reset_reference_transport(state);
                 }
-                sync_audition_output_gains(state);
+                sync_playback_output_gains(state);
             } else {
                 state.paired_playback_guard = PairedPlaybackGuard::StoppingMain {
                     root_error: root_error.clone(),
@@ -5331,8 +4988,8 @@ fn maybe_clear_paired_playback_guard_after_idle(state: &mut AppState) {
         .reference_transport
         .as_ref()
         .is_some_and(transport::AudioTransport::has_pending_load);
-    if !source_transport_is_active(state, AuditionSource::Main)
-        && !source_transport_is_active(state, AuditionSource::Reference)
+    if !source_transport_is_active(state, PlaybackSource::Main)
+        && !source_transport_is_active(state, PlaybackSource::Reference)
         && !state.transport.has_pending_load()
         && !reference_pending
     {
@@ -5395,7 +5052,7 @@ fn seek_synchronized_positions(
         }
         arm_paired_playback_guard(state);
         if !reference_was_loaded {
-            clear_live_spectrogram(state, AuditionSource::Reference);
+            clear_live_spectrogram(state, PlaybackSource::Reference);
         }
     }
     let main_token = match state.transport.seek(
@@ -5414,7 +5071,7 @@ fn seek_synchronized_positions(
             });
         }
     };
-    clear_pending_seek_intent_if_admitted(state, AuditionSource::Main, main_position_millis);
+    clear_pending_seek_intent_if_admitted(state, PlaybackSource::Main, main_position_millis);
     begin_transport_polling(state, main_token);
     if let Some((_reference_path, reference_duration_millis)) = reference_details {
         let reference_gain = reference_output_gain(state);
@@ -5452,7 +5109,7 @@ fn seek_synchronized_positions(
         };
         clear_pending_seek_intent_if_admitted(
             state,
-            AuditionSource::Reference,
+            PlaybackSource::Reference,
             reference_position_millis,
         );
         state.reference_transport_waiting_token = Some(reference_token);
@@ -5510,9 +5167,8 @@ fn seek_reference_waveform_position(
         context.request_repaint();
         return;
     };
-    state.loop_selections.clear(AuditionSource::Reference);
-    disarm_audition_auto_advance(state);
-    set_audition_source(state, AuditionSource::Reference);
+    state.loop_selections.clear(PlaybackSource::Reference);
+    set_playback_source(state, PlaybackSource::Reference);
     if let Some(reference_transport) = state.reference_transport.as_ref()
         && !state.reference_transport_loaded
         && reference_transport.has_pending_load()
@@ -5523,7 +5179,7 @@ fn seek_reference_waveform_position(
     }
     let ratio = waveform::clamp_ratio(ratio);
     let reference_position_millis = waveform::millis_for_ratio(ratio, reference_duration_millis);
-    set_pending_seek_intent(state, AuditionSource::Reference, reference_position_millis);
+    set_pending_seek_intent(state, PlaybackSource::Reference, reference_position_millis);
     state.draft_note = None;
     rollback_persisted_note_drag(state);
     state.selected_note_id = None;
@@ -5539,7 +5195,7 @@ fn seek_reference_waveform_position(
     }
     let reference_gain = reference_output_gain(state);
     if !state.reference_transport_loaded {
-        clear_live_spectrogram(state, AuditionSource::Reference);
+        clear_live_spectrogram(state, PlaybackSource::Reference);
     }
     let reference_transport = state
         .reference_transport
@@ -5574,7 +5230,7 @@ fn seek_reference_waveform_position(
         Ok(token) => {
             clear_pending_seek_intent_if_admitted(
                 state,
-                AuditionSource::Reference,
+                PlaybackSource::Reference,
                 reference_position_millis,
             );
             state.reference_transport_position_millis = reference_position_millis;
@@ -5593,14 +5249,14 @@ fn seek_reference_waveform_position(
     context.request_repaint();
 }
 
-fn source_transport_is_active(state: &AppState, source: AuditionSource) -> bool {
+fn source_transport_is_active(state: &AppState, source: PlaybackSource) -> bool {
     match source {
-        AuditionSource::Main => {
+        PlaybackSource::Main => {
             state.transport_playing
                 || state.transport_polling
                 || state.transport_waiting_token.is_some()
         }
-        AuditionSource::Reference => {
+        PlaybackSource::Reference => {
             state.reference_transport_playing
                 || state.reference_transport_polling
                 || state.reference_transport_waiting_token.is_some()
@@ -5608,13 +5264,13 @@ fn source_transport_is_active(state: &AppState, source: AuditionSource) -> bool 
     }
 }
 
-fn set_source_position(state: &mut AppState, source: AuditionSource, position_millis: u64) {
+fn set_source_position(state: &mut AppState, source: PlaybackSource, position_millis: u64) {
     match source {
-        AuditionSource::Main => {
+        PlaybackSource::Main => {
             state.transport_position_millis = position_millis;
             state.review_cursor_millis = position_millis;
         }
-        AuditionSource::Reference => {
+        PlaybackSource::Reference => {
             state.reference_transport_position_millis = position_millis;
         }
     }
@@ -5622,7 +5278,7 @@ fn set_source_position(state: &mut AppState, source: AuditionSource, position_mi
 
 fn seek_loop_owner(
     state: &mut AppState,
-    source: AuditionSource,
+    source: PlaybackSource,
     bounds: LoopBounds,
 ) -> Result<(), String> {
     if let Some(error) = paired_playback_cleanup_error(state) {
@@ -5632,7 +5288,7 @@ fn seek_loop_owner(
         .ok_or_else(|| String::from("Audio analysis is still pending."))?;
     let position_millis = bounds.start_millis.min(duration_millis);
     match source {
-        AuditionSource::Main => {
+        PlaybackSource::Main => {
             if state.transport_polling
                 || state.transport_waiting_token.is_some()
                 || state.transport.has_pending_load()
@@ -5652,11 +5308,11 @@ fn seek_loop_owner(
                 }
                 Err(error) => return Err(error),
             };
-            clear_pending_seek_intent(state, AuditionSource::Main);
+            clear_pending_seek_intent(state, PlaybackSource::Main);
             set_source_position(state, source, position_millis);
             begin_transport_polling(state, token);
         }
-        AuditionSource::Reference => {
+        PlaybackSource::Reference => {
             let Some(reference_transport) = state.reference_transport.as_ref() else {
                 return Err(String::from(transport::CONTROLS_BUSY_ERROR));
             };
@@ -5678,7 +5334,7 @@ fn seek_loop_owner(
                 Ok(token) => token,
                 Err(error) => return Err(cleanup_reference_transport_failure(state, error)),
             };
-            clear_pending_seek_intent(state, AuditionSource::Reference);
+            clear_pending_seek_intent(state, PlaybackSource::Reference);
             set_source_position(state, source, position_millis);
             state.reference_transport_waiting_token = Some(token);
             state.reference_transport_polling = true;
@@ -5690,15 +5346,15 @@ fn seek_loop_owner(
 fn finish_loop_selection(
     state: &mut AppState,
     context: &mut ui::UiUpdateContext<Message>,
-    owner: AuditionSource,
+    owner: PlaybackSource,
     start_ratio: f32,
     end_ratio: f32,
 ) {
     if !library_is_ready(state) {
         return;
     }
-    if (owner == AuditionSource::Main && reject_main_source_mismatch(state, context))
-        || (owner == AuditionSource::Reference
+    if (owner == PlaybackSource::Main && reject_main_source_mismatch(state, context))
+        || (owner == PlaybackSource::Reference
             && (reject_main_source_mismatch(state, context)
                 || reject_reference_source_mismatch(state, context)))
     {
@@ -5711,15 +5367,14 @@ fn finish_loop_selection(
     }
     if state.busy
         || state.waveform_busy
-        || (owner == AuditionSource::Reference && state.reference_waveform_busy)
+        || (owner == PlaybackSource::Reference && state.reference_waveform_busy)
     {
         return;
     }
-    if owner == AuditionSource::Reference && selected_reference_details(state).is_none() {
+    if owner == PlaybackSource::Reference && selected_reference_details(state).is_none() {
         return;
     }
-    disarm_audition_auto_advance(state);
-    set_audition_source(state, owner);
+    set_playback_source(state, owner);
     let start_ratio = waveform::clamp_ratio(start_ratio);
     let end_ratio = waveform::clamp_ratio(end_ratio);
     let (start_ratio, end_ratio) = if start_ratio <= end_ratio {
@@ -5755,8 +5410,8 @@ fn finish_loop_selection(
         set_source_position(state, owner, bounds.start_millis);
     }
     let label = match owner {
-        AuditionSource::Main => "Main",
-        AuditionSource::Reference => "Reference",
+        PlaybackSource::Main => "Main",
+        PlaybackSource::Reference => "Reference",
     };
     state.status = format!(
         "{label} loop {}–{}.",
@@ -5766,16 +5421,16 @@ fn finish_loop_selection(
     context.request_repaint();
 }
 
-fn select_audition_source(
+fn select_playback_source(
     state: &mut AppState,
     context: &mut ui::UiUpdateContext<Message>,
-    source: AuditionSource,
+    source: PlaybackSource,
 ) {
     if !library_is_ready(state) {
         return;
     }
-    if (source == AuditionSource::Main && reject_main_source_mismatch(state, context))
-        || (source == AuditionSource::Reference
+    if (source == PlaybackSource::Main && reject_main_source_mismatch(state, context))
+        || (source == PlaybackSource::Reference
             && (reject_main_source_mismatch(state, context)
                 || reject_reference_source_mismatch(state, context)))
     {
@@ -5789,7 +5444,7 @@ fn select_audition_source(
     if state.busy {
         return;
     }
-    if source == AuditionSource::Reference {
+    if source == PlaybackSource::Reference {
         if state.reference_waveform_busy {
             state.status = String::from("Reference analysis is still pending.");
             context.request_repaint();
@@ -5801,23 +5456,23 @@ fn select_audition_source(
             return;
         }
     }
-    if state.audition_source != source {
-        set_audition_source(state, source);
+    if state.playback_source != source {
+        set_playback_source(state, source);
         state.status = match source {
-            AuditionSource::Main => String::from("Now hearing the imported track."),
-            AuditionSource::Reference => String::from("Now hearing the reference track."),
+            PlaybackSource::Main => String::from("Now hearing the imported track."),
+            PlaybackSource::Reference => String::from("Now hearing the reference track."),
         };
     }
     context.request_repaint();
 }
 
-fn activate_audition_source(
+fn activate_playback_source(
     state: &mut AppState,
     context: &mut ui::UiUpdateContext<Message>,
-    source: AuditionSource,
+    source: PlaybackSource,
 ) {
-    if (source == AuditionSource::Main && reject_main_source_mismatch(state, context))
-        || (source == AuditionSource::Reference
+    if (source == PlaybackSource::Main && reject_main_source_mismatch(state, context))
+        || (source == PlaybackSource::Reference
             && (reject_main_source_mismatch(state, context)
                 || reject_reference_source_mismatch(state, context)))
     {
@@ -5831,7 +5486,7 @@ fn activate_audition_source(
     if state.busy {
         return;
     }
-    if source == AuditionSource::Reference {
+    if source == PlaybackSource::Reference {
         if state.reference_waveform_busy {
             state.status = String::from("Reference analysis is still pending.");
             context.request_repaint();
@@ -5849,18 +5504,18 @@ fn activate_audition_source(
         || source_transport_is_active(
             state,
             match source {
-                AuditionSource::Main => AuditionSource::Reference,
-                AuditionSource::Reference => AuditionSource::Main,
+                PlaybackSource::Main => PlaybackSource::Reference,
+                PlaybackSource::Reference => PlaybackSource::Main,
             },
         );
     if !playback_active {
-        select_audition_source(state, context, source);
+        select_playback_source(state, context, source);
         toggle_playback(state, context);
     } else if source_active {
-        if state.audition_source == source {
+        if state.playback_source == source {
             stop_playback(state, context);
         } else {
-            select_audition_source(state, context, source);
+            select_playback_source(state, context, source);
         }
     } else {
         if let Err(error) = start_source_alongside_active(state, source) {
@@ -5869,34 +5524,34 @@ fn activate_audition_source(
             return;
         }
         state.reference_only_playback = false;
-        select_audition_source(state, context, source);
+        select_playback_source(state, context, source);
     }
 }
 
 fn start_source_alongside_active(
     state: &mut AppState,
-    source: AuditionSource,
+    source: PlaybackSource,
 ) -> Result<(), String> {
     if let Some(error) = paired_playback_cleanup_error(state) {
         return Err(error.to_owned());
     }
     match source {
-        AuditionSource::Main => {
+        PlaybackSource::Main => {
             let duration_millis = selected_main_duration(state)
                 .ok_or_else(|| String::from("Audio analysis is still pending."))?;
             if !state.transport.has_command_capacity(1) {
                 return Err(String::from(transport::CONTROLS_BUSY_ERROR));
             }
             arm_paired_playback_guard(state);
-            let loop_bounds = loop_bounds_for_source(state, AuditionSource::Main);
-            let pending_intent_millis = pending_seek_intent(state, AuditionSource::Main);
+            let loop_bounds = loop_bounds_for_source(state, PlaybackSource::Main);
+            let pending_intent_millis = pending_seek_intent(state, PlaybackSource::Main);
             let position_millis =
-                playback_start_position(state, AuditionSource::Main, duration_millis, loop_bounds);
+                playback_start_position(state, PlaybackSource::Main, duration_millis, loop_bounds);
             let starts_new_segment = matches!(
-                resume_transport_command(state, AuditionSource::Main, position_millis, loop_bounds,),
+                resume_transport_command(state, PlaybackSource::Main, position_millis, loop_bounds,),
                 ResumeTransportCommand::Seek
             );
-            state.transport.set_output_gain(state.audition_volume);
+            state.transport.set_output_gain(state.playback_volume);
             let result = if starts_new_segment {
                 state.transport.seek(
                     state.transport_generation,
@@ -5912,17 +5567,17 @@ fn start_source_alongside_active(
                     if starts_new_segment && let Some(intent_millis) = pending_intent_millis {
                         clear_pending_seek_intent_if_admitted(
                             state,
-                            AuditionSource::Main,
+                            PlaybackSource::Main,
                             intent_millis,
                         );
                     }
-                    set_source_position(state, AuditionSource::Main, position_millis);
+                    set_source_position(state, PlaybackSource::Main, position_millis);
                     begin_transport_polling(state, token);
                     paired_playback_commands_admitted(state);
                     Ok(())
                 }
                 Err(error) => {
-                    sync_audition_output_gains(state);
+                    sync_playback_output_gains(state);
                     Err(if paired_playback_intended(state) {
                         cleanup_transport_failure(state, error, None)
                     } else {
@@ -5931,13 +5586,13 @@ fn start_source_alongside_active(
                 }
             }
         }
-        AuditionSource::Reference => {
+        PlaybackSource::Reference => {
             let (path, duration_millis) = selected_reference_details(state)
                 .ok_or_else(|| String::from("Import and analyze a reference track first."))?;
             let reference_ticket = reference_source_ticket_for_path(state, &path)
                 .ok_or_else(|| String::from("Reference source verification is still pending."))?;
             let reference_was_loaded = state.reference_transport_loaded;
-            let pending_intent_millis = pending_seek_intent(state, AuditionSource::Reference);
+            let pending_intent_millis = pending_seek_intent(state, PlaybackSource::Reference);
             let reference_uses_resume_seek = pending_intent_millis.is_some();
             let required_slots = if reference_was_loaded {
                 if reference_uses_resume_seek { 1 } else { 2 }
@@ -5946,14 +5601,14 @@ fn start_source_alongside_active(
             } else {
                 3
             };
-            let loop_bounds = loop_bounds_for_source(state, AuditionSource::Reference);
+            let loop_bounds = loop_bounds_for_source(state, PlaybackSource::Reference);
             let position_millis = playback_start_position(
                 state,
-                AuditionSource::Reference,
+                PlaybackSource::Reference,
                 duration_millis,
                 loop_bounds,
             );
-            let reference_gain = reference_output_gain_for_source(state, AuditionSource::Reference);
+            let reference_gain = reference_output_gain_for_source(state, PlaybackSource::Reference);
             let reference_transport = state
                 .reference_transport
                 .get_or_insert_with(transport::AudioTransport::spawn);
@@ -5966,7 +5621,7 @@ fn start_source_alongside_active(
             let reference_transport = reference_transport.clone();
             arm_paired_playback_guard(state);
             if !reference_was_loaded {
-                clear_live_spectrogram(state, AuditionSource::Reference);
+                clear_live_spectrogram(state, PlaybackSource::Reference);
             }
             let mut loaded = reference_was_loaded;
             let result = {
@@ -5999,7 +5654,7 @@ fn start_source_alongside_active(
                     {
                         clear_pending_seek_intent_if_admitted(
                             state,
-                            AuditionSource::Reference,
+                            PlaybackSource::Reference,
                             intent_millis,
                         );
                     }
@@ -6017,14 +5672,14 @@ fn start_source_alongside_active(
             }
             match result {
                 Ok(token) => {
-                    set_source_position(state, AuditionSource::Reference, position_millis);
+                    set_source_position(state, PlaybackSource::Reference, position_millis);
                     state.reference_transport_waiting_token = Some(token);
                     state.reference_transport_polling = true;
                     paired_playback_commands_admitted(state);
                     Ok(())
                 }
                 Err(error) => {
-                    sync_audition_output_gains(state);
+                    sync_playback_output_gains(state);
                     Err(cleanup_reference_transport_failure(state, error))
                 }
             }
@@ -6032,122 +5687,47 @@ fn start_source_alongside_active(
     }
 }
 
-fn set_audition_source(state: &mut AppState, source: AuditionSource) {
-    if state.audition_source == source {
+fn set_playback_source(state: &mut AppState, source: PlaybackSource) {
+    if state.playback_source == source {
         return;
     }
-    state.audition_source = source;
-    sync_audition_output_gains(state);
+    state.playback_source = source;
+    sync_playback_output_gains(state);
     reset_live_spectrogram_segment(state, source);
 }
 
-fn play_audition(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
-    if !library_is_ready(state) {
-        return;
-    }
-    if reject_main_source_mismatch(state, context) {
-        return;
-    }
-    if let Some(error) = paired_playback_cleanup_error(state) {
-        state.status = error.to_owned();
-        context.request_repaint();
-        return;
-    }
-    if state.busy || state.workspace_mode != WorkspaceMode::Audition {
-        return;
-    }
-    let reference_playback_available = !reference_source_is_mismatched(state);
-    if state.transport_playing
-        || (state.reference_transport_playing && reference_playback_available)
-    {
-        state.status = String::from("Audition playback is already active.");
-        context.request_repaint();
-        return;
-    }
-    let Some(track_id) = state.library.selected_track_id.clone() else {
-        state.status = String::from("Select an audition track before playing.");
-        context.request_repaint();
-        return;
-    };
-    if !state
-        .audition_queue
-        .iter()
-        .any(|queued_id| queued_id == &track_id)
-    {
-        state.status = String::from("Select an audition track before playing.");
-        context.request_repaint();
-        return;
-    }
-
-    let waveform_ready = !state.waveform_busy
-        && state.waveform_track_id.as_deref() == Some(track_id.as_str())
-        && state.waveform.is_some();
-    let transport_pending = state.transport_polling
-        || state.transport_waiting_token.is_some()
-        || state.transport.has_pending_load()
-        || (reference_playback_available
-            && (state.reference_transport_polling
-                || state.reference_transport_waiting_token.is_some()
-                || state
-                    .reference_transport
-                    .as_ref()
-                    .is_some_and(transport::AudioTransport::has_pending_load)));
-    if !waveform_ready
-        || (state.reference_waveform_busy && reference_playback_available)
-        || transport_pending
-    {
-        state.audition_auto_advance = true;
-        state.audition_play_token = None;
-        state.audition_pending_play_track_id = Some(track_id.clone());
-        let title = state
-            .library
-            .tracks
-            .iter()
-            .find(|track| track.id == track_id)
-            .map_or(track_id, |track| track.title.clone());
-        state.status = format!("Loading audition track: {title}…");
-        context.request_repaint();
-        return;
-    }
-
-    // The existing toggle path owns paired main/reference admission. Calling it
-    // only after the active-playback guard makes this a one-way Play command.
-    state.audition_pending_play_track_id = None;
-    toggle_playback(state, context);
-}
-
-fn source_position(state: &AppState, source: AuditionSource) -> u64 {
+fn source_position(state: &AppState, source: PlaybackSource) -> u64 {
     match source {
-        AuditionSource::Main => state.transport_position_millis,
-        AuditionSource::Reference => state.reference_transport_position_millis,
+        PlaybackSource::Main => state.transport_position_millis,
+        PlaybackSource::Reference => state.reference_transport_position_millis,
     }
 }
 
-fn pending_seek_intent(state: &AppState, source: AuditionSource) -> Option<u64> {
+fn pending_seek_intent(state: &AppState, source: PlaybackSource) -> Option<u64> {
     match source {
-        AuditionSource::Main => state.pending_main_seek_intent,
-        AuditionSource::Reference => state.pending_reference_seek_intent,
+        PlaybackSource::Main => state.pending_main_seek_intent,
+        PlaybackSource::Reference => state.pending_reference_seek_intent,
     }
 }
 
-fn set_pending_seek_intent(state: &mut AppState, source: AuditionSource, position_millis: u64) {
+fn set_pending_seek_intent(state: &mut AppState, source: PlaybackSource, position_millis: u64) {
     cancel_pending_comment_playback(state);
     match source {
-        AuditionSource::Main => state.pending_main_seek_intent = Some(position_millis),
-        AuditionSource::Reference => state.pending_reference_seek_intent = Some(position_millis),
+        PlaybackSource::Main => state.pending_main_seek_intent = Some(position_millis),
+        PlaybackSource::Reference => state.pending_reference_seek_intent = Some(position_millis),
     }
 }
 
-fn clear_pending_seek_intent(state: &mut AppState, source: AuditionSource) {
+fn clear_pending_seek_intent(state: &mut AppState, source: PlaybackSource) {
     match source {
-        AuditionSource::Main => state.pending_main_seek_intent = None,
-        AuditionSource::Reference => state.pending_reference_seek_intent = None,
+        PlaybackSource::Main => state.pending_main_seek_intent = None,
+        PlaybackSource::Reference => state.pending_reference_seek_intent = None,
     }
 }
 
 fn clear_pending_seek_intent_if_admitted(
     state: &mut AppState,
-    source: AuditionSource,
+    source: PlaybackSource,
     admitted_intent_millis: u64,
 ) {
     // Compare the admitted intent identity, not the transport's normalized position.
@@ -6172,7 +5752,7 @@ enum ResumeTransportCommand {
 
 fn resume_transport_command(
     state: &AppState,
-    source: AuditionSource,
+    source: PlaybackSource,
     position_millis: u64,
     loop_bounds: Option<LoopBounds>,
 ) -> ResumeTransportCommand {
@@ -6188,7 +5768,7 @@ fn resume_transport_command(
 
 fn playback_start_position(
     state: &AppState,
-    source: AuditionSource,
+    source: PlaybackSource,
     duration_millis: u64,
     loop_bounds: Option<LoopBounds>,
 ) -> u64 {
@@ -6209,109 +5789,10 @@ fn playback_start_position(
     }
 }
 
-fn previous_audition(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
-    move_audition(state, context, AuditionMove::Previous);
-}
-
-fn next_audition(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
-    move_audition(state, context, AuditionMove::Next);
-}
-
-#[derive(Clone, Copy)]
-enum AuditionMove {
-    Previous,
-    Next,
-}
-
-fn move_audition(
-    state: &mut AppState,
-    context: &mut ui::UiUpdateContext<Message>,
-    direction: AuditionMove,
-) {
-    if !library_is_ready(state) {
-        return;
-    }
-    if let Some(error) = paired_playback_cleanup_error(state) {
-        state.status = error.to_owned();
-        context.request_repaint();
-        return;
-    }
-    if state.busy || state.workspace_mode != WorkspaceMode::Audition {
-        return;
-    }
-    let Some(current_id) = state.library.selected_track_id.clone() else {
-        state.status = match direction {
-            AuditionMove::Previous => {
-                String::from("Already at the beginning of the audition queue.")
-            }
-            AuditionMove::Next => String::from("Already at the end of the audition queue."),
-        };
-        context.request_repaint();
-        return;
-    };
-    let Some(current_index) = state
-        .audition_queue
-        .iter()
-        .position(|track_id| track_id == &current_id)
-    else {
-        state.status = match direction {
-            AuditionMove::Previous => {
-                String::from("Already at the beginning of the audition queue.")
-            }
-            AuditionMove::Next => String::from("Already at the end of the audition queue."),
-        };
-        context.request_repaint();
-        return;
-    };
-    let destination_index = match direction {
-        AuditionMove::Previous => current_index.checked_sub(1),
-        AuditionMove::Next => current_index
-            .checked_add(1)
-            .filter(|index| *index < state.audition_queue.len()),
-    };
-    let Some(destination_index) = destination_index else {
-        state.status = match direction {
-            AuditionMove::Previous => {
-                String::from("Already at the beginning of the audition queue.")
-            }
-            AuditionMove::Next => String::from("Already at the end of the audition queue."),
-        };
-        context.request_repaint();
-        return;
-    };
-    let Some(destination_id) = state.audition_queue.get(destination_index).cloned() else {
-        return;
-    };
-
-    if matches!(direction, AuditionMove::Next)
-        && !state
-            .audition_heard
-            .iter()
-            .any(|heard_id| heard_id == &current_id)
-    {
-        state.audition_heard.push(current_id);
-    }
-    state
-        .audition_heard
-        .retain(|heard_id| heard_id != &destination_id);
-    let title = state
-        .library
-        .tracks
-        .iter()
-        .find(|track| track.id == destination_id)
-        .map_or_else(|| destination_id.clone(), |track| track.title.clone());
-    select_track_internal(state, context, destination_id, true);
-    state.status = match direction {
-        AuditionMove::Previous => format!("Loading previous audition track: {title}…"),
-        AuditionMove::Next => format!("Loading next audition track: {title}…"),
-    };
-    context.request_repaint();
-}
-
 fn admit_pause_for_active_transports(state: &mut AppState) -> Result<bool, String> {
     let main_active =
-        !state.reference_only_playback && source_transport_is_active(state, AuditionSource::Main);
-    let reference_active = source_transport_is_active(state, AuditionSource::Reference);
+        !state.reference_only_playback && source_transport_is_active(state, PlaybackSource::Main);
+    let reference_active = source_transport_is_active(state, PlaybackSource::Reference);
     if !main_active && !reference_active {
         return Ok(false);
     }
@@ -6387,9 +5868,6 @@ fn stop_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Message
         context.request_repaint();
         return;
     }
-    state.audition_auto_advance = false;
-    state.audition_play_token = None;
-    state.audition_pending_play_track_id = None;
     cancel_pending_comment_playback(state);
     match admit_pause_for_active_transports(state) {
         Ok(true) => state.status = String::from("Stopping playback…"),
@@ -6475,10 +5953,6 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
     if state.transport_playing
         || (state.reference_transport_playing && reference_playback_available)
     {
-        if state.workspace_mode == WorkspaceMode::Audition {
-            state.audition_auto_advance = false;
-            state.audition_play_token = None;
-        }
         match admit_pause_for_active_transports(state) {
             Ok(true) => state.status = String::from("Pausing playback…"),
             Ok(false) => {
@@ -6489,13 +5963,13 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
         }
     } else {
         let duration_millis = waveform.duration_millis;
-        let main_loop_bounds = loop_bounds_for_source(state, AuditionSource::Main);
-        let reference_loop_bounds = loop_bounds_for_source(state, AuditionSource::Reference);
-        let pending_main_intent_millis = pending_seek_intent(state, AuditionSource::Main);
-        let pending_reference_intent_millis = pending_seek_intent(state, AuditionSource::Reference);
+        let main_loop_bounds = loop_bounds_for_source(state, PlaybackSource::Main);
+        let reference_loop_bounds = loop_bounds_for_source(state, PlaybackSource::Reference);
+        let pending_main_intent_millis = pending_seek_intent(state, PlaybackSource::Main);
+        let pending_reference_intent_millis = pending_seek_intent(state, PlaybackSource::Reference);
         let main_position_millis = playback_start_position(
             state,
-            AuditionSource::Main,
+            PlaybackSource::Main,
             duration_millis,
             main_loop_bounds,
         );
@@ -6504,7 +5978,7 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
             .map(|(_, duration_millis)| {
                 playback_start_position(
                     state,
-                    AuditionSource::Reference,
+                    PlaybackSource::Reference,
                     *duration_millis,
                     reference_loop_bounds,
                 )
@@ -6542,7 +6016,7 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
         let main_starts_new_segment = matches!(
             resume_transport_command(
                 state,
-                AuditionSource::Main,
+                PlaybackSource::Main,
                 main_position_millis,
                 main_loop_bounds,
             ),
@@ -6552,7 +6026,7 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
             || matches!(
                 resume_transport_command(
                     state,
-                    AuditionSource::Reference,
+                    PlaybackSource::Reference,
                     reference_position_millis,
                     reference_loop_bounds,
                 ),
@@ -6571,10 +6045,6 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
         let main_token = match main_result {
             Ok(token) => token,
             Err(error) => {
-                if state.workspace_mode == WorkspaceMode::Audition {
-                    state.audition_auto_advance = false;
-                    state.audition_play_token = None;
-                }
                 state.status = if reference_details.is_some() {
                     cleanup_reference_transport_failure(state, error)
                 } else {
@@ -6586,20 +6056,16 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
             }
         };
         if main_starts_new_segment && let Some(intent_millis) = pending_main_intent_millis {
-            clear_pending_seek_intent_if_admitted(state, AuditionSource::Main, intent_millis);
+            clear_pending_seek_intent_if_admitted(state, PlaybackSource::Main, intent_millis);
         }
-        set_source_position(state, AuditionSource::Main, main_position_millis);
-        if state.workspace_mode == WorkspaceMode::Audition {
-            state.audition_auto_advance = true;
-            state.audition_play_token = Some(main_token);
-        }
+        set_source_position(state, PlaybackSource::Main, main_position_millis);
         begin_transport_polling(state, main_token);
 
         if let Some((_path, reference_duration_millis)) = reference_details {
             let reference_uses_resume_seek = pending_reference_intent_millis.is_some();
             let reference_gain = reference_output_gain(state);
             if !state.reference_transport_loaded {
-                clear_live_spectrogram(state, AuditionSource::Reference);
+                clear_live_spectrogram(state, PlaybackSource::Reference);
             }
             let reference_transport = state
                 .reference_transport
@@ -6644,7 +6110,7 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
                 if let Some(intent_millis) = pending_reference_intent_millis {
                     clear_pending_seek_intent_if_admitted(
                         state,
-                        AuditionSource::Reference,
+                        PlaybackSource::Reference,
                         intent_millis,
                     );
                 }
@@ -6671,11 +6137,11 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
                     }
                 }
             };
-            set_source_position(state, AuditionSource::Reference, reference_position_millis);
+            set_source_position(state, PlaybackSource::Reference, reference_position_millis);
             state.reference_transport_waiting_token = Some(reference_token);
             state.reference_transport_polling = true;
             paired_playback_commands_admitted(state);
-            state.status = if state.audition_source == AuditionSource::Reference {
+            state.status = if state.playback_source == PlaybackSource::Reference {
                 String::from("Playing reference and imported track…")
             } else {
                 String::from("Playing imported and reference tracks…")
@@ -6730,9 +6196,9 @@ fn start_main_note_draft(
     rollback_persisted_note_drag(state);
     state.comment_source = CommentSource::Main;
     state.comment_source_explicit = true;
-    set_audition_source(state, AuditionSource::Main);
+    set_playback_source(state, PlaybackSource::Main);
     state.review_cursor_millis = time_millis;
-    set_pending_seek_intent(state, AuditionSource::Main, time_millis);
+    set_pending_seek_intent(state, PlaybackSource::Main, time_millis);
     let Some(track_id) = state.library.selected_track_id.clone() else {
         return;
     };
@@ -6848,7 +6314,7 @@ fn start_reference_comment_draft(
         return;
     }
     let time_millis = waveform::millis_for_ratio(ratio, waveform.duration_millis);
-    set_pending_seek_intent(state, AuditionSource::Reference, time_millis);
+    set_pending_seek_intent(state, PlaybackSource::Reference, time_millis);
     let Some(owner) = selected_reference_owner(state) else {
         return;
     };
@@ -6958,7 +6424,7 @@ fn move_draft_note(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
     let time_millis = waveform::millis_for_ratio(ratio, duration_millis);
     draft.time_millis = time_millis;
     state.review_cursor_millis = time_millis;
-    set_pending_seek_intent(state, AuditionSource::Main, time_millis);
+    set_pending_seek_intent(state, PlaybackSource::Main, time_millis);
     state.status = format!("Comment at {}.", format_timestamp(time_millis));
     context.request_repaint();
 }
@@ -7021,7 +6487,7 @@ fn start_persisted_note_drag(
     state.hovered_note_id = None;
     state.review_cursor_millis = time_millis;
     state.transport_position_millis = time_millis;
-    set_pending_seek_intent(state, AuditionSource::Main, time_millis);
+    set_pending_seek_intent(state, PlaybackSource::Main, time_millis);
     state.status = format!("Dragging comment at {}…", format_timestamp(time_millis));
     context.request_repaint();
 }
@@ -7089,7 +6555,7 @@ fn finish_persisted_note_drag(
     }
     state.review_cursor_millis = final_time_millis;
     state.transport_position_millis = final_time_millis;
-    set_pending_seek_intent(state, AuditionSource::Main, final_time_millis);
+    set_pending_seek_intent(state, PlaybackSource::Main, final_time_millis);
     state.status = if changed {
         format!(
             "Comment moved to {} and saved locally.",
@@ -7133,7 +6599,7 @@ fn move_reference_draft_note(
     let time_millis = waveform::millis_for_ratio(ratio, duration_millis);
     draft.time_millis = time_millis;
     state.reference_transport_position_millis = time_millis;
-    set_pending_seek_intent(state, AuditionSource::Reference, time_millis);
+    set_pending_seek_intent(state, PlaybackSource::Reference, time_millis);
     state.status = format!("Reference comment at {}.", format_timestamp(time_millis));
     context.request_repaint();
 }
@@ -7198,7 +6664,7 @@ fn start_reference_persisted_note_drag(
     state.selected_reference_note_id = Some(address);
     state.hovered_reference_note_id = None;
     state.reference_transport_position_millis = time_millis;
-    set_pending_seek_intent(state, AuditionSource::Reference, time_millis);
+    set_pending_seek_intent(state, PlaybackSource::Reference, time_millis);
     state.status = format!(
         "Dragging reference comment at {}…",
         format_timestamp(time_millis)
@@ -7267,7 +6733,7 @@ fn finish_reference_persisted_note_drag(
         draft.time_millis = final_time_millis;
     }
     state.reference_transport_position_millis = final_time_millis;
-    set_pending_seek_intent(state, AuditionSource::Reference, final_time_millis);
+    set_pending_seek_intent(state, PlaybackSource::Reference, final_time_millis);
     state.status = if changed {
         format!(
             "Reference comment moved to {} and saved locally.",
@@ -8336,7 +7802,7 @@ fn mark_library_snapshot_persisted(state: &mut AppState) {
 }
 
 fn reset_transport(state: &mut AppState) {
-    clear_pending_seek_intent(state, AuditionSource::Main);
+    clear_pending_seek_intent(state, PlaybackSource::Main);
     match &mut state.paired_playback_guard {
         PairedPlaybackGuard::StoppingMain {
             pending_reset_main, ..
@@ -8350,12 +7816,11 @@ fn reset_transport(state: &mut AppState) {
         _ => {}
     }
     clear_paired_playback_guard(state);
-    clear_live_spectrogram(state, AuditionSource::Main);
+    clear_live_spectrogram(state, PlaybackSource::Main);
     state.transport_generation = state.transport_generation.wrapping_add(1);
-    state.audition_play_token = None;
     state.transport_position_millis = 0;
     state.review_cursor_millis = 0;
-    state.loop_selections.clear(AuditionSource::Main);
+    state.loop_selections.clear(PlaybackSource::Main);
     state.playhead_drag_active = false;
     state.transport_playing = false;
     state.transport_polling = false;
@@ -8364,7 +7829,7 @@ fn reset_transport(state: &mut AppState) {
 }
 
 fn reset_reference_transport(state: &mut AppState) {
-    clear_pending_seek_intent(state, AuditionSource::Reference);
+    clear_pending_seek_intent(state, PlaybackSource::Reference);
     match &mut state.paired_playback_guard {
         PairedPlaybackGuard::StoppingMain {
             pending_reset_reference,
@@ -8380,13 +7845,13 @@ fn reset_reference_transport(state: &mut AppState) {
         _ => {}
     }
     clear_paired_playback_guard(state);
-    clear_live_spectrogram(state, AuditionSource::Reference);
+    clear_live_spectrogram(state, PlaybackSource::Reference);
     state.reference_transport_generation = state.reference_transport_generation.wrapping_add(1);
     state.reference_playhead_drag_active = false;
     rollback_reference_persisted_note_drag(state);
     state.reference_transport_position_millis = 0;
-    state.loop_selections.clear(AuditionSource::Reference);
-    state.audition_source = AuditionSource::Main;
+    state.loop_selections.clear(PlaybackSource::Reference);
+    state.playback_source = PlaybackSource::Main;
     state.reference_transport_playing = false;
     state.reference_transport_polling = false;
     state.reference_transport_waiting_token = None;
@@ -8395,7 +7860,7 @@ fn reset_reference_transport(state: &mut AppState) {
     if let Some(reference_transport) = state.reference_transport.as_ref() {
         let _ = reference_transport.unload(state.reference_transport_generation);
     }
-    sync_audition_output_gains(state);
+    sync_playback_output_gains(state);
 }
 
 fn begin_transport_polling(state: &mut AppState, token: u64) {
@@ -8474,14 +7939,14 @@ fn apply_reference_transport_snapshot(state: &mut AppState, snapshot: transport:
     }
 }
 
-fn clear_live_spectrogram(state: &mut AppState, source: AuditionSource) {
+fn clear_live_spectrogram(state: &mut AppState, source: PlaybackSource) {
     match source {
-        AuditionSource::Main => {
+        PlaybackSource::Main => {
             state.live_spectrogram = None;
             state.live_spectrogram_revision = 0;
             state.transport.clear_live_frame();
         }
-        AuditionSource::Reference => {
+        PlaybackSource::Reference => {
             state.reference_live_spectrogram = None;
             state.reference_live_spectrogram_revision = 0;
             if let Some(reference_transport) = state.reference_transport.as_ref() {
@@ -8491,14 +7956,14 @@ fn clear_live_spectrogram(state: &mut AppState, source: AuditionSource) {
     }
 }
 
-fn reset_live_spectrogram_segment(state: &mut AppState, source: AuditionSource) {
+fn reset_live_spectrogram_segment(state: &mut AppState, source: PlaybackSource) {
     match source {
-        AuditionSource::Main => {
+        PlaybackSource::Main => {
             state.live_spectrogram = None;
             state.live_spectrogram_revision = 0;
             state.transport.reset_live_segment();
         }
-        AuditionSource::Reference => {
+        PlaybackSource::Reference => {
             state.reference_live_spectrogram = None;
             state.reference_live_spectrogram_revision = 0;
             if let Some(reference_transport) = state.reference_transport.as_ref() {
@@ -8579,31 +8044,31 @@ fn refresh_live_spectrogram(
 }
 
 fn enforce_loop(state: &mut AppState, was_main_playing: bool, was_reference_playing: bool) {
-    enforce_loop_for_source(state, AuditionSource::Main, was_main_playing);
-    enforce_loop_for_source(state, AuditionSource::Reference, was_reference_playing);
+    enforce_loop_for_source(state, PlaybackSource::Main, was_main_playing);
+    enforce_loop_for_source(state, PlaybackSource::Reference, was_reference_playing);
 }
 
-fn enforce_loop_for_source(state: &mut AppState, source: AuditionSource, was_playing: bool) {
-    if source == AuditionSource::Main && state.reference_only_playback {
+fn enforce_loop_for_source(state: &mut AppState, source: PlaybackSource, was_playing: bool) {
+    if source == PlaybackSource::Main && state.reference_only_playback {
         return;
     }
     let Some(bounds) = loop_bounds_for_source(state, source) else {
         return;
     };
     let source_is_playing = match source {
-        AuditionSource::Main => state.transport_playing,
-        AuditionSource::Reference => state.reference_transport_playing,
+        PlaybackSource::Main => state.transport_playing,
+        PlaybackSource::Reference => state.reference_transport_playing,
     };
     let source_is_polling = match source {
-        AuditionSource::Main => state.transport_polling || state.transport_waiting_token.is_some(),
-        AuditionSource::Reference => {
+        PlaybackSource::Main => state.transport_polling || state.transport_waiting_token.is_some(),
+        PlaybackSource::Reference => {
             state.reference_transport_polling || state.reference_transport_waiting_token.is_some()
         }
     };
     if source_is_polling || !(was_playing || source_is_playing) {
         return;
     }
-    if source == AuditionSource::Reference && !state.reference_transport_loaded {
+    if source == PlaybackSource::Reference && !state.reference_transport_loaded {
         return;
     }
     if source_position(state, source) < bounds.end_millis {
@@ -8644,9 +8109,8 @@ fn seek_review_position(
     else {
         return;
     };
-    disarm_audition_auto_advance(state);
     let time_millis = waveform::millis_for_ratio(ratio, duration_millis);
-    set_pending_seek_intent(state, AuditionSource::Main, time_millis);
+    set_pending_seek_intent(state, PlaybackSource::Main, time_millis);
     state.reference_only_playback = false;
     if resume {
         match resume_main_at_position_with_reference(state, time_millis) {
@@ -8861,14 +8325,14 @@ fn maybe_start_pending_comment_playback(
             state.comment_source_explicit = true;
             state.selected_note_id = Some(pending.address.clone());
             state.draft_note = None;
-            set_audition_source(state, AuditionSource::Main);
+            set_playback_source(state, PlaybackSource::Main);
         }
         CommentSource::Reference => {
             state.comment_source = CommentSource::Reference;
             state.comment_source_explicit = true;
             state.selected_reference_note_id = Some(pending.address.clone());
             state.reference_draft_note = None;
-            set_audition_source(state, AuditionSource::Reference);
+            set_playback_source(state, PlaybackSource::Reference);
         }
     }
 
@@ -8932,17 +8396,15 @@ fn toggle_settings(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
         close_settings(state);
     } else {
         close_stage_menu(state);
-        close_status_menu(state);
         close_reference_menu(state);
-        state.review_filter_menu_open = false;
         state.settings_open = true;
     }
     context.request_repaint();
 }
 
 fn library_track_card_height() -> f32 {
-    26.0 + (ui::dropdown_trigger_height() * 2.0)
-        + (TRACK_CARD_CONTENT_SPACING * 4.0)
+    26.0 + ui::dropdown_trigger_height()
+        + (TRACK_CARD_CONTENT_SPACING * 3.0)
         + 18.0
         + REMOVAL_CONFIRMATION_ROW_HEIGHT
         + (TRACK_CARD_CONTENT_INSET * 2.0)
@@ -8951,20 +8413,12 @@ fn library_track_card_height() -> f32 {
 const VIRTUAL_LIST_VIEWPORT_ROWS: usize = 8;
 const VIRTUAL_LIST_OVERSCAN_ROWS: usize = 4;
 
-fn audition_queue_row_height() -> f32 {
-    28.0 + 18.0
-        + REMOVAL_CONFIRMATION_ROW_HEIGHT
-        + ui::dropdown_trigger_height()
-        + (TRACK_CARD_CONTENT_SPACING * 3.0)
-        + (TRACK_CARD_CONTENT_INSET * 2.0)
-}
-
 fn planner_card_height() -> f32 {
     28.0 + 20.0
         + REMOVAL_CONFIRMATION_ROW_HEIGHT
         + 22.0
-        + (ui::dropdown_trigger_height() * 2.0)
-        + (TRACK_CARD_CONTENT_SPACING * 5.0)
+        + ui::dropdown_trigger_height()
+        + (TRACK_CARD_CONTENT_SPACING * 4.0)
         + (TRACK_CARD_CONTENT_INSET * 2.0)
 }
 
@@ -9039,7 +8493,7 @@ fn select_track_internal(
     state: &mut AppState,
     context: &mut ui::UiUpdateContext<Message>,
     id: String,
-    pending_play: bool,
+    enter_review: bool,
 ) {
     if !library_is_ready(state)
         || state.busy
@@ -9047,53 +8501,18 @@ fn select_track_internal(
     {
         return;
     }
-    let in_audition = state.workspace_mode == WorkspaceMode::Audition;
-    let entering_review_from_planner = state.workspace_mode == WorkspaceMode::Planner;
+    let entering_review_from_planner =
+        enter_review && state.workspace_mode == WorkspaceMode::Planner;
     let reveal_id = id.clone();
-    let previous_selected_id = state.library.selected_track_id.clone();
-    if !in_audition {
+    if enter_review {
         state.workspace_mode = WorkspaceMode::Review;
-    }
-    if entering_review_from_planner
-        && state.review_status_filter.is_some_and(|status| {
-            state
-                .library
-                .tracks
-                .iter()
-                .any(|track| track.id == id && track.status != status)
-        })
-    {
-        state.review_status_filter = None;
-    }
-    if in_audition
-        && let Some(previous_id) = previous_selected_id.as_deref()
-        && previous_id != id
-    {
-        remove_audition_queue_entry_if_outside_filter(state, previous_id);
     }
     state.library.selected_track_id = Some(id.clone());
     refresh_selected_track_index(state);
     reset_comments_windows(state);
     cancel_pending_comment_playback(state);
     state.loop_selections.clear_all();
-    if in_audition {
-        if let Some(index) = state
-            .audition_queue
-            .iter()
-            .position(|track_id| track_id == &id)
-        {
-            state.audition_queue_index = index;
-        }
-        state.audition_auto_advance = pending_play;
-        state.audition_play_token = None;
-        state.audition_pending_play_track_id = pending_play.then_some(id);
-    } else {
-        state.audition_auto_advance = false;
-        state.audition_play_token = None;
-        state.audition_pending_play_track_id = None;
-    }
     close_stage_menu(state);
-    close_status_menu(state);
     close_reference_menu(state);
     state.remove_confirmation_track_id = None;
     clear_planner_drag(state);
@@ -9180,379 +8599,12 @@ fn set_workspace_mode(
     if state.workspace_mode == mode {
         return;
     }
-    state.audition_auto_advance = false;
-    state.audition_play_token = None;
-    state.audition_pending_play_track_id = None;
     state.workspace_mode = mode;
-    if mode == WorkspaceMode::Audition {
-        rebuild_audition_queue(state);
-        if let Some(track_id) = state.audition_queue.first().cloned() {
-            select_track_internal(state, context, track_id, false);
-        } else {
-            reset_transport(state);
-            reset_reference_transport(state);
-        }
-    }
     close_stage_menu(state);
-    close_status_menu(state);
     close_reference_menu(state);
     state.remove_confirmation_track_id = None;
     clear_planner_drag(state);
     context.request_repaint();
-}
-
-fn disarm_audition_auto_advance(state: &mut AppState) {
-    if state.workspace_mode == WorkspaceMode::Audition {
-        state.audition_auto_advance = false;
-        state.audition_play_token = None;
-        state.audition_pending_play_track_id = None;
-    }
-}
-
-fn rebuild_audition_queue(state: &mut AppState) {
-    let mut queue = state
-        .library
-        .tracks
-        .iter()
-        .filter(|track| track.status == state.audition_status_filter)
-        .map(|track| track.id.clone())
-        .collect::<Vec<_>>();
-    let seed = audition_shuffle_seed(
-        state.audition_status_filter,
-        &queue,
-        state.audition_shuffle_round,
-    );
-    deterministic_shuffle(&mut queue, seed);
-    let selected_id = state.library.selected_track_id.as_deref();
-    state.audition_queue_index = selected_id
-        .and_then(|selected_id| queue.iter().position(|id| id == selected_id))
-        .unwrap_or(0)
-        .min(queue.len());
-    state.audition_queue = queue;
-    state.audition_heard.clear();
-}
-
-fn shuffle_audition(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
-    if let Some(error) = paired_playback_cleanup_error(state) {
-        state.status = error.to_owned();
-        context.request_repaint();
-        return;
-    }
-    if state.busy || state.workspace_mode != WorkspaceMode::Audition {
-        return;
-    }
-    let previous_queue = state.audition_queue.clone();
-    let previous_selected = state.library.selected_track_id.clone();
-    state.audition_shuffle_round = state.audition_shuffle_round.wrapping_add(1);
-    rebuild_audition_queue(state);
-    ensure_audition_shuffle_change(
-        &mut state.audition_queue,
-        &previous_queue,
-        previous_selected.as_deref(),
-    );
-    state.audition_heard.clear();
-
-    if let Some(track_id) = state.audition_queue.first().cloned() {
-        select_track_internal(state, context, track_id, true);
-        state.status = format!(
-            "New {} audition order ready — loading first track…",
-            state.audition_status_filter.label()
-        );
-    } else {
-        state.audition_auto_advance = false;
-        state.audition_play_token = None;
-        state.audition_pending_play_track_id = None;
-        reset_transport(state);
-        reset_reference_transport(state);
-        state.status = format!("No tracks in {}.", state.audition_status_filter.label());
-    }
-    context.request_repaint();
-}
-
-fn ensure_audition_shuffle_change(
-    queue: &mut [String],
-    previous_queue: &[String],
-    previous_selected: Option<&str>,
-) {
-    if queue.len() < 2 {
-        return;
-    }
-
-    let rotation_matches_previous = |rotation: usize| {
-        queue.len() == previous_queue.len()
-            && (0..queue.len())
-                .all(|index| queue[(index + rotation) % queue.len()] == previous_queue[index])
-    };
-    let first_is_new = |rotation: usize| {
-        previous_selected.is_none_or(|selected| queue[rotation].as_str() != selected)
-    };
-    let rotation = (0..queue.len())
-        .find(|rotation| !rotation_matches_previous(*rotation) && first_is_new(*rotation))
-        .or_else(|| (0..queue.len()).find(|rotation| !rotation_matches_previous(*rotation)));
-    if let Some(rotation) = rotation {
-        queue.rotate_left(rotation);
-    }
-}
-
-fn reconcile_audition_queue(state: &mut AppState) {
-    let old_queue = std::mem::take(&mut state.audition_queue);
-    let old_index = state.audition_queue_index;
-    let current_id = old_queue.get(old_index).cloned();
-    let active_anchor_id = audition_navigation_anchor(state).map(ToOwned::to_owned);
-    let filter = state.audition_status_filter;
-    let mut library_status_by_id = HashMap::with_capacity(state.library.tracks.len());
-    let mut library_ids = HashSet::with_capacity(state.library.tracks.len());
-    for track in &state.library.tracks {
-        library_ids.insert(track.id.as_str());
-        library_status_by_id
-            .entry(track.id.as_str())
-            .or_insert(track.status);
-    }
-
-    let mut queue = Vec::with_capacity(old_queue.len() + state.library.tracks.len());
-    let mut queued_ids = HashSet::with_capacity(old_queue.len() + state.library.tracks.len());
-    for track_id in &old_queue {
-        let Some(status) = library_status_by_id.get(track_id.as_str()) else {
-            continue;
-        };
-        if (*status == filter || active_anchor_id.as_deref() == Some(track_id.as_str()))
-            && queued_ids.insert(track_id.as_str())
-        {
-            queue.push(track_id.clone());
-        }
-    }
-    for track in &state.library.tracks {
-        if track.status == filter && queued_ids.insert(track.id.as_str()) {
-            queue.push(track.id.clone());
-        }
-    }
-    state.audition_queue_index = current_id
-        .and_then(|current_id| queue.iter().position(|id| id == &current_id))
-        .unwrap_or(old_index.min(queue.len()));
-    state.audition_queue = queue;
-    state
-        .audition_heard
-        .retain(|heard_id| library_ids.contains(heard_id.as_str()));
-}
-
-fn audition_navigation_anchor(state: &AppState) -> Option<&str> {
-    if state.workspace_mode != WorkspaceMode::Audition
-        || state.audition_pending_play_track_id.is_some()
-        || !(state.transport_playing
-            || state.transport_polling
-            || state.transport_waiting_token.is_some()
-            || state.reference_transport_playing
-            || state.reference_transport_polling
-            || state.reference_transport_waiting_token.is_some())
-    {
-        return None;
-    }
-    state.library.selected_track_id.as_deref()
-}
-
-fn remove_audition_queue_entry_if_outside_filter(state: &mut AppState, track_id: &str) {
-    let matches_filter = state
-        .library
-        .tracks
-        .iter()
-        .find(|track| track.id == track_id)
-        .is_some_and(|track| track.status == state.audition_status_filter);
-    if matches_filter {
-        return;
-    }
-    let Some(position) = state.audition_queue.iter().position(|id| id == track_id) else {
-        return;
-    };
-    state.audition_queue.remove(position);
-    if position < state.audition_queue_index {
-        state.audition_queue_index = state.audition_queue_index.saturating_sub(1);
-    }
-    if state.audition_queue.is_empty() {
-        state.audition_queue_index = 0;
-    } else {
-        state.audition_queue_index = state.audition_queue_index.min(state.audition_queue.len());
-    }
-}
-
-fn sync_audition_queue_after_status_change(state: &mut AppState, track_id: &str) {
-    let matches_filter = state
-        .library
-        .tracks
-        .iter()
-        .find(|track| track.id == track_id)
-        .is_some_and(|track| track.status == state.audition_status_filter);
-    let is_navigation_anchor = audition_navigation_anchor(state) == Some(track_id);
-    let Some(_) = state.audition_queue.iter().position(|id| id == track_id) else {
-        if matches_filter {
-            state.audition_queue.push(track_id.to_owned());
-        }
-        return;
-    };
-    if !matches_filter && !is_navigation_anchor {
-        remove_audition_queue_entry_if_outside_filter(state, track_id);
-    }
-}
-
-fn audition_shuffle_seed(status: storage::TrackStatus, track_ids: &[String], round: u64) -> u64 {
-    let mut hash = 0xcbf29ce484222325_u64 ^ round;
-    for byte in status.label().bytes().chain([0]) {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    for id in track_ids {
-        for byte in id.bytes().chain([0]) {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-    }
-    hash
-}
-
-fn deterministic_shuffle(items: &mut [String], mut seed: u64) {
-    for index in (1..items.len()).rev() {
-        seed ^= seed >> 12;
-        seed ^= seed << 25;
-        seed ^= seed >> 27;
-        seed = seed.wrapping_mul(0x2545f4914f6cdd1d);
-        items.swap(index, (seed as usize) % (index + 1));
-    }
-}
-
-fn next_audition_track_index(state: &AppState) -> Option<usize> {
-    let selected_id = state.library.selected_track_id.as_deref();
-    let mut library_status_by_id = HashMap::with_capacity(state.library.tracks.len());
-    for track in &state.library.tracks {
-        library_status_by_id
-            .entry(track.id.as_str())
-            .or_insert(track.status);
-    }
-    let heard_ids = state
-        .audition_heard
-        .iter()
-        .map(String::as_str)
-        .collect::<HashSet<_>>();
-    let mut index = state.audition_queue_index;
-    if state.audition_queue.get(index).map(String::as_str) == selected_id {
-        index += 1;
-    }
-    while let Some(track_id) = state.audition_queue.get(index) {
-        if !heard_ids.contains(track_id.as_str())
-            && library_status_by_id
-                .get(track_id.as_str())
-                .is_some_and(|status| *status == state.audition_status_filter)
-        {
-            return Some(index);
-        }
-        index += 1;
-    }
-    None
-}
-
-fn advance_audition(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
-    if let Some(current_id) = state.library.selected_track_id.as_ref()
-        && !state
-            .audition_heard
-            .iter()
-            .any(|heard_id| heard_id == current_id)
-    {
-        state.audition_heard.push(current_id.clone());
-    }
-    let Some(next_index) = next_audition_track_index(state) else {
-        state.audition_auto_advance = false;
-        state.audition_play_token = None;
-        state.audition_pending_play_track_id = None;
-        state.status = String::from("Audition complete.");
-        return;
-    };
-    let Some(track_id) = state.audition_queue.get(next_index).cloned() else {
-        return;
-    };
-    let title = state
-        .library
-        .tracks
-        .iter()
-        .find(|track| track.id == track_id)
-        .map_or_else(|| track_id.clone(), |track| track.title.clone());
-    select_track_internal(state, context, track_id, true);
-    state.status = format!("Loading next audition track: {title}…");
-}
-
-fn maybe_start_pending_audition(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
-    if !library_is_ready(state) {
-        return;
-    }
-    if let Some(error) = paired_playback_cleanup_error(state) {
-        state.status = error.to_owned();
-        context.request_repaint();
-        return;
-    }
-    let Some(track_id) = state.audition_pending_play_track_id.clone() else {
-        return;
-    };
-    if state.workspace_mode != WorkspaceMode::Audition
-        || state.busy
-        || state.waveform_busy
-        || state.transport_polling
-        || state.transport_waiting_token.is_some()
-        || state.transport.has_pending_load()
-        || (state.reference_waveform_busy && !reference_source_is_mismatched(state))
-        || state.library.selected_track_id.as_deref() != Some(track_id.as_str())
-        || state.waveform_track_id.as_deref() != Some(track_id.as_str())
-        || state.waveform.is_none()
-    {
-        return;
-    }
-    if !state.transport.has_command_capacity(1) {
-        return;
-    }
-    if selected_reference_details(state).is_some() {
-        let reference_transport = state
-            .reference_transport
-            .get_or_insert_with(transport::AudioTransport::spawn);
-        let required_slots = if state.reference_transport_loaded {
-            2
-        } else {
-            3
-        };
-        if reference_transport.has_pending_load()
-            || !reference_transport.has_command_capacity(required_slots)
-        {
-            return;
-        }
-    }
-    state.audition_pending_play_track_id = None;
-    toggle_playback(state, context);
-}
-
-fn close_status_menu(state: &mut AppState) {
-    state.status_menu_track_id = None;
-    state.status_menu_host = None;
-}
-
-fn toggle_status_menu(
-    state: &mut AppState,
-    track_id: String,
-    host: StatusMenuHost,
-    context: &mut ui::UiUpdateContext<Message>,
-) {
-    if !state.busy
-        && state
-            .library
-            .tracks
-            .iter()
-            .any(|track| track.id == track_id)
-    {
-        if state.status_menu_track_id.as_deref() == Some(track_id.as_str())
-            && state.status_menu_host == Some(host)
-        {
-            close_status_menu(state);
-        } else {
-            close_stage_menu(state);
-            state.status_menu_track_id = Some(track_id);
-            state.status_menu_host = Some(host);
-        }
-        context.request_repaint();
-    }
 }
 
 fn clear_planner_drag(state: &mut AppState) {
@@ -9736,12 +8788,7 @@ fn planner_board_surface(content: ui::View<Message>) -> ui::View<Message> {
 fn project_surface(state: &AppState) -> ui::View<Message> {
     let workspace = {
         let mut projection_cache = state.library_projection_cache.borrow_mut();
-        projection_cache.ensure(
-            state.library.generation(),
-            &state.library,
-            state.review_status_filter,
-            state.planner_status_filter,
-        );
+        projection_cache.ensure(state.library.generation(), &state.library);
         match state.workspace_mode {
             WorkspaceMode::Review => ui::row([
                 library_panel(state, &projection_cache)
@@ -9752,14 +8799,6 @@ fn project_surface(state: &AppState) -> ui::View<Message> {
             .spacing(10.0)
             .fill(),
             WorkspaceMode::Planner => planner_panel(state, &projection_cache).fill(),
-            WorkspaceMode::Audition => ui::row([
-                audition_panel(state, &projection_cache)
-                    .width(LIBRARY_WIDTH)
-                    .fill_height(),
-                review_panel(state).fill(),
-            ])
-            .spacing(10.0)
-            .fill(),
         }
     };
 
@@ -9788,24 +8827,20 @@ fn project_surface(state: &AppState) -> ui::View<Message> {
                 .filter(|track| !reference_dropdown_paths(state, track).is_empty())
                 .map(|track| reference_menu_popover(state, track, anchor))
         });
-    let workspace_tabs = [
-        WorkspaceMode::Review,
-        WorkspaceMode::Planner,
-        WorkspaceMode::Audition,
-    ]
-    .into_iter()
-    .map(|mode| {
-        let label = workspace_mode_label(mode);
-        ui::button(label)
-            .selected(state.workspace_mode == mode)
-            .message(Message::SelectWorkspace(mode))
-            .key(format!("workspace-tab-{}", label.to_ascii_lowercase()))
-            .width(82.0)
-            .height(28.0)
-    })
-    .collect::<Vec<_>>();
+    let workspace_tabs = [WorkspaceMode::Review, WorkspaceMode::Planner]
+        .into_iter()
+        .map(|mode| {
+            let label = workspace_mode_label(mode);
+            ui::button(label)
+                .selected(state.workspace_mode == mode)
+                .message(Message::SelectWorkspace(mode))
+                .key(format!("workspace-tab-{}", label.to_ascii_lowercase()))
+                .width(82.0)
+                .height(28.0)
+        })
+        .collect::<Vec<_>>();
     let global_review_controls = match state.workspace_mode {
-        WorkspaceMode::Review | WorkspaceMode::Audition => selected_track(state)
+        WorkspaceMode::Review => selected_track(state)
             .map(|track| review_global_controls(state, track))
             .unwrap_or_else(|| ui::spacer().width(0.0)),
         WorkspaceMode::Planner => ui::spacer().width(0.0),
@@ -9947,431 +8982,9 @@ fn project_surface(state: &AppState) -> ui::View<Message> {
     .into_view()
 }
 
-fn audition_panel(state: &AppState, projection: &LibraryProjectionCache) -> ui::View<Message> {
-    let selected_id = state.library.selected_track_id.as_deref();
-    let status_menu_track_id = state.status_menu_track_id.as_deref();
-    let status_menu_host = state.status_menu_host;
-    let remove_confirmation_track_id = state.remove_confirmation_track_id.as_deref();
-    let queue_count = state.audition_queue.len();
-    let filter_buttons = audition_statuses()
-        .into_iter()
-        .map(|status| {
-            status_filter_button(
-                Some(state.audition_status_filter),
-                "audition",
-                Some(status),
-                audition_status_filter_message,
-                true,
-            )
-        })
-        .collect::<Vec<_>>();
-    let queue = if state.audition_queue.is_empty() {
-        ui::column([
-            ui::text("No matching tracks.").height(26.0).fill_width(),
-            ui::text(format!(
-                "Move a track into {} or choose another filter.",
-                state.audition_status_filter.label()
-            ))
-            .wrap()
-            .height(44.0)
-            .fill_width()
-            .subtle(),
-        ])
-        .padding(12.0)
-        .spacing(6.0)
-        .fill_width()
-    } else {
-        let row_height = audition_queue_row_height() + TRACK_CARD_LIST_SPACING;
-        let window =
-            resolved_virtual_list_window(state.audition_queue_window, queue_count, None, false);
-        ui::virtual_list_windowed(|index| {
-            let queue_index: usize = index;
-            let track_id: &str = state.audition_queue[queue_index].as_str();
-            let track = projection
-                .library_index(track_id)
-                .and_then(|library_index| state.library.tracks.get(library_index));
-            let Some(track) = track else {
-                return virtual_row_with_spacing(
-                    ui::spacer()
-                        .fill_width()
-                        .height(audition_queue_row_height()),
-                    row_height,
-                );
-            };
-            virtual_row_with_spacing(
-                audition_queue_row(
-                    queue_index,
-                    track,
-                    selected_id,
-                    status_menu_track_id,
-                    status_menu_host,
-                    remove_confirmation_track_id,
-                ),
-                row_height,
-            )
-        })
-        .window(window)
-        .row_height(row_height)
-        .overscan_px(row_height * VIRTUAL_LIST_OVERSCAN_ROWS as f32)
-        .on_window_changed(Message::AuditionQueueWindowChanged)
-        .retain_materialized_window()
-        .view()
-        .without_chrome()
-        .fill_height()
-    };
-    let progress = if queue_count == 0 {
-        String::from("0 tracks")
-    } else {
-        format!(
-            "{} of {} track{}",
-            state
-                .audition_queue_index
-                .saturating_add(1)
-                .min(queue_count),
-            queue_count,
-            plural(queue_count)
-        )
-    };
-    let audition_controls = ui::row([
-        ui::button("Previous")
-            .message(Message::AuditionPrevious)
-            .key("audition-previous")
-            .height(30.0)
-            .width(76.0),
-        ui::button("Play")
-            .message(Message::AuditionPlay)
-            .key("audition-play")
-            .height(30.0)
-            .width(42.0),
-        ui::button("Stop")
-            .message(Message::StopPlayback)
-            .key("audition-stop")
-            .height(30.0)
-            .width(42.0),
-        ui::button("Next")
-            .message(Message::AuditionNext)
-            .key("audition-next")
-            .height(30.0)
-            .width(50.0),
-    ])
-    .spacing(4.0)
-    .fill_width();
-    let content = ui::column([
-        ui::row([
-            ui::column([
-                ui::text("AUDITION")
-                    .style(ui::WidgetStyle::strong(ui::WidgetTone::Neutral))
-                    .height(18.0)
-                    .fill_width(),
-                ui::text("Fixed shuffle · one pass")
-                    .height(26.0)
-                    .fill_width()
-                    .muted_text(),
-            ])
-            .fill_width(),
-            ui::button("Shuffle")
-                .primary()
-                .message(Message::ShuffleAudition)
-                .key("audition-shuffle")
-                .height(26.0)
-                .width(80.0),
-        ])
-        .fill_width()
-        .spacing(8.0),
-        audition_controls,
-        ui::text("PLAY STATUS").height(18.0).fill_width().subtle(),
-        ui::column(filter_buttons).spacing(3.0).fill_width(),
-        ui::row([ui::text(format!(
-            "{} queue · {}",
-            state.audition_status_filter.label(),
-            progress
-        ))
-        .truncate()
-        .height(22.0)
-        .fill_width()
-        .subtle()])
-        .fill_width()
-        .height(22.0),
-        queue,
-    ])
-    .padding(WORKSPACE_PANEL_PADDING)
-    .spacing(WORKSPACE_PANEL_SPACING)
-    .fill_height();
-    workspace_surface(content)
-}
-
-fn audition_queue_row(
-    index: usize,
-    track: &storage::Track,
-    selected_id: Option<&str>,
-    status_menu_track_id: Option<&str>,
-    status_menu_host: Option<StatusMenuHost>,
-    remove_confirmation_track_id: Option<&str>,
-) -> ui::View<Message> {
-    let selected = selected_id == Some(track.id.as_str());
-    let track_id = track.id.clone();
-    let status_menu_open = status_menu_host == Some(StatusMenuHost::Audition)
-        && status_menu_track_id == Some(track.id.as_str());
-    let remove_confirmation_open = remove_confirmation_track_id == Some(track.id.as_str());
-    let title = format!("{:02}  {}", index + 1, track.title);
-    let favorite_control =
-        favorite_toggle(track, selected, format!("audition-favorite-{}", track.id));
-    let replace_control = replace_toggle(track, format!("audition-replace-{}", track.id));
-    let remove_id = track.id.clone();
-    let remove_control = ui::close_button()
-        .subtle()
-        .message(Message::RequestRemoveTrack(remove_id.clone()))
-        .key(format!("audition-remove-{}", track.id))
-        .tooltip("Remove track")
-        .size(28.0, 24.0);
-    let status_control =
-        status_dropdown_for_host(track, status_menu_open, selected, StatusMenuHost::Audition);
-    let removal_controls = if remove_confirmation_open {
-        ui::row([
-            card_control(
-                selected,
-                "Confirm",
-                ui::button("Confirm")
-                    .message(Message::ConfirmRemoveTrack(remove_id.clone()))
-                    .height(20.0),
-            )
-            .height(20.0),
-            card_control(
-                selected,
-                "Cancel",
-                ui::button("Cancel")
-                    .message(Message::CancelRemoveTrack)
-                    .height(20.0),
-            )
-            .height(20.0),
-        ])
-        .spacing(4.0)
-        .fill_width()
-    } else {
-        ui::spacer()
-            .fill_width()
-            .height(REMOVAL_CONFIRMATION_ROW_HEIGHT)
-    };
-    let input = ui::button(title.clone())
-        .selected(selected)
-        .message(Message::SelectTrack(track_id.clone()))
-        .key(format!("audition-queue-track-{track_id}"))
-        .fill_width()
-        .height(28.0);
-    let row = ui::column([
-        ui::row([
-            input.fill_width().height(28.0),
-            favorite_control,
-            replace_control,
-            remove_control,
-        ])
-        .fill_width()
-        .spacing(TRACK_CARD_CONTENT_SPACING)
-        .height(28.0),
-        ui::text(track.original_name.clone())
-            .truncate()
-            .height(18.0)
-            .fill_width()
-            .subtle(),
-        removal_controls,
-        status_control,
-    ])
-    .padding(TRACK_CARD_CONTENT_INSET)
-    .spacing(TRACK_CARD_CONTENT_SPACING)
-    .fill_width();
-    ui::stack([track_card_chrome(selected, track.favorite), row])
-        .key(format!("audition-queue-row-{track_id}"))
-        .fill_width()
-}
-
-fn audition_statuses() -> [storage::TrackStatus; 5] {
-    [
-        storage::TrackStatus::Inbox,
-        storage::TrackStatus::Refine,
-        storage::TrackStatus::Release,
-        storage::TrackStatus::Archive,
-        storage::TrackStatus::Maybe,
-    ]
-}
-
-fn status_filter_options() -> [Option<storage::TrackStatus>; 6] {
-    [
-        None,
-        Some(storage::TrackStatus::Inbox),
-        Some(storage::TrackStatus::Refine),
-        Some(storage::TrackStatus::Release),
-        Some(storage::TrackStatus::Archive),
-        Some(storage::TrackStatus::Maybe),
-    ]
-}
-
-fn status_filter_label(status: Option<storage::TrackStatus>) -> &'static str {
-    status.map_or("All", storage::TrackStatus::label)
-}
-
-fn status_filter_button(
-    selected: Option<storage::TrackStatus>,
-    key_prefix: &str,
-    status: Option<storage::TrackStatus>,
-    message: fn(Option<storage::TrackStatus>) -> Message,
-    fill_width: bool,
-) -> ui::View<Message> {
-    let width = (!fill_width).then_some(76.0);
-    colored_status_option(
-        status,
-        selected == status,
-        message(status),
-        format!(
-            "{key_prefix}-status-filter-{}",
-            status_filter_label(status).to_ascii_lowercase()
-        ),
-        width,
-        26.0,
-    )
-}
-
-fn audition_status_filter_message(status: Option<storage::TrackStatus>) -> Message {
-    Message::SetAuditionFilter(status.expect("audition filters always select a status"))
-}
-
-fn status_filter_controls(
-    selected: Option<storage::TrackStatus>,
-    key_prefix: &str,
-    message: fn(Option<storage::TrackStatus>) -> Message,
-) -> ui::View<Message> {
-    ui::row(
-        status_filter_options()
-            .into_iter()
-            .map(|status| status_filter_button(selected, key_prefix, status, message, false))
-            .collect::<Vec<_>>(),
-    )
-    .spacing(3.0)
-    .fill_width()
-}
-
-fn status_filter_dropdown(
-    selected: Option<storage::TrackStatus>,
-    key_prefix: &str,
-    message: fn(Option<storage::TrackStatus>) -> Message,
-    open: bool,
-) -> ui::View<Message> {
-    let trigger = ui::row([
-        status_rail(selected, ui::dropdown_trigger_height()),
-        ui::dropdown_trigger(status_filter_label(selected), open)
-            .toggle_message(Message::ToggleReviewFilterMenu)
-            .build()
-            .key(format!("{key_prefix}-status-filter"))
-            .fill_width(),
-    ])
-    .spacing(STATUS_RAIL_GAP)
-    .fill_width()
-    .height(ui::dropdown_trigger_height());
-    if open {
-        ui::column([
-            trigger,
-            status_filter_menu(selected, key_prefix, message)
-                .fill_width()
-                .height(ui::dropdown_menu_height(status_filter_options().len())),
-        ])
-        .spacing(3.0)
-        .fill_width()
-    } else {
-        ui::column([trigger]).fill_width()
-    }
-}
-
-fn status_filter_menu(
-    selected: Option<storage::TrackStatus>,
-    key_prefix: &str,
-    message: fn(Option<storage::TrackStatus>) -> Message,
-) -> ui::View<Message> {
-    colored_status_menu(
-        format!("{key_prefix}-status-filter-menu"),
-        status_filter_options()
-            .into_iter()
-            .map(|status| {
-                (
-                    status,
-                    selected == status,
-                    message(status),
-                    format!(
-                        "{key_prefix}-status-filter-option-{}",
-                        status_filter_label(status).to_ascii_lowercase()
-                    ),
-                )
-            })
-            .collect(),
-    )
-}
-
-fn colored_status_option(
-    status: Option<storage::TrackStatus>,
-    selected: bool,
-    message: Message,
-    key: String,
-    width: Option<f32>,
-    height: f32,
-) -> ui::View<Message> {
-    let button_width = width.map(|width| (width - STATUS_RAIL_WIDTH - STATUS_RAIL_GAP).max(0.0));
-    let button = ui::button(status_filter_label(status))
-        .selected(selected)
-        .message(message)
-        .key(key)
-        .fill_width()
-        .height(height);
-    let button = if let Some(width) = button_width {
-        button.width(width)
-    } else {
-        button
-    };
-    let row = ui::row([status_rail(status, height), button]).spacing(STATUS_RAIL_GAP);
-    if let Some(width) = width {
-        row.width(width).height(height)
-    } else {
-        row.fill_width().height(height)
-    }
-}
-
-fn colored_status_menu(
-    key: String,
-    options: Vec<(Option<storage::TrackStatus>, bool, Message, String)>,
-) -> ui::View<Message> {
-    let option_count = options.len();
-    ui::column(
-        options
-            .into_iter()
-            .map(|(status, selected, message, option_key)| {
-                colored_status_option(status, selected, message, option_key, None, 22.0)
-            })
-            .collect::<Vec<_>>(),
-    )
-    .key(key)
-    .style(ui::WidgetStyle::strong(ui::WidgetTone::Neutral))
-    .padding(4.0)
-    .spacing(3.0)
-    .fill_width()
-    .height(ui::dropdown_menu_height(option_count))
-}
-
-fn review_status_filter_message(status: Option<storage::TrackStatus>) -> Message {
-    Message::SetReviewStatusFilter(status)
-}
-
-fn planner_status_filter_message(status: Option<storage::TrackStatus>) -> Message {
-    Message::SetPlannerStatusFilter(status)
-}
-
-const fn workspace_mode_label(mode: WorkspaceMode) -> &'static str {
-    match mode {
-        WorkspaceMode::Review => "Review",
-        WorkspaceMode::Planner => "Planner",
-        WorkspaceMode::Audition => "Audition",
-    }
-}
-
 fn planner_panel(state: &AppState, projection: &LibraryProjectionCache) -> ui::View<Message> {
     let stages = [
-        storage::TrackStage::SoundDesign,
+        storage::TrackStage::Backlog,
         storage::TrackStage::Production,
         storage::TrackStage::Mixdown,
         storage::TrackStage::Mastering,
@@ -10384,12 +8997,9 @@ fn planner_panel(state: &AppState, projection: &LibraryProjectionCache) -> ui::V
             stage,
             &state.library,
             projection.planner_stage_indices(stage),
-            state.planner_status_filter,
             PlannerColumnContext {
                 selected_id: state.library.selected_track_id.as_deref(),
                 stage_menu_track_id: state.stage_menu_track_id.as_deref(),
-                status_menu_track_id: state.status_menu_track_id.as_deref(),
-                status_menu_host: state.status_menu_host,
                 remove_confirmation_track_id: state.remove_confirmation_track_id.as_deref(),
                 drag_source_track_id,
             },
@@ -10408,12 +9018,6 @@ fn planner_panel(state: &AppState, projection: &LibraryProjectionCache) -> ui::V
             ui::spacer().height(30.0).fill_width(),
         ])
         .fill_width(),
-        status_filter_controls(
-            state.planner_status_filter,
-            "planner",
-            planner_status_filter_message,
-        )
-        .width(480.0),
         ui::text(format!(
             "{} track{} · derived from the library",
             track_count,
@@ -10447,8 +9051,6 @@ fn planner_panel(state: &AppState, projection: &LibraryProjectionCache) -> ui::V
 struct PlannerColumnContext<'a> {
     selected_id: Option<&'a str>,
     stage_menu_track_id: Option<&'a str>,
-    status_menu_track_id: Option<&'a str>,
-    status_menu_host: Option<StatusMenuHost>,
     remove_confirmation_track_id: Option<&'a str>,
     drag_source_track_id: Option<&'a str>,
 }
@@ -10458,7 +9060,6 @@ fn planner_column(
     stage: storage::TrackStage,
     library: &storage::Library,
     track_indices: &[usize],
-    status_filter: Option<storage::TrackStatus>,
     context: PlannerColumnContext<'_>,
     current_window: ui::VirtualListWindow,
     drag_active: bool,
@@ -10467,8 +9068,6 @@ fn planner_column(
     let PlannerColumnContext {
         selected_id,
         stage_menu_track_id,
-        status_menu_track_id,
-        status_menu_host,
         remove_confirmation_track_id,
         drag_source_track_id,
     } = context;
@@ -10499,22 +9098,7 @@ fn planner_column(
         .spacing(8.0),
     ];
     if track_indices.is_empty() {
-        let empty_content = if status_filter.is_some() {
-            ui::column([
-                ui::text("No matching tracks.").height(24.0).fill_width(),
-                ui::text(format!(
-                    "No tracks in the {} status.",
-                    status_filter_label(status_filter)
-                ))
-                .wrap()
-                .height(44.0)
-                .fill_width()
-                .subtle(),
-            ])
-            .padding(10.0)
-            .spacing(6.0)
-            .fill_width()
-        } else {
+        children.push(
             ui::column([
                 ui::text("No tracks here yet.").height(24.0).fill_width(),
                 ui::text("Choose this stage from a card when it is ready.")
@@ -10525,9 +9109,8 @@ fn planner_column(
             ])
             .padding(10.0)
             .spacing(6.0)
-            .fill_width()
-        };
-        children.push(empty_content);
+            .fill_width(),
+        );
     } else {
         let row_height = planner_card_height() + TRACK_CARD_LIST_SPACING;
         let logical_window = resolved_virtual_list_window(current_window, count, None, false);
@@ -10539,8 +9122,6 @@ fn planner_column(
                         track,
                         selected_id,
                         stage_menu_track_id,
-                        status_menu_track_id,
-                        status_menu_host,
                         remove_confirmation_track_id,
                         drag_source_track_id,
                     ),
@@ -10715,14 +9296,14 @@ fn planner_insertion_marker(active: bool, at_bottom: bool) -> ui::View<Message> 
 
 fn planner_column_heading(stage: storage::TrackStage) -> &'static str {
     match stage {
-        storage::TrackStage::SoundDesign => "Backlog",
+        storage::TrackStage::Backlog => "Backlog",
         _ => stage.label(),
     }
 }
 
 const fn planner_column_tone(stage: storage::TrackStage) -> ui::WidgetTone {
     match stage {
-        storage::TrackStage::SoundDesign => ui::WidgetTone::Warning,
+        storage::TrackStage::Backlog => ui::WidgetTone::Warning,
         storage::TrackStage::Production => ui::WidgetTone::Accent,
         storage::TrackStage::Mixdown => ui::WidgetTone::Success,
         storage::TrackStage::Mastering => ui::WidgetTone::Danger,
@@ -10743,8 +9324,6 @@ fn planner_card(
     track: &storage::Track,
     selected_id: Option<&str>,
     stage_menu_track_id: Option<&str>,
-    status_menu_track_id: Option<&str>,
-    status_menu_host: Option<StatusMenuHost>,
     remove_confirmation_track_id: Option<&str>,
     drag_source_track_id: Option<&str>,
 ) -> ui::View<Message> {
@@ -10753,8 +9332,6 @@ fn planner_card(
         track,
         selected_id,
         stage_menu_track_id,
-        status_menu_track_id,
-        status_menu_host,
         remove_confirmation_track_id,
         drag_source_track_id,
         card_key,
@@ -10767,16 +9344,12 @@ fn planner_card_with_key(
     track: &storage::Track,
     selected_id: Option<&str>,
     stage_menu_track_id: Option<&str>,
-    status_menu_track_id: Option<&str>,
-    status_menu_host: Option<StatusMenuHost>,
     remove_confirmation_track_id: Option<&str>,
     drag_source_track_id: Option<&str>,
     card_key: String,
 ) -> ui::View<Message> {
     let selected = selected_id == Some(track.id.as_str());
     let stage_menu_open = stage_menu_track_id == Some(track.id.as_str());
-    let status_menu_open = status_menu_host == Some(StatusMenuHost::Planner(track.stage))
-        && status_menu_track_id == Some(track.id.as_str());
     let remove_confirmation_open = remove_confirmation_track_id == Some(track.id.as_str());
     let title_track_id = track.id.clone();
     let review_track_id = track.id.clone();
@@ -10786,7 +9359,7 @@ fn planner_card_with_key(
     let replace_control = replace_toggle(track, format!("planner-replace-{}", track.id));
     let review_control = ui::icon_button(planner_review_icon())
         .subtle()
-        .message(Message::SelectTrack(review_track_id))
+        .message(Message::ReviewTrack(review_track_id))
         .key(format!("planner-review-{}", track.id))
         .tooltip("Review track")
         .size(28.0, 24.0);
@@ -10872,12 +9445,6 @@ fn planner_card_with_key(
         .fill_width()
         .subtle(),
         stage_dropdown(track, stage_menu_open, selected),
-        status_dropdown_for_host(
-            track,
-            status_menu_open,
-            selected,
-            StatusMenuHost::Planner(track.stage),
-        ),
     ])
     .padding(TRACK_CARD_CONTENT_INSET)
     .spacing(TRACK_CARD_CONTENT_SPACING)
@@ -10886,18 +9453,6 @@ fn planner_card_with_key(
         .key(card_key)
         .fill_width()
         .height(planner_card_height())
-}
-
-#[cfg(test)]
-fn tracks_with_status(
-    tracks: &[storage::Track],
-    status: Option<storage::TrackStatus>,
-) -> Vec<&storage::Track> {
-    let (favorites, non_favorites): (Vec<_>, Vec<_>) = tracks
-        .iter()
-        .filter(|track| status.is_none_or(|status| track.status == status))
-        .partition(|track| track.favorite);
-    favorites.into_iter().chain(non_favorites).collect()
 }
 
 #[cfg(test)]
@@ -10915,7 +9470,7 @@ impl<'a> PlannerTrackProjection<'a> {
 
 fn planner_stage_index(stage: storage::TrackStage) -> usize {
     match stage {
-        storage::TrackStage::SoundDesign => 0,
+        storage::TrackStage::Backlog => 0,
         storage::TrackStage::Production => 1,
         storage::TrackStage::Mixdown => 2,
         storage::TrackStage::Mastering => 3,
@@ -10923,13 +9478,9 @@ fn planner_stage_index(stage: storage::TrackStage) -> usize {
 }
 
 #[cfg(test)]
-fn planner_tracks_with_status(
-    library: &storage::Library,
-    status: Option<storage::TrackStatus>,
-) -> PlannerTrackProjection<'_> {
+fn planner_tracks_with_favorites(library: &storage::Library) -> PlannerTrackProjection<'_> {
     let ordered = storage::planner_tracks(library)
         .into_iter()
-        .filter(|track| status.is_none_or(|status| track.status == status))
         .collect::<Vec<_>>();
     let mut by_stage = std::array::from_fn(|_| Vec::new());
     for track in &ordered {
@@ -10955,11 +9506,10 @@ fn planner_insertion_target_is_valid(
     library: &storage::Library,
     source_id: &str,
     target: &PlannerInsertionTarget,
-    status_filter: Option<storage::TrackStatus>,
 ) -> bool {
     let mut projection = LibraryProjectionCache::default();
-    projection.ensure(0, library, None, status_filter);
-    planner_insertion_target_is_valid_cached(library, &projection, source_id, target, status_filter)
+    projection.ensure(0, library);
+    planner_insertion_target_is_valid_cached(library, &projection, source_id, target)
 }
 
 fn planner_insertion_target_is_valid_cached(
@@ -10967,15 +9517,11 @@ fn planner_insertion_target_is_valid_cached(
     projection: &LibraryProjectionCache,
     source_id: &str,
     target: &PlannerInsertionTarget,
-    status_filter: Option<storage::TrackStatus>,
 ) -> bool {
     let Some(source_index) = projection.library_index(source_id) else {
         return false;
     };
-    let source = &library.tracks[source_index];
-    if status_filter.is_some_and(|status| source.status != status) {
-        return false;
-    }
+    let _source = &library.tracks[source_index];
     let target_count = projection.planner_stage_indices(target.stage).len();
     target.slot <= target_count
 }
@@ -10988,17 +9534,16 @@ fn planner_insertion_status_cached(
     let tracks = projection.planner_stage_indices(target.stage);
     if let Some(&library_index) = tracks.get(target.slot) {
         let track = &library.tracks[library_index];
-        format!("Release above {}.", track.title)
+        format!("Place above {}.", track.title)
     } else {
         format!(
-            "Release at the end of {}.",
+            "Place at the end of {}.",
             planner_column_heading(target.stage)
         )
     }
 }
 
 const STAGE_MENU_WIDTH: f32 = 174.0;
-const STATUS_MENU_WIDTH: f32 = 174.0;
 const REFERENCE_SETTINGS_WINDOW_WIDTH: f32 = 680.0;
 const REFERENCE_SETTINGS_WINDOW_HEIGHT: f32 = 520.0;
 const REFERENCE_SETTINGS_WINDOW_PADDING: f32 = 22.0;
@@ -11015,7 +9560,6 @@ fn keyboard_stage_menu_anchor(state: &AppState) -> Point {
     match state.workspace_mode {
         WorkspaceMode::Review => Point::new(LIBRARY_WIDTH, 150.0),
         WorkspaceMode::Planner => Point::new(18.0 + STAGE_MENU_WIDTH * 0.5, 96.0),
-        WorkspaceMode::Audition => Point::new(LIBRARY_WIDTH, 150.0),
     }
 }
 
@@ -11029,7 +9573,7 @@ fn stage_menu_anchor_from_pointer(position: Point) -> Point {
 fn stage_dropdown_options(track: &storage::Track) -> Vec<ui::DropdownOption<Message>> {
     let stage_id = track.id.clone();
     [
-        storage::TrackStage::SoundDesign,
+        storage::TrackStage::Backlog,
         storage::TrackStage::Production,
         storage::TrackStage::Mixdown,
         storage::TrackStage::Mastering,
@@ -11046,16 +9590,6 @@ fn stage_dropdown_options(track: &storage::Track) -> Vec<ui::DropdownOption<Mess
         )
     })
     .collect()
-}
-
-fn status_visual_color(status: storage::TrackStatus, theme: &ThemeTokens) -> ui::Rgba8 {
-    match status {
-        storage::TrackStatus::Inbox => TRACK_CARD_SELECTED_CORAL,
-        storage::TrackStatus::Refine => theme.accent_warning,
-        storage::TrackStatus::Release => theme.highlight_cyan,
-        storage::TrackStatus::Archive => theme.text_muted,
-        storage::TrackStatus::Maybe => theme.accent_danger,
-    }
 }
 
 fn card_control(
@@ -11300,98 +9834,6 @@ fn reference_menu_popover(
     ))
 }
 
-fn status_dropdown_trigger(
-    track: &storage::Track,
-    open: bool,
-    host: StatusMenuHost,
-) -> ui::View<Message> {
-    let status_id = track.id.clone();
-    let label = track.status.label().to_owned();
-    let trigger = ui::dropdown_trigger(label, open)
-        .toggle_message(Message::ToggleStatusMenuAt {
-            track_id: status_id,
-            host,
-        })
-        .build()
-        .style(ui::WidgetStyle::strong(ui::WidgetTone::Neutral))
-        .key(format!("status-dropdown-{}", track.id))
-        .fill_width()
-        .height(ui::dropdown_trigger_height());
-    let trigger = if open {
-        trigger.overlays(ui::overlays().popover(status_menu_popover(track, host)))
-    } else {
-        trigger
-    };
-    ui::row([status_dropdown_rail(track.status), trigger])
-        .spacing(STATUS_RAIL_GAP)
-        .fill_width()
-        .height(ui::dropdown_trigger_height())
-}
-
-fn status_dropdown_for_host(
-    track: &storage::Track,
-    open: bool,
-    _selected: bool,
-    host: StatusMenuHost,
-) -> ui::View<Message> {
-    let _ = _selected;
-    ui::column([status_dropdown_trigger(track, open, host)])
-        .fill_width()
-        .height(ui::dropdown_trigger_height())
-}
-
-fn status_menu_popover(track: &storage::Track, host: StatusMenuHost) -> ui::View<Message> {
-    anchored_popover_from_parts(AnchoredPopoverParts::below(
-        status_menu(track, host),
-        ui::AnchoredPopoverAnchor::trigger(
-            0.0,
-            0.0,
-            STATUS_MENU_WIDTH,
-            ui::dropdown_trigger_height(),
-        ),
-        Vector2::new(STATUS_MENU_WIDTH, ui::dropdown_menu_height(5)),
-    ))
-}
-
-fn status_menu(track: &storage::Track, host: StatusMenuHost) -> ui::View<Message> {
-    let track_id = track.id.clone();
-    colored_status_menu(
-        format!("status-menu-{}-{}", track.id, status_menu_host_key(host)),
-        [
-            storage::TrackStatus::Inbox,
-            storage::TrackStatus::Refine,
-            storage::TrackStatus::Release,
-            storage::TrackStatus::Archive,
-            storage::TrackStatus::Maybe,
-        ]
-        .into_iter()
-        .map(|status| {
-            (
-                Some(status),
-                track.status == status,
-                Message::SetStatus {
-                    track_id: track_id.clone(),
-                    status,
-                },
-                format!(
-                    "status-menu-option-{}-{}",
-                    track.id,
-                    status.label().to_ascii_lowercase()
-                ),
-            )
-        })
-        .collect(),
-    )
-}
-
-const fn status_menu_host_key(host: StatusMenuHost) -> &'static str {
-    match host {
-        StatusMenuHost::Library => "library",
-        StatusMenuHost::Planner(_) => "planner",
-        StatusMenuHost::Audition => "audition",
-    }
-}
-
 fn library_panel(state: &AppState, projection: &LibraryProjectionCache) -> ui::View<Message> {
     let selected_id = state.library.selected_track_id.clone();
     let review_indices = projection.review_indices();
@@ -11418,41 +9860,18 @@ fn library_panel(state: &AppState, projection: &LibraryProjectionCache) -> ui::V
             .message(Message::ImportPressed)
             .fill_width()
             .height(34.0),
-        status_filter_dropdown(
-            state.review_status_filter,
-            "review",
-            review_status_filter_message,
-            state.review_filter_menu_open,
-        ),
         if review_indices.is_empty() {
-            if total_track_count == 0 {
-                ui::column([
-                    ui::text("No tracks yet.").height(28.0).fill_width(),
-                    ui::text("Choose a file or drop audio onto the workspace.")
-                        .wrap()
-                        .height(48.0)
-                        .fill_width()
-                        .subtle(),
-                ])
-                .padding(12.0)
-                .spacing(6.0)
-                .fill_width()
-            } else {
-                ui::column([
-                    ui::text("No matching tracks.").height(28.0).fill_width(),
-                    ui::text(format!(
-                        "No tracks in the {} status.",
-                        status_filter_label(state.review_status_filter)
-                    ))
+            ui::column([
+                ui::text("No tracks yet.").height(28.0).fill_width(),
+                ui::text("Choose a file or drop audio onto the workspace.")
                     .wrap()
                     .height(48.0)
                     .fill_width()
                     .subtle(),
-                ])
-                .padding(12.0)
-                .spacing(6.0)
-                .fill_width()
-            }
+            ])
+            .padding(12.0)
+            .spacing(6.0)
+            .fill_width()
         } else {
             let selected_index = selected_id
                 .as_deref()
@@ -11476,8 +9895,6 @@ fn library_panel(state: &AppState, projection: &LibraryProjectionCache) -> ui::V
                         &state.library.tracks[review_indices[index]],
                         selected_id.as_deref(),
                         state.stage_menu_track_id.as_deref(),
-                        state.status_menu_track_id.as_deref(),
-                        state.status_menu_host,
                         state.remove_confirmation_track_id.as_deref(),
                     ),
                     row_height,
@@ -11512,15 +9929,11 @@ fn track_row(
     track: &storage::Track,
     selected_id: Option<&str>,
     stage_menu_track_id: Option<&str>,
-    status_menu_track_id: Option<&str>,
-    status_menu_host: Option<StatusMenuHost>,
     remove_confirmation_track_id: Option<&str>,
 ) -> ui::View<Message> {
     let selected = selected_id == Some(track.id.as_str());
     let id = track.id.clone();
     let stage_menu_open = stage_menu_track_id == Some(track.id.as_str());
-    let status_menu_open = status_menu_host == Some(StatusMenuHost::Library)
-        && status_menu_track_id == Some(track.id.as_str());
     let remove_confirmation_open = remove_confirmation_track_id == Some(track.id.as_str());
     let title_widget_id = library_track_title_id(&track.id);
     let remove_id = track.id.clone();
@@ -11534,8 +9947,6 @@ fn track_row(
         .tooltip("Remove track")
         .size(28.0, 24.0);
     let stage_control = stage_dropdown(track, stage_menu_open, selected);
-    let status_control =
-        status_dropdown_for_host(track, status_menu_open, selected, StatusMenuHost::Library);
     let removal_controls = if remove_confirmation_open {
         ui::row([
             card_control(
@@ -11602,7 +10013,6 @@ fn track_row(
                 .subtle(),
             removal_controls,
             stage_control,
-            status_control,
         ])
         .padding(TRACK_CARD_CONTENT_INSET)
         .fill_width()
@@ -11612,22 +10022,22 @@ fn track_row(
     .fill_width()
 }
 
-fn audition_source_choice(
+fn playback_source_choice(
     label: &'static str,
-    source: AuditionSource,
+    source: PlaybackSource,
     selected: bool,
     shows_stop: bool,
 ) -> ui::View<Message> {
-    ui::icon_button(audition_source_icon(shows_stop))
+    ui::icon_button(playback_source_icon(shows_stop))
         .active(selected)
-        .message(Message::ActivateAuditionSource(source))
-        .key(format!("audition-source-{}", label.to_ascii_lowercase()))
-        .tooltip(format!("Audition {label}"))
-        .size(AUDITION_SOURCE_SELECTOR_WIDTH, 28.0)
+        .message(Message::ActivatePlaybackSource(source))
+        .key(format!("playback-source-{}", label.to_ascii_lowercase()))
+        .tooltip(format!("Play {label}"))
+        .size(PLAYBACK_SOURCE_SELECTOR_WIDTH, 28.0)
 }
 
-fn source_button_shows_stop(state: &AppState, source: AuditionSource) -> bool {
-    state.audition_source == source && source_transport_is_active(state, source)
+fn source_button_shows_stop(state: &AppState, source: PlaybackSource) -> bool {
+    state.playback_source == source && source_transport_is_active(state, source)
 }
 
 const REVIEW_TRANSPORT_ICON_TINTS: ui::SvgIconTintPalette = ui::SvgIconTintPalette::new(
@@ -11667,7 +10077,7 @@ static REVIEW_VOLUME_ICON: ui::SvgIconTintCache = ui::SvgIconTintCache::new(
 </svg>"#,
 );
 
-fn audition_source_icon(transporting: bool) -> ui::SvgIcon {
+fn playback_source_icon(transporting: bool) -> ui::SvgIcon {
     let icon = if transporting {
         &REVIEW_SOURCE_STOP_ICON
     } else {
@@ -11683,10 +10093,10 @@ fn review_transport_icon(icon: &'static ui::SvgIconTintCache, active: bool) -> u
 fn current_live_frame_for_source(
     state: &AppState,
     track_id: &str,
-    source: AuditionSource,
+    source: PlaybackSource,
 ) -> Option<Arc<transport::LiveSpectrogramFrame>> {
     match source {
-        AuditionSource::Main => {
+        PlaybackSource::Main => {
             if state.waveform_track_id.as_deref() != Some(track_id) {
                 return None;
             }
@@ -11696,7 +10106,7 @@ fn current_live_frame_for_source(
                 && frame.revision == state.live_spectrogram_revision)
                 .then(|| Arc::clone(frame))
         }
-        AuditionSource::Reference => {
+        PlaybackSource::Reference => {
             if state.reference_waveform_track_id.as_deref() != Some(track_id) {
                 return None;
             }
@@ -11713,14 +10123,14 @@ fn current_live_frame_for_source(
     }
 }
 
-fn review_spectrogram_source(state: &AppState) -> AuditionSource {
+fn review_spectrogram_source(state: &AppState) -> PlaybackSource {
     if state.reference_only_playback {
-        AuditionSource::Reference
+        PlaybackSource::Reference
     } else {
         match (state.transport_playing, state.reference_transport_playing) {
-            (true, false) => AuditionSource::Main,
-            (false, true) => AuditionSource::Reference,
-            (true, true) | (false, false) => state.audition_source,
+            (true, false) => PlaybackSource::Main,
+            (false, true) => PlaybackSource::Reference,
+            (true, true) | (false, false) => state.playback_source,
         }
     }
 }
@@ -11728,7 +10138,7 @@ fn review_spectrogram_source(state: &AppState) -> AuditionSource {
 fn live_spectrogram_display_sample_rate(
     state: &AppState,
     track_id: &str,
-    source: AuditionSource,
+    source: PlaybackSource,
     frame: Option<&transport::LiveSpectrogramFrame>,
 ) -> u32 {
     if let Some(frame) = frame {
@@ -11739,13 +10149,13 @@ fn live_spectrogram_display_sample_rate(
     // source's decoded waveform metadata so the empty shell uses the source
     // Nyquist range. Fall back to 48 kHz only when that metadata is unavailable.
     let sample_rate = match source {
-        AuditionSource::Main => state
+        PlaybackSource::Main => state
             .waveform_track_id
             .as_deref()
             .filter(|id| *id == track_id)
             .and(state.waveform.as_ref())
             .map(|waveform| waveform.sample_rate),
-        AuditionSource::Reference => state
+        PlaybackSource::Reference => state
             .reference_waveform_track_id
             .as_deref()
             .filter(|id| *id == track_id)
@@ -11760,7 +10170,7 @@ fn live_spectrogram_display_sample_rate(
 fn live_spectrogram_frame_for_review(
     state: &AppState,
     track: &storage::Track,
-) -> (AuditionSource, Option<Arc<transport::LiveSpectrogramFrame>>) {
+) -> (PlaybackSource, Option<Arc<transport::LiveSpectrogramFrame>>) {
     let source = review_spectrogram_source(state);
     let frame = current_live_frame_for_source(state, &track.id, source);
     (source, frame)
@@ -11787,8 +10197,8 @@ fn live_spectrogram_section(state: &AppState, track: &storage::Track) -> ui::Vie
             format!(
                 "LIVE SPECTROGRAM · {} · {} BANDS",
                 match source {
-                    AuditionSource::Main => "MAIN",
-                    AuditionSource::Reference => "REFERENCE",
+                    PlaybackSource::Main => "MAIN",
+                    PlaybackSource::Reference => "REFERENCE",
                 },
                 frame.values.len() / frame.row_count.max(1),
             )
@@ -11944,7 +10354,7 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
         });
     let loop_selection = state
         .loop_selections
-        .get(AuditionSource::Main)
+        .get(PlaybackSource::Main)
         .map(|selection| (selection.start_ratio, selection.end_ratio));
     let waveform_view = if let Some(waveform) = state
         .waveform
@@ -12076,18 +10486,18 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
     .spacing(WAVEFORM_SECTION_SPACING)
     .fill_width()
     .height(waveform_pair_height);
-    let main_choice = audition_source_choice(
+    let main_choice = playback_source_choice(
         "MAIN",
-        AuditionSource::Main,
-        state.audition_source == AuditionSource::Main,
-        source_button_shows_stop(state, AuditionSource::Main),
+        PlaybackSource::Main,
+        state.playback_source == PlaybackSource::Main,
+        source_button_shows_stop(state, PlaybackSource::Main),
     );
-    let audition_source_control = if track.reference_path.is_some() {
-        let reference_choice = audition_source_choice(
+    let playback_source_control = if track.reference_path.is_some() {
+        let reference_choice = playback_source_choice(
             "REF",
-            AuditionSource::Reference,
-            state.audition_source == AuditionSource::Reference,
-            source_button_shows_stop(state, AuditionSource::Reference),
+            PlaybackSource::Reference,
+            state.playback_source == PlaybackSource::Reference,
+            source_button_shows_stop(state, PlaybackSource::Reference),
         );
         ui::column([
             ui::column([ui::spacer().fill(), main_choice, ui::spacer().fill()])
@@ -12098,7 +10508,7 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
             ui::spacer().height(reference_label_area_height),
         ])
         .spacing(0.0)
-        .width(AUDITION_SOURCE_SELECTOR_WIDTH)
+        .width(PLAYBACK_SOURCE_SELECTOR_WIDTH)
         .height(waveform_pair_height)
     } else {
         ui::column([
@@ -12107,10 +10517,10 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
             ui::spacer().fill(),
         ])
         .spacing(0.0)
-        .width(AUDITION_SOURCE_SELECTOR_WIDTH)
+        .width(PLAYBACK_SOURCE_SELECTOR_WIDTH)
         .height(waveform_pair_height)
     };
-    let waveform_with_source = ui::row([audition_source_control, waveform_pair])
+    let waveform_with_source = ui::row([playback_source_control, waveform_pair])
         .spacing(8.0)
         .fill_width()
         .height(waveform_pair_height);
@@ -12219,16 +10629,16 @@ fn review_global_controls(state: &AppState, track: &storage::Track) -> ui::View<
             .key("review-transport-volume")
             .tooltip(format!(
                 "Volume {:02}",
-                (state.audition_volume * 100.0).round() as u32
+                (state.playback_volume * 100.0).round() as u32
             ))
             .size(20.0, 26.0),
-        ui::slider(state.audition_volume)
+        ui::slider(state.playback_volume)
             .primary()
             .compact()
             .track_height(5.0)
             .track_border()
-            .on_edit(Message::AuditionVolumeChanged)
-            .key("native-audition-volume")
+            .on_edit(Message::PlaybackVolumeChanged)
+            .key("native-playback-volume")
             .height(26.0)
             .width(180.0),
     ])
@@ -12287,7 +10697,7 @@ fn reference_waveform_section(state: &AppState, track: &storage::Track) -> ui::V
     let reference_loop_bounds = reference_waveform.and_then(|waveform| {
         state
             .loop_selections
-            .get(AuditionSource::Reference)
+            .get(PlaybackSource::Reference)
             .and_then(|selection| projected_loop_bounds(selection, waveform.duration_millis))
     });
     let reference_meter_lufs = current_reference_lufs_meter_value(state, &track.id);
@@ -12316,7 +10726,7 @@ fn reference_waveform_section(state: &AppState, track: &storage::Track) -> ui::V
     let reference_body = if let Some(waveform) = reference_waveform {
         let loop_selection = state
             .loop_selections
-            .get(AuditionSource::Reference)
+            .get(PlaybackSource::Reference)
             .map(|selection| (selection.start_ratio, selection.end_ratio));
         let notes = reference_notes_for_track(&state.library, track);
         let reference_annotations_available = track
@@ -13471,46 +11881,42 @@ fn plural(count: usize) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        APP_VERSION_LABEL, AppState, AudioImportRequest, AudioImportTarget, AuditionSource,
+        APP_VERSION_LABEL, AppState, AudioImportRequest, AudioImportTarget,
         DEFAULT_LIVE_SPECTROGRAM_DISPLAY_SAMPLE_RATE, FavoriteMarkerWidget, ImportBatchProgress,
         LIBRARY_REVEAL_MARGIN, LIBRARY_SCROLL_VIEWPORT_ID, LibraryLoadState,
         LibraryProjectionCache, LibrarySaveAttempt, LiveSpectrogramMode, LoopBounds, LoopSelection,
         LoopSelections, MAIN_SOURCE_MISMATCH_STATUS, Message, NoteAddress, NoteDraft, NoteOwner,
-        PairedPlaybackGuard, PendingImportCommit, PlannerInsertionTarget, REFERENCE_MENU_WIDTH,
-        REFERENCE_SOURCE_MISMATCH_STATUS, ReferenceUnloadState, ResumeTransportCommand,
-        SETTINGS_REFERENCE_ROW_METADATA_HEIGHT, SETTINGS_REFERENCE_ROW_TEXT_HEIGHT,
-        SETTINGS_REFERENCE_ROW_TEXT_SPACING, SETTINGS_REFERENCE_ROW_TITLE_HEIGHT,
-        STATUS_BAR_VERSION_WIDTH, SharedLibrary, StatusMenuHost,
+        PairedPlaybackGuard, PendingImportCommit, PlannerInsertionTarget, PlaybackSource,
+        REFERENCE_MENU_WIDTH, REFERENCE_SOURCE_MISMATCH_STATUS, ReferenceUnloadState,
+        ResumeTransportCommand, SETTINGS_REFERENCE_ROW_METADATA_HEIGHT,
+        SETTINGS_REFERENCE_ROW_TEXT_HEIGHT, SETTINGS_REFERENCE_ROW_TEXT_SPACING,
+        SETTINGS_REFERENCE_ROW_TITLE_HEIGHT, STATUS_BAR_VERSION_WIDTH, SharedLibrary,
         TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER, TRACK_CARD_LIST_SPACING, TRACK_CARD_SELECTED_CORAL,
         WAVEFORM_HEIGHT, WaveformDecodeRequest, WorkspaceMode, animation_requested,
-        apply_transport_snapshot, audition_panel, audition_shuffle_seed, audition_statuses,
-        cleanup_reference_transport_failure, current_live_frame_for_source,
-        current_loudness_match_gain_db, current_lufs_meter_value,
-        current_reference_lufs_meter_value, decode_result_is_current, deterministic_shuffle,
-        enforce_loop, ensure_library_projection_cache, favorite_toggle, frame_surface_revisions,
-        library_dirty, library_track_card_height, library_track_title_id,
-        live_frame_matches_current_session, live_spectrogram_display_sample_rate, loop_bounds,
-        main_output_gain, native_launch_options, note_editor, note_ratio_for_id,
-        owned_tracks_in_stage, paint_live_playback_overlay, planner_insertion_target_is_valid,
-        planner_stage_index, planner_tracks_with_status, playback_shortcut,
-        progress_paired_playback_cleanup, project_surface, qualified_note_identity_key,
-        rebuild_audition_queue, reconcile_audition_queue, reference_assignment_counts,
+        apply_transport_snapshot, cleanup_reference_transport_failure,
+        current_live_frame_for_source, current_loudness_match_gain_db, current_lufs_meter_value,
+        current_reference_lufs_meter_value, decode_result_is_current, enforce_loop,
+        favorite_toggle, frame_surface_revisions, library_dirty, library_track_card_height,
+        library_track_title_id, live_frame_matches_current_session,
+        live_spectrogram_display_sample_rate, loop_bounds, main_output_gain, native_launch_options,
+        note_editor, note_ratio_for_id, owned_tracks_in_stage, paint_live_playback_overlay,
+        planner_insertion_target_is_valid, planner_stage_index, planner_tracks_with_favorites,
+        playback_shortcut, progress_paired_playback_cleanup, project_surface,
+        qualified_note_identity_key, reference_assignment_counts,
         reference_decode_result_is_current, reference_output_gain,
         reference_settings_auxiliary_windows, reference_settings_window_view,
         refresh_live_spectrogram, refresh_live_spectrograms, resume_transport_command,
-        review_spectrogram_source, review_status_filter_message, schedule_import,
-        schedule_library_save, schedule_reference_catalog_import, schedule_reference_import,
+        review_spectrogram_source, schedule_import, schedule_library_save,
+        schedule_reference_catalog_import, schedule_reference_import,
         schedule_reference_waveform_decode, schedule_replace, schedule_waveform_decode,
         seek_synchronized_positions, selected_reference_notes, selected_track, stage_dropdown,
         stage_menu_anchor_from_pointer, stage_menu_popover, start_source_alongside_active,
-        status_dropdown_for_host, status_filter_dropdown, status_menu,
-        sync_audition_queue_after_status_change, tracks_with_status,
         transport_command_is_confirmed, update,
     };
     use crate::transport::{LiveFrameState, Snapshot};
     use crate::{
         audio::{LoudnessPoint, WaveformData},
-        storage::{Library, Note, ReferenceTrack, Track, TrackStage, TrackStatus},
+        storage::{Library, Note, ReferenceTrack, Track, TrackStage},
         transport, waveform,
     };
     use radiant::{
@@ -13623,8 +12029,7 @@ mod tests {
             reference_path: None,
             size: 0,
             favorite: false,
-            stage: TrackStage::SoundDesign,
-            status: TrackStatus::Inbox,
+            stage: TrackStage::Backlog,
             notes: Vec::new(),
         });
         state
@@ -13779,7 +12184,6 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Production,
-            status: TrackStatus::Inbox,
             notes: Vec::new(),
         }
     }
@@ -13801,10 +12205,9 @@ mod tests {
     }
 
     #[test]
-    fn library_projection_cache_reuses_key_and_rebuilds_on_filter_or_generation_change() {
+    fn library_projection_cache_reuses_key_and_rebuilds_on_generation_change() {
         let mut favorite = audition_track("favorite");
         favorite.favorite = true;
-        favorite.status = TrackStatus::Refine;
         let regular = audition_track("regular");
         let library = Library {
             tracks: vec![favorite, regular],
@@ -13813,21 +12216,17 @@ mod tests {
         };
         let mut cache = LibraryProjectionCache::default();
 
-        cache.ensure(4, &library, None, None);
+        cache.ensure(4, &library);
         assert_eq!(cache.rebuild_count, 1);
         assert_eq!(cache.library_index("favorite"), Some(0));
         assert_eq!(cache.review_indices(), &[0, 1]);
         assert_eq!(cache.planner_indices(), &[1, 0]);
 
-        cache.ensure(4, &library, None, None);
+        cache.ensure(4, &library);
         assert_eq!(cache.rebuild_count, 1);
 
-        cache.ensure(4, &library, Some(TrackStatus::Refine), None);
+        cache.ensure(5, &library);
         assert_eq!(cache.rebuild_count, 2);
-        assert_eq!(cache.review_indices(), &[0]);
-
-        cache.ensure(5, &library, Some(TrackStatus::Refine), None);
-        assert_eq!(cache.rebuild_count, 3);
     }
 
     fn reference_removal_state() -> AppState {
@@ -14053,7 +12452,7 @@ mod tests {
         (state, path, proof, notes)
     }
 
-    fn audition_volume_edit(
+    fn playback_volume_edit(
         start: f32,
         value: f32,
         terminal: Option<EditPhase>,
@@ -14086,13 +12485,10 @@ mod tests {
     }
 
     fn audition_state(ids: &[&str]) -> AppState {
-        let queue = ids.iter().map(|id| String::from(*id)).collect::<Vec<_>>();
-        let selected_id = queue.first().cloned();
+        let selected_id = ids.first().map(|id| String::from(*id));
         let mut state = AppState {
             busy: false,
-            workspace_mode: WorkspaceMode::Audition,
-            audition_queue: queue,
-            audition_queue_index: 0,
+            workspace_mode: WorkspaceMode::Review,
             waveform: selected_id.as_ref().map(|_| audition_waveform()),
             waveform_track_id: selected_id.clone(),
             ..AppState::default()
@@ -14201,24 +12597,24 @@ mod tests {
 
         state.transport_playing = true;
         state.reference_transport_playing = false;
-        state.audition_source = AuditionSource::Main;
-        assert_eq!(review_spectrogram_source(&state), AuditionSource::Main);
+        state.playback_source = PlaybackSource::Main;
+        assert_eq!(review_spectrogram_source(&state), PlaybackSource::Main);
 
         state.live_spectrogram = None;
         state.live_spectrogram_revision = 0;
-        assert_eq!(review_spectrogram_source(&state), AuditionSource::Main);
-        assert!(current_live_frame_for_source(&state, &track.id, AuditionSource::Main).is_none());
+        assert_eq!(review_spectrogram_source(&state), PlaybackSource::Main);
+        assert!(current_live_frame_for_source(&state, &track.id, PlaybackSource::Main).is_none());
 
         state.transport_playing = false;
         state.reference_transport_playing = true;
-        state.audition_source = AuditionSource::Reference;
-        assert_eq!(review_spectrogram_source(&state), AuditionSource::Reference);
+        state.playback_source = PlaybackSource::Reference;
+        assert_eq!(review_spectrogram_source(&state), PlaybackSource::Reference);
 
         state.transport_playing = true;
         state.reference_transport_playing = true;
-        state.audition_source = AuditionSource::Main;
-        assert_eq!(review_spectrogram_source(&state), AuditionSource::Main);
-        assert!(current_live_frame_for_source(&state, &track.id, AuditionSource::Main).is_none());
+        state.playback_source = PlaybackSource::Main;
+        assert_eq!(review_spectrogram_source(&state), PlaybackSource::Main);
+        assert!(current_live_frame_for_source(&state, &track.id, PlaybackSource::Main).is_none());
     }
 
     #[test]
@@ -14240,7 +12636,7 @@ mod tests {
             });
             state.transport_playing = true;
             state.reference_transport_playing = true;
-            state.audition_source = AuditionSource::Main;
+            state.playback_source = PlaybackSource::Main;
             state.live_spectrogram_mode = mode;
             state
                 .reference_transport
@@ -14298,7 +12694,7 @@ mod tests {
                 RepaintScope::PaintOnly
             );
 
-            state.audition_source = AuditionSource::Reference;
+            state.playback_source = PlaybackSource::Reference;
             let switched_source = frame_surface_revisions(&mut state);
             assert_eq!(
                 switched_source.repaint_scope_since(repeated_revision),
@@ -14387,7 +12783,7 @@ mod tests {
                 Vector2::new(1180.0, 1100.0),
                 Duration::ZERO,
             );
-            assert!(current_live_frame_for_source(&state, "main", AuditionSource::Main).is_some());
+            assert!(current_live_frame_for_source(&state, "main", PlaybackSource::Main).is_some());
             let mut primitives = Vec::new();
             paint_live_playback_overlay(&mut state, context, &mut primitives);
 
@@ -14562,14 +12958,14 @@ mod tests {
         state.waveform.as_mut().expect("main waveform").sample_rate = 22_050;
 
         assert_eq!(
-            live_spectrogram_display_sample_rate(&state, &track.id, AuditionSource::Main, None,),
+            live_spectrogram_display_sample_rate(&state, &track.id, PlaybackSource::Main, None,),
             22_050
         );
         assert_eq!(
             live_spectrogram_display_sample_rate(
                 &state,
                 &track.id,
-                AuditionSource::Main,
+                PlaybackSource::Main,
                 Some(live_frame(0, 0, 1).as_ref()),
             ),
             48_000
@@ -14577,7 +12973,7 @@ mod tests {
 
         state.waveform_track_id = Some(String::from("other"));
         assert_eq!(
-            live_spectrogram_display_sample_rate(&state, &track.id, AuditionSource::Main, None,),
+            live_spectrogram_display_sample_rate(&state, &track.id, PlaybackSource::Main, None,),
             DEFAULT_LIVE_SPECTROGRAM_DISPLAY_SAMPLE_RATE
         );
     }
@@ -14720,7 +13116,7 @@ mod tests {
         ));
         state.transport_playing = true;
         let track = selected_track(&state).expect("selected test track").clone();
-        assert!(current_live_frame_for_source(&state, &track.id, AuditionSource::Main).is_some());
+        assert!(current_live_frame_for_source(&state, &track.id, PlaybackSource::Main).is_some());
     }
 
     #[test]
@@ -15106,8 +13502,8 @@ mod tests {
     fn source_icon_stop_states(primitives: &[PaintPrimitive]) -> Vec<bool> {
         let mut expected_documents = Vec::new();
         for (shows_stop, icon) in [
-            (false, super::audition_source_icon(false)),
-            (true, super::audition_source_icon(true)),
+            (false, super::playback_source_icon(false)),
+            (true, super::playback_source_icon(true)),
         ] {
             let mut expected_primitives = Vec::new();
             icon.append_paint(
@@ -15141,11 +13537,11 @@ mod tests {
             .collect()
     }
 
-    fn audition_source_icon_rects(primitives: &[PaintPrimitive]) -> Vec<Rect> {
+    fn playback_source_icon_rects(primitives: &[PaintPrimitive]) -> Vec<Rect> {
         let mut expected_documents = Vec::new();
         for icon in [
-            super::audition_source_icon(false),
-            super::audition_source_icon(true),
+            super::playback_source_icon(false),
+            super::playback_source_icon(true),
         ] {
             let mut expected_primitives = Vec::new();
             icon.append_paint(
@@ -15541,8 +13937,7 @@ mod tests {
             reference_path: None,
             size: 0,
             favorite: false,
-            stage: TrackStage::SoundDesign,
-            status: TrackStatus::Inbox,
+            stage: TrackStage::Backlog,
             notes: vec![Note {
                 id: note_id.clone(),
                 time_millis: 1_250,
@@ -15611,8 +14006,7 @@ mod tests {
             reference_path: Some(reference_path.clone()),
             size: 0,
             favorite: false,
-            stage: TrackStage::SoundDesign,
-            status: TrackStatus::Inbox,
+            stage: TrackStage::Backlog,
             notes: Vec::new(),
         });
         state.library.reference_tracks.push(ReferenceTrack {
@@ -15687,7 +14081,6 @@ mod tests {
         for label in [
             "Review",
             "Planner",
-            "Audition",
             "SPACE  play · ESC  stop · N  note",
             APP_VERSION_LABEL,
         ] {
@@ -15849,8 +14242,7 @@ mod tests {
             reference_path: Some(second_path.clone()),
             size: 0,
             favorite: false,
-            stage: TrackStage::SoundDesign,
-            status: TrackStatus::Inbox,
+            stage: TrackStage::Backlog,
             notes: Vec::new(),
         }];
         state.library.tracks.push(Track {
@@ -15862,8 +14254,7 @@ mod tests {
             reference_path: Some(first_path.clone()),
             size: 0,
             favorite: false,
-            stage: TrackStage::SoundDesign,
-            status: TrackStatus::Inbox,
+            stage: TrackStage::Backlog,
             notes: Vec::new(),
         });
         state.library.reference_tracks = vec![
@@ -16017,11 +14408,8 @@ mod tests {
             busy: false,
             stage_menu_track_id: Some(String::from("stage")),
             stage_menu_anchor: Some(Point::new(10.0, 10.0)),
-            status_menu_track_id: Some(String::from("status")),
-            status_menu_host: Some(StatusMenuHost::Library),
             reference_menu_track_id: Some(String::from("reference")),
             reference_menu_anchor: Some(Point::new(20.0, 20.0)),
-            review_filter_menu_open: true,
             ..AppState::default()
         };
         let mut context = ui::UiUpdateContext::default();
@@ -16030,11 +14418,8 @@ mod tests {
         assert!(state.settings_open);
         assert_eq!(state.stage_menu_track_id, None);
         assert_eq!(state.stage_menu_anchor, None);
-        assert_eq!(state.status_menu_track_id, None);
-        assert_eq!(state.status_menu_host, None);
         assert_eq!(state.reference_menu_track_id, None);
         assert_eq!(state.reference_menu_anchor, None);
-        assert!(!state.review_filter_menu_open);
 
         update(&mut state, Message::ToggleSettings, &mut context);
         assert!(!state.settings_open);
@@ -16059,8 +14444,7 @@ mod tests {
                 reference_path: None,
                 size: 0,
                 favorite: false,
-                stage: TrackStage::SoundDesign,
-                status: TrackStatus::Inbox,
+                stage: TrackStage::Backlog,
                 notes: Vec::new(),
             }],
             selected_track_id: Some(String::from("main-track")),
@@ -16125,8 +14509,7 @@ mod tests {
             reference_path: Some(reference_path.clone()),
             size: 0,
             favorite: false,
-            stage: TrackStage::SoundDesign,
-            status: TrackStatus::Inbox,
+            stage: TrackStage::Backlog,
             notes: Vec::new(),
         });
         state.library.reference_tracks.push(ReferenceTrack {
@@ -16324,8 +14707,7 @@ mod tests {
             reference_path: None,
             size: 0,
             favorite: false,
-            stage: TrackStage::SoundDesign,
-            status: TrackStatus::Inbox,
+            stage: TrackStage::Backlog,
             notes: vec![
                 Note {
                     id: note_id.clone(),
@@ -16602,7 +14984,7 @@ mod tests {
     }
 
     #[test]
-    fn audition_volume_changes_output_gain_without_changing_raw_lufs() {
+    fn playback_volume_changes_output_gain_without_changing_raw_lufs() {
         let mut state = AppState {
             busy: false,
             waveform: Some(WaveformData {
@@ -16626,7 +15008,7 @@ mod tests {
 
         update(
             &mut state,
-            Message::AuditionVolumeChanged(audition_volume_edit(
+            Message::PlaybackVolumeChanged(playback_volume_edit(
                 transport::DEFAULT_VOLUME,
                 0.25,
                 None,
@@ -16634,7 +15016,7 @@ mod tests {
             &mut context,
         );
 
-        assert_eq!(state.audition_volume, 0.25);
+        assert_eq!(state.playback_volume, 0.25);
         assert_eq!(main_output_gain(&state), 0.25);
         assert_eq!(
             context.into_command().repaint_scope(),
@@ -16650,17 +15032,17 @@ mod tests {
     }
 
     #[test]
-    fn audition_volume_terminal_edit_reprojects_and_cancel_restores() {
+    fn playback_volume_terminal_edit_reprojects_and_cancel_restores() {
         let mut state = AppState {
             busy: false,
-            audition_volume: 0.8,
+            playback_volume: 0.8,
             ..AppState::default()
         };
         let mut context = ui::UiUpdateContext::default();
 
         update(
             &mut state,
-            Message::AuditionVolumeChanged(audition_volume_edit(
+            Message::PlaybackVolumeChanged(playback_volume_edit(
                 0.8,
                 0.25,
                 Some(EditPhase::Commit),
@@ -16668,7 +15050,7 @@ mod tests {
             &mut context,
         );
 
-        assert_eq!(state.audition_volume, 0.25);
+        assert_eq!(state.playback_volume, 0.25);
         assert_eq!(main_output_gain(&state), 0.25);
         assert_eq!(
             context.into_command().repaint_scope(),
@@ -16678,7 +15060,7 @@ mod tests {
         let mut context = ui::UiUpdateContext::default();
         update(
             &mut state,
-            Message::AuditionVolumeChanged(audition_volume_edit(
+            Message::PlaybackVolumeChanged(playback_volume_edit(
                 0.25,
                 0.75,
                 Some(EditPhase::Cancel),
@@ -16686,7 +15068,7 @@ mod tests {
             &mut context,
         );
 
-        assert_eq!(state.audition_volume, 0.25);
+        assert_eq!(state.playback_volume, 0.25);
         assert_eq!(main_output_gain(&state), 0.25);
         assert_eq!(
             context.into_command().repaint_scope(),
@@ -16725,7 +15107,7 @@ mod tests {
             waveform_track_id: Some(track_id.clone()),
             transport_playing: true,
             transport_position_millis: 400,
-            audition_volume: 0.1,
+            playback_volume: 0.1,
             ..AppState::default()
         };
 
@@ -16734,7 +15116,7 @@ mod tests {
         state.transport_position_millis = 600;
         assert_eq!(current_lufs_meter_value(&state, &track_id), Some(-8.0));
 
-        state.audition_volume = 0.9;
+        state.playback_volume = 0.9;
         assert_eq!(current_lufs_meter_value(&state, &track_id), Some(-8.0));
 
         state.transport_position_millis = 800;
@@ -16831,8 +15213,8 @@ mod tests {
             waveform_track_id: Some(track_id.clone()),
             reference_waveform: Some(reference),
             reference_waveform_track_id: Some(track_id.clone()),
-            audition_volume: 0.5,
-            audition_source: AuditionSource::Reference,
+            playback_volume: 0.5,
+            playback_source: PlaybackSource::Reference,
             ..AppState::default()
         };
         state.library.selected_track_id = Some(track_id.clone());
@@ -16845,8 +15227,7 @@ mod tests {
             reference_path: Some(PathBuf::from("/external/reference.wav")),
             size: 0,
             favorite: false,
-            stage: TrackStage::SoundDesign,
-            status: TrackStatus::Inbox,
+            stage: TrackStage::Backlog,
             notes: Vec::new(),
         });
         let mut context = ui::UiUpdateContext::default();
@@ -16855,7 +15236,7 @@ mod tests {
         update(&mut state, Message::ToggleReferenceMatch, &mut context);
 
         assert!(state.reference_match_enabled);
-        assert_eq!(state.audition_volume, 0.5);
+        assert_eq!(state.playback_volume, 0.5);
         assert_eq!(
             state
                 .waveform
@@ -16899,8 +15280,8 @@ mod tests {
             waveform_track_id: Some(track_id.clone()),
             reference_waveform: Some(reference),
             reference_waveform_track_id: Some(track_id.clone()),
-            audition_volume: 0.5,
-            audition_source: AuditionSource::Reference,
+            playback_volume: 0.5,
+            playback_source: PlaybackSource::Reference,
             ..AppState::default()
         };
         state.library.selected_track_id = Some(track_id.clone());
@@ -16913,8 +15294,7 @@ mod tests {
             reference_path: Some(PathBuf::from("/external/reference.wav")),
             size: 0,
             favorite: false,
-            stage: TrackStage::SoundDesign,
-            status: TrackStatus::Inbox,
+            stage: TrackStage::Backlog,
             notes: Vec::new(),
         });
         let mut context = ui::UiUpdateContext::default();
@@ -16938,7 +15318,7 @@ mod tests {
     }
 
     #[test]
-    fn audition_source_toggle_switches_the_audible_synchronized_track() {
+    fn playback_source_toggle_switches_the_audible_synchronized_track() {
         let track_id = String::from("audition-track");
         let waveform = WaveformData {
             sample_rate: 48_000,
@@ -16961,7 +15341,7 @@ mod tests {
             waveform_track_id: Some(track_id.clone()),
             reference_waveform: Some(waveform),
             reference_waveform_track_id: Some(track_id.clone()),
-            audition_volume: 0.5,
+            playback_volume: 0.5,
             ..AppState::default()
         };
         state.library.selected_track_id = Some(track_id.clone());
@@ -16974,8 +15354,7 @@ mod tests {
             reference_path: Some(PathBuf::from("/external/reference.wav")),
             size: 0,
             favorite: false,
-            stage: TrackStage::SoundDesign,
-            status: TrackStatus::Inbox,
+            stage: TrackStage::Backlog,
             notes: Vec::new(),
         });
         let mut context = ui::UiUpdateContext::default();
@@ -16984,31 +15363,31 @@ mod tests {
         assert_eq!(reference_output_gain(&state), 0.0);
         update(
             &mut state,
-            Message::SelectAuditionSource(AuditionSource::Reference),
+            Message::SelectPlaybackSource(PlaybackSource::Reference),
             &mut context,
         );
-        assert_eq!(state.audition_source, AuditionSource::Reference);
+        assert_eq!(state.playback_source, PlaybackSource::Reference);
         assert_eq!(main_output_gain(&state), 0.0);
         assert_eq!(reference_output_gain(&state), 0.5);
         update(
             &mut state,
-            Message::SelectAuditionSource(AuditionSource::Main),
+            Message::SelectPlaybackSource(PlaybackSource::Main),
             &mut context,
         );
-        assert_eq!(state.audition_source, AuditionSource::Main);
+        assert_eq!(state.playback_source, PlaybackSource::Main);
 
         update(
             &mut state,
-            Message::SelectAuditionSource(AuditionSource::Reference),
+            Message::SelectPlaybackSource(PlaybackSource::Reference),
             &mut context,
         );
-        assert_eq!(state.audition_source, AuditionSource::Reference);
+        assert_eq!(state.playback_source, PlaybackSource::Reference);
         update(
             &mut state,
-            Message::SelectAuditionSource(AuditionSource::Reference),
+            Message::SelectPlaybackSource(PlaybackSource::Reference),
             &mut context,
         );
-        assert_eq!(state.audition_source, AuditionSource::Reference);
+        assert_eq!(state.playback_source, PlaybackSource::Reference);
     }
 
     #[test]
@@ -17016,7 +15395,7 @@ mod tests {
         let mut state = shared_reference_playback_state();
         state.transport_playing = true;
         state.reference_transport_playing = true;
-        state.audition_source = AuditionSource::Main;
+        state.playback_source = PlaybackSource::Main;
 
         let reference_transport = state
             .reference_transport
@@ -17039,23 +15418,23 @@ mod tests {
             .clone();
 
         assert_eq!(
-            super::current_live_frame_for_source(&state, &track_id, AuditionSource::Reference),
+            super::current_live_frame_for_source(&state, &track_id, PlaybackSource::Reference),
             Some(Arc::clone(&frame))
         );
 
-        super::set_audition_source(&mut state, AuditionSource::Reference);
+        super::set_playback_source(&mut state, PlaybackSource::Reference);
 
         let reset_epoch = reference_transport.live_frame_state().epoch;
         assert!(reset_epoch > reference_epoch);
         assert!(state.reference_live_spectrogram.is_none());
         assert_eq!(state.reference_live_spectrogram_revision, 0);
         assert!(
-            super::current_live_frame_for_source(&state, &track_id, AuditionSource::Reference)
+            super::current_live_frame_for_source(&state, &track_id, PlaybackSource::Reference)
                 .is_none()
         );
         let track = selected_track(&state).expect("the paired state should have a track");
         assert!(
-            current_live_frame_for_source(&state, &track.id, AuditionSource::Reference).is_none()
+            current_live_frame_for_source(&state, &track.id, PlaybackSource::Reference).is_none()
         );
     }
 
@@ -17089,22 +15468,22 @@ mod tests {
             revision: reference_frame.revision,
             pending: false,
         });
-        state.audition_source = AuditionSource::Reference;
+        state.playback_source = PlaybackSource::Reference;
         let track_id = selected_track(&state)
             .expect("the paired state should have a track")
             .id
             .clone();
 
         assert_eq!(
-            super::current_live_frame_for_source(&state, &track_id, AuditionSource::Main),
+            super::current_live_frame_for_source(&state, &track_id, PlaybackSource::Main),
             Some(Arc::clone(&main_frame))
         );
         assert_eq!(
-            super::current_live_frame_for_source(&state, &track_id, AuditionSource::Reference),
+            super::current_live_frame_for_source(&state, &track_id, PlaybackSource::Reference),
             Some(Arc::clone(&reference_frame))
         );
 
-        super::set_audition_source(&mut state, AuditionSource::Main);
+        super::set_playback_source(&mut state, PlaybackSource::Main);
 
         let reset_main_epoch = state.transport.live_frame_state().epoch;
         assert!(reset_main_epoch > main_epoch);
@@ -17120,20 +15499,20 @@ mod tests {
         );
         assert_eq!(state.reference_live_spectrogram_revision, 1);
         assert!(
-            super::current_live_frame_for_source(&state, &track_id, AuditionSource::Main).is_none()
+            super::current_live_frame_for_source(&state, &track_id, PlaybackSource::Main).is_none()
         );
         assert_eq!(
-            super::current_live_frame_for_source(&state, &track_id, AuditionSource::Reference),
+            super::current_live_frame_for_source(&state, &track_id, PlaybackSource::Reference),
             Some(Arc::clone(&reference_frame))
         );
         let track = selected_track(&state).expect("the paired state should have a track");
-        assert!(current_live_frame_for_source(&state, &track.id, AuditionSource::Main).is_none());
+        assert!(current_live_frame_for_source(&state, &track.id, PlaybackSource::Main).is_none());
     }
 
     #[test]
     fn main_waveform_click_switches_audition_to_the_imported_track() {
         let mut state = shared_reference_playback_state();
-        state.audition_source = AuditionSource::Reference;
+        state.playback_source = PlaybackSource::Reference;
         let mut context = ui::UiUpdateContext::default();
 
         update(
@@ -17145,7 +15524,7 @@ mod tests {
             &mut context,
         );
 
-        assert_eq!(state.audition_source, AuditionSource::Main);
+        assert_eq!(state.playback_source, PlaybackSource::Main);
         assert!(main_output_gain(&state) > 0.0);
         assert_eq!(reference_output_gain(&state), 0.0);
     }
@@ -17264,8 +15643,7 @@ mod tests {
             reference_path: Some(PathBuf::from("/external/reference.wav")),
             size: 0,
             favorite: false,
-            stage: TrackStage::SoundDesign,
-            status: TrackStatus::Inbox,
+            stage: TrackStage::Backlog,
             notes: Vec::new(),
         });
         state.waveform_source_ticket = Some(
@@ -17296,7 +15674,7 @@ mod tests {
         assert!(state.reference_transport_polling);
         assert!(state.reference_transport_waiting_token.is_some());
         assert!(state.reference_only_playback);
-        assert_eq!(state.audition_source, AuditionSource::Reference);
+        assert_eq!(state.playback_source, PlaybackSource::Reference);
         assert_eq!(main_output_gain(&state), 0.0);
         assert_eq!(
             waveform::ratio_for_millis(state.review_cursor_millis, 2_000),
@@ -17382,8 +15760,7 @@ mod tests {
             reference_path: Some(PathBuf::from("/external/reference.wav")),
             size: 0,
             favorite: false,
-            stage: TrackStage::SoundDesign,
-            status: TrackStatus::Inbox,
+            stage: TrackStage::Backlog,
             notes: Vec::new(),
         });
         state.waveform_source_ticket = Some(
@@ -17481,8 +15858,7 @@ mod tests {
             reference_path: Some(PathBuf::from("/external/reference.wav")),
             size: 0,
             favorite: false,
-            stage: TrackStage::SoundDesign,
-            status: TrackStatus::Inbox,
+            stage: TrackStage::Backlog,
             notes: Vec::new(),
         });
         state.waveform_source_ticket = Some(
@@ -17565,8 +15941,7 @@ mod tests {
             reference_path: Some(PathBuf::from("/external/paired-reference.wav")),
             size: 0,
             favorite: false,
-            stage: TrackStage::SoundDesign,
-            status: TrackStatus::Inbox,
+            stage: TrackStage::Backlog,
             notes: Vec::new(),
         });
         state.waveform_source_ticket = Some(
@@ -17664,7 +16039,7 @@ mod tests {
         assert_eq!(state.reference_transport_position_millis, 1_000);
         assert_eq!(state.review_cursor_millis, 600);
         assert_eq!(state.transport_position_millis, 600);
-        assert_eq!(state.audition_source, AuditionSource::Reference);
+        assert_eq!(state.playback_source, PlaybackSource::Reference);
 
         update(
             &mut state,
@@ -17862,11 +16237,11 @@ mod tests {
 
         update(
             &mut state,
-            Message::ActivateAuditionSource(AuditionSource::Main),
+            Message::ActivatePlaybackSource(PlaybackSource::Main),
             &mut context,
         );
 
-        assert_eq!(state.audition_source, AuditionSource::Main);
+        assert_eq!(state.playback_source, PlaybackSource::Main);
         assert!(state.transport_polling);
         assert!(state.transport_waiting_token.is_some());
         assert!(!state.reference_transport_polling);
@@ -17880,11 +16255,11 @@ mod tests {
 
         update(
             &mut state,
-            Message::ActivateAuditionSource(AuditionSource::Reference),
+            Message::ActivatePlaybackSource(PlaybackSource::Reference),
             &mut context,
         );
 
-        assert_eq!(state.audition_source, AuditionSource::Reference);
+        assert_eq!(state.playback_source, PlaybackSource::Reference);
         assert!(state.transport_polling);
         assert!(state.transport_waiting_token.is_some());
         assert!(state.reference_transport_polling);
@@ -17901,11 +16276,11 @@ mod tests {
 
         update(
             &mut state,
-            Message::ActivateAuditionSource(AuditionSource::Main),
+            Message::ActivatePlaybackSource(PlaybackSource::Main),
             &mut context,
         );
 
-        assert_eq!(state.audition_source, AuditionSource::Main);
+        assert_eq!(state.playback_source, PlaybackSource::Main);
         assert_eq!(state.status, "Stopping playback…");
         assert!(state.transport_polling);
         assert!(state.transport_waiting_token.is_some());
@@ -17922,11 +16297,11 @@ mod tests {
 
         update(
             &mut state,
-            Message::ActivateAuditionSource(AuditionSource::Reference),
+            Message::ActivatePlaybackSource(PlaybackSource::Reference),
             &mut context,
         );
 
-        assert_eq!(state.audition_source, AuditionSource::Reference);
+        assert_eq!(state.playback_source, PlaybackSource::Reference);
         assert!(state.transport_playing);
         assert!(state.reference_transport_playing);
         assert!(!state.transport_polling);
@@ -17938,18 +16313,18 @@ mod tests {
     #[test]
     fn main_source_circle_promotes_reference_only_playback() {
         let mut state = shared_reference_playback_state();
-        state.audition_source = AuditionSource::Reference;
+        state.playback_source = PlaybackSource::Reference;
         state.reference_only_playback = true;
         state.reference_transport_playing = true;
         let mut context = ui::UiUpdateContext::default();
 
         update(
             &mut state,
-            Message::ActivateAuditionSource(AuditionSource::Main),
+            Message::ActivatePlaybackSource(PlaybackSource::Main),
             &mut context,
         );
 
-        assert_eq!(state.audition_source, AuditionSource::Main);
+        assert_eq!(state.playback_source, PlaybackSource::Main);
         assert!(state.transport_polling);
         assert!(state.transport_waiting_token.is_some());
         assert!(state.reference_transport_playing);
@@ -17961,14 +16336,14 @@ mod tests {
     #[test]
     fn focused_reference_circle_stops_reference_only_playback_without_main_command() {
         let mut state = shared_reference_playback_state();
-        state.audition_source = AuditionSource::Reference;
+        state.playback_source = PlaybackSource::Reference;
         state.reference_only_playback = true;
         state.reference_transport_playing = true;
         let mut context = ui::UiUpdateContext::default();
 
         update(
             &mut state,
-            Message::ActivateAuditionSource(AuditionSource::Reference),
+            Message::ActivatePlaybackSource(PlaybackSource::Reference),
             &mut context,
         );
 
@@ -18198,8 +16573,7 @@ mod tests {
             reference_path: Some(PathBuf::from("/external/reference.wav")),
             size: 0,
             favorite: false,
-            stage: TrackStage::SoundDesign,
-            status: TrackStatus::Inbox,
+            stage: TrackStage::Backlog,
             notes: Vec::new(),
         });
         state.waveform_source_ticket = Some(
@@ -18279,8 +16653,7 @@ mod tests {
             reference_path: Some(PathBuf::from("/external/reference.wav")),
             size: 0,
             favorite: false,
-            stage: TrackStage::SoundDesign,
-            status: TrackStatus::Inbox,
+            stage: TrackStage::Backlog,
             notes: Vec::new(),
         });
         state.transport_position_millis = 500;
@@ -18346,7 +16719,7 @@ mod tests {
             &mut context,
         );
 
-        assert_eq!(state.audition_source, AuditionSource::Main);
+        assert_eq!(state.playback_source, PlaybackSource::Main);
         assert_eq!(
             state.loop_selections.main,
             Some(LoopSelection {
@@ -18574,7 +16947,7 @@ mod tests {
         let error = String::from("reference-only loop seek failed");
         let main_generation = state.transport_generation;
         let reference_generation = state.reference_transport_generation;
-        state.audition_source = AuditionSource::Reference;
+        state.playback_source = PlaybackSource::Reference;
         state.reference_only_playback = true;
         state.transport_playing = true;
         state.transport_position_millis = 510;
@@ -18846,9 +17219,6 @@ mod tests {
         state.transport_playing = true;
         state.transport_polling = true;
         state.transport_waiting_token = Some(7);
-        state.audition_auto_advance = true;
-        state.audition_play_token = Some(9);
-        state.audition_pending_play_track_id = Some(String::from("paired-admission-track"));
         state.reference_match_enabled = true;
         let transport_generation = state.transport_generation;
         state.transport.set_snapshot_for_test(Snapshot {
@@ -18878,9 +17248,6 @@ mod tests {
         assert!(!state.transport_playing);
         assert!(!state.transport_polling);
         assert!(state.transport_waiting_token.is_none());
-        assert!(!state.audition_auto_advance);
-        assert!(state.audition_play_token.is_none());
-        assert!(state.audition_pending_play_track_id.is_none());
         assert!(!state.reference_match_enabled);
         assert!(state.reference_waveform.is_some());
         assert!(state.reference_waveform_source_ticket.is_some());
@@ -18938,8 +17305,8 @@ mod tests {
     fn async_paired_reference_source_mismatch_restores_main_focus_after_cleanup() {
         let mut state = shared_reference_playback_state();
         state.paired_playback_guard = PairedPlaybackGuard::Active;
-        state.audition_source = AuditionSource::Reference;
-        state.audition_volume = 0.37;
+        state.playback_source = PlaybackSource::Reference;
+        state.playback_volume = 0.37;
         state.reference_match_enabled = true;
         state.transport_playing = true;
         state.reference_transport_playing = true;
@@ -18973,7 +17340,7 @@ mod tests {
         update(&mut state, Message::Frame, &mut context);
 
         assert_eq!(state.status, REFERENCE_SOURCE_MISMATCH_STATUS);
-        assert_eq!(state.audition_source, AuditionSource::Main);
+        assert_eq!(state.playback_source, PlaybackSource::Main);
         assert!(state.transport_playing);
         assert!(!state.reference_transport_playing);
         assert_eq!(state.transport_generation, transport_generation);
@@ -18997,7 +17364,7 @@ mod tests {
             state.paired_playback_guard,
             PairedPlaybackGuard::Idle
         ));
-        assert_eq!(state.audition_source, AuditionSource::Main);
+        assert_eq!(state.playback_source, PlaybackSource::Main);
         assert_eq!(state.transport_generation, transport_generation);
         assert_eq!(state.transport.requested_output_gain_for_test(), 0.37);
         assert_eq!(main_output_gain(&state), 0.37);
@@ -19088,7 +17455,7 @@ mod tests {
 
         update(
             &mut state,
-            Message::ActivateAuditionSource(AuditionSource::Reference),
+            Message::ActivatePlaybackSource(PlaybackSource::Reference),
             &mut context,
         );
 
@@ -19105,7 +17472,7 @@ mod tests {
     #[test]
     fn reference_only_promotion_main_failure_enters_paired_cleanup() {
         let mut state = shared_reference_playback_state();
-        state.audition_source = AuditionSource::Reference;
+        state.playback_source = PlaybackSource::Reference;
         state.reference_only_playback = true;
         state.reference_transport_playing = true;
         let error = String::from("main promotion failed immediately");
@@ -19114,7 +17481,7 @@ mod tests {
 
         update(
             &mut state,
-            Message::ActivateAuditionSource(AuditionSource::Main),
+            Message::ActivatePlaybackSource(PlaybackSource::Main),
             &mut context,
         );
 
@@ -19405,7 +17772,7 @@ mod tests {
         ));
         assert_eq!(
             state.transport.requested_output_gain_for_test(),
-            state.audition_volume
+            state.playback_volume
         );
     }
 
@@ -19481,7 +17848,7 @@ mod tests {
         assert!(state.transport_waiting_token.is_none());
         assert_eq!(
             state.transport.requested_output_gain_for_test(),
-            state.audition_volume
+            state.playback_volume
         );
     }
 
@@ -19561,7 +17928,7 @@ mod tests {
     #[test]
     fn reference_only_cleanup_retries_busy_unload_without_touching_main() {
         let mut state = shared_reference_playback_state();
-        state.audition_source = AuditionSource::Reference;
+        state.playback_source = PlaybackSource::Reference;
         state.reference_only_playback = true;
         state.transport_playing = true;
         state.transport_position_millis = 510;
@@ -19747,7 +18114,7 @@ mod tests {
             start_ratio: 0.25,
             end_ratio: 0.75,
         });
-        reference_driver_state.audition_source = AuditionSource::Reference;
+        reference_driver_state.playback_source = PlaybackSource::Reference;
         reference_driver_state.transport_playing = true;
         reference_driver_state.reference_transport_playing = true;
         reference_driver_state.transport_position_millis = 1_000;
@@ -19786,7 +18153,7 @@ mod tests {
             },
             &mut context,
         );
-        assert_eq!(state.audition_source, AuditionSource::Reference);
+        assert_eq!(state.playback_source, PlaybackSource::Reference);
         assert!(state.loop_selections.main.is_some());
         assert!(state.loop_selections.reference.is_some());
         assert_eq!(
@@ -19799,10 +18166,10 @@ mod tests {
 
         update(
             &mut state,
-            Message::SelectAuditionSource(AuditionSource::Main),
+            Message::SelectPlaybackSource(PlaybackSource::Main),
             &mut context,
         );
-        assert_eq!(state.audition_source, AuditionSource::Main);
+        assert_eq!(state.playback_source, PlaybackSource::Main);
         assert_eq!(
             loop_bounds(&state),
             Some(LoopBounds {
@@ -19813,14 +18180,14 @@ mod tests {
 
         update(
             &mut state,
-            Message::SelectAuditionSource(AuditionSource::Reference),
+            Message::SelectPlaybackSource(PlaybackSource::Reference),
             &mut context,
         );
         assert!(state.loop_selections.main.is_some());
         assert!(state.loop_selections.reference.is_some());
 
-        state.audition_source = AuditionSource::Main;
-        state.loop_selections.clear(AuditionSource::Main);
+        state.playback_source = PlaybackSource::Main;
+        state.loop_selections.clear(PlaybackSource::Main);
         assert!(loop_bounds(&state).is_none());
         assert!(state.loop_selections.reference.is_some());
     }
@@ -19935,8 +18302,7 @@ mod tests {
             reference_path: None,
             size: 0,
             favorite: false,
-            stage: TrackStage::SoundDesign,
-            status: TrackStatus::Inbox,
+            stage: TrackStage::Backlog,
             notes: Vec::new(),
         });
         let mut context = ui::UiUpdateContext::default();
@@ -20097,8 +18463,7 @@ mod tests {
             reference_path: Some(PathBuf::from("/external/reference.wav")),
             size: 0,
             favorite: false,
-            stage: TrackStage::SoundDesign,
-            status: TrackStatus::Inbox,
+            stage: TrackStage::Backlog,
             notes: Vec::new(),
         });
 
@@ -20126,7 +18491,7 @@ mod tests {
         );
         let main_waveform_rect = &waveform_lower_rails[0];
         let reference_waveform_rect = &waveform_lower_rails[1];
-        let source_icon_rects = audition_source_icon_rects(&frame.paint_plan.primitives);
+        let source_icon_rects = playback_source_icon_rects(&frame.paint_plan.primitives);
         let svg_count = frame
             .paint_plan
             .primitives
@@ -20138,11 +18503,11 @@ mod tests {
         assert!(labels.iter().any(|label| label == "Replace reference"));
         assert!(paint_plan_contains_icon(
             &frame.paint_plan.primitives,
-            &super::audition_source_icon(false),
+            &super::playback_source_icon(false),
         ));
         assert!(!paint_plan_contains_icon(
             &frame.paint_plan.primitives,
-            &super::audition_source_icon(true),
+            &super::playback_source_icon(true),
         ));
         assert!(labels.iter().any(|label| label == "MATCH REF"));
         assert!(
@@ -20230,7 +18595,6 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Production,
-            status: TrackStatus::Inbox,
             notes: vec![Note {
                 id: String::from("main-persisted-note"),
                 time_millis: 500,
@@ -20313,14 +18677,14 @@ mod tests {
 
         assert!(paint_plan_contains_icon(
             &frame.paint_plan.primitives,
-            &super::audition_source_icon(false),
+            &super::playback_source_icon(false),
         ));
         assert!(!paint_plan_contains_icon(
             &frame.paint_plan.primitives,
-            &super::audition_source_icon(true),
+            &super::playback_source_icon(true),
         ));
         let waveform_lower_rails = waveform_lower_rail_rects(&frame.paint_plan.primitives);
-        let source_icon_rects = audition_source_icon_rects(&frame.paint_plan.primitives);
+        let source_icon_rects = playback_source_icon_rects(&frame.paint_plan.primitives);
         let Some(main_waveform_rect) = waveform_lower_rails.first() else {
             panic!("the main-only review should paint a waveform lower rail");
         };
@@ -20342,11 +18706,11 @@ mod tests {
         state.reference_transport_playing = true;
         assert!(super::source_button_shows_stop(
             &state,
-            AuditionSource::Main
+            PlaybackSource::Main
         ));
         assert!(!super::source_button_shows_stop(
             &state,
-            AuditionSource::Reference
+            PlaybackSource::Reference
         ));
 
         let active_frame = project_surface(&state)
@@ -20357,14 +18721,14 @@ mod tests {
             "only focused Main should show Stop when both transports are active"
         );
 
-        state.audition_source = AuditionSource::Reference;
+        state.playback_source = PlaybackSource::Reference;
         assert!(!super::source_button_shows_stop(
             &state,
-            AuditionSource::Main
+            PlaybackSource::Main
         ));
         assert!(super::source_button_shows_stop(
             &state,
-            AuditionSource::Reference
+            PlaybackSource::Reference
         ));
         let swapped_focus_frame = project_surface(&state)
             .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1_000.0));
@@ -20374,15 +18738,15 @@ mod tests {
             "focus swap should move Stop to Reference"
         );
 
-        state.audition_source = AuditionSource::Main;
+        state.playback_source = PlaybackSource::Main;
         state.transport_playing = false;
         assert!(!super::source_button_shows_stop(
             &state,
-            AuditionSource::Main
+            PlaybackSource::Main
         ));
         assert!(!super::source_button_shows_stop(
             &state,
-            AuditionSource::Reference
+            PlaybackSource::Reference
         ));
         let inactive_focused_frame = project_surface(&state)
             .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1_000.0));
@@ -20392,16 +18756,16 @@ mod tests {
             "focused inactive Main should show Play beside active Reference"
         );
 
-        state.audition_source = AuditionSource::Reference;
+        state.playback_source = PlaybackSource::Reference;
         state.transport_playing = true;
         state.reference_transport_playing = false;
         assert!(!super::source_button_shows_stop(
             &state,
-            AuditionSource::Main
+            PlaybackSource::Main
         ));
         assert!(!super::source_button_shows_stop(
             &state,
-            AuditionSource::Reference
+            PlaybackSource::Reference
         ));
         let reference_inactive_focused_frame = project_surface(&state)
             .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1_000.0));
@@ -20418,7 +18782,7 @@ mod tests {
         state.transport_polling = true;
         assert!(super::source_button_shows_stop(
             &state,
-            AuditionSource::Main
+            PlaybackSource::Main
         ));
         let polling_main_frame = project_surface(&state)
             .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1_000.0));
@@ -20432,7 +18796,7 @@ mod tests {
         state.transport_waiting_token = Some(8);
         assert!(super::source_button_shows_stop(
             &state,
-            AuditionSource::Main
+            PlaybackSource::Main
         ));
         let waiting_main_frame = project_surface(&state)
             .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1_000.0));
@@ -20442,12 +18806,12 @@ mod tests {
             "focused Main should show Stop while waiting for a transport token"
         );
 
-        state.audition_source = AuditionSource::Reference;
+        state.playback_source = PlaybackSource::Reference;
         state.transport_waiting_token = None;
         state.reference_transport_polling = true;
         assert!(super::source_button_shows_stop(
             &state,
-            AuditionSource::Reference
+            PlaybackSource::Reference
         ));
         let polling_reference_frame = project_surface(&state)
             .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1_000.0));
@@ -20461,7 +18825,7 @@ mod tests {
         state.reference_transport_waiting_token = Some(9);
         assert!(super::source_button_shows_stop(
             &state,
-            AuditionSource::Reference
+            PlaybackSource::Reference
         ));
         let waiting_reference_frame = project_surface(&state)
             .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1_000.0));
@@ -20509,8 +18873,7 @@ mod tests {
             reference_path: Some(PathBuf::from("/external/reference-header.wav")),
             size: 0,
             favorite: false,
-            stage: TrackStage::SoundDesign,
-            status: TrackStatus::Inbox,
+            stage: TrackStage::Backlog,
             notes: Vec::new(),
         });
 
@@ -20550,8 +18913,7 @@ mod tests {
             reference_path: Some(first_path.clone()),
             size: 0,
             favorite: false,
-            stage: TrackStage::SoundDesign,
-            status: TrackStatus::Inbox,
+            stage: TrackStage::Backlog,
             notes: vec![Note {
                 id: String::from("main-note"),
                 time_millis: 100,
@@ -20879,8 +19241,7 @@ mod tests {
             reference_path: None,
             size: 0,
             favorite: false,
-            stage: TrackStage::SoundDesign,
-            status: TrackStatus::Inbox,
+            stage: TrackStage::Backlog,
             notes: vec![
                 Note {
                     id: String::from("target-note"),
@@ -20941,8 +19302,7 @@ mod tests {
             reference_path: Some(reference_path.clone()),
             size: 0,
             favorite: false,
-            stage: TrackStage::SoundDesign,
-            status: TrackStatus::Inbox,
+            stage: TrackStage::Backlog,
             notes: Vec::new(),
         });
         state.library.reference_tracks.push(ReferenceTrack {
@@ -21004,8 +19364,7 @@ mod tests {
             reference_path: None,
             size: 0,
             favorite: false,
-            stage: TrackStage::SoundDesign,
-            status: TrackStatus::Inbox,
+            stage: TrackStage::Backlog,
             notes: vec![
                 Note {
                     id: String::from("open-note"),
@@ -21157,8 +19516,7 @@ mod tests {
             reference_path: Some(reference_path.clone()),
             size: 0,
             favorite: false,
-            stage: TrackStage::SoundDesign,
-            status: TrackStatus::Inbox,
+            stage: TrackStage::Backlog,
             notes: Vec::new(),
         });
         state.library.reference_tracks.push(ReferenceTrack {
@@ -21326,8 +19684,7 @@ mod tests {
             reference_path: None,
             size: 0,
             favorite: false,
-            stage: TrackStage::SoundDesign,
-            status: TrackStatus::Inbox,
+            stage: TrackStage::Backlog,
             notes: vec![Note {
                 id: String::from("hover-note"),
                 time_millis: 1_000,
@@ -21391,8 +19748,7 @@ mod tests {
             reference_path: Some(reference_path.clone()),
             size: 0,
             favorite: false,
-            stage: TrackStage::SoundDesign,
-            status: TrackStatus::Inbox,
+            stage: TrackStage::Backlog,
             notes: Vec::new(),
         });
         state.library.reference_tracks.push(ReferenceTrack {
@@ -21490,8 +19846,7 @@ mod tests {
             reference_path: Some(reference_path.clone()),
             size: 0,
             favorite: false,
-            stage: TrackStage::SoundDesign,
-            status: TrackStatus::Inbox,
+            stage: TrackStage::Backlog,
             notes: Vec::new(),
         });
         state.library.reference_tracks.push(ReferenceTrack {
@@ -21667,8 +20022,7 @@ mod tests {
             reference_path: None,
             size: 0,
             favorite: false,
-            stage: TrackStage::SoundDesign,
-            status: TrackStatus::Inbox,
+            stage: TrackStage::Backlog,
             notes: vec![Note {
                 id: note_id.clone(),
                 time_millis: 1_000,
@@ -21852,8 +20206,7 @@ mod tests {
             reference_path: None,
             size: 0,
             favorite: false,
-            stage: TrackStage::SoundDesign,
-            status: TrackStatus::Inbox,
+            stage: TrackStage::Backlog,
             notes: vec![Note {
                 id: note_id,
                 time_millis: 1_250,
@@ -21931,8 +20284,7 @@ mod tests {
             reference_path: None,
             size: 0,
             favorite: false,
-            stage: TrackStage::SoundDesign,
-            status: TrackStatus::Inbox,
+            stage: TrackStage::Backlog,
             notes: vec![Note {
                 id: String::from("selected-note"),
                 time_millis: 1_000,
@@ -21990,8 +20342,7 @@ mod tests {
             reference_path: None,
             size: 0,
             favorite: false,
-            stage: TrackStage::SoundDesign,
-            status: TrackStatus::Inbox,
+            stage: TrackStage::Backlog,
             notes: vec![Note {
                 id: String::from("play-from-main-comment"),
                 time_millis: 750,
@@ -22018,7 +20369,7 @@ mod tests {
         assert_eq!(state.pending_main_seek_intent, Some(750));
         assert!(state.pending_comment_playback.is_none());
         assert_eq!(
-            resume_transport_command(&state, AuditionSource::Main, 750, None),
+            resume_transport_command(&state, PlaybackSource::Main, 750, None),
             ResumeTransportCommand::Seek
         );
 
@@ -22065,7 +20416,7 @@ mod tests {
         assert_eq!(state.pending_reference_seek_intent, Some(2_500));
         assert!(state.pending_comment_playback.is_none());
         assert_eq!(
-            resume_transport_command(&state, AuditionSource::Reference, 2_500, None),
+            resume_transport_command(&state, PlaybackSource::Reference, 2_500, None),
             ResumeTransportCommand::Seek
         );
 
@@ -22083,7 +20434,7 @@ mod tests {
         assert_eq!(
             resume_transport_command(
                 &state,
-                AuditionSource::Main,
+                PlaybackSource::Main,
                 state.transport_position_millis,
                 None,
             ),
@@ -22108,7 +20459,7 @@ mod tests {
         assert!(state.transport_polling);
 
         assert_eq!(
-            resume_transport_command(&state, AuditionSource::Main, 0, None),
+            resume_transport_command(&state, PlaybackSource::Main, 0, None),
             ResumeTransportCommand::Play
         );
     }
@@ -22156,39 +20507,6 @@ mod tests {
 
         assert!(state.pending_comment_playback.is_none());
         assert!(!animation_requested(&state));
-    }
-
-    #[test]
-    fn audition_navigation_cancels_deferred_comment_playback() {
-        let mut state = audition_state(&["a", "b"]);
-        state.pending_comment_playback = Some(super::PendingCommentPlayback {
-            address: NoteAddress::main("a", "deferred-comment"),
-        });
-        let mut context = ui::UiUpdateContext::default();
-
-        update(&mut state, Message::AuditionNext, &mut context);
-
-        assert_eq!(state.library.selected_track_id.as_deref(), Some("b"));
-        assert!(state.pending_comment_playback.is_none());
-    }
-
-    #[test]
-    fn audition_filter_reselection_cancels_deferred_comment_playback() {
-        let mut state = audition_state(&["inbox", "refine"]);
-        state.library.tracks[1].status = TrackStatus::Refine;
-        state.pending_comment_playback = Some(super::PendingCommentPlayback {
-            address: NoteAddress::main("inbox", "deferred-comment"),
-        });
-        let mut context = ui::UiUpdateContext::default();
-
-        update(
-            &mut state,
-            Message::SetAuditionFilter(TrackStatus::Refine),
-            &mut context,
-        );
-
-        assert_eq!(state.library.selected_track_id.as_deref(), Some("refine"));
-        assert!(state.pending_comment_playback.is_none());
     }
 
     #[test]
@@ -22310,11 +20628,11 @@ mod tests {
         state.loop_selections.clear_all();
 
         assert_eq!(
-            resume_transport_command(&state, AuditionSource::Main, 0, None),
+            resume_transport_command(&state, PlaybackSource::Main, 0, None),
             ResumeTransportCommand::Play
         );
         assert_eq!(
-            resume_transport_command(&state, AuditionSource::Reference, 0, None),
+            resume_transport_command(&state, PlaybackSource::Reference, 0, None),
             ResumeTransportCommand::Play
         );
 
@@ -22343,13 +20661,13 @@ mod tests {
         state.pending_reference_seek_intent = Some(4_500);
         state.reference_transport_playing = true;
 
-        start_source_alongside_active(&mut state, AuditionSource::Main)
+        start_source_alongside_active(&mut state, PlaybackSource::Main)
             .expect("main source start should admit a normalized seek");
         assert_eq!(state.transport_position_millis, 0);
         assert_eq!(state.pending_main_seek_intent, None);
         assert!(state.loop_selections.main.is_some());
 
-        start_source_alongside_active(&mut state, AuditionSource::Reference)
+        start_source_alongside_active(&mut state, PlaybackSource::Reference)
             .expect("reference source start should admit a normalized seek");
         assert_eq!(state.reference_transport_position_millis, 0);
         assert_eq!(state.pending_reference_seek_intent, None);
@@ -22486,8 +20804,7 @@ mod tests {
             reference_path: None,
             size: 0,
             favorite: false,
-            stage: TrackStage::SoundDesign,
-            status: TrackStatus::Inbox,
+            stage: TrackStage::Backlog,
             notes: vec![Note {
                 id: note_id.clone(),
                 time_millis: 1_250,
@@ -23988,11 +22305,10 @@ mod tests {
             size: 0,
             favorite: false,
             stage,
-            status: TrackStatus::Inbox,
             notes: Vec::new(),
         };
         let tracks = vec![
-            track("sound", TrackStage::SoundDesign),
+            track("sound", TrackStage::Backlog),
             track("mix", TrackStage::Mixdown),
             track("production", TrackStage::Production),
         ];
@@ -24006,8 +22322,8 @@ mod tests {
     }
 
     #[test]
-    fn planner_projection_filters_and_groups_borrowed_tracks_once() {
-        let track = |id: &str, status: TrackStatus, stage: TrackStage| Track {
+    fn planner_projection_groups_borrowed_tracks_once() {
+        let track = |id: &str, stage: TrackStage| Track {
             id: String::from(id),
             title: format!("{id} track"),
             original_name: format!("{id}.wav"),
@@ -24017,16 +22333,15 @@ mod tests {
             size: 0,
             favorite: false,
             stage,
-            status,
             notes: Vec::new(),
         };
         let library = Library {
             tracks: vec![
-                track("sound", TrackStatus::Refine, TrackStage::SoundDesign),
-                track("production", TrackStatus::Inbox, TrackStage::Production),
-                track("mix", TrackStatus::Refine, TrackStage::Mixdown),
-                track("master", TrackStatus::Refine, TrackStage::Mastering),
-                track("tail", TrackStatus::Refine, TrackStage::Production),
+                track("sound", TrackStage::Backlog),
+                track("production", TrackStage::Production),
+                track("mix", TrackStage::Mixdown),
+                track("master", TrackStage::Mastering),
+                track("tail", TrackStage::Production),
             ],
             selected_track_id: None,
             reference_tracks: Vec::new(),
@@ -24038,24 +22353,24 @@ mod tests {
             ],
         };
 
-        let projection = planner_tracks_with_status(&library, Some(TrackStatus::Refine));
+        let projection = planner_tracks_with_favorites(&library);
         assert_eq!(
             projection
                 .ordered
                 .iter()
                 .map(|track| track.id.as_str())
                 .collect::<Vec<_>>(),
-            ["mix", "sound", "master", "tail"]
+            ["mix", "sound", "production", "master", "tail"]
         );
         assert!(std::ptr::eq(projection.ordered[0], &library.tracks[2]));
         assert!(std::ptr::eq(projection.ordered[1], &library.tracks[0]));
         assert!(std::ptr::eq(
             projection.tracks_in_stage(TrackStage::Production)[0],
-            &library.tracks[4]
+            &library.tracks[1]
         ));
         assert_eq!(
             projection
-                .tracks_in_stage(TrackStage::SoundDesign)
+                .tracks_in_stage(TrackStage::Backlog)
                 .iter()
                 .map(|track| track.id.as_str())
                 .collect::<Vec<_>>(),
@@ -24067,7 +22382,7 @@ mod tests {
                 .iter()
                 .map(|track| track.id.as_str())
                 .collect::<Vec<_>>(),
-            ["tail"]
+            ["production", "tail"]
         );
         assert_eq!(
             projection
@@ -24387,14 +22702,11 @@ mod tests {
         assert!(runtime.bridge().state().planner_drag_target.is_none());
         assert!(runtime.bridge().state().planner_drag_pointer.is_none());
 
-        let production_ids = planner_tracks_with_status(
-            &runtime.bridge().state().library,
-            runtime.bridge().state().planner_status_filter,
-        )
-        .tracks_in_stage(TrackStage::Production)
-        .iter()
-        .map(|track| track.id.clone())
-        .collect::<Vec<_>>();
+        let production_ids = planner_tracks_with_favorites(&runtime.bridge().state().library)
+            .tracks_in_stage(TrackStage::Production)
+            .iter()
+            .map(|track| track.id.clone())
+            .collect::<Vec<_>>();
         let expected_production_ids = (1..cards_per_stage)
             .map(|index| format!("planner-card-{index}"))
             .chain(std::iter::once(String::from("planner-card-0")))
@@ -24433,91 +22745,6 @@ mod tests {
             resumed_layout
                 .viewport_bounds
                 .contains_key(&keyed_scroll_identity)
-        );
-    }
-
-    #[test]
-    fn review_and_planner_status_filters_only_project_matching_tracks() {
-        let track = |id: &str, status: TrackStatus, stage: TrackStage| Track {
-            id: String::from(id),
-            title: format!("{id} track"),
-            original_name: format!("{id}.wav"),
-            path: PathBuf::from(format!("/external/{id}.wav")),
-            source_proof: crate::source::SourceProvenance::Unknown,
-            reference_path: None,
-            size: 0,
-            favorite: false,
-            stage,
-            status,
-            notes: Vec::new(),
-        };
-        let tracks = vec![
-            track("inbox", TrackStatus::Inbox, TrackStage::SoundDesign),
-            track("refine", TrackStatus::Refine, TrackStage::Production),
-            track("release", TrackStatus::Release, TrackStage::Mixdown),
-        ];
-
-        let refined = tracks_with_status(&tracks, Some(TrackStatus::Refine));
-        assert_eq!(
-            refined
-                .iter()
-                .map(|track| track.id.as_str())
-                .collect::<Vec<_>>(),
-            ["refine"]
-        );
-        assert_eq!(
-            refined
-                .iter()
-                .filter(|track| track.stage == TrackStage::Production)
-                .map(|track| track.id.as_str())
-                .collect::<Vec<_>>(),
-            ["refine"]
-        );
-
-        let mut review = AppState {
-            busy: false,
-            workspace_mode: WorkspaceMode::Review,
-            review_status_filter: Some(TrackStatus::Refine),
-            ..AppState::default()
-        };
-        review.library.tracks = tracks.clone();
-        let review_labels = project_surface(&review)
-            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 720.0))
-            .paint_plan
-            .text_label_strings();
-        assert!(review_labels.iter().any(|label| label == "refine track"));
-        assert!(!review_labels.iter().any(|label| label == "inbox track"));
-        assert!(!review_labels.iter().any(|label| label == "release track"));
-
-        let mut planner = AppState {
-            busy: false,
-            workspace_mode: WorkspaceMode::Planner,
-            planner_status_filter: Some(TrackStatus::Refine),
-            ..AppState::default()
-        };
-        planner.library.tracks = tracks;
-        let planner_labels = project_surface(&planner)
-            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 720.0))
-            .paint_plan
-            .text_label_strings();
-        assert!(planner_labels.iter().any(|label| label == "refine track"));
-        assert!(!planner_labels.iter().any(|label| label == "inbox track"));
-        assert!(!planner_labels.iter().any(|label| label == "release track"));
-
-        planner.planner_status_filter = Some(TrackStatus::Archive);
-        let empty_planner_labels = project_surface(&planner)
-            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 720.0))
-            .paint_plan
-            .text_label_strings();
-        assert!(
-            empty_planner_labels
-                .iter()
-                .any(|label| label == "No tracks in the Archive status.")
-        );
-        assert!(
-            !empty_planner_labels
-                .iter()
-                .any(|label| label == "No tracks here yet.")
         );
     }
 
@@ -24567,69 +22794,6 @@ mod tests {
             slot: end.window_end,
         };
         assert_eq!(end_target.slot, total_items);
-    }
-
-    #[test]
-    fn review_and_audition_rows_stay_bounded_when_controls_are_open() {
-        let tracks = (0..48)
-            .map(|index| audition_track(&format!("interaction-card-{index}")))
-            .collect::<Vec<_>>();
-        let track_ids = tracks
-            .iter()
-            .map(|track| track.id.clone())
-            .collect::<Vec<_>>();
-
-        let mut review = AppState {
-            busy: false,
-            workspace_mode: WorkspaceMode::Review,
-            ..AppState::default()
-        };
-        review.library.tracks = tracks.clone();
-        review.library.selected_track_id = track_ids.first().cloned();
-        review.remove_confirmation_track_id = track_ids.first().cloned();
-        review.status_menu_track_id = track_ids.first().cloned();
-        review.status_menu_host = Some(StatusMenuHost::Library);
-        let review_frame = project_surface(&review)
-            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 720.0));
-        let review_titles = review_frame
-            .paint_plan
-            .text_runs()
-            .filter(|run| run.text.starts_with("interaction-card-") && !run.text.ends_with(".wav"))
-            .count();
-        assert!(review_titles < tracks.len());
-        assert!(review_frame.paint_plan.contains_text("Confirm"));
-        assert!(
-            review_frame
-                .paint_plan
-                .contains_text(TrackStatus::Release.label())
-        );
-
-        let mut audition = AppState {
-            busy: false,
-            workspace_mode: WorkspaceMode::Audition,
-            audition_status_filter: TrackStatus::Inbox,
-            audition_queue: track_ids,
-            ..AppState::default()
-        };
-        audition.library.tracks = tracks;
-        audition.library.selected_track_id = audition.audition_queue.first().cloned();
-        audition.remove_confirmation_track_id = audition.audition_queue.first().cloned();
-        audition.status_menu_track_id = audition.audition_queue.first().cloned();
-        audition.status_menu_host = Some(StatusMenuHost::Audition);
-        let audition_frame = project_surface(&audition)
-            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 720.0));
-        let audition_titles = audition_frame
-            .paint_plan
-            .text_runs()
-            .filter(|run| run.text.contains("interaction-card-") && !run.text.ends_with(".wav"))
-            .count();
-        assert!(audition_titles < 48);
-        assert!(audition_frame.paint_plan.contains_text("Confirm"));
-        assert!(
-            audition_frame
-                .paint_plan
-                .contains_text(TrackStatus::Release.label())
-        );
     }
 
     #[test]
@@ -24717,342 +22881,31 @@ mod tests {
     }
 
     #[test]
-    fn planner_status_filter_chips_click_to_filter_and_restore_all_tracks() {
-        let track = |id: &str, status: TrackStatus, stage: TrackStage| Track {
-            id: String::from(id),
-            title: format!("{id} planner card"),
-            original_name: format!("{id}.wav"),
-            path: PathBuf::from(format!("/external/{id}.wav")),
-            source_proof: crate::source::SourceProvenance::Unknown,
-            reference_path: None,
-            size: 0,
-            favorite: false,
-            stage,
-            status,
-            notes: Vec::new(),
-        };
-        let mut state = AppState {
-            busy: false,
-            workspace_mode: WorkspaceMode::Planner,
-            ..AppState::default()
-        };
-        state.library.tracks = vec![
-            track("inbox", TrackStatus::Inbox, TrackStage::SoundDesign),
-            track("refine", TrackStatus::Refine, TrackStage::Production),
-            track("release", TrackStatus::Release, TrackStage::Mixdown),
-        ];
-        state.library.planner_order = vec![
-            String::from("inbox"),
-            String::from("refine"),
-            String::from("release"),
-        ];
-
-        let bridge = DeclarativeOwnedRuntimeBridge::new(
-            state,
-            |state| project_surface(state).into_surface(),
-            |state, message| {
-                let mut context = ui::UiUpdateContext::default();
-                update(state, message, &mut context);
-            },
-        );
-        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1180.0, 720.0));
-        let all_frame = runtime.frame_with_default_theme();
-        let (refine_widget_id, refine_rect) = all_frame
-            .paint_plan
-            .text_runs()
-            .find_map(|run| {
-                (run.text.as_str() == TrackStatus::Refine.label() && run.rect.min.y < 130.0)
-                    .then_some((run.widget_id, run.rect))
-            })
-            .expect("the Planner header should paint the Refine status chip");
-        let refine_point = refine_rect.center();
-        assert_eq!(
-            runtime.widget_at(refine_point),
-            Some(refine_widget_id),
-            "the idle Planner header chip should remain the topmost interactive widget"
-        );
-
-        let click = runtime.dispatch_primary_click(refine_point);
-        assert_eq!(click.press_target, Some(refine_widget_id));
-        assert_eq!(
-            runtime.bridge().state().planner_status_filter,
-            Some(TrackStatus::Refine)
-        );
-
-        let refined_frame = runtime.frame_with_default_theme();
-        let refined_labels = refined_frame.paint_plan.text_label_strings();
-        assert!(
-            refined_labels
-                .iter()
-                .any(|label| label == "refine planner card")
-        );
-        assert!(
-            !refined_labels
-                .iter()
-                .any(|label| label == "inbox planner card")
-        );
-        assert!(
-            !refined_labels
-                .iter()
-                .any(|label| label == "release planner card")
-        );
-        assert!(
-            refined_labels
-                .iter()
-                .any(|label| label == "1 track · derived from the library")
-        );
-        let selected_refine_widget_id = refined_frame
-            .paint_plan
-            .text_runs()
-            .find_map(|run| {
-                (run.text.as_str() == TrackStatus::Refine.label() && run.rect.min.y < 130.0)
-                    .then_some(run.widget_id)
-            })
-            .expect("the selected Refine chip should remain visible");
-        assert!(
-            refined_frame.paint_plan.primitives.iter().any(|primitive| {
-                matches!(
-                    primitive,
-                    PaintPrimitive::StrokePolyline(marker)
-                        if marker.widget_id == selected_refine_widget_id
-                            && marker.points.len() == 2
-                            && (marker.points[0].x - marker.points[1].x).abs()
-                                < f32::EPSILON
-                            && (marker.width - 2.0).abs() < f32::EPSILON
-                )
-            }),
-            "the selected Refine chip should retain the button selected marker"
-        );
-
-        let (all_widget_id, all_rect) = refined_frame
-            .paint_plan
-            .text_runs()
-            .find_map(|run| {
-                (run.text.as_str() == "All" && run.rect.min.y < 130.0)
-                    .then_some((run.widget_id, run.rect))
-            })
-            .expect("the Planner header should paint the All status chip");
-        let all_point = all_rect.center();
-        assert_eq!(runtime.widget_at(all_point), Some(all_widget_id));
-        let click = runtime.dispatch_primary_click(all_point);
-        assert_eq!(click.press_target, Some(all_widget_id));
-        assert_eq!(runtime.bridge().state().planner_status_filter, None);
-
-        let unfiltered_labels = runtime
-            .frame_with_default_theme()
-            .paint_plan
-            .text_label_strings();
-        for title in [
-            "inbox planner card",
-            "refine planner card",
-            "release planner card",
-        ] {
-            assert!(
-                unfiltered_labels.iter().any(|label| label == title),
-                "the All filter should restore {title}"
-            );
-        }
-        assert!(
-            unfiltered_labels
-                .iter()
-                .any(|label| label == "3 tracks · derived from the library")
-        );
-    }
-
-    #[test]
-    fn filtered_track_lists_put_favorites_first_without_reordering_groups() {
-        let track = |id: &str, status: TrackStatus, favorite: bool| Track {
-            id: String::from(id),
-            title: format!("{id} track"),
-            original_name: format!("{id}.wav"),
-            path: PathBuf::from(format!("/external/{id}.wav")),
-            source_proof: crate::source::SourceProvenance::Unknown,
-            reference_path: None,
-            size: 0,
-            favorite,
-            stage: TrackStage::Production,
-            status,
-            notes: Vec::new(),
-        };
-        let tracks = vec![
-            track("unstarred-inbox", TrackStatus::Inbox, false),
-            track("starred-refine-first", TrackStatus::Refine, true),
-            track("unstarred-refine-first", TrackStatus::Refine, false),
-            track("starred-inbox", TrackStatus::Inbox, true),
-            track("starred-refine-second", TrackStatus::Refine, true),
-            track("unstarred-refine-second", TrackStatus::Refine, false),
-        ];
-
-        let all_tracks = tracks_with_status(&tracks, None);
-        let refined_tracks = tracks_with_status(&tracks, Some(TrackStatus::Refine));
-
-        assert_eq!(
-            all_tracks
-                .iter()
-                .map(|track| track.id.as_str())
-                .collect::<Vec<_>>(),
-            [
-                "starred-refine-first",
-                "starred-inbox",
-                "starred-refine-second",
-                "unstarred-inbox",
-                "unstarred-refine-first",
-                "unstarred-refine-second",
-            ]
-        );
-        assert_eq!(
-            refined_tracks
-                .iter()
-                .map(|track| track.id.as_str())
-                .collect::<Vec<_>>(),
-            [
-                "starred-refine-first",
-                "starred-refine-second",
-                "unstarred-refine-first",
-                "unstarred-refine-second",
-            ]
-        );
-    }
-
-    #[test]
-    fn changing_status_filters_closes_hidden_card_controls() {
-        let mut state = AppState {
-            busy: false,
-            stage_menu_track_id: Some(String::from("hidden-track")),
-            stage_menu_anchor: Some(Point::new(40.0, 80.0)),
-            status_menu_track_id: Some(String::from("hidden-track")),
-            status_menu_host: Some(StatusMenuHost::Library),
-            ..AppState::default()
-        };
-        state.library.tracks.push(Track {
-            id: String::from("hidden-track"),
-            title: String::from("Hidden track"),
-            original_name: String::from("hidden-track.wav"),
-            path: PathBuf::from("/external/hidden-track.wav"),
-            source_proof: crate::source::SourceProvenance::Unknown,
-            reference_path: None,
-            size: 0,
-            favorite: false,
-            stage: TrackStage::Production,
-            status: TrackStatus::Inbox,
-            notes: Vec::new(),
-        });
-        let mut context = ui::UiUpdateContext::default();
-
-        update(
-            &mut state,
-            Message::SetReviewStatusFilter(Some(TrackStatus::Refine)),
-            &mut context,
-        );
-        assert!(state.stage_menu_track_id.is_none());
-        assert!(state.stage_menu_anchor.is_none());
-        assert!(state.status_menu_track_id.is_none());
-        assert!(state.status_menu_host.is_none());
-
-        state.stage_menu_track_id = Some(String::from("hidden-track"));
-        state.stage_menu_anchor = Some(Point::new(40.0, 80.0));
-        state.status_menu_track_id = Some(String::from("hidden-track"));
-        state.status_menu_host = Some(StatusMenuHost::Planner(TrackStage::Production));
-        state.planner_drag_source_track_id = Some(String::from("hidden-track"));
-        state.planner_drag_target = Some(PlannerInsertionTarget {
-            stage: TrackStage::Mixdown,
-            slot: 0,
-        });
-        state.planner_drag_pointer = Some(Point::new(100.0, 120.0));
-
-        update(
-            &mut state,
-            Message::SetPlannerStatusFilter(Some(TrackStatus::Archive)),
-            &mut context,
-        );
-        assert!(state.stage_menu_track_id.is_none());
-        assert!(state.stage_menu_anchor.is_none());
-        assert!(state.status_menu_track_id.is_none());
-        assert!(state.status_menu_host.is_none());
-        assert!(state.planner_drag_source_track_id.is_none());
-        assert!(state.planner_drag_target.is_none());
-        assert!(state.planner_drag_pointer.is_none());
-    }
-
-    #[test]
-    fn planner_status_menu_closes_only_when_its_stage_window_changes() {
-        let mut state = AppState {
-            busy: false,
-            status_menu_track_id: Some(String::from("production-menu")),
-            status_menu_host: Some(StatusMenuHost::Planner(TrackStage::Production)),
-            ..AppState::default()
-        };
-        let mut context = ui::UiUpdateContext::default();
-        let changed_window = ui::VirtualListWindowChange {
-            offset_y: 120.0,
-            row_height: 32.0,
-            window: ui::VirtualListWindow {
-                total_items: 48,
-                viewport_start: 8,
-                viewport_end: 16,
-                window_start: 4,
-                window_end: 20,
-            },
-        };
-
-        update(
-            &mut state,
-            Message::PlannerColumnWindowChanged {
-                stage: TrackStage::Mixdown,
-                change: changed_window,
-            },
-            &mut context,
-        );
-        assert_eq!(
-            state.status_menu_host,
-            Some(StatusMenuHost::Planner(TrackStage::Production))
-        );
-        assert_eq!(
-            state.status_menu_track_id.as_deref(),
-            Some("production-menu")
-        );
-
-        update(
-            &mut state,
-            Message::PlannerColumnWindowChanged {
-                stage: TrackStage::Production,
-                change: changed_window,
-            },
-            &mut context,
-        );
-        assert!(state.status_menu_host.is_none());
-        assert!(state.status_menu_track_id.is_none());
-    }
-
-    #[test]
     fn planner_insertion_targets_allow_same_stage_and_reject_stale_slots() {
         let state = planner_drag_state(Point::new(120.0, 90.0));
         assert!(planner_insertion_target_is_valid(
             &state.library,
             "drag",
             &PlannerInsertionTarget {
-                stage: TrackStage::SoundDesign,
+                stage: TrackStage::Backlog,
                 slot: 0,
             },
-            None,
         ));
         assert!(planner_insertion_target_is_valid(
             &state.library,
             "drag",
             &PlannerInsertionTarget {
-                stage: TrackStage::SoundDesign,
+                stage: TrackStage::Backlog,
                 slot: 1,
             },
-            None,
         ));
         assert!(!planner_insertion_target_is_valid(
             &state.library,
             "drag",
             &PlannerInsertionTarget {
-                stage: TrackStage::SoundDesign,
+                stage: TrackStage::Backlog,
                 slot: 2,
             },
-            None,
         ));
         assert!(!planner_insertion_target_is_valid(
             &state.library,
@@ -25061,7 +22914,6 @@ mod tests {
                 stage: TrackStage::Mastering,
                 slot: 0,
             },
-            None,
         ));
     }
 
@@ -25077,7 +22929,6 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Production,
-            status: TrackStatus::Inbox,
             notes: Vec::new(),
         };
         let mut state = AppState {
@@ -25169,7 +23020,6 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Production,
-            status: TrackStatus::Inbox,
             notes: Vec::new(),
         };
         let mut state = AppState {
@@ -25350,7 +23200,6 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Production,
-            status: TrackStatus::Inbox,
             notes: Vec::new(),
         };
         let mut state = AppState {
@@ -25629,7 +23478,6 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Production,
-            status: TrackStatus::Inbox,
             notes: Vec::new(),
         };
 
@@ -25640,7 +23488,7 @@ mod tests {
             .text_label_strings();
 
         for stage in [
-            TrackStage::SoundDesign,
+            TrackStage::Backlog,
             TrackStage::Production,
             TrackStage::Mixdown,
             TrackStage::Mastering,
@@ -25665,7 +23513,6 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Production,
-            status: TrackStatus::Inbox,
             notes: Vec::new(),
         };
         #[derive(Clone)]
@@ -25732,7 +23579,6 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Production,
-            status: TrackStatus::Inbox,
             notes: Vec::new(),
         };
         let track_id = track.id.clone();
@@ -25771,7 +23617,6 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Production,
-            status: TrackStatus::Inbox,
             notes: Vec::new(),
         };
         #[derive(Clone)]
@@ -25837,7 +23682,6 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Production,
-            status: TrackStatus::Inbox,
             notes: Vec::new(),
         };
 
@@ -25952,7 +23796,6 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Production,
-            status: TrackStatus::Inbox,
             notes: Vec::new(),
         };
         #[derive(Clone)]
@@ -25986,7 +23829,7 @@ mod tests {
             .paint_plan
             .text_label_strings()
             .iter()
-            .filter(|label| *label == TrackStage::SoundDesign.label())
+            .filter(|label| *label == TrackStage::Backlog.label())
             .count();
         let option_rect = frame
             .paint_plan
@@ -26027,7 +23870,7 @@ mod tests {
         );
         let sound_design_count_after = labels_after_selection
             .iter()
-            .filter(|label| *label == TrackStage::SoundDesign.label())
+            .filter(|label| *label == TrackStage::Backlog.label())
             .count();
         assert_eq!(
             sound_design_count_after,
@@ -26048,7 +23891,6 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Production,
-            status: TrackStatus::Inbox,
             notes: Vec::new(),
         };
 
@@ -26117,7 +23959,6 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Production,
-            status: TrackStatus::Inbox,
             notes: Vec::new(),
         });
         state.library.reference_tracks = vec![
@@ -26192,424 +24033,6 @@ mod tests {
     }
 
     #[test]
-    fn open_status_dropdown_projects_statuses_in_product_order() {
-        let track = Track {
-            id: String::from("status-menu"),
-            title: String::from("Status menu"),
-            original_name: String::from("status-menu.wav"),
-            path: PathBuf::from("/external/status-menu.wav"),
-            source_proof: crate::source::SourceProvenance::Unknown,
-            reference_path: None,
-            size: 0,
-            favorite: false,
-            stage: TrackStage::Production,
-            status: TrackStatus::Refine,
-            notes: Vec::new(),
-        };
-        let expected = ["Inbox", "Refine", "Release", "Archive", "Maybe"];
-        let actual = ui::scene(status_menu(&track, StatusMenuHost::Library))
-            .into_view()
-            .view_frame_at_size_with_default_theme(Vector2::new(240.0, 220.0))
-            .paint_plan
-            .text_runs()
-            .filter(|run| !run.text.is_empty())
-            .map(|run| run.text.as_str().to_owned())
-            .collect::<Vec<_>>();
-
-        assert_eq!(actual, expected.map(String::from).to_vec());
-    }
-
-    #[test]
-    fn status_transition_preserves_stage_and_favorite_and_saves_only_on_change() {
-        let mut state = AppState {
-            busy: false,
-            status_menu_track_id: Some(String::from("status-track")),
-            ..AppState::default()
-        };
-        state.library.tracks.push(Track {
-            id: String::from("status-track"),
-            title: String::from("Status track"),
-            original_name: String::from("status-track.wav"),
-            path: PathBuf::from("/external/status-track.wav"),
-            source_proof: crate::source::SourceProvenance::Unknown,
-            reference_path: Some(PathBuf::from("/external/reference.wav")),
-            size: 42,
-            favorite: true,
-            stage: TrackStage::Mixdown,
-            status: TrackStatus::Inbox,
-            notes: vec![Note {
-                id: String::from("status-note"),
-                time_millis: 500,
-                body: String::from("Keep this note."),
-                done: false,
-            }],
-        });
-        let mut context = ui::UiUpdateContext::default();
-
-        update(
-            &mut state,
-            Message::SetStatus {
-                track_id: String::from("status-track"),
-                status: TrackStatus::Release,
-            },
-            &mut context,
-        );
-
-        let track = &state.library.tracks[0];
-        assert_eq!(track.status, TrackStatus::Release);
-        assert_eq!(track.stage, TrackStage::Mixdown);
-        assert!(track.favorite);
-        assert_eq!(track.notes.len(), 1);
-        assert!(state.status_menu_track_id.is_none());
-        assert!(state.save_admission_pending);
-        admit_library_save_for_test(&mut state, &mut context);
-        assert!(state.save_in_flight.is_some());
-        assert_eq!(state.status, "Status set to Release.");
-    }
-
-    #[test]
-    fn no_op_status_transition_closes_menu_without_scheduling_a_save() {
-        let mut state = AppState {
-            busy: false,
-            status_menu_track_id: Some(String::from("status-track")),
-            ..AppState::default()
-        };
-        state.library.tracks.push(Track {
-            id: String::from("status-track"),
-            title: String::from("Status track"),
-            original_name: String::from("status-track.wav"),
-            path: PathBuf::from("/external/status-track.wav"),
-            source_proof: crate::source::SourceProvenance::Unknown,
-            reference_path: None,
-            size: 0,
-            favorite: false,
-            stage: TrackStage::SoundDesign,
-            status: TrackStatus::Maybe,
-            notes: Vec::new(),
-        });
-        let mut context = ui::UiUpdateContext::default();
-
-        update(
-            &mut state,
-            Message::SetStatus {
-                track_id: String::from("status-track"),
-                status: TrackStatus::Maybe,
-            },
-            &mut context,
-        );
-
-        assert_eq!(state.library.tracks[0].status, TrackStatus::Maybe);
-        assert!(state.save_in_flight.is_none());
-        assert!(!library_dirty(&state));
-        assert!(state.status_menu_track_id.is_none());
-    }
-
-    #[test]
-    fn opening_stage_and_status_menus_closes_the_other_menu() {
-        let mut state = AppState {
-            busy: false,
-            ..AppState::default()
-        };
-        state.library.tracks.push(Track {
-            id: String::from("menu-track"),
-            title: String::from("Menu track"),
-            original_name: String::from("menu-track.wav"),
-            path: PathBuf::from("/external/menu-track.wav"),
-            source_proof: crate::source::SourceProvenance::Unknown,
-            reference_path: None,
-            size: 0,
-            favorite: false,
-            stage: TrackStage::Production,
-            status: TrackStatus::Inbox,
-            notes: Vec::new(),
-        });
-        let mut context = ui::UiUpdateContext::default();
-
-        update(
-            &mut state,
-            Message::ToggleStatusMenuAt {
-                track_id: String::from("menu-track"),
-                host: StatusMenuHost::Library,
-            },
-            &mut context,
-        );
-        assert!(state.stage_menu_track_id.is_none());
-        assert_eq!(state.status_menu_track_id.as_deref(), Some("menu-track"));
-
-        update(
-            &mut state,
-            Message::ToggleStageMenu(String::from("menu-track")),
-            &mut context,
-        );
-        assert_eq!(state.stage_menu_track_id.as_deref(), Some("menu-track"));
-        assert!(state.status_menu_track_id.is_none());
-    }
-
-    #[test]
-    fn keyboard_status_dropdown_expands_selected_review_header() {
-        let mut state = AppState {
-            busy: false,
-            workspace_mode: super::WorkspaceMode::Review,
-            ..AppState::default()
-        };
-        state.library.selected_track_id = Some(String::from("selected-header"));
-        state.library.tracks.push(Track {
-            id: String::from("selected-header"),
-            title: String::from("Selected header"),
-            original_name: String::from("selected-header.wav"),
-            path: PathBuf::from("/external/selected-header.wav"),
-            source_proof: crate::source::SourceProvenance::Unknown,
-            reference_path: None,
-            size: 0,
-            favorite: false,
-            stage: TrackStage::Production,
-            status: TrackStatus::Inbox,
-            notes: Vec::new(),
-        });
-        let bridge = DeclarativeOwnedRuntimeBridge::new(
-            state,
-            |state| project_surface(state).into_surface(),
-            |state, message| {
-                let mut context = ui::UiUpdateContext::default();
-                update(state, message, &mut context);
-            },
-        );
-        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1180.0, 720.0));
-        let _ = runtime.frame(&ThemeTokens::default());
-        let frame = runtime.frame(&ThemeTokens::default());
-        let (trigger, _trigger_rect) = frame
-            .paint_plan
-            .primitives
-            .iter()
-            .find_map(|primitive| match primitive {
-                PaintPrimitive::Text(text)
-                    if text.text.as_str() == TrackStatus::Inbox.label()
-                        && text.rect.min.x < super::LIBRARY_WIDTH
-                        && text.rect.min.y > 40.0 =>
-                {
-                    Some((text.widget_id, text.rect))
-                }
-                _ => None,
-            })
-            .expect("the selected library card should paint its status trigger");
-        assert!(runtime.focus_widget(trigger));
-        assert_eq!(
-            runtime.dispatch_event(Event::key_press(ui::WidgetKey::Enter)),
-            Some(trigger)
-        );
-        assert_eq!(
-            runtime.bridge().state().status_menu_track_id.as_deref(),
-            Some("selected-header")
-        );
-
-        let opened_frame = runtime.frame(&ThemeTokens::default());
-        let release_option = opened_frame
-            .paint_plan
-            .primitives
-            .iter()
-            .find_map(|primitive| match primitive {
-                PaintPrimitive::Text(text)
-                    if text.text.as_str() == TrackStatus::Release.label() =>
-                {
-                    Some(text.rect)
-                }
-                _ => None,
-            })
-            .expect("keyboard activation should project status options in the anchored overlay");
-        runtime.dispatch_primary_click(Point::new(
-            release_option.min.x + release_option.width() * 0.5,
-            release_option.min.y + release_option.height() * 0.5,
-        ));
-        assert_eq!(
-            runtime.bridge().state().library.tracks[0].status,
-            TrackStatus::Release
-        );
-    }
-
-    #[test]
-    fn keyboard_status_dropdown_follows_lower_library_and_planner_triggers() {
-        let track = |id: &str, status: TrackStatus| Track {
-            id: String::from(id),
-            title: String::from(id),
-            original_name: format!("{id}.wav"),
-            path: PathBuf::from(format!("/external/{id}.wav")),
-            source_proof: crate::source::SourceProvenance::Unknown,
-            reference_path: None,
-            size: 0,
-            favorite: false,
-            stage: TrackStage::Production,
-            status,
-            notes: Vec::new(),
-        };
-
-        let mut review_state = AppState {
-            busy: false,
-            workspace_mode: super::WorkspaceMode::Review,
-            ..AppState::default()
-        };
-        review_state.library.selected_track_id = Some(String::from("library-target"));
-        review_state
-            .library
-            .tracks
-            .push(track("library-first", TrackStatus::Maybe));
-        review_state
-            .library
-            .tracks
-            .push(track("library-target", TrackStatus::Inbox));
-
-        let review_bridge = DeclarativeOwnedRuntimeBridge::new(
-            review_state,
-            |state| project_surface(state).into_surface(),
-            |state, message| {
-                let mut context = ui::UiUpdateContext::default();
-                update(state, message, &mut context);
-            },
-        );
-        let mut review_runtime = SurfaceRuntime::new(review_bridge, Vector2::new(1180.0, 720.0));
-        let review_frame = review_runtime.frame(&ThemeTokens::default());
-        let (review_trigger, _review_trigger_rect) = review_frame
-            .paint_plan
-            .primitives
-            .iter()
-            .find_map(|primitive| match primitive {
-                PaintPrimitive::Text(text)
-                    if text.text.as_str() == TrackStatus::Inbox.label()
-                        && text.rect.min.x < super::LIBRARY_WIDTH
-                        && text.rect.min.y > 250.0 =>
-                {
-                    Some((text.widget_id, text.rect))
-                }
-                _ => None,
-            })
-            .expect("the lower library row should paint its status trigger");
-        assert!(review_runtime.focus_widget(review_trigger));
-        assert_eq!(
-            review_runtime.dispatch_event(Event::key_press(ui::WidgetKey::Enter)),
-            Some(review_trigger)
-        );
-        assert_eq!(
-            review_runtime
-                .bridge()
-                .state()
-                .status_menu_track_id
-                .as_deref(),
-            Some("library-target")
-        );
-        let review_option = review_runtime
-            .frame(&ThemeTokens::default())
-            .paint_plan
-            .primitives
-            .iter()
-            .find_map(|primitive| match primitive {
-                PaintPrimitive::Text(text)
-                    if text.text.as_str() == TrackStatus::Release.label() =>
-                {
-                    Some(text.rect)
-                }
-                _ => None,
-            })
-            .expect("keyboard activation should project status options in the anchored overlay");
-        review_runtime.dispatch_primary_click(Point::new(
-            review_option.min.x + review_option.width() * 0.5,
-            review_option.min.y + review_option.height() * 0.5,
-        ));
-        assert_eq!(
-            review_runtime.bridge().state().library.tracks[1].status,
-            TrackStatus::Release
-        );
-
-        let mut planner_state = AppState {
-            busy: false,
-            workspace_mode: super::WorkspaceMode::Planner,
-            ..AppState::default()
-        };
-        planner_state
-            .library
-            .tracks
-            .push(track("planner-first", TrackStatus::Maybe));
-        planner_state
-            .library
-            .tracks
-            .push(track("planner-target", TrackStatus::Inbox));
-
-        let planner_bridge = DeclarativeOwnedRuntimeBridge::new(
-            planner_state,
-            |state| project_surface(state).into_surface(),
-            |state, message| {
-                let mut context = ui::UiUpdateContext::default();
-                update(state, message, &mut context);
-            },
-        );
-        let mut planner_runtime = SurfaceRuntime::new(planner_bridge, Vector2::new(1180.0, 720.0));
-        let planner_frame = planner_runtime.frame(&ThemeTokens::default());
-        let (planner_trigger, _planner_trigger_rect) = planner_frame
-            .paint_plan
-            .primitives
-            .iter()
-            .find_map(|primitive| match primitive {
-                PaintPrimitive::Text(text)
-                    if text.text.as_str() == TrackStatus::Inbox.label()
-                        && text.rect.min.y > 250.0 =>
-                {
-                    Some((text.widget_id, text.rect))
-                }
-                _ => None,
-            })
-            .expect("the non-first planner card should paint its status trigger");
-        assert!(planner_runtime.focus_widget(planner_trigger));
-        assert_eq!(
-            planner_runtime.dispatch_event(Event::key_press(ui::WidgetKey::Enter)),
-            Some(planner_trigger)
-        );
-        assert_eq!(
-            planner_runtime
-                .bridge()
-                .state()
-                .status_menu_track_id
-                .as_deref(),
-            Some("planner-target")
-        );
-        let planner_opened_frame = planner_runtime.frame(&ThemeTokens::default());
-        let planner_option = planner_opened_frame
-            .paint_plan
-            .primitives
-            .iter()
-            .find_map(|primitive| match primitive {
-                PaintPrimitive::Text(text)
-                    if text.text.as_str() == TrackStatus::Release.label()
-                        && text.rect.min.x < 400.0 =>
-                {
-                    Some(text.rect)
-                }
-                _ => None,
-            })
-            .expect("keyboard activation should project status options in the anchored overlay");
-        let planner_option_point = Point::new(
-            planner_option.min.x + planner_option.width() * 0.5,
-            planner_option.min.y + planner_option.height() * 0.5,
-        );
-        assert!(planner_runtime.widget_at(planner_option_point).is_some());
-        planner_runtime.dispatch_primary_click(planner_option_point);
-        assert_eq!(
-            planner_runtime.bridge().state().library.tracks[1].status,
-            TrackStatus::Release
-        );
-    }
-
-    #[test]
-    fn audition_play_starts_a_ready_track_without_toggle_pause() {
-        let mut state = audition_state(&["ready"]);
-        let mut context = ui::UiUpdateContext::default();
-
-        update(&mut state, Message::AuditionPlay, &mut context);
-
-        assert!(state.transport_polling);
-        assert!(state.transport_waiting_token.is_some());
-        assert!(state.audition_auto_advance);
-        assert!(state.audition_pending_play_track_id.is_none());
-    }
-
-    #[test]
     fn main_playback_degrades_to_main_only_after_reference_mismatch() {
         let mut state = shared_reference_playback_state();
         state.reference_source_mismatch = Some(PathBuf::from("/external/changed-reference.wav"));
@@ -26625,519 +24048,6 @@ mod tests {
         assert!(!state.reference_transport_polling);
         assert!(state.reference_transport_waiting_token.is_none());
         assert!(!state.reference_only_playback);
-    }
-
-    #[test]
-    fn audition_play_degrades_to_main_only_after_reference_mismatch() {
-        let mut state = audition_state(&["reference-mismatch"]);
-        state.reference_source_mismatch = Some(PathBuf::from("/external/changed-reference.wav"));
-        state.reference_waveform = None;
-        state.reference_waveform_track_id = None;
-        state.reference_waveform_busy = true;
-        let mut context = ui::UiUpdateContext::default();
-
-        update(&mut state, Message::AuditionPlay, &mut context);
-
-        assert!(state.transport_polling);
-        assert!(state.transport_waiting_token.is_some());
-        assert!(!state.reference_transport_polling);
-        assert!(state.reference_transport_waiting_token.is_none());
-        assert!(state.audition_pending_play_track_id.is_none());
-    }
-
-    #[test]
-    fn audition_play_arms_pending_autoplay_while_the_track_loads() {
-        let mut state = audition_state(&["pending"]);
-        state.waveform = None;
-        state.waveform_track_id = None;
-        state.waveform_busy = true;
-        let mut context = ui::UiUpdateContext::default();
-
-        update(&mut state, Message::AuditionPlay, &mut context);
-
-        assert!(state.audition_auto_advance);
-        assert_eq!(
-            state.audition_pending_play_track_id.as_deref(),
-            Some("pending")
-        );
-        assert!(!state.transport_playing);
-        assert!(!state.transport_polling);
-    }
-
-    #[test]
-    fn audition_play_does_not_pause_active_playback() {
-        let mut state = audition_state(&["active"]);
-        state.transport_playing = true;
-        state.audition_auto_advance = true;
-        state.audition_play_token = Some(7);
-        let mut context = ui::UiUpdateContext::default();
-
-        update(&mut state, Message::AuditionPlay, &mut context);
-
-        assert!(state.transport_playing);
-        assert!(!state.transport_polling);
-        assert_eq!(state.audition_play_token, Some(7));
-        assert_eq!(state.status, "Audition playback is already active.");
-    }
-
-    #[test]
-    fn audition_controls_are_inert_outside_audition_and_while_busy() {
-        for mut state in [
-            AppState {
-                workspace_mode: WorkspaceMode::Review,
-                ..audition_state(&["review"])
-            },
-            AppState {
-                busy: true,
-                ..audition_state(&["busy"])
-            },
-        ] {
-            let selected_before = state.library.selected_track_id.clone();
-            let queue_before = state.audition_queue.clone();
-            let round_before = state.audition_shuffle_round;
-            let mut context = ui::UiUpdateContext::default();
-
-            for message in [
-                Message::AuditionPlay,
-                Message::AuditionPrevious,
-                Message::AuditionNext,
-                Message::ShuffleAudition,
-            ] {
-                update(&mut state, message, &mut context);
-            }
-
-            assert_eq!(state.library.selected_track_id, selected_before);
-            assert_eq!(state.audition_queue, queue_before);
-            assert_eq!(state.audition_shuffle_round, round_before);
-            assert!(state.audition_pending_play_track_id.is_none());
-        }
-    }
-
-    #[test]
-    fn audition_stop_clears_pending_autoplay_without_active_transport() {
-        let mut state = audition_state(&["pending-stop"]);
-        state.audition_auto_advance = true;
-        state.audition_pending_play_track_id = Some(String::from("pending-stop"));
-        let mut context = ui::UiUpdateContext::default();
-
-        update(&mut state, Message::StopPlayback, &mut context);
-
-        assert!(!state.audition_auto_advance);
-        assert!(state.audition_play_token.is_none());
-        assert!(state.audition_pending_play_track_id.is_none());
-        assert!(!state.transport_playing);
-        assert!(!state.transport_polling);
-    }
-
-    #[test]
-    fn audition_next_resolves_selected_id_marks_current_heard_and_arms_destination() {
-        let mut state = audition_state(&["a", "b", "c"]);
-        state.library.selected_track_id = Some(String::from("b"));
-        state.audition_queue_index = 0;
-        state.audition_heard = vec![String::from("a"), String::from("c")];
-        let mut context = ui::UiUpdateContext::default();
-
-        update(&mut state, Message::AuditionNext, &mut context);
-
-        assert_eq!(state.library.selected_track_id.as_deref(), Some("c"));
-        assert_eq!(state.audition_queue_index, 2);
-        assert!(state.audition_heard.iter().any(|id| id == "a"));
-        assert!(state.audition_heard.iter().any(|id| id == "b"));
-        assert!(!state.audition_heard.iter().any(|id| id == "c"));
-        assert_eq!(state.audition_pending_play_track_id.as_deref(), Some("c"));
-        assert!(state.audition_auto_advance);
-    }
-
-    #[test]
-    fn audition_previous_resolves_selected_id_without_marking_interrupted_current() {
-        let mut state = audition_state(&["a", "b", "c"]);
-        state.library.selected_track_id = Some(String::from("b"));
-        state.audition_queue_index = 2;
-        state.audition_heard.clear();
-        let mut context = ui::UiUpdateContext::default();
-
-        update(&mut state, Message::AuditionPrevious, &mut context);
-
-        assert_eq!(state.library.selected_track_id.as_deref(), Some("a"));
-        assert_eq!(state.audition_queue_index, 0);
-        assert!(!state.audition_heard.iter().any(|id| id == "a"));
-        assert!(!state.audition_heard.iter().any(|id| id == "b"));
-        assert_eq!(state.audition_pending_play_track_id.as_deref(), Some("a"));
-        assert!(state.audition_auto_advance);
-    }
-
-    #[test]
-    fn audition_next_keeps_pool_anchor_when_current_track_changes_status() {
-        let mut state = audition_state(&["inbox-a", "inbox-b"]);
-        state.transport_playing = true;
-        let mut context = ui::UiUpdateContext::default();
-
-        update(
-            &mut state,
-            Message::SetStatus {
-                track_id: String::from("inbox-a"),
-                status: TrackStatus::Archive,
-            },
-            &mut context,
-        );
-        assert_eq!(
-            state.library.tracks[0].status,
-            TrackStatus::Archive,
-            "the current track should still move out of the selected pool"
-        );
-        assert_eq!(
-            state.audition_queue,
-            vec![String::from("inbox-a"), String::from("inbox-b")]
-        );
-
-        update(&mut state, Message::AuditionNext, &mut context);
-
-        assert_eq!(state.library.selected_track_id.as_deref(), Some("inbox-b"));
-        assert_eq!(state.audition_queue, vec![String::from("inbox-b")]);
-        assert_eq!(state.audition_queue_index, 0);
-        assert_eq!(
-            state.audition_pending_play_track_id.as_deref(),
-            Some("inbox-b")
-        );
-
-        update(&mut state, Message::AuditionPrevious, &mut context);
-
-        assert_eq!(state.library.selected_track_id.as_deref(), Some("inbox-b"));
-        assert_eq!(state.audition_queue, vec![String::from("inbox-b")]);
-        assert!(state.status.contains("beginning"));
-    }
-
-    #[test]
-    fn audition_next_keeps_pool_anchor_during_reference_only_playback() {
-        let mut state = audition_state(&["inbox-a", "inbox-b"]);
-        state.reference_transport = Some(transport::AudioTransport::spawn());
-        state.reference_transport_playing = true;
-        state.reference_only_playback = true;
-        let mut context = ui::UiUpdateContext::default();
-
-        update(
-            &mut state,
-            Message::SetStatus {
-                track_id: String::from("inbox-a"),
-                status: TrackStatus::Archive,
-            },
-            &mut context,
-        );
-        assert_eq!(
-            state.audition_queue,
-            vec![String::from("inbox-a"), String::from("inbox-b")]
-        );
-
-        update(&mut state, Message::AuditionNext, &mut context);
-
-        assert_eq!(state.library.selected_track_id.as_deref(), Some("inbox-b"));
-        assert_eq!(state.audition_queue, vec![String::from("inbox-b")]);
-    }
-
-    #[test]
-    fn audition_navigation_boundaries_leave_selection_and_playback_unchanged() {
-        let mut next_state = audition_state(&["a", "b", "c"]);
-        next_state.library.selected_track_id = Some(String::from("c"));
-        next_state.audition_queue_index = 0;
-        next_state.transport_playing = true;
-        let mut context = ui::UiUpdateContext::default();
-
-        update(&mut next_state, Message::AuditionNext, &mut context);
-
-        assert_eq!(next_state.library.selected_track_id.as_deref(), Some("c"));
-        assert_eq!(next_state.audition_queue_index, 0);
-        assert!(next_state.transport_playing);
-        assert!(next_state.audition_pending_play_track_id.is_none());
-        assert!(next_state.status.contains("end"));
-
-        let mut previous_state = audition_state(&["a", "b", "c"]);
-        previous_state.library.selected_track_id = Some(String::from("a"));
-        previous_state.audition_queue_index = 2;
-        previous_state.transport_playing = true;
-
-        update(&mut previous_state, Message::AuditionPrevious, &mut context);
-
-        assert_eq!(
-            previous_state.library.selected_track_id.as_deref(),
-            Some("a")
-        );
-        assert_eq!(previous_state.audition_queue_index, 2);
-        assert!(previous_state.transport_playing);
-        assert!(previous_state.audition_pending_play_track_id.is_none());
-        assert!(previous_state.status.contains("beginning"));
-    }
-
-    #[test]
-    fn audition_shuffle_restarts_active_playback_with_a_new_order_and_current() {
-        let mut state = audition_state(&["a", "b", "c"]);
-        state.library.selected_track_id = Some(String::from("b"));
-        state.audition_queue = vec![String::from("a"), String::from("b"), String::from("c")];
-        state.audition_queue_index = 1;
-        state.audition_heard = vec![String::from("a")];
-        state.audition_shuffle_round = 4;
-        state.transport_playing = true;
-        let previous_order = state.audition_queue.clone();
-        let mut context = ui::UiUpdateContext::default();
-
-        update(&mut state, Message::ShuffleAudition, &mut context);
-
-        assert_eq!(state.audition_shuffle_round, 5);
-        assert_ne!(state.audition_queue, previous_order);
-        assert_eq!(
-            state.library.selected_track_id.as_deref(),
-            state.audition_queue.first().map(String::as_str)
-        );
-        assert_ne!(state.audition_queue.first().map(String::as_str), Some("b"));
-        assert!(state.audition_heard.is_empty());
-        assert_eq!(
-            state.audition_pending_play_track_id.as_deref(),
-            state.audition_queue.first().map(String::as_str)
-        );
-        assert!(state.audition_auto_advance);
-        assert!(!state.transport_playing);
-    }
-
-    #[test]
-    fn audition_shuffle_replays_single_entry_and_resets_empty_queue() {
-        let mut single_state = audition_state(&["only"]);
-        single_state.audition_heard = vec![String::from("only")];
-        single_state.audition_shuffle_round = 2;
-        let mut context = ui::UiUpdateContext::default();
-
-        update(&mut single_state, Message::ShuffleAudition, &mut context);
-
-        assert_eq!(single_state.audition_shuffle_round, 3);
-        assert_eq!(single_state.audition_queue, vec![String::from("only")]);
-        assert_eq!(
-            single_state.library.selected_track_id.as_deref(),
-            Some("only")
-        );
-        assert!(single_state.audition_heard.is_empty());
-        assert_eq!(
-            single_state.audition_pending_play_track_id.as_deref(),
-            Some("only")
-        );
-
-        let mut empty_state = audition_state(&[]);
-        empty_state.transport_playing = true;
-        empty_state.reference_transport = Some(transport::AudioTransport::spawn());
-        empty_state.reference_transport_playing = true;
-        empty_state.audition_heard = vec![String::from("gone")];
-
-        update(&mut empty_state, Message::ShuffleAudition, &mut context);
-
-        assert!(empty_state.audition_queue.is_empty());
-        assert!(empty_state.library.selected_track_id.is_none());
-        assert!(empty_state.audition_heard.is_empty());
-        assert!(!empty_state.transport_playing);
-        assert!(!empty_state.reference_transport_playing);
-        assert!(empty_state.audition_pending_play_track_id.is_none());
-        assert_eq!(empty_state.status, "No tracks in Inbox.");
-    }
-
-    #[test]
-    fn audition_stale_decode_generation_does_not_complete_pending_playback() {
-        let mut state = audition_state(&["stale"]);
-        state.waveform = None;
-        state.waveform_track_id = None;
-        state.waveform_busy = true;
-        state.waveform_generation = 2;
-        state.audition_auto_advance = true;
-        state.audition_pending_play_track_id = Some(String::from("stale"));
-        let mut context = ui::UiUpdateContext::default();
-
-        update(
-            &mut state,
-            Message::DecodeCompleted {
-                track_id: String::from("stale"),
-                generation: 1,
-                result: Ok(verified_audition_waveform()),
-            },
-            &mut context,
-        );
-
-        assert!(state.waveform.is_none());
-        assert!(state.waveform_busy);
-        assert_eq!(state.waveform_generation, 2);
-        assert_eq!(
-            state.audition_pending_play_track_id.as_deref(),
-            Some("stale")
-        );
-    }
-
-    #[test]
-    fn audition_shuffle_is_deterministic_and_preserves_the_filtered_tracks() {
-        let ids = vec![
-            String::from("track-a"),
-            String::from("track-b"),
-            String::from("track-c"),
-            String::from("track-d"),
-        ];
-        let seed = audition_shuffle_seed(TrackStatus::Inbox, &ids, 0);
-        let mut first = ids.clone();
-        let mut second = ids.clone();
-        deterministic_shuffle(&mut first, seed);
-        deterministic_shuffle(&mut second, seed);
-
-        assert_eq!(first, second);
-        let mut sorted = first;
-        sorted.sort();
-        assert_eq!(sorted, ids);
-        assert_ne!(
-            audition_shuffle_seed(TrackStatus::Inbox, &ids, 0),
-            audition_shuffle_seed(TrackStatus::Inbox, &ids, 1)
-        );
-        assert_eq!(audition_statuses().len(), 5);
-    }
-
-    #[test]
-    fn audition_queue_filters_and_updates_membership_without_reordering() {
-        let track = |id: &str, status: TrackStatus| Track {
-            id: String::from(id),
-            title: String::from(id),
-            original_name: format!("{id}.wav"),
-            path: PathBuf::from(format!("/external/{id}.wav")),
-            source_proof: crate::source::SourceProvenance::Unknown,
-            reference_path: None,
-            size: 0,
-            favorite: false,
-            stage: TrackStage::Production,
-            status,
-            notes: Vec::new(),
-        };
-        let mut state = AppState {
-            busy: false,
-            workspace_mode: WorkspaceMode::Audition,
-            ..AppState::default()
-        };
-        state.library.tracks = vec![
-            track("inbox-a", TrackStatus::Inbox),
-            track("refine-a", TrackStatus::Refine),
-            track("inbox-b", TrackStatus::Inbox),
-        ];
-        rebuild_audition_queue(&mut state);
-        assert_eq!(state.audition_queue.len(), 2);
-        assert!(state.audition_queue.iter().all(|id| {
-            state
-                .library
-                .tracks
-                .iter()
-                .find(|track| &track.id == id)
-                .is_some_and(|track| track.status == TrackStatus::Inbox)
-        }));
-        let original_order = state.audition_queue.clone();
-
-        state.library.tracks[0].status = TrackStatus::Archive;
-        sync_audition_queue_after_status_change(&mut state, "inbox-a");
-        assert!(!state.audition_queue.iter().any(|id| id == "inbox-a"));
-
-        state.library.tracks[1].status = TrackStatus::Inbox;
-        sync_audition_queue_after_status_change(&mut state, "refine-a");
-        assert_eq!(state.audition_queue.len(), 2);
-        assert_eq!(
-            state.audition_queue.first(),
-            original_order
-                .iter()
-                .find(|id| *id == "inbox-b")
-                .or_else(|| original_order.iter().find(|id| *id == "inbox-a"))
-        );
-        assert!(state.audition_queue.iter().any(|id| id == "refine-a"));
-    }
-
-    #[test]
-    fn status_change_advances_pending_audition_before_decode_can_play_it() {
-        let pending_id = String::from("pending-audition-track");
-        let next_id = String::from("next-audition-track");
-        let track = |id: &str, status: TrackStatus| Track {
-            id: String::from(id),
-            title: String::from(id),
-            original_name: format!("{id}.wav"),
-            path: PathBuf::from(format!("/external/{id}.wav")),
-            source_proof: crate::source::SourceProvenance::Unknown,
-            reference_path: None,
-            size: 0,
-            favorite: false,
-            stage: TrackStage::Production,
-            status,
-            notes: Vec::new(),
-        };
-        let mut state = AppState {
-            busy: false,
-            workspace_mode: WorkspaceMode::Audition,
-            audition_status_filter: TrackStatus::Inbox,
-            audition_queue: vec![pending_id.clone(), next_id.clone()],
-            audition_queue_index: 0,
-            audition_auto_advance: true,
-            audition_pending_play_track_id: Some(pending_id.clone()),
-            waveform: Some(WaveformData {
-                sample_rate: 48_000,
-                channels: 1,
-                duration_millis: 1_000,
-                render_frames: 48_000,
-                integrated_lufs: Some(-7.0),
-                loudness_profile: Arc::from([]),
-                summary: Arc::new(
-                    radiant::runtime::GpuSignalSummary::from_interleaved_samples(
-                        &[0.0, 0.0, 0.0, 0.0],
-                        4,
-                        1,
-                    ),
-                ),
-            }),
-            waveform_track_id: Some(pending_id.clone()),
-            ..AppState::default()
-        };
-        state.library.selected_track_id = Some(pending_id.clone());
-        state.library.tracks = vec![
-            track(&pending_id, TrackStatus::Inbox),
-            track(&next_id, TrackStatus::Inbox),
-        ];
-        let mut context = ui::UiUpdateContext::default();
-
-        update(
-            &mut state,
-            Message::SetStatus {
-                track_id: pending_id.clone(),
-                status: TrackStatus::Archive,
-            },
-            &mut context,
-        );
-
-        assert_eq!(
-            state.library.selected_track_id.as_deref(),
-            Some(next_id.as_str())
-        );
-        assert_eq!(state.audition_queue, vec![next_id.clone()]);
-        assert_eq!(
-            state.audition_pending_play_track_id.as_deref(),
-            Some(next_id.as_str())
-        );
-        assert_ne!(
-            state.audition_pending_play_track_id.as_deref(),
-            Some(pending_id.as_str())
-        );
-
-        update(&mut state, Message::Frame, &mut context);
-
-        assert!(!state.transport_playing);
-        assert!(!state.transport_polling);
-        assert_eq!(
-            state.audition_pending_play_track_id.as_deref(),
-            Some(next_id.as_str())
-        );
-    }
-
-    fn schedule_async_transport_error(
-        transport: transport::AudioTransport,
-        generation: u64,
-    ) -> std::thread::JoinHandle<()> {
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(4));
-            transport.set_error_for_test(
-                generation,
-                String::from("Could not open test-audio.wav for playback: test failure"),
-            );
-        })
     }
 
     #[test]
@@ -27201,208 +24111,8 @@ mod tests {
         assert_eq!(state.reference_transport_waiting_token, Some(11));
     }
 
-    fn wait_for_frame_state(
-        state: &mut AppState,
-        context: &mut ui::UiUpdateContext<Message>,
-        predicate: impl Fn(&AppState) -> bool,
-    ) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        loop {
-            update(state, Message::Frame, context);
-            if predicate(state) {
-                return;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the asynchronous transport state did not arrive"
-            );
-            std::thread::sleep(Duration::from_millis(4));
-        }
-    }
-
     #[test]
-    fn frame_transport_load_error_advances_pending_audition() {
-        let failed_id = String::from("failed-audition-track");
-        let next_id = String::from("next-audition-track");
-        let track = |id: &str, path: PathBuf| Track {
-            id: String::from(id),
-            title: String::from(id),
-            original_name: format!("{id}.wav"),
-            path,
-            source_proof: crate::source::SourceProvenance::Unknown,
-            reference_path: None,
-            size: 0,
-            favorite: false,
-            stage: TrackStage::Production,
-            status: TrackStatus::Inbox,
-            notes: Vec::new(),
-        };
-        let mut state = AppState {
-            busy: false,
-            workspace_mode: WorkspaceMode::Audition,
-            audition_queue: vec![failed_id.clone(), next_id.clone()],
-            audition_queue_index: 0,
-            audition_auto_advance: true,
-            audition_pending_play_track_id: Some(failed_id.clone()),
-            ..AppState::default()
-        };
-        state.library.selected_track_id = Some(failed_id.clone());
-        state.library.tracks = vec![
-            track(
-                &failed_id,
-                PathBuf::from("/external/failed-audition-track.wav"),
-            ),
-            track(&next_id, PathBuf::from("/external/next-audition-track.wav")),
-        ];
-        let error_thread =
-            schedule_async_transport_error(state.transport.clone(), state.transport_generation);
-        state.transport_waiting_token = Some(1);
-        state.transport_polling = true;
-        let mut context = ui::UiUpdateContext::default();
-
-        wait_for_frame_state(&mut state, &mut context, |state| {
-            state.library.selected_track_id.as_deref() == Some(next_id.as_str())
-        });
-        error_thread
-            .join()
-            .expect("the asynchronous transport error should publish");
-
-        assert!(state.audition_heard.iter().any(|id| id == &failed_id));
-        assert_eq!(state.audition_queue_index, 1);
-        assert_eq!(
-            state.audition_pending_play_track_id.as_deref(),
-            Some(next_id.as_str())
-        );
-        assert!(state.audition_auto_advance);
-        assert_eq!(
-            state.status,
-            format!("Loading next audition track: {next_id}…")
-        );
-    }
-
-    #[test]
-    fn acknowledged_audition_play_advances_without_a_playing_frame_even_with_reference_loop() {
-        let finished_id = String::from("finished-audition-track");
-        let next_id = String::from("next-audition-track");
-        let track = |id: &str| Track {
-            id: String::from(id),
-            title: String::from(id),
-            original_name: format!("{id}.wav"),
-            path: PathBuf::from(format!("/external/{id}.wav")),
-            source_proof: crate::source::SourceProvenance::Unknown,
-            reference_path: Some(PathBuf::from(format!("/external/{id}-reference.wav"))),
-            size: 0,
-            favorite: false,
-            stage: TrackStage::Production,
-            status: TrackStatus::Inbox,
-            notes: Vec::new(),
-        };
-        let mut state = AppState {
-            busy: false,
-            workspace_mode: WorkspaceMode::Audition,
-            audition_queue: vec![finished_id.clone(), next_id.clone()],
-            audition_queue_index: 0,
-            audition_auto_advance: true,
-            audition_play_token: Some(1),
-            transport_polling: true,
-            transport_waiting_token: Some(1),
-            waveform: Some(WaveformData {
-                sample_rate: 48_000,
-                channels: 1,
-                duration_millis: 1,
-                render_frames: 48,
-                integrated_lufs: Some(-7.0),
-                loudness_profile: Arc::from([]),
-                summary: Arc::new(
-                    radiant::runtime::GpuSignalSummary::from_interleaved_samples(
-                        &[0.0, 0.0, 0.0, 0.0],
-                        4,
-                        1,
-                    ),
-                ),
-            }),
-            waveform_track_id: Some(finished_id.clone()),
-            reference_waveform: Some(WaveformData {
-                sample_rate: 48_000,
-                channels: 1,
-                duration_millis: 1_000,
-                render_frames: 48_000,
-                integrated_lufs: Some(-7.0),
-                loudness_profile: Arc::from([]),
-                summary: Arc::new(
-                    radiant::runtime::GpuSignalSummary::from_interleaved_samples(
-                        &[0.0, 0.0, 0.0, 0.0],
-                        4,
-                        1,
-                    ),
-                ),
-            }),
-            reference_waveform_track_id: Some(finished_id.clone()),
-            loop_selections: LoopSelections {
-                main: None,
-                reference: Some(LoopSelection {
-                    start_ratio: 0.25,
-                    end_ratio: 0.75,
-                }),
-            },
-            ..AppState::default()
-        };
-        state.library.selected_track_id = Some(finished_id.clone());
-        state.library.tracks = vec![track(&finished_id), track(&next_id)];
-        state.transport.set_snapshot_for_test(Snapshot {
-            generation: state.transport_generation,
-            acknowledged_token: 1,
-            position_millis: 1,
-            playing: false,
-            ready: true,
-        });
-        let mut context = ui::UiUpdateContext::default();
-
-        update(&mut state, Message::Frame, &mut context);
-
-        assert_eq!(
-            state.library.selected_track_id.as_deref(),
-            Some(next_id.as_str())
-        );
-        assert_eq!(
-            state.audition_pending_play_track_id.as_deref(),
-            Some(next_id.as_str())
-        );
-        assert_eq!(state.audition_queue_index, 1);
-        assert!(!state.transport_playing);
-    }
-
-    #[test]
-    fn frame_transport_load_error_retains_manual_stop_and_report() {
-        let mut state = AppState {
-            busy: false,
-            status: String::from("Preparing playback…"),
-            transport_playing: true,
-            transport_polling: true,
-            ..AppState::default()
-        };
-        let error_thread =
-            schedule_async_transport_error(state.transport.clone(), state.transport_generation);
-        state.transport_waiting_token = Some(1);
-        let mut context = ui::UiUpdateContext::default();
-
-        wait_for_frame_state(&mut state, &mut context, |state| {
-            state.status != "Preparing playback…"
-        });
-        error_thread
-            .join()
-            .expect("the asynchronous transport error should publish");
-
-        assert!(state.status.starts_with("Could not "));
-        assert!(!state.transport_playing);
-        assert!(!state.transport_polling);
-        assert!(state.transport_waiting_token.is_none());
-        assert!(!state.audition_auto_advance);
-        assert!(state.audition_pending_play_track_id.is_none());
-    }
-
-    #[test]
-    fn workspace_tabs_select_review_planner_and_audition_directly() {
+    fn workspace_tabs_select_review_and_planner_directly() {
         let mut state = AppState {
             busy: false,
             ..AppState::default()
@@ -27415,12 +24125,6 @@ mod tests {
             &mut context,
         );
         assert_eq!(state.workspace_mode, WorkspaceMode::Planner);
-        update(
-            &mut state,
-            Message::SelectWorkspace(WorkspaceMode::Audition),
-            &mut context,
-        );
-        assert_eq!(state.workspace_mode, WorkspaceMode::Audition);
         update(
             &mut state,
             Message::SelectWorkspace(WorkspaceMode::Review),
@@ -27449,7 +24153,6 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Production,
-            status: TrackStatus::Inbox,
             notes: Vec::new(),
         });
 
@@ -27521,117 +24224,17 @@ mod tests {
     }
 
     #[test]
-    fn audition_surface_projects_filters_queue_and_shuffle_control() {
-        let track = |id: &str, status: TrackStatus| Track {
-            id: String::from(id),
-            title: String::from(id),
-            original_name: format!("{id}.wav"),
-            path: PathBuf::from(format!("/external/{id}.wav")),
-            source_proof: crate::source::SourceProvenance::Unknown,
-            reference_path: None,
-            size: 0,
-            favorite: false,
-            stage: TrackStage::Production,
-            status,
-            notes: Vec::new(),
-        };
-        let mut state = AppState {
-            busy: false,
-            workspace_mode: WorkspaceMode::Audition,
-            ..AppState::default()
-        };
-        state.library.tracks = vec![
-            track("inbox-track", TrackStatus::Inbox),
-            track("refine-track", TrackStatus::Refine),
-        ];
-        rebuild_audition_queue(&mut state);
-        let labels = project_surface(&state)
-            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 720.0))
-            .paint_plan
-            .text_label_strings();
-
-        for label in [
-            "AUDITION",
-            "Fixed shuffle · one pass",
-            "PLAY STATUS",
-            "Inbox",
-            "Refine",
-            "Release",
-            "Archive",
-            "Maybe",
-            "Previous",
-            "Play",
-            "Stop",
-            "Next",
-            "Shuffle",
-            "01  inbox-track",
-        ] {
-            assert!(
-                labels.iter().any(|painted| painted == label),
-                "missing {label:?}"
-            );
-        }
-        assert!(!labels.iter().any(|label| label == "refine-track"));
-    }
-
-    #[test]
-    fn audition_cards_paint_status_triggers_and_semantic_rails() {
-        let mut track = audition_track("audition-status-card");
-        track.status = TrackStatus::Refine;
-        let mut state = AppState {
-            busy: false,
-            workspace_mode: WorkspaceMode::Audition,
-            audition_status_filter: TrackStatus::Refine,
-            ..AppState::default()
-        };
-        state.library.tracks = vec![track];
-        rebuild_audition_queue(&mut state);
-
-        let frame = project_surface(&state)
-            .view_frame_at_size_with_default_theme(Vector2::new(1_180.0, 900.0));
-        let title = frame
-            .paint_plan
-            .first_text_run("01  audition-status-card")
-            .expect("the Audition queue card should paint its title");
-        let status = frame
-            .paint_plan
-            .text_runs()
-            .find(|run| {
-                run.text.as_str() == TrackStatus::Refine.label()
-                    && run.rect.min.y > title.rect.max.y
-            })
-            .expect("the Audition queue card should paint its status trigger");
-        let rail = frame
-            .paint_plan
-            .fill_rects()
-            .find(|fill| {
-                fill.color == ThemeTokens::default().accent_warning
-                    && (fill.rect.width() - super::STATUS_RAIL_WIDTH).abs() < 0.01
-                    && fill.rect.min.y < status.rect.max.y
-                    && fill.rect.max.y > status.rect.min.y
-            })
-            .expect("the Audition status trigger should paint its semantic rail");
-
-        assert!(rail.rect.max.x <= status.rect.min.x);
-        assert_eq!(rail.rect.height(), ui::dropdown_trigger_height());
-    }
-
-    #[test]
     fn workspace_cards_paint_and_route_replace_controls() {
         let track = audition_track("workspace-replace-card");
         let track_id = track.id.clone();
 
-        for workspace_mode in [WorkspaceMode::Audition, WorkspaceMode::Planner] {
+        for workspace_mode in [WorkspaceMode::Review, WorkspaceMode::Planner] {
             let mut state = AppState {
                 busy: false,
                 workspace_mode,
                 ..AppState::default()
             };
             state.library.tracks = vec![track.clone()];
-            if workspace_mode == WorkspaceMode::Audition {
-                state.audition_queue = vec![track_id.clone()];
-            }
-
             let bridge = DeclarativeOwnedRuntimeBridge::new(
                 state,
                 |state| project_surface(state).into_surface(),
@@ -27709,91 +24312,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn audition_status_menu_is_interactive_and_uses_a_distinct_host() {
-        let mut track = audition_track("audition-status-menu");
-        track.status = TrackStatus::Refine;
-        let track_id = track.id.clone();
-        let mut state = AppState {
-            busy: false,
-            workspace_mode: WorkspaceMode::Audition,
-            audition_status_filter: TrackStatus::Refine,
-            ..AppState::default()
-        };
-        state.library.tracks = vec![track];
-        rebuild_audition_queue(&mut state);
-        let bridge = DeclarativeOwnedRuntimeBridge::new(
-            state,
-            |state| project_surface(state).into_surface(),
-            |state, message| {
-                let mut context = ui::UiUpdateContext::default();
-                update(state, message, &mut context);
-            },
-        );
-        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1_180.0, 900.0));
-        let frame = runtime.frame_with_default_theme();
-        let title = frame
-            .paint_plan
-            .first_text_run("01  audition-status-menu")
-            .expect("the Audition queue card should paint its title");
-        let (_trigger, trigger_rect) = frame
-            .paint_plan
-            .text_runs()
-            .find_map(|run| {
-                (run.text.as_str() == TrackStatus::Refine.label()
-                    && run.rect.min.y > title.rect.max.y)
-                    .then_some((run.widget_id, run.rect))
-            })
-            .expect("the Audition queue card should paint a focusable status trigger");
-        let trigger_point = Point::new(
-            trigger_rect.min.x + trigger_rect.width() * 0.5,
-            trigger_rect.min.y + trigger_rect.height() * 0.5,
-        );
-
-        assert!(runtime.widget_at(trigger_point).is_some());
-        runtime.dispatch_primary_click(trigger_point);
-        assert_eq!(
-            runtime.bridge().state().status_menu_track_id.as_deref(),
-            Some(track_id.as_str())
-        );
-        assert_eq!(
-            runtime.bridge().state().status_menu_host,
-            Some(StatusMenuHost::Audition)
-        );
-        assert_eq!(
-            super::status_menu_host_key(StatusMenuHost::Audition),
-            "audition"
-        );
-
-        let opened_frame = runtime.frame_with_default_theme();
-        let option_rect = opened_frame
-            .paint_plan
-            .text_runs()
-            .find_map(|run| {
-                (run.text.as_str() == TrackStatus::Release.label()
-                    && run.rect.width() < super::STATUS_MENU_WIDTH)
-                    .then_some(run.rect)
-            })
-            .expect("the open Audition status menu should paint the Release option");
-        assert!(
-            option_rect.min.x < trigger_rect.max.x && option_rect.max.x > trigger_rect.min.x,
-            "the local status popover should remain horizontally associated with its trigger"
-        );
-        let option_point = Point::new(
-            option_rect.min.x + option_rect.width() * 0.5,
-            option_rect.min.y + option_rect.height() * 0.5,
-        );
-        assert!(runtime.widget_at(option_point).is_some());
-        runtime.dispatch_primary_click(option_point);
-
-        assert_eq!(
-            runtime.bridge().state().library.tracks[0].status,
-            TrackStatus::Release
-        );
-        assert!(runtime.bridge().state().status_menu_track_id.is_none());
-        assert!(runtime.bridge().state().status_menu_host.is_none());
-    }
-
     fn rightmost_svg_rect_after(primitives: &[PaintPrimitive], min_y: f32) -> Rect {
         primitives
             .iter()
@@ -27830,82 +24348,9 @@ mod tests {
     }
 
     #[test]
-    fn audition_card_removal_control_opens_and_cancels_confirmation() {
-        let track = audition_track("audition-remove-card");
-        let track_id = track.id.clone();
-        let mut state = AppState {
-            busy: false,
-            workspace_mode: WorkspaceMode::Audition,
-            ..AppState::default()
-        };
-        state.library.tracks = vec![track];
-        rebuild_audition_queue(&mut state);
-        let bridge = DeclarativeOwnedRuntimeBridge::new(
-            state,
-            |state| project_surface(state).into_surface(),
-            |state, message| {
-                let mut context = ui::UiUpdateContext::default();
-                update(state, message, &mut context);
-            },
-        );
-        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1_180.0, 900.0));
-        let frame = runtime.frame_with_default_theme();
-        let title = frame
-            .paint_plan
-            .first_text_run("01  audition-remove-card")
-            .expect("the Audition queue card should paint its title");
-        let remove_rect = rightmost_svg_rect_after(&frame.paint_plan.primitives, title.rect.min.y);
-        let remove_point = Point::new(
-            remove_rect.min.x + remove_rect.width() * 0.5,
-            remove_rect.min.y + remove_rect.height() * 0.5,
-        );
-
-        assert!(runtime.widget_at(remove_point).is_some());
-        runtime.dispatch_primary_click(remove_point);
-        assert_eq!(
-            runtime
-                .bridge()
-                .state()
-                .remove_confirmation_track_id
-                .as_deref(),
-            Some(track_id.as_str())
-        );
-
-        let opened_frame = runtime.frame_with_default_theme();
-        assert!(
-            opened_frame
-                .paint_plan
-                .text_label_strings()
-                .iter()
-                .any(|label| label == "Confirm")
-        );
-        let cancel_rect = opened_frame
-            .paint_plan
-            .text_runs()
-            .find(|run| run.text.as_str() == "Cancel")
-            .expect("the Audition card should paint a Cancel control")
-            .rect;
-        let cancel_point = Point::new(
-            cancel_rect.min.x + cancel_rect.width() * 0.5,
-            cancel_rect.min.y + cancel_rect.height() * 0.5,
-        );
-        assert!(runtime.widget_at(cancel_point).is_some());
-        runtime.dispatch_primary_click(cancel_point);
-
-        assert!(
-            runtime
-                .bridge()
-                .state()
-                .remove_confirmation_track_id
-                .is_none()
-        );
-        assert_eq!(runtime.bridge().state().library.tracks.len(), 1);
-    }
-
-    #[test]
     fn planner_card_review_control_switches_to_review() {
         let mut track = audition_track("planner-review-card");
-        track.stage = TrackStage::SoundDesign;
+        track.stage = TrackStage::Backlog;
         let track_id = track.id.clone();
         let mut state = AppState {
             busy: false,
@@ -27970,7 +24415,6 @@ mod tests {
         let mut state = AppState {
             busy: false,
             workspace_mode: WorkspaceMode::Planner,
-            review_status_filter: Some(TrackStatus::Inbox),
             ..AppState::default()
         };
         state.library.tracks = vec![first_track, selected_track, favorite_track];
@@ -27978,7 +24422,7 @@ mod tests {
 
         update(
             &mut state,
-            Message::SelectTrack(selected_id.clone()),
+            Message::ReviewTrack(selected_id.clone()),
             &mut context,
         );
 
@@ -27987,56 +24431,6 @@ mod tests {
             state.library.selected_track_id.as_deref(),
             Some(selected_id.as_str())
         );
-        assert_eq!(state.review_status_filter, Some(TrackStatus::Inbox));
-
-        let command = context.into_command();
-        let card_height = library_track_card_height();
-        assert_eq!(
-            scroll_into_view_request(&command),
-            Some((
-                LIBRARY_SCROLL_VIEWPORT_ID,
-                2.0 * (card_height + TRACK_CARD_LIST_SPACING),
-                card_height,
-                LIBRARY_REVEAL_MARGIN,
-                LIBRARY_REVEAL_MARGIN,
-            ))
-        );
-        assert_eq!(
-            focus_request_id(&command),
-            Some(library_track_title_id(&selected_id))
-        );
-    }
-
-    #[test]
-    fn planner_selection_clears_incompatible_review_filter_before_reveal() {
-        let first_track = audition_track("planner-filter-first");
-        let mut selected_track = audition_track("planner-filter-middle");
-        selected_track.status = TrackStatus::Release;
-        let selected_id = selected_track.id.clone();
-        let mut favorite_track = audition_track("planner-filter-favorite");
-        favorite_track.favorite = true;
-        let mut state = AppState {
-            busy: false,
-            workspace_mode: WorkspaceMode::Planner,
-            review_status_filter: Some(TrackStatus::Inbox),
-            ..AppState::default()
-        };
-        state.library.tracks = vec![first_track, selected_track, favorite_track];
-        let mut context = ui::UiUpdateContext::default();
-
-        update(
-            &mut state,
-            Message::SelectTrack(selected_id.clone()),
-            &mut context,
-        );
-
-        assert_eq!(state.workspace_mode, WorkspaceMode::Review);
-        assert_eq!(
-            state.library.selected_track_id.as_deref(),
-            Some(selected_id.as_str())
-        );
-        assert_eq!(state.review_status_filter, None);
-
         let command = context.into_command();
         let card_height = library_track_card_height();
         assert_eq!(
@@ -28058,7 +24452,7 @@ mod tests {
     #[test]
     fn planner_card_removal_control_opens_and_confirms_removal() {
         let mut track = audition_track("planner-remove-card");
-        track.stage = TrackStage::SoundDesign;
+        track.stage = TrackStage::Backlog;
         let track_id = track.id.clone();
         let mut state = AppState {
             busy: false,
@@ -28122,7 +24516,7 @@ mod tests {
     }
 
     #[test]
-    fn planner_uses_backlog_for_the_sound_design_column_heading() {
+    fn planner_uses_backlog_for_the_first_column_heading() {
         let state = AppState {
             busy: false,
             workspace_mode: WorkspaceMode::Planner,
@@ -28135,9 +24529,9 @@ mod tests {
 
         assert!(labels.iter().any(|label| label == "Backlog"));
         assert!(!labels.iter().any(|label| label == "Sound design"));
-        assert_eq!(TrackStage::SoundDesign.label(), "Sound design");
+        assert_eq!(TrackStage::Backlog.label(), "Backlog");
         assert_eq!(
-            super::planner_column_heading(TrackStage::SoundDesign),
+            super::planner_column_heading(TrackStage::Backlog),
             "Backlog"
         );
     }
@@ -28161,12 +24555,6 @@ mod tests {
                 "FINISHING BOARD",
                 None,
                 theme.surface_raised,
-            ),
-            (
-                WorkspaceMode::Audition,
-                "AUDITION",
-                Some("Fixed shuffle · one pass"),
-                theme.surface_overlay,
             ),
         ] {
             state.workspace_mode = mode;
@@ -28243,7 +24631,7 @@ mod tests {
             .expect("Planner should paint its outer board with the raised neutral surface");
 
         for stage in [
-            TrackStage::SoundDesign,
+            TrackStage::Backlog,
             TrackStage::Production,
             TrackStage::Mixdown,
             TrackStage::Mastering,
@@ -28298,7 +24686,7 @@ mod tests {
         };
 
         for stage in [
-            TrackStage::SoundDesign,
+            TrackStage::Backlog,
             TrackStage::Production,
             TrackStage::Mixdown,
             TrackStage::Mastering,
@@ -28308,7 +24696,7 @@ mod tests {
                 .first_text_run(super::planner_column_heading(stage))
                 .expect("Planner should paint every stage heading");
             let expected_color = match stage {
-                TrackStage::SoundDesign => theme.accent_warning,
+                TrackStage::Backlog => theme.accent_warning,
                 TrackStage::Production => theme.accent_mint,
                 TrackStage::Mixdown => theme.highlight_cyan,
                 TrackStage::Mastering => theme.accent_danger,
@@ -28361,7 +24749,7 @@ mod tests {
     fn favorite_state_is_immediately_visible_in_all_track_lists() {
         let mut starred = audition_track("starred-track");
         starred.favorite = true;
-        starred.stage = TrackStage::SoundDesign;
+        starred.stage = TrackStage::Backlog;
         let mut unstarred = audition_track("unstarred-track");
         unstarred.stage = TrackStage::Production;
         let mut state = AppState {
@@ -28370,16 +24758,8 @@ mod tests {
         };
         state.library.selected_track_id = Some(starred.id.clone());
         state.library.tracks = vec![starred, unstarred];
-        state.audition_queue = vec![
-            String::from("starred-track"),
-            String::from("unstarred-track"),
-        ];
 
-        for mode in [
-            WorkspaceMode::Review,
-            WorkspaceMode::Planner,
-            WorkspaceMode::Audition,
-        ] {
+        for mode in [WorkspaceMode::Review, WorkspaceMode::Planner] {
             state.workspace_mode = mode;
             let frame = project_surface(&state)
                 .view_frame_at_size_with_default_theme(Vector2::new(1_400.0, 900.0));
@@ -28894,15 +25274,10 @@ mod tests {
         };
         state.library.selected_track_id = Some(selected.id.clone());
         state.library.tracks = vec![favorite.clone(), selected.clone()];
-        state.audition_queue = vec![favorite.id.clone(), selected.id.clone()];
         let theme = ThemeTokens::default();
         let mut expected_styles = None;
 
-        for mode in [
-            WorkspaceMode::Review,
-            WorkspaceMode::Audition,
-            WorkspaceMode::Planner,
-        ] {
+        for mode in [WorkspaceMode::Review, WorkspaceMode::Planner] {
             state.workspace_mode = mode;
             let frame = project_surface(&state)
                 .view_frame_at_size_with_default_theme(Vector2::new(1_400.0, 900.0));
@@ -29042,8 +25417,8 @@ mod tests {
             ),
         );
         let expected_height = 26.0
-            + (ui::dropdown_trigger_height() * 2.0)
-            + (super::TRACK_CARD_CONTENT_SPACING * 4.0)
+            + ui::dropdown_trigger_height()
+            + (super::TRACK_CARD_CONTENT_SPACING * 3.0)
             + 18.0
             + super::REMOVAL_CONFIRMATION_ROW_HEIGHT
             + (super::TRACK_CARD_CONTENT_INSET * 2.0);
@@ -29071,40 +25446,14 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing {label:?} control bounds"))
         };
         let title_bounds = control_bounds(&track_id);
-        let stage_bounds = control_bounds("Production / arrangement");
-        let status_bounds = control_bounds("Inbox");
+        let stage_bounds = control_bounds("Production");
         for (label, bounds) in [("title", title_bounds), ("stage", stage_bounds)] {
             assert!(
                 (bounds.min.x - card_bounds.min.x - super::TRACK_CARD_CONTENT_INSET).abs() < 0.01,
                 "{label} should start at the card content inset: card={card_bounds:?}, control={bounds:?}"
             );
         }
-        assert!(
-            (status_bounds.min.x
-                - card_bounds.min.x
-                - super::TRACK_CARD_CONTENT_INSET
-                - super::STATUS_RAIL_WIDTH
-                - super::STATUS_RAIL_GAP)
-                .abs()
-                < 0.01,
-            "status trigger should follow its inset rail and gap: card={card_bounds:?}, control={status_bounds:?}"
-        );
         assert_eq!(stage_bounds.height(), 24.0);
-        assert_eq!(status_bounds.height(), ui::dropdown_trigger_height());
-        let status_rail = frame
-            .paint_plan
-            .fill_rects()
-            .find(|fill| {
-                fill.rect.width() == super::STATUS_RAIL_WIDTH
-                    && fill.rect.height() == ui::dropdown_trigger_height()
-                    && fill.rect.min.x >= card_bounds.min.x
-                    && fill.rect.max.x <= card_bounds.max.x
-            })
-            .expect("the status dropdown should retain its compact semantic rail");
-        assert!(
-            (status_rail.rect.min.x - card_bounds.min.x - super::TRACK_CARD_CONTENT_INSET).abs()
-                < 0.01
-        );
     }
 
     #[test]
@@ -29216,132 +25565,6 @@ mod tests {
             "card right border must remain left of the scrollbar: card={first:?}, scrollbar={:?}",
             scrollbar.rect
         );
-    }
-
-    #[test]
-    fn status_dropdown_uses_neutral_body_and_compact_semantic_rail() {
-        let theme = ThemeTokens::default();
-        let statuses = [
-            (TrackStatus::Inbox, super::TRACK_CARD_SELECTED_CORAL),
-            (TrackStatus::Refine, theme.accent_warning),
-            (TrackStatus::Release, theme.highlight_cyan),
-            (TrackStatus::Archive, theme.text_muted),
-            (TrackStatus::Maybe, theme.accent_danger),
-        ];
-
-        for (status, expected_rail_color) in statuses {
-            let mut track = audition_track("status-rail");
-            track.status = status;
-            let frame = ui::scene(status_dropdown_for_host(
-                &track,
-                false,
-                false,
-                StatusMenuHost::Library,
-            ))
-            .into_view()
-            .view_frame_at_size_with_default_theme(Vector2::new(240.0, 80.0));
-            let label = frame
-                .paint_plan
-                .text_runs()
-                .find(|run| run.text.as_str() == status.label())
-                .expect("status trigger should paint its selected label");
-            let body = frame
-                .paint_plan
-                .fill_polygons()
-                .find(|fill| {
-                    fill.widget_id == label.widget_id && fill.color == theme.surface_overlay
-                })
-                .expect("status trigger should use a neutral dark body");
-            let body_min_x = body
-                .points
-                .iter()
-                .map(|point| point.x)
-                .fold(f32::INFINITY, f32::min);
-            let rail = frame
-                .paint_plan
-                .fill_rects()
-                .find(|fill| {
-                    fill.color == expected_rail_color
-                        && (fill.rect.width() - super::STATUS_RAIL_WIDTH).abs() < 0.01
-                })
-                .expect("status trigger should paint one semantic color rail");
-            assert!(rail.rect.max.x <= body_min_x);
-            assert_eq!(rail.rect.height(), ui::dropdown_trigger_height());
-            assert!(!frame.paint_plan.fill_polygons().any(|fill| {
-                fill.widget_id == label.widget_id
-                    && [
-                        super::TRACK_CARD_SELECTED_CORAL,
-                        theme.accent_warning,
-                        theme.highlight_cyan,
-                        theme.accent_danger,
-                    ]
-                    .contains(&fill.color)
-            }));
-        }
-    }
-
-    #[test]
-    fn status_filter_picker_and_audition_rows_paint_semantic_rails() {
-        let theme = ThemeTokens::default();
-        let statuses = [
-            (Some(TrackStatus::Inbox), super::TRACK_CARD_SELECTED_CORAL),
-            (Some(TrackStatus::Refine), theme.accent_warning),
-            (Some(TrackStatus::Release), theme.highlight_cyan),
-            (Some(TrackStatus::Archive), theme.text_muted),
-            (Some(TrackStatus::Maybe), theme.accent_danger),
-        ];
-        let picker = ui::scene(status_filter_dropdown(
-            Some(TrackStatus::Refine),
-            "review",
-            review_status_filter_message,
-            true,
-        ))
-        .into_view()
-        .view_frame_at_size_with_default_theme(Vector2::new(260.0, 220.0));
-        for (status, expected_color) in statuses {
-            assert!(picker.paint_plan.fill_rects().any(|fill| {
-                fill.color == expected_color
-                    && (fill.rect.width() - super::STATUS_RAIL_WIDTH).abs() < 0.01
-                    && fill.rect.height() > 20.0
-            }));
-            let label = status.expect("filter option status").label();
-            assert!(
-                picker
-                    .paint_plan
-                    .text_label_strings()
-                    .iter()
-                    .any(|text| text == label)
-            );
-        }
-        assert!(
-            picker
-                .paint_plan
-                .text_label_strings()
-                .iter()
-                .any(|text| text == "All")
-        );
-        assert!(picker.paint_plan.fill_rects().any(|fill| {
-            fill.color == theme.grid_strong
-                && (fill.rect.width() - super::STATUS_RAIL_WIDTH).abs() < 0.01
-        }));
-
-        let state = AppState {
-            busy: false,
-            workspace_mode: WorkspaceMode::Audition,
-            ..AppState::default()
-        };
-        ensure_library_projection_cache(&state);
-        let projection = state.library_projection_cache.borrow();
-        let audition = ui::scene(audition_panel(&state, &projection))
-            .into_view()
-            .view_frame_at_size_with_default_theme(Vector2::new(420.0, 720.0));
-        for (_, expected_color) in statuses {
-            assert!(audition.paint_plan.fill_rects().any(|fill| {
-                fill.color == expected_color
-                    && (fill.rect.width() - super::STATUS_RAIL_WIDTH).abs() < 0.01
-                    && fill.rect.height() >= 24.0
-            }));
-        }
     }
 
     #[test]
@@ -31151,46 +27374,5 @@ mod tests {
         assert_eq!(state.reference_catalog_import_total, 0);
         assert_eq!(state.reference_catalog_import_completed, 0);
         assert_eq!(state.reference_catalog_import_failed, 0);
-    }
-
-    #[test]
-    fn audition_library_reconciliation_preserves_order_and_progress_cursor() {
-        let track = |id: &str| Track {
-            id: String::from(id),
-            title: String::from(id),
-            original_name: format!("{id}.wav"),
-            path: PathBuf::from(format!("/external/{id}.wav")),
-            source_proof: crate::source::SourceProvenance::Unknown,
-            reference_path: None,
-            size: 0,
-            favorite: false,
-            stage: TrackStage::Production,
-            status: TrackStatus::Inbox,
-            notes: Vec::new(),
-        };
-        let mut state = AppState {
-            busy: false,
-            workspace_mode: WorkspaceMode::Audition,
-            audition_queue: vec![String::from("a"), String::from("b")],
-            audition_queue_index: 1,
-            ..AppState::default()
-        };
-        state.library.selected_track_id = Some(String::from("b"));
-        state.library.tracks = vec![track("a"), track("b"), track("c")];
-
-        reconcile_audition_queue(&mut state);
-        assert_eq!(
-            state.audition_queue,
-            vec![String::from("a"), String::from("b"), String::from("c")]
-        );
-        assert_eq!(state.audition_queue_index, 1);
-
-        state.library.tracks.retain(|track| track.id != "b");
-        reconcile_audition_queue(&mut state);
-        assert_eq!(
-            state.audition_queue,
-            vec![String::from("a"), String::from("c")]
-        );
-        assert_eq!(state.audition_queue_index, 1);
     }
 }
