@@ -48,8 +48,6 @@ pub struct Track {
     pub size: u64,
     pub favorite: bool,
     pub stage: TrackStage,
-    #[serde(default)]
-    pub status: TrackStatus,
     pub notes: Vec<Note>,
 }
 
@@ -65,37 +63,10 @@ impl ReferenceTrack {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TrackStatus {
-    #[default]
-    #[serde(rename = "inbox")]
-    Inbox,
-    #[serde(rename = "refine")]
-    Refine,
-    #[serde(rename = "release")]
-    Release,
-    #[serde(rename = "archive")]
-    Archive,
-    #[serde(rename = "maybe")]
-    Maybe,
-}
-
-impl TrackStatus {
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Inbox => "Inbox",
-            Self::Refine => "Refine",
-            Self::Release => "Release",
-            Self::Archive => "Archive",
-            Self::Maybe => "Maybe",
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TrackStage {
     #[serde(rename = "sound-design")]
-    SoundDesign,
+    Backlog,
     #[serde(rename = "production")]
     Production,
     #[serde(rename = "mixdown")]
@@ -107,8 +78,8 @@ pub enum TrackStage {
 impl TrackStage {
     pub const fn label(self) -> &'static str {
         match self {
-            Self::SoundDesign => "Sound design",
-            Self::Production => "Production / arrangement",
+            Self::Backlog => "Backlog",
+            Self::Production => "Production",
             Self::Mixdown => "Mixdown",
             Self::Mastering => "Mastering",
         }
@@ -382,8 +353,7 @@ fn import_into_library_at(
         reference_path: None,
         size: metadata.len(),
         favorite: false,
-        stage: TrackStage::SoundDesign,
-        status: TrackStatus::Inbox,
+        stage: TrackStage::Backlog,
         notes: Vec::new(),
     });
     normalize_planner_order(&mut library);
@@ -862,17 +832,15 @@ pub fn planner_tracks<'a>(library: &'a Library) -> Vec<&'a Track> {
     ordered
 }
 
-/// Move one track to a visible Planner insertion slot.
+/// Move one track to a Planner insertion slot.
 ///
 /// The operation stages only the normalized ID order and the source stage, so
 /// invalid source, target, or slot data leaves the caller's library unchanged.
-/// Hidden tracks remain in their relative order when a status filter is active.
 pub fn move_track_to_planner_slot(
     library: &mut Library,
     source_id: &str,
     target_stage: TrackStage,
     target_slot: usize,
-    status_filter: Option<TrackStatus>,
 ) -> Result<bool, String> {
     let first_track_by_id = library.tracks.iter().fold(
         HashMap::<&str, &Track>::with_capacity(library.tracks.len()),
@@ -885,18 +853,12 @@ pub fn move_track_to_planner_slot(
         .get(source_id)
         .copied()
         .ok_or_else(|| String::from("That track is no longer in the library."))?;
-    if status_filter.is_some_and(|status| source.status != status) {
-        return Err(String::from(
-            "That track is not visible in the current Planner filter.",
-        ));
-    }
 
     let order_before = normalized_planner_order(library);
     let visible_target_ids = order_before
         .iter()
         .filter_map(|id| first_track_by_id.get(id.as_str()).copied())
         .filter(|track| track.stage == target_stage)
-        .filter(|track| status_filter.is_none_or(|status| track.status == status))
         .map(|track| track.id.as_str())
         .collect::<Vec<_>>();
     if target_slot > visible_target_ids.len() {
@@ -973,23 +935,6 @@ pub fn move_track_to_planner_slot(
         }
     }
     Ok(order_changed || stage_changed)
-}
-
-pub fn set_track_status(
-    library: &mut Library,
-    track_id: &str,
-    status: TrackStatus,
-) -> Result<bool, String> {
-    let track = library
-        .tracks
-        .iter_mut()
-        .find(|track| track.id == track_id)
-        .ok_or_else(|| String::from("That track is no longer in the library."))?;
-    if track.status == status {
-        return Ok(false);
-    }
-    track.status = status;
-    Ok(true)
 }
 
 pub fn selection_after_removal(library: &Library, removed_index: usize) -> Option<String> {
@@ -1268,7 +1213,6 @@ mod tests {
                 size: 42,
                 favorite: true,
                 stage: TrackStage::Mixdown,
-                status: TrackStatus::Release,
                 notes: vec![Note {
                     id: String::from("note-1"),
                     time_millis: 900,
@@ -1578,39 +1522,56 @@ mod tests {
     }
 
     #[test]
-    fn stage_labels_are_product_neutral_storage_values() {
-        assert_eq!(TrackStage::SoundDesign.label(), "Sound design");
-        assert_eq!(TrackStage::Production.label(), "Production / arrangement");
-        assert_eq!(TrackStage::Mixdown.label(), "Mixdown");
-        assert_eq!(TrackStage::Mastering.label(), "Mastering");
-    }
-
-    #[test]
-    fn track_status_defaults_to_inbox_and_uses_workflow_labels() {
-        assert_eq!(TrackStatus::default(), TrackStatus::Inbox);
-        assert_eq!(TrackStatus::Inbox.label(), "Inbox");
-        assert_eq!(TrackStatus::Refine.label(), "Refine");
-        assert_eq!(TrackStatus::Release.label(), "Release");
-        assert_eq!(TrackStatus::Archive.label(), "Archive");
-        assert_eq!(TrackStatus::Maybe.label(), "Maybe");
-    }
-
-    #[test]
-    fn track_status_serializes_to_canonical_values() {
-        let statuses = [
-            (TrackStatus::Inbox, "inbox"),
-            (TrackStatus::Refine, "refine"),
-            (TrackStatus::Release, "release"),
-            (TrackStatus::Archive, "archive"),
-            (TrackStatus::Maybe, "maybe"),
+    fn stage_labels_and_wire_order_are_stable() {
+        let stages = [
+            TrackStage::Backlog,
+            TrackStage::Production,
+            TrackStage::Mixdown,
+            TrackStage::Mastering,
         ];
+        assert_eq!(
+            stages.map(TrackStage::label),
+            ["Backlog", "Production", "Mixdown", "Mastering"]
+        );
+        assert_eq!(
+            stages
+                .into_iter()
+                .map(|stage| serde_json::to_string(&stage).expect("stage should encode"))
+                .collect::<Vec<_>>(),
+            [
+                "\"sound-design\"",
+                "\"production\"",
+                "\"mixdown\"",
+                "\"mastering\""
+            ]
+        );
+    }
 
-        for (status, expected) in statuses {
-            assert_eq!(
-                serde_json::to_string(&status).expect("status should encode"),
-                format!("\"{expected}\"")
-            );
-        }
+    #[test]
+    fn legacy_status_fields_load_and_are_omitted_on_save() {
+        let encoded = r#"{
+            "tracks": [
+                {"id":"legacy-inbox","title":"Inbox","original_name":"inbox.wav","path":"/tmp/inbox.wav","size":0,"favorite":false,"stage":"sound-design","status":"inbox","notes":[]},
+                {"id":"legacy-refine","title":"Refine","original_name":"refine.wav","path":"/tmp/refine.wav","size":0,"favorite":false,"stage":"sound-design","status":"refine","notes":[]},
+                {"id":"legacy-release","title":"Release","original_name":"release.wav","path":"/tmp/release.wav","size":0,"favorite":false,"stage":"sound-design","status":"release","notes":[]},
+                {"id":"legacy-archive","title":"Archive","original_name":"archive.wav","path":"/tmp/archive.wav","size":0,"favorite":false,"stage":"sound-design","status":"archive","notes":[]},
+                {"id":"legacy-maybe","title":"Maybe","original_name":"maybe.wav","path":"/tmp/maybe.wav","size":0,"favorite":false,"stage":"sound-design","status":"maybe","notes":[]}
+            ],
+            "selected_track_id": null
+        }"#;
+
+        let library: Library = serde_json::from_str(encoded).expect("legacy statuses should load");
+        assert_eq!(library.tracks.len(), 5);
+        assert!(
+            library
+                .tracks
+                .iter()
+                .all(|track| track.stage == TrackStage::Backlog)
+        );
+
+        let reserialized = serde_json::to_string(&library).expect("library should reserialize");
+        assert!(!reserialized.contains("\"status\""));
+        assert!(reserialized.contains("\"stage\":\"sound-design\""));
     }
 
     #[test]
@@ -1651,8 +1612,7 @@ mod tests {
                 reference_path: None,
                 size: 42,
                 favorite: false,
-                stage: TrackStage::SoundDesign,
-                status: TrackStatus::Inbox,
+                stage: TrackStage::Backlog,
                 notes: Vec::new(),
             }],
             selected_track_id: Some(String::from("track-1")),
@@ -1688,8 +1648,7 @@ mod tests {
             reference_path: None,
             size: 0,
             favorite: false,
-            stage: TrackStage::SoundDesign,
-            status: TrackStatus::Inbox,
+            stage: TrackStage::Backlog,
             notes: Vec::new(),
         };
         let library = Library {
@@ -1722,8 +1681,7 @@ mod tests {
                 reference_path: None,
                 size: 42,
                 favorite: false,
-                stage: TrackStage::SoundDesign,
-                status: TrackStatus::Inbox,
+                stage: TrackStage::Backlog,
                 notes: Vec::new(),
             }],
             selected_track_id: Some(String::from("track-1")),
@@ -1732,7 +1690,7 @@ mod tests {
         };
 
         assert!(
-            !set_track_stage(&mut library, "track-1", TrackStage::SoundDesign)
+            !set_track_stage(&mut library, "track-1", TrackStage::Backlog)
                 .expect("track should exist")
         );
         assert!(
@@ -1742,12 +1700,7 @@ mod tests {
         assert_eq!(library.tracks[0].stage, TrackStage::Mixdown);
     }
 
-    fn planner_test_track(
-        id: &str,
-        stage: TrackStage,
-        status: TrackStatus,
-        favorite: bool,
-    ) -> Track {
+    fn planner_test_track(id: &str, stage: TrackStage, favorite: bool) -> Track {
         Track {
             id: String::from(id),
             title: String::from(id),
@@ -1758,7 +1711,6 @@ mod tests {
             size: 0,
             favorite,
             stage,
-            status,
             notes: Vec::new(),
         }
     }
@@ -1767,8 +1719,8 @@ mod tests {
     fn planner_order_normalizes_legacy_and_stale_ids() {
         let mut legacy = Library {
             tracks: vec![
-                planner_test_track("plain", TrackStage::Production, TrackStatus::Inbox, false),
-                planner_test_track("starred", TrackStage::Production, TrackStatus::Inbox, true),
+                planner_test_track("plain", TrackStage::Production, false),
+                planner_test_track("starred", TrackStage::Production, true),
             ],
             selected_track_id: None,
             reference_tracks: Vec::new(),
@@ -1788,27 +1740,16 @@ mod tests {
 
     #[test]
     fn planner_tracks_preserve_order_semantics_and_first_match_identity() {
-        let mut first_duplicate = planner_test_track(
-            "duplicate",
-            TrackStage::Production,
-            TrackStatus::Inbox,
-            false,
-        );
+        let mut first_duplicate = planner_test_track("duplicate", TrackStage::Production, false);
         first_duplicate.title = String::from("first duplicate");
-        let mut later_duplicate =
-            planner_test_track("duplicate", TrackStage::Mixdown, TrackStatus::Refine, true);
+        let mut later_duplicate = planner_test_track("duplicate", TrackStage::Mixdown, true);
         later_duplicate.title = String::from("later duplicate");
         let explicit = Library {
             tracks: vec![
-                planner_test_track("tail", TrackStage::Mastering, TrackStatus::Release, false),
+                planner_test_track("tail", TrackStage::Mastering, false),
                 first_duplicate.clone(),
                 later_duplicate.clone(),
-                planner_test_track(
-                    "appended",
-                    TrackStage::SoundDesign,
-                    TrackStatus::Inbox,
-                    false,
-                ),
+                planner_test_track("appended", TrackStage::Backlog, false),
             ],
             selected_track_id: None,
             reference_tracks: Vec::new(),
@@ -1835,8 +1776,8 @@ mod tests {
 
         let legacy = Library {
             tracks: vec![
-                planner_test_track("plain", TrackStage::Production, TrackStatus::Inbox, false),
-                planner_test_track("favorite", TrackStage::Production, TrackStatus::Inbox, true),
+                planner_test_track("plain", TrackStage::Production, false),
+                planner_test_track("favorite", TrackStage::Production, true),
                 first_duplicate,
                 later_duplicate,
             ],
@@ -1864,9 +1805,9 @@ mod tests {
     fn planner_move_reorders_same_stage_and_changes_stage_atomically() {
         let mut library = Library {
             tracks: vec![
-                planner_test_track("a", TrackStage::SoundDesign, TrackStatus::Inbox, false),
-                planner_test_track("b", TrackStage::Production, TrackStatus::Inbox, false),
-                planner_test_track("c", TrackStage::Production, TrackStatus::Inbox, false),
+                planner_test_track("a", TrackStage::Backlog, false),
+                planner_test_track("b", TrackStage::Production, false),
+                planner_test_track("c", TrackStage::Production, false),
             ],
             selected_track_id: None,
             reference_tracks: Vec::new(),
@@ -1874,14 +1815,14 @@ mod tests {
         };
 
         assert!(
-            move_track_to_planner_slot(&mut library, "c", TrackStage::Production, 0, None,)
+            move_track_to_planner_slot(&mut library, "c", TrackStage::Production, 0)
                 .expect("same-stage move should validate")
         );
         assert_eq!(library.planner_order, ["a", "c", "b"]);
         assert_eq!(library.tracks[1].stage, TrackStage::Production);
 
         assert!(
-            move_track_to_planner_slot(&mut library, "a", TrackStage::Production, 2, None,)
+            move_track_to_planner_slot(&mut library, "a", TrackStage::Production, 2)
                 .expect("cross-stage move should validate")
         );
         assert_eq!(library.planner_order, ["c", "b", "a"]);
@@ -1892,13 +1833,8 @@ mod tests {
     fn planner_move_keeps_unrelated_track_storage_in_place() {
         let mut library = Library {
             tracks: vec![
-                planner_test_track("source", TrackStage::Production, TrackStatus::Inbox, false),
-                planner_test_track(
-                    "unrelated",
-                    TrackStage::Production,
-                    TrackStatus::Inbox,
-                    false,
-                ),
+                planner_test_track("source", TrackStage::Production, false),
+                planner_test_track("unrelated", TrackStage::Production, false),
             ],
             selected_track_id: None,
             reference_tracks: Vec::new(),
@@ -1907,7 +1843,7 @@ mod tests {
         let unrelated_pointer = std::ptr::from_ref(&library.tracks[1]);
 
         assert!(
-            move_track_to_planner_slot(&mut library, "source", TrackStage::Production, 2, None)
+            move_track_to_planner_slot(&mut library, "source", TrackStage::Production, 2)
                 .expect("same-stage reorder should validate")
         );
         assert_eq!(library.planner_order, ["unrelated", "source"]);
@@ -1915,23 +1851,13 @@ mod tests {
     }
 
     #[test]
-    fn planner_move_adjusts_target_after_source_and_preserves_hidden_order() {
+    fn planner_move_adjusts_target_after_source_and_preserves_order() {
         let mut library = Library {
             tracks: vec![
-                planner_test_track("a", TrackStage::Production, TrackStatus::Inbox, false),
-                planner_test_track(
-                    "hidden-one",
-                    TrackStage::Production,
-                    TrackStatus::Archive,
-                    false,
-                ),
-                planner_test_track("b", TrackStage::Production, TrackStatus::Inbox, false),
-                planner_test_track(
-                    "hidden-two",
-                    TrackStage::Production,
-                    TrackStatus::Maybe,
-                    false,
-                ),
+                planner_test_track("a", TrackStage::Production, false),
+                planner_test_track("hidden-one", TrackStage::Production, false),
+                planner_test_track("b", TrackStage::Production, false),
+                planner_test_track("hidden-two", TrackStage::Production, false),
             ],
             selected_track_id: None,
             reference_tracks: Vec::new(),
@@ -1944,18 +1870,12 @@ mod tests {
         };
 
         assert!(
-            move_track_to_planner_slot(
-                &mut library,
-                "a",
-                TrackStage::Production,
-                2,
-                Some(TrackStatus::Inbox),
-            )
-            .expect("filtered end target should validate")
+            move_track_to_planner_slot(&mut library, "a", TrackStage::Production, 2,)
+                .expect("end target should validate")
         );
         assert_eq!(
             library.planner_order,
-            ["hidden-one", "b", "a", "hidden-two"]
+            ["hidden-one", "a", "b", "hidden-two"]
         );
         assert_eq!(
             library
@@ -1970,19 +1890,14 @@ mod tests {
     #[test]
     fn planner_move_rejects_stale_slot_without_mutating_library() {
         let mut library = Library {
-            tracks: vec![planner_test_track(
-                "a",
-                TrackStage::Production,
-                TrackStatus::Inbox,
-                false,
-            )],
+            tracks: vec![planner_test_track("a", TrackStage::Production, false)],
             selected_track_id: None,
             reference_tracks: Vec::new(),
             planner_order: vec![String::from("a")],
         };
         let before = library.clone();
 
-        let error = move_track_to_planner_slot(&mut library, "a", TrackStage::Production, 2, None)
+        let error = move_track_to_planner_slot(&mut library, "a", TrackStage::Production, 2)
             .expect_err("a slot beyond the visible list should be rejected");
         assert!(error.contains("no longer available"));
         assert_eq!(library, before);
@@ -1991,19 +1906,14 @@ mod tests {
     #[test]
     fn planner_move_accepts_an_empty_stage_target() {
         let mut library = Library {
-            tracks: vec![planner_test_track(
-                "a",
-                TrackStage::Production,
-                TrackStatus::Inbox,
-                false,
-            )],
+            tracks: vec![planner_test_track("a", TrackStage::Production, false)],
             selected_track_id: None,
             reference_tracks: Vec::new(),
             planner_order: vec![String::from("a")],
         };
 
         assert!(
-            move_track_to_planner_slot(&mut library, "a", TrackStage::Mastering, 0, None)
+            move_track_to_planner_slot(&mut library, "a", TrackStage::Mastering, 0)
                 .expect("an empty stage target should validate")
         );
         assert_eq!(library.planner_order, ["a"]);
@@ -2023,7 +1933,6 @@ mod tests {
                 size: 42,
                 favorite: true,
                 stage: TrackStage::Mixdown,
-                status: TrackStatus::Maybe,
                 notes: vec![Note {
                     id: String::from("note-1"),
                     time_millis: 1_250,
@@ -2052,7 +1961,6 @@ mod tests {
         assert!(track.notes.is_empty());
         assert!(track.favorite);
         assert_eq!(track.stage, TrackStage::Mixdown);
-        assert_eq!(track.status, TrackStatus::Maybe);
     }
 
     #[test]
@@ -2126,8 +2034,7 @@ mod tests {
             reference_path: None,
             size: 84,
             favorite: false,
-            stage: TrackStage::SoundDesign,
-            status: TrackStatus::Inbox,
+            stage: TrackStage::Backlog,
             notes: Vec::new(),
         });
         library.planner_order.push(String::from("track-2"));
@@ -2146,7 +2053,6 @@ mod tests {
         assert!(track.notes.is_empty());
         assert!(track.favorite);
         assert_eq!(track.stage, TrackStage::Mixdown);
-        assert_eq!(track.status, TrackStatus::Release);
         assert_eq!(replaced.selected_track_id.as_deref(), Some("track-1"));
         let reloaded = load_library_at(&library_path).expect("replaced library should reload");
         assert_eq!(reloaded.selected_track_id.as_deref(), Some("track-1"));
@@ -2211,8 +2117,7 @@ mod tests {
                 reference_path: Some(source.clone()),
                 size: 0,
                 favorite: false,
-                stage: TrackStage::SoundDesign,
-                status: TrackStatus::Inbox,
+                stage: TrackStage::Backlog,
                 notes: Vec::new(),
             }],
             selected_track_id: Some(String::from("owner")),
@@ -2322,7 +2227,6 @@ mod tests {
                 size: 46,
                 favorite: true,
                 stage: TrackStage::Mixdown,
-                status: TrackStatus::Release,
                 notes: vec![main_note.clone()],
             }],
             selected_track_id: Some(String::from("owner")),
@@ -2374,8 +2278,7 @@ mod tests {
                 reference_path: Some(source.clone()),
                 size: 0,
                 favorite: false,
-                stage: TrackStage::SoundDesign,
-                status: TrackStatus::Inbox,
+                stage: TrackStage::Backlog,
                 notes: Vec::new(),
             }],
             selected_track_id: Some(String::from("owner")),
@@ -2506,7 +2409,6 @@ mod tests {
                 size: 42,
                 favorite: true,
                 stage: TrackStage::Mixdown,
-                status: TrackStatus::Maybe,
                 notes: vec![Note {
                     id: String::from("note-1"),
                     time_millis: 1_250,
@@ -2519,7 +2421,8 @@ mod tests {
             planner_order: Vec::new(),
         };
         let encoded = serde_json::to_string(&library).expect("library should encode");
-        assert!(encoded.contains(r#""status":"maybe""#));
+        assert!(encoded.contains(r#""stage":"mixdown""#));
+        assert!(!encoded.contains(r#""status""#));
         let decoded: Library = serde_json::from_str(&encoded).expect("library should decode");
         assert_eq!(decoded, library);
     }
@@ -2541,7 +2444,7 @@ mod tests {
         }"#;
         let library: Library = serde_json::from_str(encoded).expect("legacy library should decode");
         assert_eq!(library.tracks[0].reference_path, None);
-        assert_eq!(library.tracks[0].status, TrackStatus::Inbox);
+        assert_eq!(library.tracks[0].stage, TrackStage::Backlog);
     }
 
     #[test]
@@ -2573,8 +2476,7 @@ mod tests {
                 reference_path: Some(PathBuf::from("/external/reference.wav")),
                 size: 0,
                 favorite: false,
-                stage: TrackStage::SoundDesign,
-                status: TrackStatus::Inbox,
+                stage: TrackStage::Backlog,
                 notes: Vec::new(),
             }],
             selected_track_id: Some(String::from("track-1")),
@@ -2606,8 +2508,7 @@ mod tests {
                 reference_path: None,
                 size: 42,
                 favorite: false,
-                stage: TrackStage::SoundDesign,
-                status: TrackStatus::Inbox,
+                stage: TrackStage::Backlog,
                 notes: Vec::new(),
             }],
             selected_track_id: Some(String::from("track-1")),
@@ -2636,8 +2537,7 @@ mod tests {
             reference_path,
             size: 0,
             favorite: false,
-            stage: TrackStage::SoundDesign,
-            status: TrackStatus::Inbox,
+            stage: TrackStage::Backlog,
             notes: Vec::new(),
         };
         let mut library = Library {
@@ -2698,8 +2598,7 @@ mod tests {
                 reference_path: Some(first_path.clone()),
                 size: 0,
                 favorite: false,
-                stage: TrackStage::SoundDesign,
-                status: TrackStatus::Inbox,
+                stage: TrackStage::Backlog,
                 notes: Vec::new(),
             }],
             selected_track_id: Some(String::from("track-1")),
@@ -2742,53 +2641,6 @@ mod tests {
     }
 
     #[test]
-    fn setting_a_track_status_reports_real_changes_and_preserves_track_metadata() {
-        let mut library = Library {
-            tracks: vec![Track {
-                id: String::from("track-1"),
-                title: String::from("Night Drive"),
-                original_name: String::from("night-drive.wav"),
-                path: PathBuf::from("/external/night-drive.wav"),
-                source_proof: crate::source::SourceProvenance::Unknown,
-                reference_path: Some(PathBuf::from("/external/reference.wav")),
-                size: 42,
-                favorite: true,
-                stage: TrackStage::Mixdown,
-                status: TrackStatus::Inbox,
-                notes: vec![Note {
-                    id: String::from("note-1"),
-                    time_millis: 1_250,
-                    body: String::from("Keep the vocal entrance."),
-                    done: false,
-                }],
-            }],
-            selected_track_id: Some(String::from("track-1")),
-            reference_tracks: Vec::new(),
-            planner_order: Vec::new(),
-        };
-
-        assert!(
-            !set_track_status(&mut library, "track-1", TrackStatus::Inbox)
-                .expect("track should exist")
-        );
-        assert!(
-            set_track_status(&mut library, "track-1", TrackStatus::Archive)
-                .expect("track should exist")
-        );
-
-        let track = &library.tracks[0];
-        assert_eq!(track.status, TrackStatus::Archive);
-        assert_eq!(track.stage, TrackStage::Mixdown);
-        assert!(track.favorite);
-        assert_eq!(track.path, PathBuf::from("/external/night-drive.wav"));
-        assert_eq!(
-            track.reference_path,
-            Some(PathBuf::from("/external/reference.wav"))
-        );
-        assert_eq!(track.notes.len(), 1);
-    }
-
-    #[test]
     fn setting_reference_track_metadata_preserves_primary_track_and_comments() {
         let mut library = Library {
             tracks: vec![Track {
@@ -2801,7 +2653,6 @@ mod tests {
                 size: 42,
                 favorite: true,
                 stage: TrackStage::Mixdown,
-                status: TrackStatus::Refine,
                 notes: vec![Note {
                     id: String::from("note-1"),
                     time_millis: 1_250,

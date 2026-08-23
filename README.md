@@ -71,24 +71,22 @@ To capture the current native window for visual refinement, run the macOS screen
 
 It reuses an already-open Cadence native window or builds and launches the debug binary, then captures the titled window with macOS `screencapture`. Pass `--hover X Y` with screen coordinates before the output path to move the pointer and capture a hover state, for example `./scripts/capture_native_screenshot.sh --hover 150 210 --output artifacts/screenshots/import-hover.png`. Generated PNGs stay local under `artifacts/screenshots/`; the deterministic paint-plan tests remain the CI-safe visual contract.
 
-The native app owns its library model and JSON persistence in the Cadence host, uses Radiant’s typed native file picker and file-drop boundary, decodes imported files off the UI thread, renders a retained waveform plus timestamped comments, and provides host-controlled audition playback.
+The native app owns its library model and JSON persistence in the Cadence host, uses Radiant’s typed native file picker and file-drop boundary, decodes imported files off the UI thread, renders a retained waveform plus timestamped comments, and provides host-controlled playback.
 
 ## First slice
 
 - Import audio through the button or by dragging files onto the native workspace.
-- Drop multiple audio files onto the native workspace to queue them for serial import; each new track starts in Inbox.
-- Filter the local library by status, including All.
+- Drop multiple audio files onto the native workspace to queue them for serial import; each new track starts in Backlog.
 - Mark tracks as favorites with a persistent star toggle.
-- Move tracks through Sound design, Production / arrangement, Mixdown, and Mastering stages.
-- Move any track directly between the independent statuses Inbox, Refine, Release, Archive, and Maybe. Maybe captures an uncertain decision; Archive is a visible, reversible marker; Favorite remains a separate star.
+- Move tracks through the Backlog, Production, Mixdown, and Mastering stages.
 - Remove imported tracks from the library; native removal keeps the external source audio file in place.
-- Switch to the native finishing board: four columns derived from each track's current stage, with cards for review, favorites, and comment counts. Drag cards between columns to update their workflow stage.
-- Play, pause, seek, and adjust native audition volume with the transport controls; the LUFS meter reports K-weighted integrated LUFS from decoded audio.
-- Switch directly between the visible Review, Planner, and Audition tabs in the native workspace header. Audition filters the library by Inbox, Refine, Release, Archive, or Maybe, fixes a shuffled one-pass queue, and advances to the next matching track automatically; status changes made while listening update the queue.
+- Use the native Planner as the single workflow board: four columns derived from each track’s current stage, with cards for review, favorites, and comment counts. Drag cards between columns to update their workflow stage.
+- Play, pause, seek, and adjust native playback volume with the transport controls; the LUFS meter reports K-weighted integrated LUFS from decoded audio.
+- Switch directly between the visible Review and Planner tabs in the native workspace header. Selecting a Planner card opens its track in Review and reveals it in the library.
 - Import one external reference track per native track; its independently decoded waveform is shown below the primary waveform at the same height without changing loudness analysis.
 - Play the imported and reference tracks from one synchronized transport, then use the compact icon source toggle to choose the audible source.
 - Drag across the reference waveform to paint a normalized loop range; the shared transport keeps both tracks synchronized and repeats the selected section.
-- Toggle loudness matching to apply the bounded LUFS-derived gain offset to the reference audition.
+- Toggle loudness matching to apply the bounded LUFS-derived gain offset to reference playback.
 - Drag the upper half of the shared waveform to scrub, then release to play from that point.
 - Use the lower half of the same waveform to open an inline comment composer at the exact hovered/clicked timestamp; saved comments appear as dots on the horizontal comment line.
 - Edit saved comments in place without changing their timestamp.
@@ -96,7 +94,7 @@ The native app owns its library model and JSON persistence in the Cadence host, 
 - Press `N` or click the lower comment rail to capture the current position and write a note.
 - Click a comment pin or note timestamp to return to that moment; saved comments can be selected, played, edited, or deleted.
 
-The native planner is currently a single derived board over the library's four progress stages. Dragging a card between columns updates the existing persisted track stage; the independent track status remains available from each library row, planner card, and selected-track header.
+The native Planner is the single derived board over the library’s four workflow stages. Dragging a card between columns updates the existing persisted track stage; favorites remain a separate library property.
 
 ## Known limits
 
@@ -104,4 +102,4 @@ The native planner is currently a single derived board over the library's four p
 
 The native app persists library metadata and the original external audio-file paths as JSON under the Cadence application-support directory, then decodes the source file in a background worker to build a bounded retained waveform summary. Moving or deleting a source file therefore requires re-importing it. The native launcher takes a single-process lock around that local library.
 
-Native playback is responsive, host-controlled audition playback through Rodio. Each load is bound to the verified source ticket produced by waveform analysis and decodes from the handle opened for that ticket. An atomic replacement after a playback handle is opened may therefore finish the already-open original inode; any later end/seek reload reopens through the ticket, rejects the replacement, and stops with a source-changed error. Cadence does not copy, lock, or watch source files. The playhead displays the latest Rodio-reported position at Radiant frame cadence; it is not a sample-accurate transport clock or a lock-free realtime audio engine. Rodio/CPAL may pull decoder data and service internal control state from the output callback, so occasional device-, decoder-, or system-load-related glitches remain possible. A future DSP, recording, monitoring, plugin-hosting, automation, low-latency scrubbing, or sample-accurate transport requirement would need a dedicated callback-safe backend. Native loudness uses bounded K-weighted integrated LUFS analysis decoded in the background; playback gain is applied after that analysis, so audition volume and reference matching do not change the meter. Reference tracks are stored as external paths and must be re-imported if moved or deleted; matching changes only reference audition gain and never rewrites either audio file. The native planner supports drag-to-stage movement but does not yet persist custom boards; track statuses are stored separately from production stages.
+Native playback is responsive, host-controlled playback through Rodio. Each load is bound to the verified source ticket produced by waveform analysis and decodes from the handle opened for that ticket. An atomic replacement after a playback handle is opened may therefore finish the already-open original inode; any later end/seek reload reopens through the ticket, rejects the replacement, and stops with a source-changed error. Cadence does not copy, lock, or watch source files. The playhead displays the latest Rodio-reported position at Radiant frame cadence; it is not a sample-accurate transport clock or a lock-free realtime audio engine. Rodio/CPAL may pull decoder data and service internal control state from the output callback, so occasional device-, decoder-, or system-load-related glitches remain possible. A future DSP, recording, monitoring, plugin-hosting, automation, low-latency scrubbing, or sample-accurate transport requirement would need a dedicated callback-safe backend. Native loudness uses bounded K-weighted integrated LUFS analysis decoded in the background; playback gain is applied after that analysis, so playback volume and reference matching do not change the meter. Reference tracks are stored as external paths and must be re-imported if moved or deleted; matching changes only reference playback gain and never rewrites either audio file. The native Planner supports drag-to-stage movement but does not yet persist custom boards; stage is the only workflow state and favorites remain separate.
