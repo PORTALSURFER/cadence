@@ -926,6 +926,7 @@ struct LibraryProjectionCache {
     review_indices: Vec<usize>,
     planner_indices: Vec<usize>,
     planner_stage_indices: [Vec<usize>; 4],
+    reference_assignment_counts: HashMap<PathBuf, usize>,
     #[cfg(test)]
     rebuild_count: usize,
 }
@@ -1010,6 +1011,18 @@ impl LibraryProjectionCache {
             self.planner_stage_indices[planner_stage_index(track.stage)].push(index);
         }
 
+        self.reference_assignment_counts.clear();
+        self.reference_assignment_counts
+            .reserve(library.tracks.len());
+        for track in &library.tracks {
+            if let Some(path) = track.reference_path.as_ref() {
+                *self
+                    .reference_assignment_counts
+                    .entry(path.clone())
+                    .or_default() += 1;
+            }
+        }
+
         #[cfg(test)]
         {
             self.rebuild_count += 1;
@@ -1030,6 +1043,10 @@ impl LibraryProjectionCache {
 
     fn planner_stage_indices(&self, stage: storage::TrackStage) -> &[usize] {
         &self.planner_stage_indices[planner_stage_index(stage)]
+    }
+
+    fn reference_assignment_count(&self, path: &Path) -> Option<&usize> {
+        self.reference_assignment_counts.get(path)
     }
 }
 
@@ -9684,16 +9701,6 @@ fn stage_menu_popover(track: &storage::Track, anchor: Point) -> ui::View<Message
     ))
 }
 
-fn reference_assignment_counts(library: &storage::Library) -> HashMap<&Path, usize> {
-    let mut counts = HashMap::with_capacity(library.tracks.len());
-    for track in &library.tracks {
-        if let Some(path) = track.reference_path.as_deref() {
-            *counts.entry(path).or_default() += 1;
-        }
-    }
-    counts
-}
-
 fn settings_reference_row(
     reference: &storage::ReferenceTrack,
     assignment_count: usize,
@@ -9754,7 +9761,8 @@ fn reference_settings_window_view(state: &AppState) -> ui::View<Message> {
     } else {
         let selected_reference_path =
             selected_track(state).and_then(|track| track.reference_path.as_deref());
-        let assignment_counts = reference_assignment_counts(&state.library);
+        ensure_library_projection_cache(state);
+        let projection = state.library_projection_cache.borrow();
         let window = resolved_virtual_list_window(
             state.reference_settings_window,
             reference_count,
@@ -9763,8 +9771,8 @@ fn reference_settings_window_view(state: &AppState) -> ui::View<Message> {
         );
         ui::virtual_list_windowed(|index| {
             let reference: &storage::ReferenceTrack = &state.library.reference_tracks[index];
-            let assignment_count = assignment_counts
-                .get(reference.path.as_path())
+            let assignment_count = projection
+                .reference_assignment_count(reference.path.as_path())
                 .copied()
                 .unwrap_or_default();
             let active = selected_reference_path == Some(reference.path.as_path());
@@ -11126,7 +11134,7 @@ fn comments_panel(state: &AppState, track: &storage::Track) -> ui::View<Message>
             comments_window(state, source),
             notes.len(),
             focused_index,
-            true,
+            false,
         );
         let track_id = track.id.as_str();
         let reference_path = track.reference_path.as_deref();
@@ -11931,9 +11939,8 @@ mod tests {
         note_editor, note_ratio_for_id, owned_tracks_in_stage, paint_live_playback_overlay,
         planner_insertion_target_is_valid, planner_stage_index, planner_tracks_with_favorites,
         playback_shortcut, progress_paired_playback_cleanup, project_surface,
-        qualified_note_identity_key, reference_assignment_counts,
-        reference_decode_result_is_current, reference_dropdown_paths, reference_menu_available,
-        reference_output_gain, reference_settings_auxiliary_windows,
+        qualified_note_identity_key, reference_decode_result_is_current, reference_dropdown_paths,
+        reference_menu_available, reference_output_gain, reference_settings_auxiliary_windows,
         reference_settings_window_view, refresh_live_spectrogram, refresh_live_spectrograms,
         resume_transport_command, review_spectrogram_source, schedule_import,
         schedule_library_save, schedule_reference_catalog_import, schedule_reference_import,
@@ -14359,7 +14366,7 @@ mod tests {
     }
 
     #[test]
-    fn reference_assignment_counts_are_built_once_per_catalog_path() {
+    fn reference_settings_projection_reuses_generation_and_invalidates_after_assignment_change() {
         let first_path = PathBuf::from("/external/first-reference.wav");
         let second_path = PathBuf::from("/external/second-reference.wav");
         let mut first = audition_track("first");
@@ -14368,18 +14375,66 @@ mod tests {
         second.reference_path = Some(first_path.clone());
         let mut third = audition_track("third");
         third.reference_path = Some(second_path.clone());
-        let mut unassigned = audition_track("unassigned");
-        unassigned.reference_path = None;
 
-        let library = Library {
-            tracks: vec![first, second, third, unassigned].into(),
-            ..Library::default()
+        let mut state = AppState {
+            busy: false,
+            settings_open: true,
+            ..AppState::default()
         };
-        let counts = reference_assignment_counts(&library);
+        state.library.tracks = vec![first, second, third].into();
+        state.library.reference_tracks = vec![
+            ReferenceTrack {
+                path: first_path.clone(),
+                source_proof: crate::source::SourceProvenance::Unknown,
+                notes: crate::storage::SharedVec::default(),
+            },
+            ReferenceTrack {
+                path: second_path.clone(),
+                source_proof: crate::source::SourceProvenance::Unknown,
+                notes: crate::storage::SharedVec::default(),
+            },
+        ]
+        .into();
 
-        assert_eq!(counts.get(first_path.as_path()), Some(&2));
-        assert_eq!(counts.get(second_path.as_path()), Some(&1));
-        assert_eq!(counts.get(Path::new("/external/missing.wav")), None);
+        let initial_frame = reference_settings_window_view(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(680.0, 520.0));
+        let initial_labels = initial_frame.paint_plan.text_label_strings();
+        let first_title_index = initial_labels
+            .iter()
+            .position(|label| label == "first-reference.wav")
+            .expect("the first reference row should be painted");
+        let second_title_index = initial_labels
+            .iter()
+            .position(|label| label == "second-reference.wav")
+            .expect("the second reference row should be painted");
+        assert_eq!(initial_labels[first_title_index + 1], "2 assigned");
+        assert_eq!(initial_labels[second_title_index + 1], "1 assigned");
+
+        let initial_rebuild_count = state.library_projection_cache.borrow().rebuild_count;
+        assert_eq!(initial_rebuild_count, 1);
+
+        let auxiliary_windows = reference_settings_auxiliary_windows(&mut state);
+        assert_eq!(auxiliary_windows.len(), 1);
+        let reused_frame = reference_settings_window_view(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(680.0, 520.0));
+        let reused_labels = reused_frame.paint_plan.text_label_strings();
+        assert_eq!(reused_labels[first_title_index + 1], "2 assigned");
+        assert_eq!(reused_labels[second_title_index + 1], "1 assigned");
+        assert_eq!(
+            state.library_projection_cache.borrow().rebuild_count,
+            initial_rebuild_count
+        );
+
+        state.library.make_mut().tracks[1].reference_path = Some(second_path);
+        let updated_frame = reference_settings_window_view(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(680.0, 520.0));
+        let updated_labels = updated_frame.paint_plan.text_label_strings();
+        assert_eq!(updated_labels[first_title_index + 1], "1 assigned");
+        assert_eq!(updated_labels[second_title_index + 1], "2 assigned");
+        assert_eq!(
+            state.library_projection_cache.borrow().rebuild_count,
+            initial_rebuild_count + 1
+        );
     }
 
     #[test]
@@ -23061,6 +23116,256 @@ mod tests {
                 .state()
                 .main_comments_window
                 .contains(edited_index)
+        );
+    }
+
+    #[test]
+    fn ordinary_comment_window_changes_preserve_main_and_reference_scroll_with_selection_elsewhere()
+    {
+        let track_id = String::from("ordinary-comment-window-track");
+        let reference_path = PathBuf::from("/external/ordinary-comment-reference.wav");
+        let mut track = audition_track(&track_id);
+        track.reference_path = Some(reference_path.clone());
+        track.notes = (0..64)
+            .map(|index| Note {
+                id: format!("ordinary-main-note-{index}"),
+                time_millis: index as u64 * 100,
+                body: format!("ordinary-main-comment-{index}"),
+                done: false,
+            })
+            .collect();
+
+        let mut state = AppState {
+            busy: false,
+            comment_source_explicit: true,
+            workspace_mode: WorkspaceMode::Review,
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(track_id.clone());
+        state.library.tracks = vec![track].into();
+        state.library.reference_tracks = vec![ReferenceTrack {
+            path: reference_path.clone(),
+            source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
+            notes: (0..64)
+                .map(|index| Note {
+                    id: format!("ordinary-reference-note-{index}"),
+                    time_millis: index as u64 * 100,
+                    body: format!("ordinary-reference-comment-{index}"),
+                    done: false,
+                })
+                .collect(),
+        }]
+        .into();
+
+        let reported = ui::resolve_virtual_list_window(ui::VirtualListWindowRequest {
+            total_items: 64,
+            viewport_len: 8,
+            requested_start: 40,
+            overscan: 4,
+            ..ui::VirtualListWindowRequest::default()
+        });
+        let change = ui::VirtualListWindowChange {
+            offset_y: reported.viewport_start as f32 * super::COMMENT_ROW_HEIGHT,
+            row_height: super::COMMENT_ROW_HEIGHT,
+            window: reported,
+        };
+
+        state.selected_note_id = Some(NoteAddress::main(track_id.clone(), "ordinary-main-note-0"));
+        state.selected_reference_note_id = Some(NoteAddress::reference(
+            reference_path.clone(),
+            "ordinary-reference-note-0",
+        ));
+
+        let bridge = DeclarativeOwnedRuntimeBridge::new(
+            state,
+            |state| project_surface(state).into_surface(),
+            |state, message| {
+                let mut context = ui::UiUpdateContext::default();
+                update(state, message, &mut context);
+            },
+        );
+        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1_180.0, 3_000.0));
+        let _initial_frame = runtime.frame_with_default_theme();
+
+        runtime.dispatch_message(Message::SelectCommentSource(super::CommentSource::Main));
+        runtime.dispatch_message(Message::CommentsWindowChanged {
+            source: super::CommentSource::Main,
+            change,
+        });
+        let main_frame = runtime.frame_with_default_theme();
+        assert_eq!(
+            super::resolved_virtual_list_window(
+                runtime.bridge().state().main_comments_window,
+                64,
+                Some(0),
+                false,
+            ),
+            reported
+        );
+        assert_eq!(runtime.bridge().state().main_comments_window, reported);
+        assert!(
+            main_frame
+                .paint_plan
+                .text_runs()
+                .any(|run| run.text.as_str() == "ordinary-main-comment-40"),
+            "main comments paint labels: {:?}",
+            main_frame.paint_plan.text_label_strings()
+        );
+        assert!(
+            !main_frame
+                .paint_plan
+                .text_runs()
+                .any(|run| run.text.as_str() == "ordinary-main-comment-0")
+        );
+
+        runtime.dispatch_message(Message::SelectCommentSource(
+            super::CommentSource::Reference,
+        ));
+        runtime.dispatch_message(Message::CommentsWindowChanged {
+            source: super::CommentSource::Reference,
+            change,
+        });
+        let reference_frame = runtime.frame_with_default_theme();
+        assert_eq!(runtime.bridge().state().reference_comments_window, reported);
+        assert!(
+            reference_frame
+                .paint_plan
+                .text_runs()
+                .any(|run| run.text.as_str() == "ordinary-reference-comment-40")
+        );
+        assert!(
+            !reference_frame
+                .paint_plan
+                .text_runs()
+                .any(|run| run.text.as_str() == "ordinary-reference-comment-0")
+        );
+        assert_eq!(
+            super::resolved_virtual_list_window(
+                runtime.bridge().state().reference_comments_window,
+                64,
+                Some(0),
+                false,
+            ),
+            reported
+        );
+    }
+
+    #[test]
+    fn explicit_comment_reveal_scrolls_main_and_reference_viewports() {
+        let track_id = String::from("explicit-comment-reveal-track");
+        let reference_path = PathBuf::from("/external/explicit-comment-reference.wav");
+        let target_index = 40;
+        let mut track = audition_track(&track_id);
+        track.reference_path = Some(reference_path.clone());
+        track.notes = (0..64)
+            .map(|index| Note {
+                id: format!("explicit-main-note-{index}"),
+                time_millis: index as u64 * 100,
+                body: format!("explicit-main-comment-{index}"),
+                done: false,
+            })
+            .collect();
+
+        let mut state = AppState {
+            busy: false,
+            comment_source_explicit: true,
+            workspace_mode: WorkspaceMode::Review,
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(track_id.clone());
+        state.library.tracks = vec![track].into();
+        state.library.reference_tracks = vec![ReferenceTrack {
+            path: reference_path.clone(),
+            source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
+            notes: (0..64)
+                .map(|index| Note {
+                    id: format!("explicit-reference-note-{index}"),
+                    time_millis: index as u64 * 100,
+                    body: format!("explicit-reference-comment-{index}"),
+                    done: false,
+                })
+                .collect(),
+        }]
+        .into();
+
+        let main_address = NoteAddress::main(
+            track_id.clone(),
+            format!("explicit-main-note-{target_index}"),
+        );
+        let reference_address = NoteAddress::reference(
+            reference_path,
+            format!("explicit-reference-note-{target_index}"),
+        );
+
+        let bridge = DeclarativeOwnedRuntimeBridge::new(
+            state,
+            |state| project_surface(state).into_surface(),
+            |state, message| {
+                let mut context = ui::UiUpdateContext::default();
+                update(state, message, &mut context);
+            },
+        );
+        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1_180.0, 3_000.0));
+        let _initial_frame = runtime.frame_with_default_theme();
+
+        let mut expected_state = runtime.bridge().state().clone();
+        let mut main_context = ui::UiUpdateContext::default();
+        update(
+            &mut expected_state,
+            Message::SelectNote(main_address.clone()),
+            &mut main_context,
+        );
+        assert!(expected_state.main_comments_window.contains(target_index));
+        assert_eq!(
+            scroll_into_view_request(&main_context.into_command()),
+            Some((
+                super::MAIN_COMMENTS_SCROLL_VIEWPORT_ID,
+                target_index as f32 * super::COMMENT_ROW_HEIGHT,
+                super::COMMENT_ROW_HEIGHT,
+                super::LIBRARY_REVEAL_MARGIN,
+                super::LIBRARY_REVEAL_MARGIN,
+            ))
+        );
+        runtime.dispatch_message(Message::SelectNote(main_address));
+        let main_frame = runtime.frame_with_default_theme();
+        assert!(
+            main_frame
+                .paint_plan
+                .text_runs()
+                .any(|run| run.text.as_str() == "explicit-main-comment-40"),
+            "main comments paint labels: {:?}",
+            main_frame.paint_plan.text_label_strings()
+        );
+
+        let mut expected_state = runtime.bridge().state().clone();
+        let mut reference_context = ui::UiUpdateContext::default();
+        update(
+            &mut expected_state,
+            Message::SelectReferenceNote(reference_address.clone()),
+            &mut reference_context,
+        );
+        assert!(
+            expected_state
+                .reference_comments_window
+                .contains(target_index)
+        );
+        assert_eq!(
+            scroll_into_view_request(&reference_context.into_command()),
+            Some((
+                super::REFERENCE_COMMENTS_SCROLL_VIEWPORT_ID,
+                target_index as f32 * super::COMMENT_ROW_HEIGHT,
+                super::COMMENT_ROW_HEIGHT,
+                super::LIBRARY_REVEAL_MARGIN,
+                super::LIBRARY_REVEAL_MARGIN,
+            ))
+        );
+        runtime.dispatch_message(Message::SelectReferenceNote(reference_address));
+        let reference_frame = runtime.frame_with_default_theme();
+        assert!(
+            reference_frame
+                .paint_plan
+                .text_runs()
+                .any(|run| run.text.as_str() == "explicit-reference-comment-40")
         );
     }
 
