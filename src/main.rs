@@ -427,6 +427,8 @@ const DEFAULT_LIVE_SPECTROGRAM_DISPLAY_SAMPLE_RATE: u32 = 48_000;
 const LIVE_SPECTROGRAM_RESIZE_HANDLE_ID: u64 = 0xCAD3_2001;
 const LIVE_SPECTROGRAM_BODY_ID: u64 = 0xCAD3_2002;
 const LIVE_PLAYBACK_OVERLAY_KEY: u64 = 0xCAD3_2301;
+const MAIN_LUFS_METER_ID: u64 = 0xCAD3_2103;
+const REFERENCE_LUFS_METER_ID: u64 = 0xCAD3_2104;
 const LIVE_SPECTROGRAM_HEADER_HEIGHT: f32 = 22.0;
 const LIVE_SPECTROGRAM_SECTION_SPACING: f32 = 4.0;
 const MAIN_WAVEFORM_HEADER_HEIGHT: f32 = 22.0;
@@ -1605,6 +1607,34 @@ fn paint_live_playback_overlay(
     primitives: &mut Vec<PaintPrimitive>,
 ) {
     let theme = ThemeTokens::default();
+    if state.workspace_mode == WorkspaceMode::Review
+        && let Some(track_id) = state.library.selected_track_id.as_deref()
+    {
+        if state.transport_playing
+            && let Some(bounds) = chrome::lufs_meter_bounds(context.plan, MAIN_LUFS_METER_ID)
+        {
+            chrome::paint_lufs_meter_overlay(
+                primitives,
+                bounds,
+                MAIN_LUFS_METER_ID,
+                current_lufs_meter_value(state, track_id),
+                state.waveform_busy,
+                &theme,
+            );
+        }
+        if state.reference_transport_playing
+            && let Some(bounds) = chrome::lufs_meter_bounds(context.plan, REFERENCE_LUFS_METER_ID)
+        {
+            chrome::paint_lufs_meter_overlay(
+                primitives,
+                bounds,
+                REFERENCE_LUFS_METER_ID,
+                current_reference_lufs_meter_value(state, track_id),
+                state.reference_waveform_busy,
+                &theme,
+            );
+        }
+    }
     if let Some(ratio) = playback_ratio_for_source(state, PlaybackSource::Main)
         && let Some(bounds) =
             waveform_overlay_bounds(&context, waveform::MAIN_WAVEFORM_WIDGET_ID, WAVEFORM_HEIGHT)
@@ -3681,6 +3711,14 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 || state.busy
                 || state.workspace_mode != WorkspaceMode::Planner
             {
+                return;
+            }
+            if let ui::DragHandleMessage::Moved { .. } = &message {
+                if state.planner_drag_source_track_id.as_deref() != Some(track_id.as_str()) {
+                    return;
+                }
+                state.planner_drag_pointer = drag_message_position(message);
+                context.request_paint_only();
                 return;
             }
             if !state
@@ -10468,6 +10506,7 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
     let meter_lufs = current_lufs_meter_value(state, &track.id);
     let waveform_with_meter = ui::row([
         chrome::lufs_meter(meter_lufs, state.waveform_busy)
+            .id(MAIN_LUFS_METER_ID)
             .width(LUFS_METER_WIDTH)
             .height(WAVEFORM_HEIGHT),
         waveform_view,
@@ -10896,6 +10935,7 @@ fn reference_waveform_section(state: &AppState, track: &storage::Track) -> ui::V
     };
     let reference_meter = if has_reference {
         chrome::lufs_meter(reference_meter_lufs, state.reference_waveform_busy)
+            .id(REFERENCE_LUFS_METER_ID)
             .width(LUFS_METER_WIDTH)
             .height(REFERENCE_WAVEFORM_HEIGHT)
     } else {
@@ -12904,26 +12944,6 @@ mod tests {
                         | PaintPrimitive::StrokePolyline(_)
                 )
             }));
-            match mode {
-                LiveSpectrogramMode::Waterfall => assert!(
-                    primitives
-                        .iter()
-                        .any(|primitive| matches!(primitive, PaintPrimitive::FillRectBatch(_)))
-                ),
-                LiveSpectrogramMode::Spectrum => {
-                    assert!(
-                        primitives
-                            .iter()
-                            .any(|primitive| matches!(primitive, PaintPrimitive::FillPolygon(_)))
-                    );
-                    assert!(
-                        !primitives
-                            .iter()
-                            .any(|primitive| matches!(primitive, PaintPrimitive::StrokePolygon(_)))
-                    );
-                }
-            }
-
             let body_clip_start = primitives
                 .iter()
                 .position(|primitive| {
@@ -12945,6 +12965,26 @@ mod tests {
                 })
                 .expect("live spectrogram overlay clip end");
             let body_layers = &primitives[body_clip_start + 1..body_clip_end];
+            match mode {
+                LiveSpectrogramMode::Waterfall => assert!(
+                    body_layers
+                        .iter()
+                        .any(|primitive| matches!(primitive, PaintPrimitive::FillRectBatch(_)))
+                ),
+                LiveSpectrogramMode::Spectrum => {
+                    assert!(
+                        body_layers
+                            .iter()
+                            .any(|primitive| matches!(primitive, PaintPrimitive::FillPolygon(_)))
+                    );
+                    assert!(
+                        !body_layers
+                            .iter()
+                            .any(|primitive| matches!(primitive, PaintPrimitive::StrokePolygon(_)))
+                    );
+                }
+            }
+
             let body_fill = body_layers
                 .iter()
                 .position(|primitive| {
@@ -13025,11 +13065,14 @@ mod tests {
             paint_live_playback_overlay(&mut state, context, &mut primitives);
 
             assert!(
-                !primitives.iter().any(|primitive| {
-                    matches!(
-                        primitive,
-                        PaintPrimitive::FillRectBatch(_) | PaintPrimitive::FillPolygon(_)
-                    )
+                !primitives.iter().any(|primitive| match primitive {
+                    PaintPrimitive::FillRectBatch(fill) => {
+                        fill.widget_id == super::spectrogram::LIVE_SPECTROGRAM_OVERLAY_WIDGET_ID
+                    }
+                    PaintPrimitive::FillPolygon(fill) => {
+                        fill.widget_id == super::spectrogram::LIVE_SPECTROGRAM_OVERLAY_WIDGET_ID
+                    }
+                    _ => false,
                 }),
                 "stale generation/epoch frame must not reach the overlay"
             );
@@ -15404,6 +15447,162 @@ mod tests {
             Some(-8.0)
         );
         assert_eq!(current_lufs_meter_value(&state, &track_id), Some(-8.0));
+    }
+
+    #[test]
+    fn active_meter_positions_stay_paint_only_and_refresh_cached_main_and_reference_meters() {
+        let meter_waveform = |first_lufs: f32, second_lufs: f32| WaveformData {
+            sample_rate: 100,
+            channels: 1,
+            duration_millis: 800,
+            render_frames: 80,
+            integrated_lufs: Some(-8.0),
+            loudness_profile: Arc::from([
+                LoudnessPoint {
+                    end_frame: 40,
+                    lufs: first_lufs,
+                },
+                LoudnessPoint {
+                    end_frame: 80,
+                    lufs: second_lufs,
+                },
+            ]),
+            summary: Arc::new(
+                radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                    &[0.1, 0.8, 0.2, 0.4],
+                    4,
+                    1,
+                ),
+            ),
+        };
+
+        for (main_playing, reference_playing) in [(true, false), (false, true), (true, true)] {
+            let track_id = String::from("cached-meter-track");
+            let mut state = audition_state(&[track_id.as_str()]);
+            state.waveform = Some(meter_waveform(-4.0, -12.0));
+            state.reference_waveform = Some(meter_waveform(-6.0, -18.0));
+            state.waveform_track_id = Some(track_id.clone());
+            state.reference_waveform_track_id = Some(track_id.clone());
+            state.transport_playing = main_playing;
+            state.reference_transport_playing = reference_playing;
+            state.transport_position_millis = 400;
+            state.reference_transport_position_millis = 400;
+
+            let before = frame_surface_revisions(&mut state);
+            let cached_frame = project_surface(&state)
+                .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1100.0));
+            assert!(
+                super::chrome::lufs_meter_bounds(
+                    &cached_frame.paint_plan,
+                    super::MAIN_LUFS_METER_ID
+                )
+                .is_some()
+            );
+            assert!(
+                super::chrome::lufs_meter_bounds(
+                    &cached_frame.paint_plan,
+                    super::REFERENCE_LUFS_METER_ID
+                )
+                .is_some()
+            );
+            assert!(
+                cached_frame
+                    .paint_plan
+                    .text_label_strings()
+                    .iter()
+                    .any(|label| label == "-4.0")
+            );
+            assert!(
+                cached_frame
+                    .paint_plan
+                    .text_label_strings()
+                    .iter()
+                    .any(|label| label == "-6.0")
+            );
+
+            state.transport_position_millis = 800;
+            state.reference_transport_position_millis = 800;
+            let after = frame_surface_revisions(&mut state);
+            assert_eq!(
+                after.repaint_scope_since(before),
+                RepaintScope::PaintOnly,
+                "position-only active updates must not reproject the retained frame"
+            );
+
+            let context = TransientOverlayContext::new(
+                &cached_frame.paint_plan,
+                Vector2::new(1180.0, 1100.0),
+                Duration::ZERO,
+            );
+            let mut primitives = Vec::new();
+            paint_live_playback_overlay(&mut state, context, &mut primitives);
+            let theme = ThemeTokens::default();
+
+            for (active, widget_id, current_label, stale_label) in [
+                (main_playing, super::MAIN_LUFS_METER_ID, "-12.0", "-4.0"),
+                (
+                    reference_playing,
+                    super::REFERENCE_LUFS_METER_ID,
+                    "-18.0",
+                    "-6.0",
+                ),
+            ] {
+                if !active {
+                    assert!(!primitives.iter().any(|primitive| {
+                        matches!(
+                            primitive,
+                            PaintPrimitive::Text(text)
+                                if text.widget_id == widget_id && text.text.as_str() == current_label
+                        )
+                    }));
+                    continue;
+                }
+
+                assert!(primitives.iter().any(|primitive| {
+                    matches!(
+                        primitive,
+                        PaintPrimitive::FillPolygon(fill)
+                            if fill.widget_id == widget_id
+                                && fill.color == theme.surface_overlay
+                    )
+                }));
+                assert!(primitives.iter().any(|primitive| {
+                    matches!(
+                        primitive,
+                        PaintPrimitive::Text(text)
+                            if text.widget_id == widget_id && text.text.as_str() == "LUFS"
+                    )
+                }));
+                assert!(primitives.iter().any(|primitive| {
+                    matches!(
+                        primitive,
+                        PaintPrimitive::Text(text)
+                            if text.widget_id == widget_id && text.text.as_str() == current_label
+                    )
+                }));
+                assert!(primitives.iter().any(|primitive| {
+                    matches!(
+                        primitive,
+                        PaintPrimitive::FillRect(fill)
+                            if fill.widget_id == widget_id && fill.color == theme.grid_soft
+                    )
+                }));
+                assert!(primitives.iter().any(|primitive| {
+                    matches!(
+                        primitive,
+                        PaintPrimitive::Text(text)
+                            if text.widget_id == widget_id && text.text.as_str() == "TECHNO"
+                    )
+                }));
+                assert!(!primitives.iter().any(|primitive| {
+                    matches!(
+                        primitive,
+                        PaintPrimitive::Text(text)
+                            if text.widget_id == widget_id && text.text.as_str() == stale_label
+                    )
+                }));
+            }
+        }
     }
 
     #[test]
@@ -23844,6 +24043,48 @@ mod tests {
             context.into_command().repaint_scope(),
             Some(RepaintScope::PaintOnly)
         );
+    }
+
+    #[test]
+    fn planner_drag_move_on_large_state_is_paint_only_and_ignores_mismatched_ids() {
+        let initial_pointer = Point::new(320.0, 300.0);
+        let moved_pointer = Point::new(460.0, 510.0);
+        let mut state = planner_scroll_state(2_500);
+        state.planner_drag_source_track_id = Some(String::from("planner-card-0"));
+        state.planner_drag_pointer = Some(initial_pointer);
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::PlannerCardDrag {
+                track_id: String::from("planner-card-0"),
+                message: ui::DragHandleMessage::moved(moved_pointer),
+            },
+            &mut context,
+        );
+
+        assert_eq!(state.planner_drag_pointer, Some(moved_pointer));
+        assert_eq!(
+            context.into_command().repaint_scope(),
+            Some(RepaintScope::PaintOnly)
+        );
+
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::PlannerCardDrag {
+                track_id: String::from("planner-card-not-active"),
+                message: ui::DragHandleMessage::moved(initial_pointer),
+            },
+            &mut context,
+        );
+
+        assert_eq!(state.planner_drag_pointer, Some(moved_pointer));
+        assert_eq!(
+            state.planner_drag_source_track_id.as_deref(),
+            Some("planner-card-0")
+        );
+        assert_eq!(context.into_command().repaint_scope(), None);
     }
 
     #[test]
