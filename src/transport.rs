@@ -9,6 +9,8 @@
 use crate::source::{self, VerifiedSourceTicket};
 use rodio::{Decoder, DeviceSinkBuilder, Player, Source, source::SeekError};
 use rtrb::{Consumer, Producer, RingBuffer};
+#[cfg(test)]
+use std::sync::Condvar;
 use std::{
     sync::{
         Arc, Mutex, Weak,
@@ -1506,13 +1508,108 @@ impl PendingLoad {
     }
 }
 
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct TransportParkGateState {
+    park_count: usize,
+    permit: bool,
+    exited: bool,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct TransportParkGate {
+    state: Mutex<TransportParkGateState>,
+    changed: Condvar,
+}
+
+#[cfg(test)]
+impl TransportParkGate {
+    fn wait_for_park(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("transport test park state should not be poisoned");
+        state.park_count += 1;
+        self.changed.notify_all();
+        while !state.permit {
+            state = self
+                .changed
+                .wait(state)
+                .expect("transport test park state should not be poisoned");
+        }
+        state.permit = false;
+        self.changed.notify_all();
+    }
+
+    fn notify(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("transport test park state should not be poisoned");
+        let observed_park_count = state.park_count;
+        state.permit = true;
+        self.changed.notify_all();
+        while !state.exited && state.park_count == observed_park_count {
+            state = self
+                .changed
+                .wait(state)
+                .expect("transport test park state should not be poisoned");
+        }
+    }
+
+    fn wait_until_parked(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("transport test park state should not be poisoned");
+        while state.park_count == 0 {
+            state = self
+                .changed
+                .wait(state)
+                .expect("transport test park state should not be poisoned");
+        }
+    }
+
+    fn wait_until_exited(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("transport test park state should not be poisoned");
+        while !state.exited {
+            state = self
+                .changed
+                .wait(state)
+                .expect("transport test park state should not be poisoned");
+        }
+    }
+
+    fn mark_exited(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.exited = true;
+            self.changed.notify_all();
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct TransportWake {
     thread: Mutex<Option<thread::Thread>>,
     sequence: AtomicU64,
+    #[cfg(test)]
+    park_gate: Option<Arc<TransportParkGate>>,
 }
 
 impl TransportWake {
+    #[cfg(test)]
+    fn with_park_gate(park_gate: Arc<TransportParkGate>) -> Self {
+        Self {
+            thread: Mutex::new(None),
+            sequence: AtomicU64::new(0),
+            park_gate: Some(park_gate),
+        }
+    }
+
     fn register(&self) {
         if let Ok(mut thread_handle) = self.thread.lock() {
             *thread_handle = Some(thread::current());
@@ -1526,10 +1623,46 @@ impl TransportWake {
         {
             thread.unpark();
         }
+        #[cfg(test)]
+        if let Some(park_gate) = self.park_gate.as_ref() {
+            park_gate.notify();
+        }
     }
 
     fn sequence(&self) -> u64 {
         self.sequence.load(Ordering::Acquire)
+    }
+
+    fn park(&self) {
+        #[cfg(test)]
+        if let Some(park_gate) = self.park_gate.as_ref() {
+            park_gate.wait_for_park();
+            return;
+        }
+        thread::park();
+    }
+
+    #[cfg(test)]
+    fn wait_until_parked(&self) {
+        self.park_gate
+            .as_ref()
+            .expect("transport test should have a park gate")
+            .wait_until_parked();
+    }
+
+    #[cfg(test)]
+    fn wait_until_exited(&self) {
+        self.park_gate
+            .as_ref()
+            .expect("transport test should have a park gate")
+            .wait_until_exited();
+    }
+
+    #[cfg(test)]
+    fn mark_exited(&self) {
+        if let Some(park_gate) = self.park_gate.as_ref() {
+            park_gate.mark_exited();
+        }
     }
 }
 
@@ -1543,13 +1676,46 @@ impl Drop for PendingLoad {
     }
 }
 
+#[derive(Debug)]
+struct TransportCommandEndpoint {
+    commands: Option<SyncSender<Command>>,
+    wake: Arc<TransportWake>,
+}
+
+impl TransportCommandEndpoint {
+    fn new(commands: SyncSender<Command>, wake: Arc<TransportWake>) -> Self {
+        Self {
+            commands: Some(commands),
+            wake,
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn try_send(&self, command: Command) -> Result<(), TrySendError<Command>> {
+        let Some(commands) = self.commands.as_ref() else {
+            return Err(TrySendError::Disconnected(command));
+        };
+        commands.try_send(command)
+    }
+
+    fn notify(&self) {
+        self.wake.notify();
+    }
+}
+
+impl Drop for TransportCommandEndpoint {
+    fn drop(&mut self) {
+        drop(self.commands.take());
+        self.wake.notify();
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct AudioTransport {
-    commands: SyncSender<Command>,
+    endpoint: Arc<TransportCommandEndpoint>,
     queued_commands: Arc<AtomicUsize>,
     shared: Arc<SharedSnapshot>,
     pending_load: Arc<PendingLoad>,
-    wake: Arc<TransportWake>,
     next_token: Arc<AtomicU64>,
     #[cfg(test)]
     test_next_command_error: Arc<Mutex<Option<String>>>,
@@ -1557,11 +1723,22 @@ pub struct AudioTransport {
 
 impl AudioTransport {
     pub fn spawn() -> Self {
+        Self::spawn_with_wake(Arc::new(TransportWake::default()))
+    }
+
+    #[cfg(test)]
+    fn spawn_with_park_gate() -> Self {
+        Self::spawn_with_wake(Arc::new(TransportWake::with_park_gate(Arc::new(
+            TransportParkGate::default(),
+        ))))
+    }
+
+    fn spawn_with_wake(wake: Arc<TransportWake>) -> Self {
         let (commands, receiver) = mpsc::sync_channel(COMMAND_CAPACITY);
         let queued_commands = Arc::new(AtomicUsize::new(0));
         let shared = Arc::new(SharedSnapshot::new());
         let pending_load = Arc::new(PendingLoad::new());
-        let wake = Arc::new(TransportWake::default());
+        let endpoint = Arc::new(TransportCommandEndpoint::new(commands, Arc::clone(&wake)));
         let thread_queued_commands = Arc::clone(&queued_commands);
         let thread_shared = Arc::clone(&shared);
         let thread_pending_load = Arc::clone(&pending_load);
@@ -1580,15 +1757,19 @@ impl AudioTransport {
             })
             .expect("Cadence audio transport thread should spawn");
         Self {
-            commands,
+            endpoint,
             queued_commands,
             shared,
             pending_load,
-            wake,
             next_token: Arc::new(AtomicU64::new(1)),
             #[cfg(test)]
             test_next_command_error: Arc::new(Mutex::new(None)),
         }
+    }
+
+    #[cfg(test)]
+    fn test_wake(&self) -> Arc<TransportWake> {
+        Arc::clone(&self.endpoint.wake)
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -1727,13 +1908,13 @@ impl AudioTransport {
         };
         if !self.try_reserve_command_slot() {
             self.store_pending_load(command)?;
-            self.wake.notify();
+            self.endpoint.notify();
             return Ok(token);
         }
-        match self.commands.try_send(command) {
+        match self.endpoint.try_send(command) {
             Ok(()) => {
                 self.clear_pending_load(generation);
-                self.wake.notify();
+                self.endpoint.notify();
                 Ok(token)
             }
             // Wake the transport so it can pick up the latest load intent from
@@ -1741,7 +1922,7 @@ impl AudioTransport {
             Err(TrySendError::Full(command)) => {
                 self.release_command_slot();
                 self.store_pending_load(command)?;
-                self.wake.notify();
+                self.endpoint.notify();
                 Ok(token)
             }
             Err(TrySendError::Disconnected(_)) => {
@@ -1812,9 +1993,9 @@ impl AudioTransport {
         if !self.try_reserve_command_slot() {
             return Err(String::from(CONTROLS_BUSY_ERROR));
         }
-        match self.commands.try_send(command) {
+        match self.endpoint.try_send(command) {
             Ok(()) => {
-                self.wake.notify();
+                self.endpoint.notify();
                 Ok(())
             }
             Err(TrySendError::Full(_)) => {
@@ -1872,12 +2053,6 @@ impl AudioTransport {
 
     fn clear_pending_load(&self, generation: u64) {
         self.pending_load.clear_generation(generation);
-    }
-}
-
-impl Drop for AudioTransport {
-    fn drop(&mut self) {
-        self.wake.notify();
     }
 }
 
@@ -2019,6 +2194,8 @@ fn run_transport(
     drop(player);
     drop(loaded);
     drop(output);
+    #[cfg(test)]
+    wake.mark_exited();
 }
 
 #[derive(Debug)]
@@ -2054,7 +2231,7 @@ fn wait_for_transport_command(
                 // command channel and pending-load wake both unpark this
                 // thread, while the repeated checks close the race around
                 // entering the park.
-                thread::park();
+                wake.park();
             }
             Some(deadline) => {
                 let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
@@ -2627,11 +2804,13 @@ mod tests {
     fn pending_load_blocks_dependent_controls_until_it_is_admitted() {
         let (commands, _receiver) = mpsc::sync_channel(super::COMMAND_CAPACITY);
         let transport = AudioTransport {
-            commands,
+            endpoint: Arc::new(super::TransportCommandEndpoint::new(
+                commands,
+                Arc::new(super::TransportWake::default()),
+            )),
             queued_commands: Arc::new(AtomicUsize::new(super::COMMAND_CAPACITY)),
             shared: Arc::new(SharedSnapshot::new()),
             pending_load: Arc::new(PendingLoad::new()),
-            wake: Arc::new(super::TransportWake::default()),
             next_token: Arc::new(AtomicU64::new(1)),
             test_next_command_error: Arc::new(Mutex::new(None)),
         };
@@ -2645,6 +2824,17 @@ mod tests {
             Err(String::from(CONTROLS_BUSY_ERROR))
         );
         assert_eq!(transport.play(0), Err(String::from(CONTROLS_BUSY_ERROR)));
+    }
+
+    #[test]
+    fn dropping_the_last_transport_handle_disconnects_a_parked_worker() {
+        let transport = AudioTransport::spawn_with_park_gate();
+        let wake = transport.test_wake();
+        wake.wait_until_parked();
+
+        drop(transport);
+
+        wake.wait_until_exited();
     }
 
     #[test]
