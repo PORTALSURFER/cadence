@@ -138,19 +138,6 @@ impl LufsMeterWidget {
             analyzing,
         }
     }
-
-    fn fraction(&self) -> f32 {
-        self.value.map(lufs_fraction).unwrap_or(0.0)
-    }
-
-    fn value_label(&self) -> String {
-        match self.value {
-            Some(value) if value <= -59.9 => String::from("-∞"),
-            Some(value) => format!("{:.1}", value),
-            None if self.analyzing => String::from("…"),
-            None => String::from("—"),
-        }
-    }
 }
 
 impl Widget for LufsMeterWidget {
@@ -181,128 +168,195 @@ impl Widget for LufsMeterWidget {
         _layout: &LayoutOutput,
         theme: &ThemeTokens,
     ) {
-        if !bounds.has_finite_positive_area() {
-            return;
-        }
-
-        primitives.push(PaintPrimitive::FillPolygon(PaintFillPolygon {
-            widget_id: self.common.id,
-            points: rounded_corner_points(bounds, METER_RADIUS),
-            color: theme.surface_overlay,
-        }));
-
-        push_text_run_with_metrics(
+        paint_lufs_meter(
             primitives,
             self.common.id,
-            "LUFS",
-            Rect::from_min_max(
-                Point::new(bounds.min.x + 6.0, bounds.min.y + 8.0),
-                Point::new(bounds.max.x - 6.0, bounds.min.y + 24.0),
-            ),
-            theme.text_muted,
-            PaintTextAlign::Center,
-            PaintTextMetrics::new(9.0, Some(11.0)),
-        );
-        push_text_run_with_metrics(
-            primitives,
-            self.common.id,
-            self.value_label(),
-            Rect::from_min_max(
-                Point::new(bounds.min.x + 4.0, bounds.min.y + 26.0),
-                Point::new(bounds.max.x - 4.0, bounds.min.y + 46.0),
-            ),
-            theme.text_primary,
-            PaintTextAlign::Center,
-            PaintTextMetrics::new(12.0, Some(15.0)),
-        );
-
-        let track = Rect::from_min_max(
-            Point::new(bounds.min.x + 27.0, bounds.min.y + 56.0),
-            Point::new(bounds.max.x - 27.0, bounds.max.y - 18.0),
-        );
-        if !track.has_finite_positive_area() {
-            return;
-        }
-        let track_points = rounded_corner_points(track, 4.0);
-        primitives.push(PaintPrimitive::FillPolygon(PaintFillPolygon {
-            widget_id: self.common.id,
-            points: track_points.clone(),
-            color: theme.bg_tertiary,
-        }));
-        primitives.push(PaintPrimitive::StrokePolygon(PaintStrokePolygon {
-            widget_id: self.common.id,
-            points: track_points,
-            color: theme.border,
-            width: 2.0,
-        }));
-
-        let techno_range = techno_range_rect(track);
-        if techno_range.has_finite_positive_area() {
-            primitives.push(PaintPrimitive::FillPolygon(PaintFillPolygon {
-                widget_id: self.common.id,
-                points: rounded_corner_points(techno_range, 3.0),
-                color: theme.grid_strong,
-            }));
-        }
-
-        let fill_height = track.height() * self.fraction();
-        if fill_height > 0.0 {
-            let fill = Rect::from_min_max(
-                Point::new(track.min.x, track.max.y - fill_height),
-                track.max,
-            );
-            primitives.push(PaintPrimitive::FillPolygon(PaintFillPolygon {
-                widget_id: self.common.id,
-                points: rounded_corner_points(fill, 3.0),
-                color: self
-                    .value
-                    .filter(|value| *value > -6.0)
-                    .map_or(theme.highlight_orange_soft, |_| theme.highlight_orange),
-            }));
-        }
-
-        if techno_range.has_finite_positive_area() {
-            primitives.push(PaintPrimitive::StrokePolygon(PaintStrokePolygon {
-                widget_id: self.common.id,
-                points: rounded_corner_points(techno_range, 3.0),
-                color: theme.border_emphasis,
-                width: 1.0,
-            }));
-        }
-
-        for fraction in [0.0_f32, 0.5, 1.0] {
-            let y = track.max.y - track.height() * fraction;
-            for rect in [
-                Rect::from_min_max(
-                    Point::new(bounds.min.x + 14.0, y - 0.5),
-                    Point::new(bounds.min.x + 22.0, y + 0.5),
-                ),
-                Rect::from_min_max(
-                    Point::new(bounds.max.x - 22.0, y - 0.5),
-                    Point::new(bounds.max.x - 14.0, y + 0.5),
-                ),
-            ] {
-                primitives.push(PaintPrimitive::FillRect(PaintFillRect {
-                    widget_id: self.common.id,
-                    rect,
-                    color: theme.grid_soft,
-                }));
-            }
-        }
-
-        push_text_run_with_metrics(
-            primitives,
-            self.common.id,
-            "TECHNO",
-            Rect::from_min_max(
-                Point::new(bounds.min.x + 4.0, bounds.max.y - 16.0),
-                Point::new(bounds.max.x - 4.0, bounds.max.y - 3.0),
-            ),
-            theme.text_muted,
-            PaintTextAlign::Center,
-            PaintTextMetrics::new(7.0, Some(9.0)),
+            bounds,
+            self.value,
+            self.analyzing,
+            theme,
         );
     }
+}
+
+/// Paint the complete meter over a retained frame at the frame's cached bounds.
+pub(crate) fn paint_lufs_meter_overlay(
+    primitives: &mut Vec<PaintPrimitive>,
+    bounds: Rect,
+    widget_id: u64,
+    value: Option<f32>,
+    analyzing: bool,
+    theme: &ThemeTokens,
+) {
+    paint_lufs_meter(primitives, widget_id, bounds, value, analyzing, theme);
+}
+
+/// Recover the complete cached bounds from the meter's retained background.
+pub(crate) fn lufs_meter_bounds(
+    plan: &radiant::runtime::SurfacePaintPlan,
+    widget_id: u64,
+) -> Option<Rect> {
+    plan.primitives.iter().find_map(|primitive| {
+        let PaintPrimitive::FillPolygon(fill) = primitive else {
+            return None;
+        };
+        if fill.widget_id != widget_id {
+            return None;
+        }
+        let first = fill.points.first()?;
+        let (min_x, max_x, min_y, max_y) = fill.points.iter().skip(1).fold(
+            (first.x, first.x, first.y, first.y),
+            |(min_x, max_x, min_y, max_y), point| {
+                (
+                    min_x.min(point.x),
+                    max_x.max(point.x),
+                    min_y.min(point.y),
+                    max_y.max(point.y),
+                )
+            },
+        );
+        let bounds = Rect::from_min_max(Point::new(min_x, min_y), Point::new(max_x, max_y));
+        bounds.has_finite_positive_area().then_some(bounds)
+    })
+}
+
+fn paint_lufs_meter(
+    primitives: &mut Vec<PaintPrimitive>,
+    widget_id: u64,
+    bounds: Rect,
+    value: Option<f32>,
+    analyzing: bool,
+    theme: &ThemeTokens,
+) {
+    if !bounds.has_finite_positive_area() {
+        return;
+    }
+
+    let value = value.filter(|value| value.is_finite());
+    let fraction = value.map(lufs_fraction).unwrap_or(0.0);
+    let value_label = match value {
+        Some(value) if value <= -59.9 => String::from("-∞"),
+        Some(value) => format!("{value:.1}"),
+        None if analyzing => String::from("…"),
+        None => String::from("—"),
+    };
+
+    primitives.push(PaintPrimitive::FillPolygon(PaintFillPolygon {
+        widget_id,
+        points: rounded_corner_points(bounds, METER_RADIUS),
+        color: theme.surface_overlay,
+    }));
+
+    push_text_run_with_metrics(
+        primitives,
+        widget_id,
+        "LUFS",
+        Rect::from_min_max(
+            Point::new(bounds.min.x + 6.0, bounds.min.y + 8.0),
+            Point::new(bounds.max.x - 6.0, bounds.min.y + 24.0),
+        ),
+        theme.text_muted,
+        PaintTextAlign::Center,
+        PaintTextMetrics::new(9.0, Some(11.0)),
+    );
+    push_text_run_with_metrics(
+        primitives,
+        widget_id,
+        value_label,
+        Rect::from_min_max(
+            Point::new(bounds.min.x + 4.0, bounds.min.y + 26.0),
+            Point::new(bounds.max.x - 4.0, bounds.min.y + 46.0),
+        ),
+        theme.text_primary,
+        PaintTextAlign::Center,
+        PaintTextMetrics::new(12.0, Some(15.0)),
+    );
+
+    let track = Rect::from_min_max(
+        Point::new(bounds.min.x + 27.0, bounds.min.y + 56.0),
+        Point::new(bounds.max.x - 27.0, bounds.max.y - 18.0),
+    );
+    if !track.has_finite_positive_area() {
+        return;
+    }
+    let track_points = rounded_corner_points(track, 4.0);
+    primitives.push(PaintPrimitive::FillPolygon(PaintFillPolygon {
+        widget_id,
+        points: track_points.clone(),
+        color: theme.bg_tertiary,
+    }));
+    primitives.push(PaintPrimitive::StrokePolygon(PaintStrokePolygon {
+        widget_id,
+        points: track_points,
+        color: theme.border,
+        width: 2.0,
+    }));
+
+    let techno_range = techno_range_rect(track);
+    if techno_range.has_finite_positive_area() {
+        primitives.push(PaintPrimitive::FillPolygon(PaintFillPolygon {
+            widget_id,
+            points: rounded_corner_points(techno_range, 3.0),
+            color: theme.grid_strong,
+        }));
+    }
+
+    let fill_height = track.height() * fraction;
+    if fill_height > 0.0 {
+        let fill = Rect::from_min_max(
+            Point::new(track.min.x, track.max.y - fill_height),
+            track.max,
+        );
+        primitives.push(PaintPrimitive::FillPolygon(PaintFillPolygon {
+            widget_id,
+            points: rounded_corner_points(fill, 3.0),
+            color: value
+                .filter(|value| *value > -6.0)
+                .map_or(theme.highlight_orange_soft, |_| theme.highlight_orange),
+        }));
+    }
+
+    if techno_range.has_finite_positive_area() {
+        primitives.push(PaintPrimitive::StrokePolygon(PaintStrokePolygon {
+            widget_id,
+            points: rounded_corner_points(techno_range, 3.0),
+            color: theme.border_emphasis,
+            width: 1.0,
+        }));
+    }
+
+    for fraction in [0.0_f32, 0.5, 1.0] {
+        let y = track.max.y - track.height() * fraction;
+        for rect in [
+            Rect::from_min_max(
+                Point::new(bounds.min.x + 14.0, y - 0.5),
+                Point::new(bounds.min.x + 22.0, y + 0.5),
+            ),
+            Rect::from_min_max(
+                Point::new(bounds.max.x - 22.0, y - 0.5),
+                Point::new(bounds.max.x - 14.0, y + 0.5),
+            ),
+        ] {
+            primitives.push(PaintPrimitive::FillRect(PaintFillRect {
+                widget_id,
+                rect,
+                color: theme.grid_soft,
+            }));
+        }
+    }
+
+    push_text_run_with_metrics(
+        primitives,
+        widget_id,
+        "TECHNO",
+        Rect::from_min_max(
+            Point::new(bounds.min.x + 4.0, bounds.max.y - 16.0),
+            Point::new(bounds.max.x - 4.0, bounds.max.y - 3.0),
+        ),
+        theme.text_muted,
+        PaintTextAlign::Center,
+        PaintTextMetrics::new(7.0, Some(9.0)),
+    );
 }
 
 fn lufs_fraction(value: f32) -> f32 {
