@@ -926,6 +926,7 @@ struct LibraryProjectionCache {
     review_indices: Vec<usize>,
     planner_indices: Vec<usize>,
     planner_stage_indices: [Vec<usize>; 4],
+    reference_assignment_counts: HashMap<PathBuf, usize>,
     #[cfg(test)]
     rebuild_count: usize,
 }
@@ -1010,6 +1011,18 @@ impl LibraryProjectionCache {
             self.planner_stage_indices[planner_stage_index(track.stage)].push(index);
         }
 
+        self.reference_assignment_counts.clear();
+        self.reference_assignment_counts
+            .reserve(library.tracks.len());
+        for track in &library.tracks {
+            if let Some(path) = track.reference_path.as_ref() {
+                *self
+                    .reference_assignment_counts
+                    .entry(path.clone())
+                    .or_default() += 1;
+            }
+        }
+
         #[cfg(test)]
         {
             self.rebuild_count += 1;
@@ -1030,6 +1043,10 @@ impl LibraryProjectionCache {
 
     fn planner_stage_indices(&self, stage: storage::TrackStage) -> &[usize] {
         &self.planner_stage_indices[planner_stage_index(stage)]
+    }
+
+    fn reference_assignment_count(&self, path: &Path) -> Option<&usize> {
+        self.reference_assignment_counts.get(path)
     }
 }
 
@@ -9684,16 +9701,6 @@ fn stage_menu_popover(track: &storage::Track, anchor: Point) -> ui::View<Message
     ))
 }
 
-fn reference_assignment_counts(library: &storage::Library) -> HashMap<&Path, usize> {
-    let mut counts = HashMap::with_capacity(library.tracks.len());
-    for track in &library.tracks {
-        if let Some(path) = track.reference_path.as_deref() {
-            *counts.entry(path).or_default() += 1;
-        }
-    }
-    counts
-}
-
 fn settings_reference_row(
     reference: &storage::ReferenceTrack,
     assignment_count: usize,
@@ -9754,7 +9761,8 @@ fn reference_settings_window_view(state: &AppState) -> ui::View<Message> {
     } else {
         let selected_reference_path =
             selected_track(state).and_then(|track| track.reference_path.as_deref());
-        let assignment_counts = reference_assignment_counts(&state.library);
+        ensure_library_projection_cache(state);
+        let projection = state.library_projection_cache.borrow();
         let window = resolved_virtual_list_window(
             state.reference_settings_window,
             reference_count,
@@ -9763,8 +9771,8 @@ fn reference_settings_window_view(state: &AppState) -> ui::View<Message> {
         );
         ui::virtual_list_windowed(|index| {
             let reference: &storage::ReferenceTrack = &state.library.reference_tracks[index];
-            let assignment_count = assignment_counts
-                .get(reference.path.as_path())
+            let assignment_count = projection
+                .reference_assignment_count(reference.path.as_path())
                 .copied()
                 .unwrap_or_default();
             let active = selected_reference_path == Some(reference.path.as_path());
@@ -11126,7 +11134,7 @@ fn comments_panel(state: &AppState, track: &storage::Track) -> ui::View<Message>
             comments_window(state, source),
             notes.len(),
             focused_index,
-            true,
+            false,
         );
         let track_id = track.id.as_str();
         let reference_path = track.reference_path.as_deref();
@@ -11931,9 +11939,8 @@ mod tests {
         note_editor, note_ratio_for_id, owned_tracks_in_stage, paint_live_playback_overlay,
         planner_insertion_target_is_valid, planner_stage_index, planner_tracks_with_favorites,
         playback_shortcut, progress_paired_playback_cleanup, project_surface,
-        qualified_note_identity_key, reference_assignment_counts,
-        reference_decode_result_is_current, reference_dropdown_paths, reference_menu_available,
-        reference_output_gain, reference_settings_auxiliary_windows,
+        qualified_note_identity_key, reference_decode_result_is_current, reference_dropdown_paths,
+        reference_menu_available, reference_output_gain, reference_settings_auxiliary_windows,
         reference_settings_window_view, refresh_live_spectrogram, refresh_live_spectrograms,
         resume_transport_command, review_spectrogram_source, schedule_import,
         schedule_library_save, schedule_reference_catalog_import, schedule_reference_import,
@@ -14359,7 +14366,7 @@ mod tests {
     }
 
     #[test]
-    fn reference_assignment_counts_are_built_once_per_catalog_path() {
+    fn reference_assignment_cache_reuses_generation_and_invalidates_after_assignment_change() {
         let first_path = PathBuf::from("/external/first-reference.wav");
         let second_path = PathBuf::from("/external/second-reference.wav");
         let mut first = audition_track("first");
@@ -14371,15 +14378,30 @@ mod tests {
         let mut unassigned = audition_track("unassigned");
         unassigned.reference_path = None;
 
-        let library = Library {
+        let mut shared = SharedLibrary::from(Library {
             tracks: vec![first, second, third, unassigned].into(),
             ..Library::default()
-        };
-        let counts = reference_assignment_counts(&library);
+        });
+        let mut cache = LibraryProjectionCache::default();
 
-        assert_eq!(counts.get(first_path.as_path()), Some(&2));
-        assert_eq!(counts.get(second_path.as_path()), Some(&1));
-        assert_eq!(counts.get(Path::new("/external/missing.wav")), None);
+        cache.ensure(shared.generation(), &shared);
+        assert_eq!(cache.rebuild_count, 1);
+        assert_eq!(cache.reference_assignment_count(&first_path), Some(&2));
+        assert_eq!(cache.reference_assignment_count(&second_path), Some(&1));
+        assert_eq!(
+            cache.reference_assignment_count(Path::new("/external/missing.wav")),
+            None
+        );
+
+        cache.ensure(shared.generation(), &shared);
+        assert_eq!(cache.rebuild_count, 1);
+
+        shared.tracks[1].reference_path = Some(second_path.clone());
+        cache.ensure(shared.generation(), &shared);
+        assert_eq!(cache.rebuild_count, 2);
+
+        assert_eq!(cache.reference_assignment_count(&first_path), Some(&1));
+        assert_eq!(cache.reference_assignment_count(&second_path), Some(&2));
     }
 
     #[test]
@@ -23061,6 +23083,183 @@ mod tests {
                 .state()
                 .main_comments_window
                 .contains(edited_index)
+        );
+    }
+
+    #[test]
+    fn ordinary_comment_window_changes_preserve_main_and_reference_scroll_with_selection_elsewhere()
+    {
+        let track_id = String::from("ordinary-comment-window-track");
+        let reference_path = PathBuf::from("/external/ordinary-comment-reference.wav");
+        let mut track = audition_track(&track_id);
+        track.reference_path = Some(reference_path.clone());
+        track.notes = (0..64)
+            .map(|index| Note {
+                id: format!("ordinary-main-note-{index}"),
+                time_millis: index as u64 * 100,
+                body: format!("ordinary-main-comment-{index}"),
+                done: false,
+            })
+            .collect();
+
+        let mut state = AppState {
+            busy: false,
+            comment_source_explicit: true,
+            workspace_mode: WorkspaceMode::Review,
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(track_id.clone());
+        state.library.tracks = vec![track].into();
+        state.library.reference_tracks = vec![ReferenceTrack {
+            path: reference_path.clone(),
+            source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
+            notes: (0..64)
+                .map(|index| Note {
+                    id: format!("ordinary-reference-note-{index}"),
+                    time_millis: index as u64 * 100,
+                    body: format!("ordinary-reference-comment-{index}"),
+                    done: false,
+                })
+                .collect(),
+        }]
+        .into();
+
+        let reported = ui::resolve_virtual_list_window(ui::VirtualListWindowRequest {
+            total_items: 64,
+            viewport_len: 8,
+            requested_start: 40,
+            overscan: 4,
+            ..ui::VirtualListWindowRequest::default()
+        });
+        let change = ui::VirtualListWindowChange {
+            offset_y: reported.viewport_start as f32 * super::COMMENT_ROW_HEIGHT,
+            row_height: super::COMMENT_ROW_HEIGHT,
+            window: reported,
+        };
+        let mut context = ui::UiUpdateContext::default();
+
+        state.selected_note_id = Some(NoteAddress::main(track_id.clone(), "ordinary-main-note-0"));
+        update(
+            &mut state,
+            Message::CommentsWindowChanged {
+                source: super::CommentSource::Main,
+                change,
+            },
+            &mut context,
+        );
+        assert_eq!(state.main_comments_window, reported);
+        assert_eq!(
+            super::resolved_virtual_list_window(state.main_comments_window, 64, Some(0), false),
+            reported
+        );
+        assert_eq!(state.main_comments_window, reported);
+
+        state.comment_source = super::CommentSource::Reference;
+        state.selected_reference_note_id = Some(NoteAddress::reference(
+            reference_path,
+            "ordinary-reference-note-0",
+        ));
+        update(
+            &mut state,
+            Message::CommentsWindowChanged {
+                source: super::CommentSource::Reference,
+                change,
+            },
+            &mut context,
+        );
+        assert_eq!(state.reference_comments_window, reported);
+        assert_eq!(
+            super::resolved_virtual_list_window(
+                state.reference_comments_window,
+                64,
+                Some(0),
+                false,
+            ),
+            reported
+        );
+        assert_eq!(state.reference_comments_window, reported);
+    }
+
+    #[test]
+    fn explicit_comment_reveal_scrolls_main_and_reference_viewports() {
+        let track_id = String::from("explicit-comment-reveal-track");
+        let reference_path = PathBuf::from("/external/explicit-comment-reference.wav");
+        let target_index = 40;
+        let mut track = audition_track(&track_id);
+        track.reference_path = Some(reference_path.clone());
+        track.notes = (0..64)
+            .map(|index| Note {
+                id: format!("explicit-main-note-{index}"),
+                time_millis: index as u64 * 100,
+                body: format!("explicit-main-comment-{index}"),
+                done: false,
+            })
+            .collect();
+
+        let mut state = AppState {
+            busy: false,
+            comment_source_explicit: true,
+            workspace_mode: WorkspaceMode::Review,
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(track_id.clone());
+        state.library.tracks = vec![track].into();
+        state.library.reference_tracks = vec![ReferenceTrack {
+            path: reference_path.clone(),
+            source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
+            notes: (0..64)
+                .map(|index| Note {
+                    id: format!("explicit-reference-note-{index}"),
+                    time_millis: index as u64 * 100,
+                    body: format!("explicit-reference-comment-{index}"),
+                    done: false,
+                })
+                .collect(),
+        }]
+        .into();
+
+        let main_address = NoteAddress::main(
+            track_id.clone(),
+            format!("explicit-main-note-{target_index}"),
+        );
+        let mut main_context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::SelectNote(main_address),
+            &mut main_context,
+        );
+        assert!(state.main_comments_window.contains(target_index));
+        assert_eq!(
+            scroll_into_view_request(&main_context.into_command()),
+            Some((
+                super::MAIN_COMMENTS_SCROLL_VIEWPORT_ID,
+                target_index as f32 * super::COMMENT_ROW_HEIGHT,
+                super::COMMENT_ROW_HEIGHT,
+                super::LIBRARY_REVEAL_MARGIN,
+                super::LIBRARY_REVEAL_MARGIN,
+            ))
+        );
+
+        let reference_address = NoteAddress::reference(
+            reference_path,
+            format!("explicit-reference-note-{target_index}"),
+        );
+        let mut reference_context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::SelectReferenceNote(reference_address),
+            &mut reference_context,
+        );
+        assert!(state.reference_comments_window.contains(target_index));
+        assert_eq!(
+            scroll_into_view_request(&reference_context.into_command()),
+            Some((
+                super::REFERENCE_COMMENTS_SCROLL_VIEWPORT_ID,
+                target_index as f32 * super::COMMENT_ROW_HEIGHT,
+                super::COMMENT_ROW_HEIGHT,
+                super::LIBRARY_REVEAL_MARGIN,
+                super::LIBRARY_REVEAL_MARGIN,
+            ))
         );
     }
 
