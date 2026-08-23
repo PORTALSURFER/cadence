@@ -243,7 +243,8 @@ pub fn decode_audio_file_with_cancellation(
 ) -> Result<DecodedAudioFile, String> {
     let verified =
         source::open_and_hash(path, &should_cancel).map_err(|error| error.to_string())?;
-    let verified_waveform = decode_waveform_from_verified_source(verified, &should_cancel, |_| {})?;
+    let verified_waveform =
+        decode_waveform_from_verified_source_final_only(verified, &should_cancel)?;
     let fingerprint = waveform_cache_fingerprint(path).ok_or_else(|| {
         format!(
             "Could not inspect {} after waveform analysis",
@@ -262,16 +263,47 @@ pub fn decode_audio_file_with_cancellation(
 /// Decode from an already hashed, retained source handle.  The ticket is
 /// returned only after the same handle and path pass the post-decode stamp
 /// fence.
+#[allow(dead_code)]
 pub fn decode_waveform_from_verified_source(
+    verified: VerifiedSourceFile,
+    should_cancel: impl Fn() -> bool,
+    mut on_progress: impl FnMut(WaveformProgress),
+) -> Result<VerifiedWaveform, String> {
+    decode_waveform_from_verified_source_with_policy(
+        verified,
+        should_cancel,
+        PreviewSink::Progressive {
+            on_progress: &mut on_progress,
+            next_preview_frame: None,
+        },
+    )
+}
+
+/// Decode from an already verified source without constructing progressive
+/// preview snapshots. This is used by production paths whose source fence
+/// requires the complete waveform before publication.
+pub(crate) fn decode_waveform_from_verified_source_final_only(
+    verified: VerifiedSourceFile,
+    should_cancel: impl Fn() -> bool,
+) -> Result<VerifiedWaveform, String> {
+    decode_waveform_from_verified_source_with_policy(
+        verified,
+        should_cancel,
+        PreviewSink::FinalOnly,
+    )
+}
+
+fn decode_waveform_from_verified_source_with_policy(
     mut verified: VerifiedSourceFile,
     should_cancel: impl Fn() -> bool,
-    on_progress: impl FnMut(WaveformProgress),
+    preview_sink: PreviewSink<'_>,
 ) -> Result<VerifiedWaveform, String> {
     let path = verified.path().to_path_buf();
     let decode_file = verified
         .try_clone_for_decode()
         .map_err(|error| error.to_string())?;
-    let waveform = decode_waveform_from_open_file(&path, decode_file, &should_cancel, on_progress)?;
+    let waveform =
+        decode_waveform_from_open_file(&path, decode_file, &should_cancel, preview_sink)?;
     verified
         .validate_after_decode(&should_cancel)
         .map_err(|error| error.to_string())?;
@@ -727,6 +759,68 @@ fn progressive_preview<T>(
     build(progress)
 }
 
+enum PreviewSink<'a> {
+    FinalOnly,
+    Progressive {
+        on_progress: &'a mut dyn FnMut(WaveformProgress),
+        next_preview_frame: Option<usize>,
+    },
+}
+
+impl PreviewSink<'_> {
+    fn configure(&mut self, sample_rate: u32) {
+        if let Self::Progressive {
+            next_preview_frame, ..
+        } = self
+        {
+            next_preview_frame
+                .get_or_insert_with(|| frames_for_millis(sample_rate, PREVIEW_FIRST_MILLIS));
+        }
+    }
+
+    fn emit_if_due(
+        &mut self,
+        decoded_frames: usize,
+        expected_frames: Option<u64>,
+        reducer: &PeakReducer,
+        window: &PeakWindow,
+        sample_rate: u32,
+        channels: usize,
+    ) {
+        let Self::Progressive {
+            on_progress,
+            next_preview_frame,
+        } = self
+        else {
+            return;
+        };
+        let Some(next_frame) = next_preview_frame else {
+            return;
+        };
+        if decoded_frames < *next_frame {
+            return;
+        }
+
+        if let Some(progress) = progressive_preview(decoded_frames, expected_frames, |progress| {
+            let peaks = reducer.snapshot_with_partial(window.snapshot());
+            (!peaks.is_empty()).then(|| WaveformProgress {
+                waveform: preview_waveform(
+                    peaks,
+                    sample_rate,
+                    channels,
+                    decoded_frames,
+                    expected_frames,
+                ),
+                progress: Some(progress),
+            })
+        }) {
+            on_progress(progress);
+        }
+        *next_frame =
+            decoded_frames.saturating_add(frames_for_millis(sample_rate, PREVIEW_INTERVAL_MILLIS));
+    }
+}
+
 fn loudness_channel_map(channel_layout: Channels, channel_count: usize) -> Vec<LoudnessChannel> {
     let mapped = channel_layout
         .iter()
@@ -1104,7 +1198,7 @@ pub fn decode_waveform_with_cancellation(
 pub fn decode_waveform_with_progress_and_cancellation(
     path: &Path,
     should_cancel: impl Fn() -> bool,
-    on_progress: impl FnMut(WaveformProgress),
+    mut on_progress: impl FnMut(WaveformProgress),
 ) -> Result<WaveformData, String> {
     if should_cancel() {
         return Err(String::from("cancelled"));
@@ -1115,14 +1209,22 @@ pub fn decode_waveform_with_progress_and_cancellation(
             path.display()
         )
     })?;
-    decode_waveform_from_open_file(path, file, should_cancel, on_progress)
+    decode_waveform_from_open_file(
+        path,
+        file,
+        should_cancel,
+        PreviewSink::Progressive {
+            on_progress: &mut on_progress,
+            next_preview_frame: None,
+        },
+    )
 }
 
 fn decode_waveform_from_open_file(
     path: &Path,
     file: File,
     should_cancel: impl Fn() -> bool,
-    mut on_progress: impl FnMut(WaveformProgress),
+    mut preview_sink: PreviewSink<'_>,
 ) -> Result<WaveformData, String> {
     let media = MediaSourceStream::new(Box::new(file), Default::default());
     let mut hint = Hint::new();
@@ -1160,7 +1262,7 @@ fn decode_waveform_from_open_file(
     let mut sample_rate = None;
     let mut channels = None;
     let mut channel_layout = None;
-    let mut next_preview_frame = None;
+    let mut sample_buffer = None;
 
     loop {
         if should_cancel() {
@@ -1219,9 +1321,7 @@ fn decode_waveform_from_open_file(
         sample_rate = Some(decoded_sample_rate);
         channels = Some(decoded_channels);
         channel_layout = Some(decoded_channel_layout);
-        let preview_interval = frames_for_millis(decoded_sample_rate, PREVIEW_INTERVAL_MILLIS);
-        let first_preview = frames_for_millis(decoded_sample_rate, PREVIEW_FIRST_MILLIS);
-        let next_preview_frame = next_preview_frame.get_or_insert(first_preview);
+        preview_sink.configure(decoded_sample_rate);
         if loudness.is_none() {
             loudness = Some(LoudnessAccumulator::new(
                 decoded_sample_rate,
@@ -1231,8 +1331,19 @@ fn decode_waveform_from_open_file(
         }
         let loudness = loudness.as_mut().expect("loudness analyzer initialized");
 
-        let mut sample_buffer =
-            SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
+        let required_samples = decoded.capacity().saturating_mul(decoded_channels);
+        if sample_buffer
+            .as_ref()
+            .is_none_or(|buffer: &SampleBuffer<f32>| buffer.capacity() < required_samples)
+        {
+            sample_buffer = Some(SampleBuffer::<f32>::new(
+                decoded.capacity() as u64,
+                *decoded.spec(),
+            ));
+        }
+        let sample_buffer = sample_buffer
+            .as_mut()
+            .expect("sample buffer initialized for decoded packet");
         sample_buffer.copy_interleaved_ref(decoded);
         let samples = sample_buffer.samples();
         loudness.add_frames(samples)?;
@@ -1249,26 +1360,14 @@ fn decode_waveform_from_open_file(
         if should_cancel() {
             return Err(String::from("cancelled"));
         }
-        if decoded_frames >= *next_preview_frame {
-            if let Some(progress) =
-                progressive_preview(decoded_frames, expected_frames, |progress| {
-                    let peaks = reducer.snapshot_with_partial(window.snapshot());
-                    (!peaks.is_empty()).then(|| WaveformProgress {
-                        waveform: preview_waveform(
-                            peaks,
-                            decoded_sample_rate,
-                            decoded_channels,
-                            decoded_frames,
-                            expected_frames,
-                        ),
-                        progress: Some(progress),
-                    })
-                })
-            {
-                on_progress(progress);
-            }
-            *next_preview_frame = decoded_frames.saturating_add(preview_interval);
-        }
+        preview_sink.emit_if_due(
+            decoded_frames,
+            expected_frames,
+            &reducer,
+            &window,
+            decoded_sample_rate,
+            decoded_channels,
+        );
     }
 
     if let Some(peak) = window.finish() {

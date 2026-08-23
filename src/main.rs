@@ -26,8 +26,10 @@ use radiant::{
     },
 };
 use std::{
-    collections::{HashMap, VecDeque},
+    cell::RefCell,
+    collections::{HashMap, HashSet, VecDeque},
     fmt::Write as _,
+    ops::{Deref, DerefMut},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -935,6 +937,211 @@ struct LibrarySaveAttempt {
     revision: u64,
 }
 
+/// UI-owned library state is shared with blocking workers through an immutable
+/// Arc snapshot. A mutable dereference is the single COW boundary: it only
+/// clones when an in-flight worker still owns an older snapshot. In particular,
+/// save admission captures `snapshot()` and never clones the full library on
+/// the UI thread.
+#[derive(Clone, Debug)]
+struct SharedLibrary {
+    value: Arc<storage::Library>,
+    generation: u64,
+}
+
+impl Default for SharedLibrary {
+    fn default() -> Self {
+        Self::new(storage::Library::default())
+    }
+}
+
+impl From<storage::Library> for SharedLibrary {
+    fn from(library: storage::Library) -> Self {
+        Self::new(library)
+    }
+}
+
+impl PartialEq for SharedLibrary {
+    fn eq(&self, other: &Self) -> bool {
+        self.value == other.value
+    }
+}
+
+impl Eq for SharedLibrary {}
+
+impl Deref for SharedLibrary {
+    type Target = storage::Library;
+
+    fn deref(&self) -> &Self::Target {
+        self.value.as_ref()
+    }
+}
+
+impl DerefMut for SharedLibrary {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.generation = self.generation.wrapping_add(1);
+        Arc::make_mut(&mut self.value)
+    }
+}
+
+impl SharedLibrary {
+    fn new(library: storage::Library) -> Self {
+        Self {
+            value: Arc::new(library),
+            generation: 0,
+        }
+    }
+
+    fn snapshot(&self) -> Arc<storage::Library> {
+        Arc::clone(&self.value)
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn make_mut(&mut self) -> &mut storage::Library {
+        self.deref_mut()
+    }
+
+    fn replace(&mut self, library: storage::Library) {
+        self.value = Arc::new(library);
+        self.generation = self.generation.wrapping_add(1);
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct LibraryProjectionCache {
+    generation: Option<u64>,
+    review_filter: Option<storage::TrackStatus>,
+    planner_filter: Option<storage::TrackStatus>,
+    id_to_library_index: HashMap<String, usize>,
+    review_indices: Vec<usize>,
+    planner_indices: Vec<usize>,
+    planner_stage_indices: [Vec<usize>; 4],
+    #[cfg(test)]
+    rebuild_count: usize,
+}
+
+impl LibraryProjectionCache {
+    fn ensure(
+        &mut self,
+        generation: u64,
+        library: &storage::Library,
+        review_filter: Option<storage::TrackStatus>,
+        planner_filter: Option<storage::TrackStatus>,
+    ) {
+        if self.generation == Some(generation)
+            && self.review_filter == review_filter
+            && self.planner_filter == planner_filter
+        {
+            return;
+        }
+
+        self.generation = Some(generation);
+        self.review_filter = review_filter;
+        self.planner_filter = planner_filter;
+        self.id_to_library_index.clear();
+        self.id_to_library_index.reserve(library.tracks.len());
+        for (index, track) in library.tracks.iter().enumerate() {
+            self.id_to_library_index
+                .entry(track.id.clone())
+                .or_insert(index);
+        }
+
+        self.review_indices.clear();
+        self.review_indices.reserve(library.tracks.len());
+        for favorite in [true, false] {
+            self.review_indices.extend(
+                library
+                    .tracks
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, track)| {
+                        track.favorite == favorite
+                            && review_filter.is_none_or(|status| track.status == status)
+                    })
+                    .map(|(index, _)| index),
+            );
+        }
+
+        self.planner_indices.clear();
+        self.planner_indices.reserve(library.tracks.len());
+        for stage in &mut self.planner_stage_indices {
+            stage.clear();
+            stage.reserve(library.tracks.len() / 4);
+        }
+        let mut planner_ids = Vec::with_capacity(library.tracks.len());
+        let mut seen = HashSet::with_capacity(library.planner_order.len() + library.tracks.len());
+        if library.planner_order.is_empty() {
+            planner_ids.extend(
+                library
+                    .tracks
+                    .iter()
+                    .filter(|track| track.favorite)
+                    .map(|track| track.id.as_str()),
+            );
+            planner_ids.extend(
+                library
+                    .tracks
+                    .iter()
+                    .filter(|track| !track.favorite)
+                    .map(|track| track.id.as_str()),
+            );
+        } else {
+            planner_ids.extend(
+                library
+                    .planner_order
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|id| seen.insert(*id)),
+            );
+            planner_ids.extend(
+                library
+                    .tracks
+                    .iter()
+                    .map(|track| track.id.as_str())
+                    .filter(|id| seen.insert(*id)),
+            );
+        }
+        let mut planner_seen = HashSet::with_capacity(planner_ids.len());
+        for id in planner_ids {
+            let Some(&index) = self.id_to_library_index.get(id) else {
+                continue;
+            };
+            if !planner_seen.insert(index) {
+                continue;
+            }
+            let track = &library.tracks[index];
+            if planner_filter.is_some_and(|status| track.status != status) {
+                continue;
+            }
+            self.planner_indices.push(index);
+            self.planner_stage_indices[planner_stage_index(track.stage)].push(index);
+        }
+
+        #[cfg(test)]
+        {
+            self.rebuild_count += 1;
+        }
+    }
+
+    fn library_index(&self, track_id: &str) -> Option<usize> {
+        self.id_to_library_index.get(track_id).copied()
+    }
+
+    fn review_indices(&self) -> &[usize] {
+        &self.review_indices
+    }
+
+    fn planner_indices(&self) -> &[usize] {
+        &self.planner_indices
+    }
+
+    fn planner_stage_indices(&self, stage: storage::TrackStage) -> &[usize] {
+        &self.planner_stage_indices[planner_stage_index(stage)]
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct WaveformDecodeRequest {
     track_id: String,
@@ -1033,7 +1240,8 @@ enum PairedPlaybackGuard {
 
 #[derive(Clone, Debug)]
 struct AppState {
-    library: storage::Library,
+    library: SharedLibrary,
+    library_projection_cache: RefCell<LibraryProjectionCache>,
     selected_track_index: Option<usize>,
     library_load_state: LibraryLoadState,
     workspace_mode: WorkspaceMode,
@@ -1194,7 +1402,8 @@ struct PendingCommentPlayback {
 impl Default for AppState {
     fn default() -> Self {
         Self {
-            library: storage::Library::default(),
+            library: SharedLibrary::default(),
+            library_projection_cache: RefCell::new(LibraryProjectionCache::default()),
             selected_track_index: None,
             library_load_state: LibraryLoadState::Ready,
             workspace_mode: WorkspaceMode::Review,
@@ -1326,6 +1535,15 @@ impl AppState {
             ..Self::default()
         }
     }
+}
+
+fn ensure_library_projection_cache(state: &AppState) {
+    state.library_projection_cache.borrow_mut().ensure(
+        state.library.generation(),
+        &state.library,
+        state.review_status_filter,
+        state.planner_status_filter,
+    );
 }
 
 fn allocate_note_draft_nonce(state: &mut AppState) -> u64 {
@@ -1655,15 +1873,15 @@ fn activate_loaded_library(
 ) {
     state.audio_import_in_flight = None;
     state.pending_import_commit = None;
-    state.library = library;
+    state.library.replace(library);
     reset_comments_windows(state);
     state.library_revision = 0;
     state.persisted_library_revision = 0;
     state.save_in_flight = None;
     state.save_admission_pending = false;
-    storage::normalize_planner_order(&mut state.library);
+    storage::normalize_planner_order(state.library.make_mut());
     let (startup_track_id, startup_selection_changed) =
-        normalize_startup_track_selection(&mut state.library);
+        normalize_startup_track_selection(state.library.make_mut());
     refresh_selected_track_index(state);
     state.status = if state.library.tracks.is_empty() {
         String::from("Ready — import a track to begin.")
@@ -2203,7 +2421,7 @@ fn decode_or_load_cached_waveform(
     // Do not publish decoder previews until the retained-handle source fence has
     // accepted the completed waveform. A cache miss must never make an
     // unverified version visible while the encoded source can still change.
-    let result = audio::decode_waveform_from_verified_source(verified, &should_cancel, |_| {});
+    let result = audio::decode_waveform_from_verified_source_final_only(verified, &should_cancel);
     if should_cancel() {
         return Err(String::from("cancelled"));
     }
@@ -2261,7 +2479,7 @@ fn start_waveform_decode(
                     &path,
                     expected_proof,
                     || worker_cancellation.is_cancelled(),
-                    |progress| {
+                    move |progress| {
                         let _ = sink.emit(progress);
                     },
                 )
@@ -2393,7 +2611,7 @@ fn start_reference_waveform_decode(
                     &path,
                     expected_proof,
                     || worker_cancellation.is_cancelled(),
-                    |progress| {
+                    move |progress| {
                         let _ = sink.emit(progress);
                     },
                 )
@@ -2670,7 +2888,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
             match result {
                 Ok(library) => {
-                    state.library = library;
+                    state.library.replace(library);
                     reset_comments_windows(state);
                     refresh_selected_track_index(state);
                     mark_library_snapshot_persisted(state);
@@ -2817,7 +3035,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                         library.tracks.len(),
                         plural(library.tracks.len())
                     );
-                    state.library = library;
+                    state.library.replace(library);
                     reset_comments_windows(state);
                     refresh_selected_track_index(state);
                     mark_library_snapshot_persisted(state);
@@ -2878,7 +3096,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                         .find(|track| track.id == track_id)
                         .map(|track| track.title.clone())
                         .unwrap_or_else(|| String::from("track"));
-                    state.library = library;
+                    state.library.replace(library);
                     reset_comments_windows(state);
                     refresh_selected_track_index(state);
                     mark_library_snapshot_persisted(state);
@@ -2935,7 +3153,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             record_import_attempt(state, failed);
             match result {
                 Ok(library) => {
-                    state.library = library;
+                    state.library.replace(library);
                     reset_comments_windows(state);
                     refresh_selected_track_index(state);
                     mark_library_snapshot_persisted(state);
@@ -3856,12 +4074,21 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             let Some(source_id) = state.planner_drag_source_track_id.as_deref() else {
                 return;
             };
-            if !planner_insertion_target_is_valid(
-                &state.library,
-                source_id,
-                &target,
-                state.planner_status_filter,
-            ) {
+            ensure_library_projection_cache(state);
+            let (valid, status) = {
+                let projection = state.library_projection_cache.borrow();
+                let valid = planner_insertion_target_is_valid_cached(
+                    &state.library,
+                    &projection,
+                    source_id,
+                    &target,
+                    state.planner_status_filter,
+                );
+                let status = valid
+                    .then(|| planner_insertion_status_cached(&state.library, &projection, &target));
+                (valid, status)
+            };
+            if !valid {
                 if state.planner_drag_target.take().is_some() {
                     context.request_repaint();
                 }
@@ -3871,8 +4098,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 return;
             }
             state.planner_drag_target = Some(target.clone());
-            state.status =
-                planner_insertion_status(&state.library, &target, state.planner_status_filter);
+            state.status = status.expect("valid Planner target has a status message");
             context.request_repaint();
         }
         Message::PlannerInsertionHoverCleared(target) => {
@@ -3908,14 +4134,15 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 Ok(true) => {
                     close_stage_menu(state);
                     close_status_menu(state);
-                    state.status = planner_insertion_status(
-                        &state.library,
-                        &PlannerInsertionTarget {
-                            stage: target.stage,
-                            slot: target.slot,
-                        },
-                        state.planner_status_filter,
-                    );
+                    let status_target = PlannerInsertionTarget {
+                        stage: target.stage,
+                        slot: target.slot,
+                    };
+                    ensure_library_projection_cache(state);
+                    state.status = {
+                        let projection = state.library_projection_cache.borrow();
+                        planner_insertion_status_cached(&state.library, &projection, &status_target)
+                    };
                     schedule_library_save(state, context);
                 }
                 Ok(false) => {
@@ -7301,9 +7528,9 @@ fn start_import_commit(
     decoded: audio::DecodedAudioFile,
 ) {
     state.pending_import_commit = Some(PendingImportCommit::Main);
-    let library = state.library.clone();
+    let library = state.library.snapshot();
     context.business().blocking_io("cadence-import-track").run(
-        move |_| storage::import_into_library(library, decoded),
+        move |_| storage::import_into_library(Arc::unwrap_or_clone(library), decoded),
         Message::ImportCompleted,
     );
 }
@@ -7319,13 +7546,19 @@ fn start_reference_commit(
         track_id: track_id.clone(),
         path: path.clone(),
     });
-    let library = state.library.clone();
+    let library = state.library.snapshot();
     let commit_track_id = track_id.clone();
     context
         .business()
         .blocking_io("cadence-import-reference")
         .run(
-            move |_| storage::set_reference_track(library, &commit_track_id, decoded),
+            move |_| {
+                storage::set_reference_track(
+                    Arc::unwrap_or_clone(library),
+                    &commit_track_id,
+                    decoded,
+                )
+            },
             move |result| Message::ReferenceImportCompleted {
                 track_id,
                 path,
@@ -7341,12 +7574,12 @@ fn start_reference_catalog_commit(
     decoded: audio::DecodedAudioFile,
 ) {
     state.pending_import_commit = Some(PendingImportCommit::Catalog { path: path.clone() });
-    let library = state.library.clone();
+    let library = state.library.snapshot();
     context
         .business()
         .blocking_io("cadence-import-reference-catalog")
         .run(
-            move |_| storage::add_reference_track(library, decoded),
+            move |_| storage::add_reference_track(Arc::unwrap_or_clone(library), decoded),
             move |result| Message::ReferenceCatalogImportCompleted { path, result },
         );
 }
@@ -7360,10 +7593,10 @@ fn start_replace_commit(
     state.pending_import_commit = Some(PendingImportCommit::Replacement {
         track_id: track_id.clone(),
     });
-    let library = state.library.clone();
+    let library = state.library.snapshot();
     let commit_track_id = track_id.clone();
     context.business().blocking_io("cadence-replace-track").run(
-        move |_| storage::replace_track(library, &commit_track_id, decoded),
+        move |_| storage::replace_track(Arc::unwrap_or_clone(library), &commit_track_id, decoded),
         move |result| Message::ReplaceCompleted { track_id, result },
     );
 }
@@ -7377,13 +7610,19 @@ fn start_reference_selection_commit(
     decoded: audio::DecodedAudioFile,
 ) {
     state.pending_import_commit = Some(PendingImportCommit::ReferenceSelection { request_id });
-    let library = state.library.clone();
+    let library = state.library.snapshot();
     let commit_track_id = track_id.clone();
     context
         .business()
         .blocking_io("cadence-select-reference")
         .run(
-            move |_| storage::set_reference_track(library, &commit_track_id, decoded),
+            move |_| {
+                storage::set_reference_track(
+                    Arc::unwrap_or_clone(library),
+                    &commit_track_id,
+                    decoded,
+                )
+            },
             move |result| Message::ReferenceSelectionCompleted {
                 request_id,
                 track_id,
@@ -7485,7 +7724,7 @@ fn complete_reference_selection_commit(
 
     match result {
         Ok(library) => {
-            state.library = library;
+            state.library.replace(library);
             reset_comments_windows(state);
             refresh_selected_track_index(state);
             mark_library_snapshot_persisted(state);
@@ -8066,7 +8305,7 @@ fn dispatch_library_save(state: &mut AppState, context: &mut ui::UiUpdateContext
         .expect("library save attempt id overflow");
     state.last_save_attempt_id = id;
     let attempt = LibrarySaveAttempt { id, revision };
-    let library = state.library.clone();
+    let library = state.library.snapshot();
     state.save_in_flight = Some(attempt);
     context.business().blocking_io("cadence-save-library").run(
         move |_| storage::persist_library(&library),
@@ -8894,11 +9133,26 @@ fn select_track_internal(
     schedule_selected_waveform_decode(state, context);
     schedule_selected_reference_decode(state, context);
     if entering_review_from_planner {
-        let tracks = tracks_with_status(&state.library.tracks, state.review_status_filter);
-        if let Some(index) = tracks.iter().position(|track| track.id == reveal_id) {
+        ensure_library_projection_cache(state);
+        let reveal_index = {
+            let projection = state.library_projection_cache.borrow();
+            projection
+                .library_index(&reveal_id)
+                .and_then(|library_index| {
+                    projection
+                        .review_indices()
+                        .iter()
+                        .position(|index| *index == library_index)
+                })
+        };
+        if let Some(index) = reveal_index {
             state.review_library_window = resolved_virtual_list_window(
                 state.review_library_window,
-                tracks.len(),
+                state
+                    .library_projection_cache
+                    .borrow()
+                    .review_indices()
+                    .len(),
                 Some(index),
                 true,
             );
@@ -9016,34 +9270,27 @@ fn shuffle_audition(state: &mut AppState, context: &mut ui::UiUpdateContext<Mess
 }
 
 fn ensure_audition_shuffle_change(
-    queue: &mut Vec<String>,
+    queue: &mut [String],
     previous_queue: &[String],
     previous_selected: Option<&str>,
 ) {
     if queue.len() < 2 {
         return;
     }
-    let shuffled = queue.clone();
-    let order_changed = |candidate: &[String]| candidate != previous_queue;
-    let first_is_new = |candidate: &[String]| {
-        previous_selected.is_none_or(|selected| candidate.first().is_none_or(|id| id != selected))
-    };
 
-    for rotation in 0..queue.len() {
-        let mut candidate = shuffled.clone();
-        candidate.rotate_left(rotation);
-        if order_changed(&candidate) && first_is_new(&candidate) {
-            *queue = candidate;
-            return;
-        }
-    }
-    for rotation in 0..queue.len() {
-        let mut candidate = shuffled.clone();
-        candidate.rotate_left(rotation);
-        if order_changed(&candidate) {
-            *queue = candidate;
-            return;
-        }
+    let rotation_matches_previous = |rotation: usize| {
+        queue.len() == previous_queue.len()
+            && (0..queue.len())
+                .all(|index| queue[(index + rotation) % queue.len()] == previous_queue[index])
+    };
+    let first_is_new = |rotation: usize| {
+        previous_selected.is_none_or(|selected| queue[rotation].as_str() != selected)
+    };
+    let rotation = (0..queue.len())
+        .find(|rotation| !rotation_matches_previous(*rotation) && first_is_new(*rotation))
+        .or_else(|| (0..queue.len()).find(|rotation| !rotation_matches_previous(*rotation)));
+    if let Some(rotation) = rotation {
+        queue.rotate_left(rotation);
     }
 }
 
@@ -9051,28 +9298,31 @@ fn reconcile_audition_queue(state: &mut AppState) {
     let old_queue = std::mem::take(&mut state.audition_queue);
     let old_index = state.audition_queue_index;
     let current_id = old_queue.get(old_index).cloned();
-    let active_anchor_id = audition_navigation_anchor(state);
-    let mut queue = old_queue
-        .into_iter()
-        .filter(|track_id| {
-            state
-                .library
-                .tracks
-                .iter()
-                .find(|track| &track.id == track_id)
-                .is_some_and(|track| {
-                    track.status == state.audition_status_filter
-                        || active_anchor_id == Some(track_id.as_str())
-                })
-        })
-        .collect::<Vec<_>>();
-    for track in state
-        .library
-        .tracks
-        .iter()
-        .filter(|track| track.status == state.audition_status_filter)
-    {
-        if !queue.iter().any(|track_id| track_id == &track.id) {
+    let active_anchor_id = audition_navigation_anchor(state).map(ToOwned::to_owned);
+    let filter = state.audition_status_filter;
+    let mut library_status_by_id = HashMap::with_capacity(state.library.tracks.len());
+    let mut library_ids = HashSet::with_capacity(state.library.tracks.len());
+    for track in &state.library.tracks {
+        library_ids.insert(track.id.as_str());
+        library_status_by_id
+            .entry(track.id.as_str())
+            .or_insert(track.status);
+    }
+
+    let mut queue = Vec::with_capacity(old_queue.len() + state.library.tracks.len());
+    let mut queued_ids = HashSet::with_capacity(old_queue.len() + state.library.tracks.len());
+    for track_id in &old_queue {
+        let Some(status) = library_status_by_id.get(track_id.as_str()) else {
+            continue;
+        };
+        if (*status == filter || active_anchor_id.as_deref() == Some(track_id.as_str()))
+            && queued_ids.insert(track_id.as_str())
+        {
+            queue.push(track_id.clone());
+        }
+    }
+    for track in &state.library.tracks {
+        if track.status == filter && queued_ids.insert(track.id.as_str()) {
             queue.push(track.id.clone());
         }
     }
@@ -9080,13 +9330,9 @@ fn reconcile_audition_queue(state: &mut AppState) {
         .and_then(|current_id| queue.iter().position(|id| id == &current_id))
         .unwrap_or(old_index.min(queue.len()));
     state.audition_queue = queue;
-    state.audition_heard.retain(|heard_id| {
-        state
-            .library
-            .tracks
-            .iter()
-            .any(|track| &track.id == heard_id)
-    });
+    state
+        .audition_heard
+        .retain(|heard_id| library_ids.contains(heard_id.as_str()));
 }
 
 fn audition_navigation_anchor(state: &AppState) -> Option<&str> {
@@ -9174,21 +9420,26 @@ fn deterministic_shuffle(items: &mut [String], mut seed: u64) {
 
 fn next_audition_track_index(state: &AppState) -> Option<usize> {
     let selected_id = state.library.selected_track_id.as_deref();
+    let mut library_status_by_id = HashMap::with_capacity(state.library.tracks.len());
+    for track in &state.library.tracks {
+        library_status_by_id
+            .entry(track.id.as_str())
+            .or_insert(track.status);
+    }
+    let heard_ids = state
+        .audition_heard
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
     let mut index = state.audition_queue_index;
     if state.audition_queue.get(index).map(String::as_str) == selected_id {
         index += 1;
     }
     while let Some(track_id) = state.audition_queue.get(index) {
-        if !state
-            .audition_heard
-            .iter()
-            .any(|heard_id| heard_id == track_id)
-            && state
-                .library
-                .tracks
-                .iter()
-                .find(|track| track.id == *track_id)
-                .is_some_and(|track| track.status == state.audition_status_filter)
+        if !heard_ids.contains(track_id.as_str())
+            && library_status_by_id
+                .get(track_id.as_str())
+                .is_some_and(|status| *status == state.audition_status_filter)
         {
             return Some(index);
         }
@@ -9483,20 +9734,33 @@ fn planner_board_surface(content: ui::View<Message>) -> ui::View<Message> {
 }
 
 fn project_surface(state: &AppState) -> ui::View<Message> {
-    let workspace = match state.workspace_mode {
-        WorkspaceMode::Review => ui::row([
-            library_panel(state).width(LIBRARY_WIDTH).fill_height(),
-            review_panel(state).fill(),
-        ])
-        .spacing(10.0)
-        .fill(),
-        WorkspaceMode::Planner => planner_panel(state).fill(),
-        WorkspaceMode::Audition => ui::row([
-            audition_panel(state).width(LIBRARY_WIDTH).fill_height(),
-            review_panel(state).fill(),
-        ])
-        .spacing(10.0)
-        .fill(),
+    let workspace = {
+        let mut projection_cache = state.library_projection_cache.borrow_mut();
+        projection_cache.ensure(
+            state.library.generation(),
+            &state.library,
+            state.review_status_filter,
+            state.planner_status_filter,
+        );
+        match state.workspace_mode {
+            WorkspaceMode::Review => ui::row([
+                library_panel(state, &projection_cache)
+                    .width(LIBRARY_WIDTH)
+                    .fill_height(),
+                review_panel(state).fill(),
+            ])
+            .spacing(10.0)
+            .fill(),
+            WorkspaceMode::Planner => planner_panel(state, &projection_cache).fill(),
+            WorkspaceMode::Audition => ui::row([
+                audition_panel(state, &projection_cache)
+                    .width(LIBRARY_WIDTH)
+                    .fill_height(),
+                review_panel(state).fill(),
+            ])
+            .spacing(10.0)
+            .fill(),
+        }
     };
 
     let stage_menu = state
@@ -9683,27 +9947,12 @@ fn project_surface(state: &AppState) -> ui::View<Message> {
     .into_view()
 }
 
-fn audition_panel(state: &AppState) -> ui::View<Message> {
+fn audition_panel(state: &AppState, projection: &LibraryProjectionCache) -> ui::View<Message> {
     let selected_id = state.library.selected_track_id.as_deref();
     let status_menu_track_id = state.status_menu_track_id.as_deref();
     let status_menu_host = state.status_menu_host;
     let remove_confirmation_track_id = state.remove_confirmation_track_id.as_deref();
-    let mut tracks_by_id = HashMap::with_capacity(state.library.tracks.len());
-    for track in &state.library.tracks {
-        tracks_by_id.entry(track.id.as_str()).or_insert(track);
-    }
-    let queue_tracks = state
-        .audition_queue
-        .iter()
-        .enumerate()
-        .filter_map(|(index, track_id)| {
-            tracks_by_id
-                .get(track_id.as_str())
-                .copied()
-                .map(|track| (index, track))
-        })
-        .collect::<Vec<_>>();
-    let queue_count = queue_tracks.len();
+    let queue_count = state.audition_queue.len();
     let filter_buttons = audition_statuses()
         .into_iter()
         .map(|status| {
@@ -9716,7 +9965,7 @@ fn audition_panel(state: &AppState) -> ui::View<Message> {
             )
         })
         .collect::<Vec<_>>();
-    let queue = if queue_tracks.is_empty() {
+    let queue = if state.audition_queue.is_empty() {
         ui::column([
             ui::text("No matching tracks.").height(26.0).fill_width(),
             ui::text(format!(
@@ -9733,14 +9982,22 @@ fn audition_panel(state: &AppState) -> ui::View<Message> {
         .fill_width()
     } else {
         let row_height = audition_queue_row_height() + TRACK_CARD_LIST_SPACING;
-        let window = resolved_virtual_list_window(
-            state.audition_queue_window,
-            queue_tracks.len(),
-            None,
-            false,
-        );
+        let window =
+            resolved_virtual_list_window(state.audition_queue_window, queue_count, None, false);
         ui::virtual_list_windowed(|index| {
-            let (queue_index, track) = queue_tracks[index];
+            let queue_index: usize = index;
+            let track_id: &str = state.audition_queue[queue_index].as_str();
+            let track = projection
+                .library_index(track_id)
+                .and_then(|library_index| state.library.tracks.get(library_index));
+            let Some(track) = track else {
+                return virtual_row_with_spacing(
+                    ui::spacer()
+                        .fill_width()
+                        .height(audition_queue_row_height()),
+                    row_height,
+                );
+            };
             virtual_row_with_spacing(
                 audition_queue_row(
                     queue_index,
@@ -10112,21 +10369,21 @@ const fn workspace_mode_label(mode: WorkspaceMode) -> &'static str {
     }
 }
 
-fn planner_panel(state: &AppState) -> ui::View<Message> {
+fn planner_panel(state: &AppState, projection: &LibraryProjectionCache) -> ui::View<Message> {
     let stages = [
         storage::TrackStage::SoundDesign,
         storage::TrackStage::Production,
         storage::TrackStage::Mixdown,
         storage::TrackStage::Mastering,
     ];
-    let filtered_tracks = planner_tracks_with_status(&state.library, state.planner_status_filter);
     let drag_source_track_id = state.planner_drag_source_track_id.as_deref();
     let drag_active = drag_source_track_id.is_some();
     let drag_target = state.planner_drag_target.as_ref();
     let columns = stages.into_iter().map(|stage| {
         planner_column(
             stage,
-            filtered_tracks.tracks_in_stage(stage),
+            &state.library,
+            projection.planner_stage_indices(stage),
             state.planner_status_filter,
             PlannerColumnContext {
                 selected_id: state.library.selected_track_id.as_deref(),
@@ -10141,7 +10398,7 @@ fn planner_panel(state: &AppState) -> ui::View<Message> {
             drag_target,
         )
     });
-    let track_count = filtered_tracks.len();
+    let track_count = projection.planner_indices().len();
     let header = ui::row([
         ui::column([
             ui::text("FINISHING BOARD")
@@ -10196,9 +10453,11 @@ struct PlannerColumnContext<'a> {
     drag_source_track_id: Option<&'a str>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn planner_column(
     stage: storage::TrackStage,
-    tracks: &[&storage::Track],
+    library: &storage::Library,
+    track_indices: &[usize],
     status_filter: Option<storage::TrackStatus>,
     context: PlannerColumnContext<'_>,
     current_window: ui::VirtualListWindow,
@@ -10213,7 +10472,7 @@ fn planner_column(
         remove_confirmation_track_id,
         drag_source_track_id,
     } = context;
-    let count = tracks.len();
+    let count = track_indices.len();
     let tone = planner_column_tone(stage);
     let current_target = drag_target.is_some_and(|target| target.stage == stage);
     let active_slot = drag_target
@@ -10239,7 +10498,7 @@ fn planner_column(
         .fill_width()
         .spacing(8.0),
     ];
-    if tracks.is_empty() {
+    if track_indices.is_empty() {
         let empty_content = if status_filter.is_some() {
             ui::column([
                 ui::text("No matching tracks.").height(24.0).fill_width(),
@@ -10273,7 +10532,7 @@ fn planner_column(
         let row_height = planner_card_height() + TRACK_CARD_LIST_SPACING;
         let logical_window = resolved_virtual_list_window(current_window, count, None, false);
         let scroll = ui::virtual_list_windowed(|index| {
-            let track = tracks[index];
+            let track = &library.tracks[track_indices[index]];
             virtual_row_with_spacing(
                 planner_card_drop_row(
                     planner_card(
@@ -10629,6 +10888,7 @@ fn planner_card_with_key(
         .height(planner_card_height())
 }
 
+#[cfg(test)]
 fn tracks_with_status(
     tracks: &[storage::Track],
     status: Option<storage::TrackStatus>,
@@ -10640,18 +10900,16 @@ fn tracks_with_status(
     favorites.into_iter().chain(non_favorites).collect()
 }
 
+#[cfg(test)]
 struct PlannerTrackProjection<'a> {
     ordered: Vec<&'a storage::Track>,
     by_stage: [Vec<&'a storage::Track>; 4],
 }
 
+#[cfg(test)]
 impl<'a> PlannerTrackProjection<'a> {
     fn tracks_in_stage(&self, stage: storage::TrackStage) -> &[&'a storage::Track] {
         &self.by_stage[planner_stage_index(stage)]
-    }
-
-    fn len(&self) -> usize {
-        self.ordered.len()
     }
 }
 
@@ -10664,6 +10922,7 @@ fn planner_stage_index(stage: storage::TrackStage) -> usize {
     }
 }
 
+#[cfg(test)]
 fn planner_tracks_with_status(
     library: &storage::Library,
     status: Option<storage::TrackStatus>,
@@ -10691,32 +10950,44 @@ fn owned_tracks_in_stage(
         .collect()
 }
 
+#[cfg(test)]
 fn planner_insertion_target_is_valid(
     library: &storage::Library,
     source_id: &str,
     target: &PlannerInsertionTarget,
     status_filter: Option<storage::TrackStatus>,
 ) -> bool {
-    let Some(source) = library.tracks.iter().find(|track| track.id == source_id) else {
+    let mut projection = LibraryProjectionCache::default();
+    projection.ensure(0, library, None, status_filter);
+    planner_insertion_target_is_valid_cached(library, &projection, source_id, target, status_filter)
+}
+
+fn planner_insertion_target_is_valid_cached(
+    library: &storage::Library,
+    projection: &LibraryProjectionCache,
+    source_id: &str,
+    target: &PlannerInsertionTarget,
+    status_filter: Option<storage::TrackStatus>,
+) -> bool {
+    let Some(source_index) = projection.library_index(source_id) else {
         return false;
     };
+    let source = &library.tracks[source_index];
     if status_filter.is_some_and(|status| source.status != status) {
         return false;
     }
-    let target_count = planner_tracks_with_status(library, status_filter)
-        .tracks_in_stage(target.stage)
-        .len();
+    let target_count = projection.planner_stage_indices(target.stage).len();
     target.slot <= target_count
 }
 
-fn planner_insertion_status(
+fn planner_insertion_status_cached(
     library: &storage::Library,
+    projection: &LibraryProjectionCache,
     target: &PlannerInsertionTarget,
-    status_filter: Option<storage::TrackStatus>,
 ) -> String {
-    let projection = planner_tracks_with_status(library, status_filter);
-    let tracks = projection.tracks_in_stage(target.stage);
-    if let Some(track) = tracks.get(target.slot) {
+    let tracks = projection.planner_stage_indices(target.stage);
+    if let Some(&library_index) = tracks.get(target.slot) {
+        let track = &library.tracks[library_index];
         format!("Release above {}.", track.title)
     } else {
         format!(
@@ -11121,9 +11392,9 @@ const fn status_menu_host_key(host: StatusMenuHost) -> &'static str {
     }
 }
 
-fn library_panel(state: &AppState) -> ui::View<Message> {
+fn library_panel(state: &AppState, projection: &LibraryProjectionCache) -> ui::View<Message> {
     let selected_id = state.library.selected_track_id.clone();
-    let tracks = tracks_with_status(&state.library.tracks, state.review_status_filter);
+    let review_indices = projection.review_indices();
     let total_track_count = state.library.tracks.len();
     let content = ui::column([
         ui::row([
@@ -11153,7 +11424,7 @@ fn library_panel(state: &AppState) -> ui::View<Message> {
             review_status_filter_message,
             state.review_filter_menu_open,
         ),
-        if tracks.is_empty() {
+        if review_indices.is_empty() {
             if total_track_count == 0 {
                 ui::column([
                     ui::text("No tracks yet.").height(28.0).fill_width(),
@@ -11185,11 +11456,16 @@ fn library_panel(state: &AppState) -> ui::View<Message> {
         } else {
             let selected_index = selected_id
                 .as_deref()
-                .and_then(|selected_id| tracks.iter().position(|track| track.id == selected_id));
+                .and_then(|selected_id| projection.library_index(selected_id))
+                .and_then(|library_index| {
+                    review_indices
+                        .iter()
+                        .position(|index| *index == library_index)
+                });
             let row_height = library_track_card_height() + TRACK_CARD_LIST_SPACING;
             let window = resolved_virtual_list_window(
                 state.review_library_window,
-                tracks.len(),
+                review_indices.len(),
                 selected_index,
                 false,
             );
@@ -11197,7 +11473,7 @@ fn library_panel(state: &AppState) -> ui::View<Message> {
                 virtual_row_with_spacing(
                     track_row(
                         index,
-                        tracks[index],
+                        &state.library.tracks[review_indices[index]],
                         selected_id.as_deref(),
                         state.stage_menu_track_id.as_deref(),
                         state.status_menu_track_id.as_deref(),
@@ -13197,27 +13473,29 @@ mod tests {
     use super::{
         APP_VERSION_LABEL, AppState, AudioImportRequest, AudioImportTarget, AuditionSource,
         DEFAULT_LIVE_SPECTROGRAM_DISPLAY_SAMPLE_RATE, FavoriteMarkerWidget, ImportBatchProgress,
-        LIBRARY_REVEAL_MARGIN, LIBRARY_SCROLL_VIEWPORT_ID, LibraryLoadState, LibrarySaveAttempt,
-        LiveSpectrogramMode, LoopBounds, LoopSelection, LoopSelections,
-        MAIN_SOURCE_MISMATCH_STATUS, Message, NoteAddress, NoteDraft, NoteOwner,
+        LIBRARY_REVEAL_MARGIN, LIBRARY_SCROLL_VIEWPORT_ID, LibraryLoadState,
+        LibraryProjectionCache, LibrarySaveAttempt, LiveSpectrogramMode, LoopBounds, LoopSelection,
+        LoopSelections, MAIN_SOURCE_MISMATCH_STATUS, Message, NoteAddress, NoteDraft, NoteOwner,
         PairedPlaybackGuard, PendingImportCommit, PlannerInsertionTarget, REFERENCE_MENU_WIDTH,
         REFERENCE_SOURCE_MISMATCH_STATUS, ReferenceUnloadState, ResumeTransportCommand,
         SETTINGS_REFERENCE_ROW_METADATA_HEIGHT, SETTINGS_REFERENCE_ROW_TEXT_HEIGHT,
         SETTINGS_REFERENCE_ROW_TEXT_SPACING, SETTINGS_REFERENCE_ROW_TITLE_HEIGHT,
-        STATUS_BAR_VERSION_WIDTH, StatusMenuHost, TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER,
-        TRACK_CARD_LIST_SPACING, TRACK_CARD_SELECTED_CORAL, WAVEFORM_HEIGHT, WaveformDecodeRequest,
-        WorkspaceMode, animation_requested, apply_transport_snapshot, audition_panel,
-        audition_shuffle_seed, audition_statuses, cleanup_reference_transport_failure,
-        current_live_frame_for_source, current_loudness_match_gain_db, current_lufs_meter_value,
+        STATUS_BAR_VERSION_WIDTH, SharedLibrary, StatusMenuHost,
+        TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER, TRACK_CARD_LIST_SPACING, TRACK_CARD_SELECTED_CORAL,
+        WAVEFORM_HEIGHT, WaveformDecodeRequest, WorkspaceMode, animation_requested,
+        apply_transport_snapshot, audition_panel, audition_shuffle_seed, audition_statuses,
+        cleanup_reference_transport_failure, current_live_frame_for_source,
+        current_loudness_match_gain_db, current_lufs_meter_value,
         current_reference_lufs_meter_value, decode_result_is_current, deterministic_shuffle,
-        enforce_loop, favorite_toggle, frame_surface_revisions, library_dirty,
-        library_track_card_height, library_track_title_id, live_frame_matches_current_session,
-        live_spectrogram_display_sample_rate, loop_bounds, main_output_gain, native_launch_options,
-        note_editor, note_ratio_for_id, owned_tracks_in_stage, paint_live_playback_overlay,
-        planner_insertion_target_is_valid, planner_stage_index, planner_tracks_with_status,
-        playback_shortcut, progress_paired_playback_cleanup, project_surface,
-        qualified_note_identity_key, rebuild_audition_queue, reconcile_audition_queue,
-        reference_assignment_counts, reference_decode_result_is_current, reference_output_gain,
+        enforce_loop, ensure_library_projection_cache, favorite_toggle, frame_surface_revisions,
+        library_dirty, library_track_card_height, library_track_title_id,
+        live_frame_matches_current_session, live_spectrogram_display_sample_rate, loop_bounds,
+        main_output_gain, native_launch_options, note_editor, note_ratio_for_id,
+        owned_tracks_in_stage, paint_live_playback_overlay, planner_insertion_target_is_valid,
+        planner_stage_index, planner_tracks_with_status, playback_shortcut,
+        progress_paired_playback_cleanup, project_surface, qualified_note_identity_key,
+        rebuild_audition_queue, reconcile_audition_queue, reference_assignment_counts,
+        reference_decode_result_is_current, reference_output_gain,
         reference_settings_auxiliary_windows, reference_settings_window_view,
         refresh_live_spectrogram, refresh_live_spectrograms, resume_transport_command,
         review_spectrogram_source, review_status_filter_message, schedule_import,
@@ -13506,6 +13784,52 @@ mod tests {
         }
     }
 
+    #[test]
+    fn shared_library_snapshot_isolated_from_later_mutation() {
+        let mut shared = SharedLibrary::from(Library {
+            tracks: vec![audition_track("snapshot")],
+            ..Library::default()
+        });
+        let snapshot = shared.snapshot();
+
+        assert!(Arc::ptr_eq(&snapshot, &shared.snapshot()));
+        shared.tracks[0].title = String::from("mutated");
+
+        assert_eq!(snapshot.tracks[0].title, "snapshot");
+        assert_eq!(shared.tracks[0].title, "mutated");
+        assert!(!Arc::ptr_eq(&snapshot, &shared.snapshot()));
+    }
+
+    #[test]
+    fn library_projection_cache_reuses_key_and_rebuilds_on_filter_or_generation_change() {
+        let mut favorite = audition_track("favorite");
+        favorite.favorite = true;
+        favorite.status = TrackStatus::Refine;
+        let regular = audition_track("regular");
+        let library = Library {
+            tracks: vec![favorite, regular],
+            planner_order: vec![String::from("regular"), String::from("favorite")],
+            ..Library::default()
+        };
+        let mut cache = LibraryProjectionCache::default();
+
+        cache.ensure(4, &library, None, None);
+        assert_eq!(cache.rebuild_count, 1);
+        assert_eq!(cache.library_index("favorite"), Some(0));
+        assert_eq!(cache.review_indices(), &[0, 1]);
+        assert_eq!(cache.planner_indices(), &[1, 0]);
+
+        cache.ensure(4, &library, None, None);
+        assert_eq!(cache.rebuild_count, 1);
+
+        cache.ensure(4, &library, Some(TrackStatus::Refine), None);
+        assert_eq!(cache.rebuild_count, 2);
+        assert_eq!(cache.review_indices(), &[0]);
+
+        cache.ensure(5, &library, Some(TrackStatus::Refine), None);
+        assert_eq!(cache.rebuild_count, 3);
+    }
+
     fn reference_removal_state() -> AppState {
         let first_path = PathBuf::from("/external/track-a-reference.wav");
         let second_path = PathBuf::from("/external/track-b-reference.wav");
@@ -13611,7 +13935,7 @@ mod tests {
         path: &Path,
         proof: &crate::source::AudioSourceProof,
     ) -> Library {
-        let mut library = state.library.clone();
+        let mut library = Arc::unwrap_or_clone(state.library.snapshot());
         library
             .tracks
             .iter_mut()
@@ -20339,7 +20663,7 @@ mod tests {
             Some(PendingImportCommit::ReferenceSelection { .. })
         ));
         let committed = {
-            let mut library = state.library.clone();
+            let mut library = Arc::unwrap_or_clone(state.library.snapshot());
             library.tracks[0].reference_path = Some(second_path.clone());
             library.reference_tracks[1].source_proof =
                 crate::source::SourceProvenance::Verified(second_decoded.source_proof().clone());
@@ -23436,7 +23760,8 @@ mod tests {
                 tracks: vec![first_track, second_track],
                 selected_track_id: Some(first_id.clone()),
                 ..Library::default()
-            },
+            }
+            .into(),
             ..AppState::default()
         };
         let bridge = RuntimeTaskBridge(DeclarativeOwnedCommandRuntimeBridge::new(
@@ -23545,7 +23870,8 @@ mod tests {
                 tracks: vec![first_track, second_track],
                 selected_track_id: Some(first_id.clone()),
                 ..Library::default()
-            },
+            }
+            .into(),
             ..AppState::default()
         };
         let bridge = RuntimeTaskBridge(DeclarativeOwnedCommandRuntimeBridge::new(
@@ -29004,7 +29330,9 @@ mod tests {
             workspace_mode: WorkspaceMode::Audition,
             ..AppState::default()
         };
-        let audition = ui::scene(audition_panel(&state))
+        ensure_library_projection_cache(&state);
+        let projection = state.library_projection_cache.borrow();
+        let audition = ui::scene(audition_panel(&state, &projection))
             .into_view()
             .view_frame_at_size_with_default_theme(Vector2::new(420.0, 720.0));
         for (_, expected_color) in statuses {
@@ -30120,7 +30448,7 @@ mod tests {
                 request_id,
                 track_id: track_id.to_string(),
                 path: path.clone(),
-                result: Ok(library_before.clone()),
+                result: Ok(Arc::unwrap_or_clone(library_before.snapshot())),
             },
             &mut context,
         );
@@ -30652,7 +30980,7 @@ mod tests {
             Message::ReferenceImportCompleted {
                 track_id: track_id.clone(),
                 path: first_reference.clone(),
-                result: Ok(reference_library),
+                result: Ok(Arc::unwrap_or_clone(reference_library.snapshot())),
             },
             &mut context,
         );
@@ -30768,7 +31096,7 @@ mod tests {
             &mut state,
             Message::ReferenceCatalogImportCompleted {
                 path: first_catalog.clone(),
-                result: Ok(first_library.clone()),
+                result: Ok(Arc::unwrap_or_clone(first_library.snapshot())),
             },
             &mut context,
         );
