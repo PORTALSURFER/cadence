@@ -3062,7 +3062,8 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     .library
                     .tracks
                     .iter()
-                    .any(|track| track.id == track_id)
+                    .find(|track| track.id == track_id)
+                    .is_some_and(|track| reference_menu_available(state, track))
             {
                 if state.reference_menu_track_id.as_deref() == Some(track_id.as_str()) {
                     close_reference_menu(state);
@@ -3081,7 +3082,8 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     .library
                     .tracks
                     .iter()
-                    .any(|track| track.id == track_id)
+                    .find(|track| track.id == track_id)
+                    .is_some_and(|track| reference_menu_available(state, track))
             {
                 if state.reference_menu_track_id.as_deref() == Some(track_id.as_str()) {
                     close_reference_menu(state);
@@ -3460,20 +3462,10 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             context.request_repaint();
         }
         Message::SelectTrack(id) => {
-            if library_is_ready(state)
-                && !state.busy
-                && state.library.tracks.iter().any(|track| track.id == id)
-            {
-                select_track_internal(state, context, id, false);
-            }
+            select_track_internal(state, context, id, false);
         }
         Message::ReviewTrack(id) => {
-            if library_is_ready(state)
-                && !state.busy
-                && state.library.tracks.iter().any(|track| track.id == id)
-            {
-                select_track_internal(state, context, id, true);
-            }
+            select_track_internal(state, context, id, true);
         }
         Message::SelectWorkspace(mode) => {
             set_workspace_mode(state, context, mode);
@@ -4248,7 +4240,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
             if let Some(draft) = state.draft_note.as_mut() {
                 draft.body = body;
-                context.request_repaint();
+                context.request_paint_only();
             }
         }
         Message::SaveDraftNote(identity) => {
@@ -4456,7 +4448,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
             if let Some(draft) = state.reference_draft_note.as_mut() {
                 draft.body = body;
-                context.request_repaint();
+                context.request_paint_only();
             }
         }
         Message::SaveReferenceDraftNote(identity) => {
@@ -8495,15 +8487,31 @@ fn select_track_internal(
     id: String,
     enter_review: bool,
 ) {
-    if !library_is_ready(state)
-        || state.busy
-        || !state.library.tracks.iter().any(|track| track.id == id)
+    if !library_is_ready(state) || state.busy {
+        return;
+    }
+
+    ensure_library_projection_cache(state);
+    if state
+        .library_projection_cache
+        .borrow()
+        .library_index(&id)
+        .is_none()
     {
         return;
     }
+
     let entering_review_from_planner =
         enter_review && state.workspace_mode == WorkspaceMode::Planner;
-    let reveal_id = id.clone();
+
+    if state.library.selected_track_id.as_deref() == Some(id.as_str()) {
+        if entering_review_from_planner {
+            set_workspace_mode(state, context, WorkspaceMode::Review);
+            reveal_track_in_review(state, context, &id);
+        }
+        return;
+    }
+
     if enter_review {
         state.workspace_mode = WorkspaceMode::Review;
     }
@@ -8552,39 +8560,47 @@ fn select_track_internal(
     schedule_selected_waveform_decode(state, context);
     schedule_selected_reference_decode(state, context);
     if entering_review_from_planner {
-        ensure_library_projection_cache(state);
-        let reveal_index = {
-            let projection = state.library_projection_cache.borrow();
-            projection
-                .library_index(&reveal_id)
-                .and_then(|library_index| {
-                    projection
-                        .review_indices()
-                        .iter()
-                        .position(|index| *index == library_index)
-                })
-        };
-        if let Some(index) = reveal_index {
-            state.review_library_window = resolved_virtual_list_window(
-                state.review_library_window,
-                state
-                    .library_projection_cache
-                    .borrow()
+        reveal_track_in_review(state, context, &id);
+    }
+}
+
+fn reveal_track_in_review(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    track_id: &str,
+) {
+    ensure_library_projection_cache(state);
+    let reveal_index = {
+        let projection = state.library_projection_cache.borrow();
+        projection
+            .library_index(track_id)
+            .and_then(|library_index| {
+                projection
                     .review_indices()
-                    .len(),
-                Some(index),
-                true,
-            );
-            let card_height = library_track_card_height();
-            context.scroll_into_view(
-                LIBRARY_SCROLL_VIEWPORT_ID,
-                index as f32 * (card_height + TRACK_CARD_LIST_SPACING),
-                card_height,
-                LIBRARY_REVEAL_MARGIN,
-                LIBRARY_REVEAL_MARGIN,
-            );
-            context.focus(library_track_title_id(&reveal_id));
-        }
+                    .iter()
+                    .position(|index| *index == library_index)
+            })
+    };
+    if let Some(index) = reveal_index {
+        state.review_library_window = resolved_virtual_list_window(
+            state.review_library_window,
+            state
+                .library_projection_cache
+                .borrow()
+                .review_indices()
+                .len(),
+            Some(index),
+            true,
+        );
+        let card_height = library_track_card_height();
+        context.scroll_into_view(
+            LIBRARY_SCROLL_VIEWPORT_ID,
+            index as f32 * (card_height + TRACK_CARD_LIST_SPACING),
+            card_height,
+            LIBRARY_REVEAL_MARGIN,
+            LIBRARY_REVEAL_MARGIN,
+        );
+        context.focus(library_track_title_id(track_id));
     }
 }
 
@@ -8824,7 +8840,7 @@ fn project_surface(state: &AppState) -> ui::View<Message> {
                 .tracks
                 .iter()
                 .find(|track| track.id == track_id)
-                .filter(|track| !reference_dropdown_paths(state, track).is_empty())
+                .filter(|track| reference_menu_available(state, track))
                 .map(|track| reference_menu_popover(state, track, anchor))
         });
     let workspace_tabs = [WorkspaceMode::Review, WorkspaceMode::Planner]
@@ -10551,38 +10567,50 @@ fn reference_dropdown_paths(state: &AppState, track: &storage::Track) -> Vec<Pat
     paths
 }
 
+fn reference_menu_available(state: &AppState, track: &storage::Track) -> bool {
+    !state.library.reference_tracks.is_empty() || track.reference_path.is_some()
+}
+
 fn review_reference_controls(state: &AppState, track: &storage::Track) -> ui::View<Message> {
-    let menu_open = reference_menu_is_open(state, track);
+    let menu_available = reference_menu_available(state, track);
+    let menu_open = menu_available && reference_menu_is_open(state, track);
     let selector_label = track
         .reference_path
         .as_ref()
         .map_or("Choose reference".to_owned(), |path| {
             reference_track_name(path)
         });
-    let reference_id = track.id.clone();
-    let selector = ui::dropdown_trigger(selector_label, menu_open)
-        .toggle_message(Message::ToggleReferenceMenu(reference_id.clone()))
-        .build()
+    let selector = if menu_available {
+        let reference_id = track.id.clone();
+        ui::dropdown_trigger(selector_label, menu_open)
+            .toggle_message(Message::ToggleReferenceMenu(reference_id.clone()))
+            .build()
+            .pointer_target(
+                ui::pointer_target(true)
+                    .pointer_move(false)
+                    .pointer_press(true)
+                    .pointer_release(false)
+                    .pointer_drop(false)
+                    .wheel(false)
+                    .filter_map(move |message| match message {
+                        ui::PointerShieldMessage::PointerPress { position, .. } => {
+                            Some(Message::ToggleReferenceMenuAt {
+                                track_id: reference_id.clone(),
+                                position,
+                            })
+                        }
+                        _ => None,
+                    }),
+            )
+    } else {
+        ui::dropdown_trigger(selector_label, false)
+            .toggle_message(Message::ToggleReferenceMenu(track.id.clone()))
+            .build()
+    };
+    let selector = selector
         .key(format!("reference-dropdown-{}", track.id))
         .width(REFERENCE_MENU_WIDTH)
-        .height(26.0)
-        .pointer_target(
-            ui::pointer_target(true)
-                .pointer_move(false)
-                .pointer_press(true)
-                .pointer_release(false)
-                .pointer_drop(false)
-                .wheel(false)
-                .filter_map(move |message| match message {
-                    ui::PointerShieldMessage::PointerPress { position, .. } => {
-                        Some(Message::ToggleReferenceMenuAt {
-                            track_id: reference_id.clone(),
-                            position,
-                        })
-                    }
-                    _ => None,
-                }),
-        );
+        .height(26.0);
     let has_reference = track.reference_path.is_some();
     let action = ui::button(if has_reference {
         "Replace reference"
@@ -10670,7 +10698,7 @@ fn reference_dropdown_options(
 
 fn reference_menu_is_open(state: &AppState, track: &storage::Track) -> bool {
     state.reference_menu_track_id.as_deref() == Some(track.id.as_str())
-        && !reference_dropdown_paths(state, track).is_empty()
+        && reference_menu_available(state, track)
 }
 
 fn reference_section_height(state: &AppState, track: &storage::Track) -> f32 {
@@ -11626,11 +11654,12 @@ fn reference_note_row(
 }
 
 fn refresh_selected_track_index(state: &mut AppState) {
+    ensure_library_projection_cache(state);
     state.selected_track_index = state
         .library
         .selected_track_id
         .as_deref()
-        .and_then(|id| state.library.tracks.iter().position(|track| track.id == id));
+        .and_then(|id| state.library_projection_cache.borrow().library_index(id));
 }
 
 fn selected_track(state: &AppState) -> Option<&storage::Track> {
@@ -11903,11 +11932,11 @@ mod tests {
         planner_insertion_target_is_valid, planner_stage_index, planner_tracks_with_favorites,
         playback_shortcut, progress_paired_playback_cleanup, project_surface,
         qualified_note_identity_key, reference_assignment_counts,
-        reference_decode_result_is_current, reference_output_gain,
-        reference_settings_auxiliary_windows, reference_settings_window_view,
-        refresh_live_spectrogram, refresh_live_spectrograms, resume_transport_command,
-        review_spectrogram_source, schedule_import, schedule_library_save,
-        schedule_reference_catalog_import, schedule_reference_import,
+        reference_decode_result_is_current, reference_dropdown_paths, reference_menu_available,
+        reference_output_gain, reference_settings_auxiliary_windows,
+        reference_settings_window_view, refresh_live_spectrogram, refresh_live_spectrograms,
+        resume_transport_command, review_spectrogram_source, schedule_import,
+        schedule_library_save, schedule_reference_catalog_import, schedule_reference_import,
         schedule_reference_waveform_decode, schedule_replace, schedule_waveform_decode,
         seek_synchronized_positions, selected_reference_notes, selected_track, stage_dropdown,
         stage_menu_anchor_from_pointer, stage_menu_popover, start_source_alongside_active,
@@ -12030,7 +12059,7 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Backlog,
-            notes: Vec::new(),
+            notes: crate::storage::SharedVec::default(),
         });
         state
     }
@@ -12184,23 +12213,69 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Production,
-            notes: Vec::new(),
+            notes: crate::storage::SharedVec::default(),
         }
     }
 
     #[test]
     fn shared_library_snapshot_isolated_from_later_mutation() {
         let mut shared = SharedLibrary::from(Library {
-            tracks: vec![audition_track("snapshot")],
+            tracks: vec![audition_track("snapshot")].into(),
             ..Library::default()
         });
         let snapshot = shared.snapshot();
 
         assert!(Arc::ptr_eq(&snapshot, &shared.snapshot()));
+        assert!(snapshot.tracks.shares_storage_with(&shared.tracks));
+        assert!(
+            snapshot
+                .reference_tracks
+                .shares_storage_with(&shared.reference_tracks)
+        );
+        assert!(
+            snapshot
+                .planner_order
+                .shares_storage_with(&shared.planner_order)
+        );
+        assert!(
+            snapshot.tracks[0]
+                .notes
+                .shares_storage_with(&shared.tracks[0].notes)
+        );
+
         shared.tracks[0].title = String::from("mutated");
 
         assert_eq!(snapshot.tracks[0].title, "snapshot");
         assert_eq!(shared.tracks[0].title, "mutated");
+        assert!(!snapshot.tracks.shares_storage_with(&shared.tracks));
+        assert!(
+            snapshot.tracks[0]
+                .notes
+                .shares_storage_with(&shared.tracks[0].notes)
+        );
+        assert!(
+            snapshot
+                .reference_tracks
+                .shares_storage_with(&shared.reference_tracks)
+        );
+        assert!(
+            snapshot
+                .planner_order
+                .shares_storage_with(&shared.planner_order)
+        );
+
+        shared.tracks[0].notes.push(Note {
+            id: String::from("detached-note"),
+            time_millis: 0,
+            body: String::from("detached"),
+            done: false,
+        });
+        assert!(snapshot.tracks[0].notes.is_empty());
+        assert!(
+            !snapshot.tracks[0]
+                .notes
+                .shares_storage_with(&shared.tracks[0].notes)
+        );
         assert!(!Arc::ptr_eq(&snapshot, &shared.snapshot()));
     }
 
@@ -12210,8 +12285,8 @@ mod tests {
         favorite.favorite = true;
         let regular = audition_track("regular");
         let library = Library {
-            tracks: vec![favorite, regular],
-            planner_order: vec![String::from("regular"), String::from("favorite")],
+            tracks: vec![favorite, regular].into(),
+            planner_order: vec![String::from("regular"), String::from("favorite")].into(),
             ..Library::default()
         };
         let mut cache = LibraryProjectionCache::default();
@@ -12241,7 +12316,7 @@ mod tests {
             ..AppState::default()
         };
         state.library.selected_track_id = Some(String::from("track-a"));
-        state.library.tracks = vec![first_track, second_track];
+        state.library.tracks = vec![first_track, second_track].into();
         state.library.reference_tracks = vec![
             ReferenceTrack {
                 path: first_path,
@@ -12251,7 +12326,8 @@ mod tests {
                     time_millis: 500,
                     body: String::from("A reference comment"),
                     done: false,
-                }],
+                }]
+                .into(),
             },
             ReferenceTrack {
                 path: second_path,
@@ -12261,9 +12337,11 @@ mod tests {
                     time_millis: 750,
                     body: String::from("B reference comment"),
                     done: false,
-                }],
+                }]
+                .into(),
             },
-        ];
+        ]
+        .into();
         state
     }
 
@@ -12316,7 +12394,7 @@ mod tests {
         state.library.reference_tracks.push(ReferenceTrack {
             path: catalog_path,
             source_proof: crate::source::SourceProvenance::from_optional(catalog_proof),
-            notes: Vec::new(),
+            notes: crate::storage::SharedVec::default(),
         });
         state
     }
@@ -12438,7 +12516,7 @@ mod tests {
         track.path = path.clone();
         track.reference_path = None;
         track.source_proof = crate::source::SourceProvenance::Unknown;
-        track.notes = notes.clone();
+        track.notes = notes.clone().into();
         let mut state = AppState {
             busy: false,
             waveform: Some(verified.into_waveform()),
@@ -13359,7 +13437,7 @@ mod tests {
         let saved_track = audition_track("saved-track");
         let saved_track_id = saved_track.id.clone();
         let library = Library {
-            tracks: vec![audition_track("first-track"), saved_track],
+            tracks: vec![audition_track("first-track"), saved_track].into(),
             selected_track_id: Some(saved_track_id.clone()),
             ..Library::default()
         };
@@ -13390,7 +13468,7 @@ mod tests {
             let first_track = audition_track("first-track");
             let first_track_id = first_track.id.clone();
             let library = Library {
-                tracks: vec![first_track, audition_track("second-track")],
+                tracks: vec![first_track, audition_track("second-track")].into(),
                 selected_track_id: persisted_selection,
                 ..Library::default()
             };
@@ -13707,7 +13785,8 @@ mod tests {
                 time_millis: 500,
                 body: String::from("Existing reference comment"),
                 done: false,
-            }],
+            }]
+            .into(),
         });
         state.reference_draft_note = Some(NoteDraft {
             owner: NoteOwner::ReferenceTrack(
@@ -13830,7 +13909,7 @@ mod tests {
         state.library.reference_tracks.push(ReferenceTrack {
             path: reference_path.clone(),
             source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
-            notes: Vec::new(),
+            notes: crate::storage::SharedVec::default(),
         });
         let mut context = ui::UiUpdateContext::default();
 
@@ -13919,6 +13998,84 @@ mod tests {
     }
 
     #[test]
+    fn draft_typing_updates_both_editors_with_paint_only_repaint() {
+        let mut main_state = audition_state(&["main-draft"]);
+        main_state.draft_note = Some(NoteDraft {
+            owner: NoteOwner::MainTrack(String::from("main-draft")),
+            note_id: None,
+            nonce: 1,
+            time_millis: 250,
+            body: String::from("before"),
+        });
+        let main_identity = main_state
+            .draft_note
+            .as_ref()
+            .expect("main draft should be active")
+            .identity();
+        let mut main_context = ui::UiUpdateContext::default();
+
+        update(
+            &mut main_state,
+            Message::DraftNoteChanged {
+                identity: main_identity,
+                body: String::from("after"),
+            },
+            &mut main_context,
+        );
+
+        assert_eq!(main_state.draft_note.as_ref().unwrap().body, "after");
+        assert_eq!(
+            main_context.into_command().repaint_scope(),
+            Some(RepaintScope::PaintOnly)
+        );
+
+        let mut reference_state = shared_reference_playback_state();
+        let reference_path = reference_state.library.tracks[0]
+            .reference_path
+            .clone()
+            .expect("reference path should be assigned");
+        reference_state
+            .library
+            .reference_tracks
+            .push(ReferenceTrack {
+                path: reference_path.clone(),
+                source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
+                notes: crate::storage::SharedVec::default(),
+            });
+        reference_state.reference_draft_note = Some(NoteDraft {
+            owner: NoteOwner::ReferenceTrack(reference_path),
+            note_id: None,
+            nonce: 1,
+            time_millis: 500,
+            body: String::from("before"),
+        });
+        let reference_identity = reference_state
+            .reference_draft_note
+            .as_ref()
+            .expect("reference draft should be active")
+            .identity();
+        let mut reference_context = ui::UiUpdateContext::default();
+
+        update(
+            &mut reference_state,
+            Message::ReferenceDraftNoteChanged {
+                identity: reference_identity,
+                body: String::from("after"),
+            },
+            &mut reference_context,
+        );
+
+        assert_eq!(
+            reference_state.reference_draft_note.as_ref().unwrap().body,
+            "after"
+        );
+        assert_eq!(
+            reference_context.into_command().repaint_scope(),
+            Some(RepaintScope::PaintOnly)
+        );
+    }
+
+    #[test]
     fn editing_existing_comment_populates_draft_and_focuses_main_editor() {
         let track_id = String::from("edit-track");
         let note_id = String::from("edit-note");
@@ -13943,7 +14100,8 @@ mod tests {
                 time_millis: 1_250,
                 body: String::from("Existing comment body"),
                 done: false,
-            }],
+            }]
+            .into(),
         });
         let mut context = ui::UiUpdateContext::default();
 
@@ -14007,7 +14165,7 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Backlog,
-            notes: Vec::new(),
+            notes: crate::storage::SharedVec::default(),
         });
         state.library.reference_tracks.push(ReferenceTrack {
             path: reference_path.clone(),
@@ -14017,7 +14175,8 @@ mod tests {
                 time_millis: 875,
                 body: String::from("Existing reference body"),
                 done: true,
-            }],
+            }]
+            .into(),
         });
         let mut context = ui::UiUpdateContext::default();
 
@@ -14213,7 +14372,7 @@ mod tests {
         unassigned.reference_path = None;
 
         let library = Library {
-            tracks: vec![first, second, third, unassigned],
+            tracks: vec![first, second, third, unassigned].into(),
             ..Library::default()
         };
         let counts = reference_assignment_counts(&library);
@@ -14243,8 +14402,9 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Backlog,
-            notes: Vec::new(),
-        }];
+            notes: crate::storage::SharedVec::default(),
+        }]
+        .into();
         state.library.tracks.push(Track {
             id: String::from("assigned"),
             title: String::from("Assigned"),
@@ -14255,20 +14415,21 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Backlog,
-            notes: Vec::new(),
+            notes: crate::storage::SharedVec::default(),
         });
         state.library.reference_tracks = vec![
             ReferenceTrack {
                 path: first_path,
                 source_proof: crate::source::SourceProvenance::Unknown,
-                notes: Vec::new(),
+                notes: crate::storage::SharedVec::default(),
             },
             ReferenceTrack {
                 path: second_path,
                 source_proof: crate::source::SourceProvenance::Unknown,
-                notes: Vec::new(),
+                notes: crate::storage::SharedVec::default(),
             },
-        ];
+        ]
+        .into();
 
         let labels = reference_settings_window_view(&state)
             .view_frame_at_size_with_default_theme(Vector2::new(680.0, 520.0))
@@ -14311,7 +14472,7 @@ mod tests {
             .map(|index| ReferenceTrack {
                 path: PathBuf::from(format!("/external/reference-window-{index}.wav")),
                 source_proof: crate::source::SourceProvenance::Unknown,
-                notes: Vec::new(),
+                notes: crate::storage::SharedVec::default(),
             })
             .collect();
 
@@ -14340,7 +14501,7 @@ mod tests {
         state.library.reference_tracks.push(ReferenceTrack {
             path,
             source_proof: crate::source::SourceProvenance::Unknown,
-            notes: Vec::new(),
+            notes: crate::storage::SharedVec::default(),
         });
 
         let frame = reference_settings_window_view(&state)
@@ -14445,15 +14606,17 @@ mod tests {
                 size: 0,
                 favorite: false,
                 stage: TrackStage::Backlog,
-                notes: Vec::new(),
-            }],
+                notes: crate::storage::SharedVec::default(),
+            }]
+            .into(),
             selected_track_id: Some(String::from("main-track")),
             reference_tracks: vec![ReferenceTrack {
                 path: path.clone(),
                 source_proof: crate::source::SourceProvenance::Unknown,
-                notes: Vec::new(),
-            }],
-            planner_order: Vec::new(),
+                notes: crate::storage::SharedVec::default(),
+            }]
+            .into(),
+            planner_order: Vec::new().into(),
         };
         let mut state = AppState {
             busy: true,
@@ -14510,12 +14673,12 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Backlog,
-            notes: Vec::new(),
+            notes: crate::storage::SharedVec::default(),
         });
         state.library.reference_tracks.push(ReferenceTrack {
             path: reference_path.clone(),
             source_proof: crate::source::SourceProvenance::Unknown,
-            notes: Vec::new(),
+            notes: crate::storage::SharedVec::default(),
         });
         let previous_generation = state.reference_waveform_generation;
         let mut context = ui::UiUpdateContext::default();
@@ -14721,7 +14884,8 @@ mod tests {
                     body: String::from("keep this"),
                     done: false,
                 },
-            ],
+            ]
+            .into(),
         });
         (state, track_id, note_id)
     }
@@ -15228,7 +15392,7 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Backlog,
-            notes: Vec::new(),
+            notes: crate::storage::SharedVec::default(),
         });
         let mut context = ui::UiUpdateContext::default();
 
@@ -15295,7 +15459,7 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Backlog,
-            notes: Vec::new(),
+            notes: crate::storage::SharedVec::default(),
         });
         let mut context = ui::UiUpdateContext::default();
 
@@ -15355,7 +15519,7 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Backlog,
-            notes: Vec::new(),
+            notes: crate::storage::SharedVec::default(),
         });
         let mut context = ui::UiUpdateContext::default();
 
@@ -15644,7 +15808,7 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Backlog,
-            notes: Vec::new(),
+            notes: crate::storage::SharedVec::default(),
         });
         state.waveform_source_ticket = Some(
             verified_audition_waveform_for(Path::new("/external/reference-click.wav"))
@@ -15761,7 +15925,7 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Backlog,
-            notes: Vec::new(),
+            notes: crate::storage::SharedVec::default(),
         });
         state.waveform_source_ticket = Some(
             verified_audition_waveform_for(Path::new("/external/active-reference-click.wav"))
@@ -15859,7 +16023,7 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Backlog,
-            notes: Vec::new(),
+            notes: crate::storage::SharedVec::default(),
         });
         state.waveform_source_ticket = Some(
             verified_audition_waveform_for(Path::new("/external/main-seek.wav"))
@@ -15942,7 +16106,7 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Backlog,
-            notes: Vec::new(),
+            notes: crate::storage::SharedVec::default(),
         });
         state.waveform_source_ticket = Some(
             verified_audition_waveform_for(Path::new("/external/paired-admission.wav"))
@@ -16005,7 +16169,8 @@ mod tests {
                     body: String::from("keep this reference comment"),
                     done: false,
                 },
-            ],
+            ]
+            .into(),
         });
         (state, note_id)
     }
@@ -16065,7 +16230,7 @@ mod tests {
         state.library.reference_tracks.push(ReferenceTrack {
             path: reference_path,
             source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
-            notes: Vec::new(),
+            notes: crate::storage::SharedVec::default(),
         });
         let mut context = ui::UiUpdateContext::default();
 
@@ -16574,7 +16739,7 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Backlog,
-            notes: Vec::new(),
+            notes: crate::storage::SharedVec::default(),
         });
         state.waveform_source_ticket = Some(
             verified_audition_waveform_for(Path::new("/external/resume-reference.wav"))
@@ -16654,7 +16819,7 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Backlog,
-            notes: Vec::new(),
+            notes: crate::storage::SharedVec::default(),
         });
         state.transport_position_millis = 500;
         state.review_cursor_millis = 500;
@@ -17792,13 +17957,8 @@ mod tests {
             .transport_waiting_token
             .expect("cleanup should have a pending main pause");
         let reference_generation = state.reference_transport_generation;
-        let track_id = state
-            .library
-            .tracks
-            .first()
-            .expect("the synthetic state should have a track")
-            .id
-            .clone();
+        let track_id = String::from("paired-cleanup-target");
+        state.library.tracks.push(audition_track(&track_id));
         let mut context = ui::UiUpdateContext::default();
 
         update(&mut state, Message::SelectTrack(track_id), &mut context);
@@ -18303,7 +18463,7 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Backlog,
-            notes: Vec::new(),
+            notes: crate::storage::SharedVec::default(),
         });
         let mut context = ui::UiUpdateContext::default();
 
@@ -18464,7 +18624,7 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Backlog,
-            notes: Vec::new(),
+            notes: crate::storage::SharedVec::default(),
         });
 
         let frame = project_surface(&state)
@@ -18600,7 +18760,8 @@ mod tests {
                 time_millis: 500,
                 body: String::from("main persisted note"),
                 done: false,
-            }],
+            }]
+            .into(),
         });
         state.library.reference_tracks.push(ReferenceTrack {
             path: reference_path,
@@ -18610,7 +18771,8 @@ mod tests {
                 time_millis: 500,
                 body: String::from("reference persisted note"),
                 done: false,
-            }],
+            }]
+            .into(),
         });
 
         let frame = project_surface(&state)
@@ -18874,7 +19036,7 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Backlog,
-            notes: Vec::new(),
+            notes: crate::storage::SharedVec::default(),
         });
 
         let frame = project_surface(&state)
@@ -18919,7 +19081,8 @@ mod tests {
                 time_millis: 100,
                 body: String::from("Main track note"),
                 done: false,
-            }],
+            }]
+            .into(),
         });
         state.library.reference_tracks = vec![
             ReferenceTrack {
@@ -18927,7 +19090,7 @@ mod tests {
                 source_proof: crate::source::SourceProvenance::Verified(
                     first_decoded.source_proof().clone(),
                 ),
-                notes: Vec::new(),
+                notes: crate::storage::SharedVec::default(),
             },
             ReferenceTrack {
                 path: second_path.clone(),
@@ -18939,9 +19102,11 @@ mod tests {
                     time_millis: 700,
                     body: String::from("Only on the second reference."),
                     done: false,
-                }],
+                }]
+                .into(),
             },
-        ];
+        ]
+        .into();
         let mut context = ui::UiUpdateContext::default();
 
         update(
@@ -19255,7 +19420,8 @@ mod tests {
                     body: String::from("keep this"),
                     done: true,
                 },
-            ],
+            ]
+            .into(),
         });
         let mut context = ui::UiUpdateContext::default();
 
@@ -19303,7 +19469,7 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Backlog,
-            notes: Vec::new(),
+            notes: crate::storage::SharedVec::default(),
         });
         state.library.reference_tracks.push(ReferenceTrack {
             path: reference_path,
@@ -19313,7 +19479,8 @@ mod tests {
                 time_millis: 250,
                 body: String::from("Reference note"),
                 done: false,
-            }],
+            }]
+            .into(),
         });
         let mut context = ui::UiUpdateContext::default();
 
@@ -19378,7 +19545,8 @@ mod tests {
                     body: String::from("second comment"),
                     done: true,
                 },
-            ],
+            ]
+            .into(),
         });
 
         let frame = project_surface(&state)
@@ -19517,7 +19685,7 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Backlog,
-            notes: Vec::new(),
+            notes: crate::storage::SharedVec::default(),
         });
         state.library.reference_tracks.push(ReferenceTrack {
             path: reference_path.clone(),
@@ -19527,7 +19695,8 @@ mod tests {
                 time_millis: 1_000,
                 body: String::from("selected reference comment"),
                 done: false,
-            }],
+            }]
+            .into(),
         });
 
         let frame = project_surface(&state)
@@ -19690,7 +19859,8 @@ mod tests {
                 time_millis: 1_000,
                 body: String::from("hover me"),
                 done: false,
-            }],
+            }]
+            .into(),
         });
         let mut context = ui::UiUpdateContext::default();
 
@@ -19749,7 +19919,7 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Backlog,
-            notes: Vec::new(),
+            notes: crate::storage::SharedVec::default(),
         });
         state.library.reference_tracks.push(ReferenceTrack {
             path: reference_path,
@@ -19759,7 +19929,8 @@ mod tests {
                 time_millis: 500,
                 body: String::from("reference hover me"),
                 done: false,
-            }],
+            }]
+            .into(),
         });
 
         let bridge = DeclarativeOwnedCommandRuntimeBridge::new(
@@ -19847,12 +20018,12 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Backlog,
-            notes: Vec::new(),
+            notes: crate::storage::SharedVec::default(),
         });
         state.library.reference_tracks.push(ReferenceTrack {
             path: reference_path,
             source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
-            notes: Vec::new(),
+            notes: crate::storage::SharedVec::default(),
         });
 
         let bridge = DeclarativeOwnedRuntimeBridge::new(
@@ -20028,7 +20199,8 @@ mod tests {
                 time_millis: 1_000,
                 body: String::from("hover and select me"),
                 done: false,
-            }],
+            }]
+            .into(),
         });
 
         let bridge = DeclarativeOwnedRuntimeBridge::new(
@@ -20212,7 +20384,8 @@ mod tests {
                 time_millis: 1_250,
                 body: String::from("play from this row"),
                 done: false,
-            }],
+            }]
+            .into(),
         });
 
         let bridge = DeclarativeOwnedRuntimeBridge::new(
@@ -20290,7 +20463,8 @@ mod tests {
                 time_millis: 1_000,
                 body: String::from("select me"),
                 done: false,
-            }],
+            }]
+            .into(),
         });
         let mut context = ui::UiUpdateContext::default();
 
@@ -20348,7 +20522,8 @@ mod tests {
                 time_millis: 750,
                 body: String::from("start here"),
                 done: false,
-            }],
+            }]
+            .into(),
         });
         let mut context = ui::UiUpdateContext::default();
 
@@ -20395,7 +20570,8 @@ mod tests {
                 time_millis: 2_500,
                 body: String::from("start reference here"),
                 done: false,
-            }],
+            }]
+            .into(),
         });
         state.reference_transport_position_millis = 500;
         let mut context = ui::UiUpdateContext::default();
@@ -20810,7 +20986,8 @@ mod tests {
                 time_millis: 1_250,
                 body: String::from("play this"),
                 done: false,
-            }],
+            }]
+            .into(),
         });
         let mut context = ui::UiUpdateContext::default();
         let address = NoteAddress::main(track_id.clone(), note_id.clone());
@@ -20872,7 +21049,8 @@ mod tests {
             time_millis: 600,
             body: String::from("target comment"),
             done: false,
-        }];
+        }]
+        .into();
         let mut state = AppState {
             busy: false,
             waveform: Some(audition_waveform()),
@@ -20880,7 +21058,7 @@ mod tests {
             ..AppState::default()
         };
         state.library.selected_track_id = Some(current_id.clone());
-        state.library.tracks = vec![audition_track(&current_id), target];
+        state.library.tracks = vec![audition_track(&current_id), target].into();
         let address = NoteAddress::main(target_id.clone(), note_id.clone());
         let mut context = ui::UiUpdateContext::default();
 
@@ -20952,7 +21130,8 @@ mod tests {
                 time_millis: 2_500,
                 body: String::from("play the reference"),
                 done: false,
-            }],
+            }]
+            .into(),
         });
         state.transport_playing = true;
         state.reference_transport_playing = true;
@@ -21012,7 +21191,8 @@ mod tests {
                         time_millis,
                         body: String::from("play reference at eof"),
                         done: false,
-                    }],
+                    }]
+                    .into(),
                 });
             }
 
@@ -21244,7 +21424,8 @@ mod tests {
                 time_millis: 250,
                 body: String::from("keep reference note"),
                 done: false,
-            }],
+            }]
+            .into(),
         });
         state.reference_waveform_generation = 1;
         state.reference_waveform_busy = true;
@@ -21334,7 +21515,7 @@ mod tests {
             state.library.tracks[0].source_proof,
             crate::source::SourceProvenance::Verified(proof)
         );
-        assert_eq!(state.library.tracks[0].notes, notes);
+        assert_eq!(state.library.tracks[0].notes.as_slice(), notes.as_slice());
         assert!(state.save_admission_pending);
         admit_library_save_for_test(&mut state, &mut context);
         assert!(state.save_in_flight.is_some());
@@ -21352,7 +21533,7 @@ mod tests {
         state.library.reference_tracks.push(ReferenceTrack {
             path: reference_path.clone(),
             source_proof: crate::source::SourceProvenance::Unknown,
-            notes: Vec::new(),
+            notes: crate::storage::SharedVec::default(),
         });
         state.reference_waveform_source_ticket = Some(reference_ticket);
         state.reference_waveform_track_id = state.library.selected_track_id.clone();
@@ -21402,7 +21583,7 @@ mod tests {
             state.library.tracks[0].source_proof,
             crate::source::SourceProvenance::Unknown
         );
-        assert_eq!(state.library.tracks[0].notes, notes);
+        assert_eq!(state.library.tracks[0].notes.as_slice(), notes.as_slice());
         assert_eq!(
             state.library.reference_tracks[0].source_proof,
             crate::source::SourceProvenance::Unknown
@@ -21420,7 +21601,7 @@ mod tests {
         state.library.reference_tracks.push(ReferenceTrack {
             path: reference_path.clone(),
             source_proof: crate::source::SourceProvenance::Unknown,
-            notes: Vec::new(),
+            notes: crate::storage::SharedVec::default(),
         });
         state.reference_waveform_source_ticket = Some(reference_ticket);
         state.reference_waveform_track_id = state.library.selected_track_id.clone();
@@ -21472,7 +21653,7 @@ mod tests {
             state.library.tracks[0].source_proof,
             crate::source::SourceProvenance::Unknown
         );
-        assert_eq!(state.library.tracks[0].notes, notes);
+        assert_eq!(state.library.tracks[0].notes.as_slice(), notes.as_slice());
         assert_eq!(
             state.library.reference_tracks[0].source_proof,
             crate::source::SourceProvenance::Unknown
@@ -21493,12 +21674,13 @@ mod tests {
     fn binding_historical_reference_comments_preserves_notes() {
         let track_id = String::from("historical-reference-binding");
         let path = PathBuf::from("/external/historical-reference-binding.wav");
-        let notes = vec![Note {
+        let notes: crate::storage::SharedVec<Note> = vec![Note {
             id: String::from("historical-reference-note"),
             time_millis: 375,
             body: String::from("preserve reference bytes"),
             done: false,
-        }];
+        }]
+        .into();
         let verified = verified_audition_waveform_for(&path);
         let proof = verified.ticket().proof().clone();
         let mut track = audition_track(&track_id);
@@ -21599,7 +21781,7 @@ mod tests {
             state.library.tracks[0].source_proof,
             crate::source::SourceProvenance::Unknown
         );
-        assert_eq!(state.library.tracks[0].notes, notes);
+        assert_eq!(state.library.tracks[0].notes.as_slice(), notes.as_slice());
         assert!(state.save_in_flight.is_none());
         assert!(
             state
@@ -21652,7 +21834,7 @@ mod tests {
             state.library.tracks[0].source_proof,
             crate::source::SourceProvenance::Unknown
         );
-        assert_eq!(state.library.tracks[0].notes, notes);
+        assert_eq!(state.library.tracks[0].notes.as_slice(), notes.as_slice());
         assert!(state.save_in_flight.is_none());
         assert!(state.status.contains("binding canceled"));
     }
@@ -21699,7 +21881,7 @@ mod tests {
             state.library.tracks[0].source_proof,
             crate::source::SourceProvenance::Unknown
         );
-        assert_eq!(state.library.tracks[0].notes, notes);
+        assert_eq!(state.library.tracks[0].notes.as_slice(), notes.as_slice());
         assert!(state.save_in_flight.is_none());
     }
 
@@ -21759,7 +21941,7 @@ mod tests {
             update(&mut state, message, &mut ui::UiUpdateContext::default());
         }
 
-        assert_eq!(state.library.tracks[0].notes, notes);
+        assert_eq!(state.library.tracks[0].notes.as_slice(), notes.as_slice());
         assert!(state.draft_note.is_none());
         assert!(state.selected_note_id.is_none());
         assert!(state.hovered_note_id.is_none());
@@ -22074,8 +22256,8 @@ mod tests {
             save_in_flight: Some(LibrarySaveAttempt { id: 1, revision: 1 }),
             library_load_state: LibraryLoadState::Ready,
             library: Library {
-                tracks: vec![first_track, second_track],
-                selected_track_id: Some(first_id.clone()),
+                tracks: vec![first_track, second_track].into(),
+                selected_track_id: Some(second_id.clone()),
                 ..Library::default()
             }
             .into(),
@@ -22184,8 +22366,8 @@ mod tests {
             save_in_flight: Some(LibrarySaveAttempt { id: 1, revision: 1 }),
             library_load_state: LibraryLoadState::Ready,
             library: Library {
-                tracks: vec![first_track, second_track],
-                selected_track_id: Some(first_id.clone()),
+                tracks: vec![first_track, second_track].into(),
+                selected_track_id: Some(second_id.clone()),
                 ..Library::default()
             }
             .into(),
@@ -22305,7 +22487,7 @@ mod tests {
             size: 0,
             favorite: false,
             stage,
-            notes: Vec::new(),
+            notes: crate::storage::SharedVec::default(),
         };
         let tracks = vec![
             track("sound", TrackStage::Backlog),
@@ -22333,7 +22515,7 @@ mod tests {
             size: 0,
             favorite: false,
             stage,
-            notes: Vec::new(),
+            notes: crate::storage::SharedVec::default(),
         };
         let library = Library {
             tracks: vec![
@@ -22342,15 +22524,17 @@ mod tests {
                 track("mix", TrackStage::Mixdown),
                 track("master", TrackStage::Mastering),
                 track("tail", TrackStage::Production),
-            ],
+            ]
+            .into(),
             selected_track_id: None,
-            reference_tracks: Vec::new(),
+            reference_tracks: Vec::new().into(),
             planner_order: vec![
                 String::from("missing"),
                 String::from("mix"),
                 String::from("mix"),
                 String::from("sound"),
-            ],
+            ]
+            .into(),
         };
 
         let projection = planner_tracks_with_favorites(&library);
@@ -22825,7 +23009,7 @@ mod tests {
             ..AppState::default()
         };
         state.library.selected_track_id = Some(track_id.clone());
-        state.library.tracks = vec![track];
+        state.library.tracks = vec![track].into();
 
         let bridge = DeclarativeOwnedRuntimeBridge::new(
             state,
@@ -22929,7 +23113,7 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Production,
-            notes: Vec::new(),
+            notes: crate::storage::SharedVec::default(),
         };
         let mut state = AppState {
             busy: false,
@@ -22938,12 +23122,13 @@ mod tests {
             planner_drag_pointer: Some(Point::new(120.0, 90.0)),
             ..AppState::default()
         };
-        state.library.tracks = vec![track("first"), track("second"), track("third")];
+        state.library.tracks = vec![track("first"), track("second"), track("third")].into();
         state.library.planner_order = vec![
             String::from("first"),
             String::from("second"),
             String::from("third"),
-        ];
+        ]
+        .into();
         let mut context = ui::UiUpdateContext::default();
 
         update(
@@ -23020,19 +23205,20 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Production,
-            notes: Vec::new(),
+            notes: crate::storage::SharedVec::default(),
         };
         let mut state = AppState {
             busy: false,
             workspace_mode: WorkspaceMode::Planner,
             ..AppState::default()
         };
-        state.library.tracks = vec![track("first"), track("second"), track("third")];
+        state.library.tracks = vec![track("first"), track("second"), track("third")].into();
         state.library.planner_order = vec![
             String::from("first"),
             String::from("second"),
             String::from("third"),
-        ];
+        ]
+        .into();
         let bridge = DeclarativeOwnedCommandRuntimeBridge::new(
             state,
             |state| project_surface(state).into_surface(),
@@ -23090,7 +23276,7 @@ mod tests {
                 .is_none()
         );
         assert_eq!(
-            runtime.bridge().state().library.planner_order,
+            runtime.bridge().state().library.planner_order.as_slice(),
             ["first", "second", "third"]
         );
     }
@@ -23200,15 +23386,15 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Production,
-            notes: Vec::new(),
+            notes: crate::storage::SharedVec::default(),
         };
         let mut state = AppState {
             busy: false,
             workspace_mode: WorkspaceMode::Planner,
             ..AppState::default()
         };
-        state.library.tracks = vec![track("first"), track("second")];
-        state.library.planner_order = vec![String::from("first"), String::from("second")];
+        state.library.tracks = vec![track("first"), track("second")].into();
+        state.library.planner_order = vec![String::from("first"), String::from("second")].into();
         let bridge = DeclarativeOwnedCommandRuntimeBridge::new(
             state,
             |state| project_surface(state).into_surface(),
@@ -23278,7 +23464,7 @@ mod tests {
             TrackStage::Mixdown
         );
         assert_eq!(
-            runtime.bridge().state().library.planner_order,
+            runtime.bridge().state().library.planner_order.as_slice(),
             ["second", "first"]
         );
     }
@@ -23452,7 +23638,7 @@ mod tests {
         );
 
         assert_eq!(state.library.tracks[0].stage, TrackStage::Production);
-        assert_eq!(state.library.planner_order, ["drag"]);
+        assert_eq!(state.library.planner_order.as_slice(), ["drag"]);
         assert!(state.save_admission_pending);
         admit_library_save_for_test(&mut state, &mut context);
         assert!(state.save_in_flight.is_some());
@@ -23478,7 +23664,7 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Production,
-            notes: Vec::new(),
+            notes: crate::storage::SharedVec::default(),
         };
 
         let labels = ui::scene(stage_menu_popover(&track, Point::new(80.0, 60.0)))
@@ -23513,7 +23699,7 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Production,
-            notes: Vec::new(),
+            notes: crate::storage::SharedVec::default(),
         };
         #[derive(Clone)]
         struct TriggerState {
@@ -23579,7 +23765,7 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Production,
-            notes: Vec::new(),
+            notes: crate::storage::SharedVec::default(),
         };
         let track_id = track.id.clone();
         let mut state = AppState {
@@ -23617,7 +23803,7 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Production,
-            notes: Vec::new(),
+            notes: crate::storage::SharedVec::default(),
         };
         #[derive(Clone)]
         struct KeyboardState {
@@ -23682,7 +23868,7 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Production,
-            notes: Vec::new(),
+            notes: crate::storage::SharedVec::default(),
         };
 
         for workspace_mode in [super::WorkspaceMode::Planner, super::WorkspaceMode::Review] {
@@ -23796,7 +23982,7 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Production,
-            notes: Vec::new(),
+            notes: crate::storage::SharedVec::default(),
         };
         #[derive(Clone)]
         struct DropdownState {
@@ -23891,7 +24077,7 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Production,
-            notes: Vec::new(),
+            notes: crate::storage::SharedVec::default(),
         };
 
         let planner_anchor = Point::new(220.0, 140.0);
@@ -23959,20 +24145,21 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Production,
-            notes: Vec::new(),
+            notes: crate::storage::SharedVec::default(),
         });
         state.library.reference_tracks = vec![
             ReferenceTrack {
                 path: first_path,
                 source_proof: crate::source::SourceProvenance::Unknown,
-                notes: Vec::new(),
+                notes: crate::storage::SharedVec::default(),
             },
             ReferenceTrack {
                 path: second_path.clone(),
                 source_proof: crate::source::SourceProvenance::Unknown,
-                notes: Vec::new(),
+                notes: crate::storage::SharedVec::default(),
             },
-        ];
+        ]
+        .into();
         let bridge = DeclarativeOwnedRuntimeBridge::new(
             state,
             |state| project_surface(state).into_surface(),
@@ -24030,6 +24217,44 @@ mod tests {
             Some(second_path)
         );
         assert!(runtime.bridge().state().reference_menu_track_id.is_none());
+    }
+
+    #[test]
+    fn closed_reference_selector_does_not_admit_an_empty_catalog() {
+        let mut state = audition_state(&["reference-menu-empty"]);
+        state.library.tracks[0].reference_path = None;
+        let track = state.library.tracks[0].clone();
+        assert!(!reference_menu_available(&state, &track));
+
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::ToggleReferenceMenu(track.id.clone()),
+            &mut context,
+        );
+
+        assert!(state.reference_menu_track_id.is_none());
+        assert!(state.reference_menu_anchor.is_none());
+        assert_eq!(context.into_command().repaint_scope(), None);
+    }
+
+    #[test]
+    fn open_reference_selector_keeps_catalog_order_and_assigned_fallback() {
+        let catalog_path = PathBuf::from("/external/catalog-reference.wav");
+        let assigned_path = PathBuf::from("/external/assigned-reference.wav");
+        let mut state = audition_state(&["reference-menu-order"]);
+        state.library.tracks[0].reference_path = Some(assigned_path.clone());
+        state.library.reference_tracks.push(ReferenceTrack {
+            path: catalog_path.clone(),
+            source_proof: crate::source::SourceProvenance::Unknown,
+            notes: crate::storage::SharedVec::default(),
+        });
+
+        assert!(reference_menu_available(&state, &state.library.tracks[0]));
+        assert_eq!(
+            reference_dropdown_paths(&state, &state.library.tracks[0]),
+            vec![catalog_path, assigned_path]
+        );
     }
 
     #[test]
@@ -24153,7 +24378,7 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Production,
-            notes: Vec::new(),
+            notes: crate::storage::SharedVec::default(),
         });
 
         let frame = project_surface(&state)
@@ -24234,7 +24459,7 @@ mod tests {
                 workspace_mode,
                 ..AppState::default()
             };
-            state.library.tracks = vec![track.clone()];
+            state.library.tracks = vec![track.clone()].into();
             let bridge = DeclarativeOwnedRuntimeBridge::new(
                 state,
                 |state| project_surface(state).into_surface(),
@@ -24357,7 +24582,7 @@ mod tests {
             workspace_mode: WorkspaceMode::Planner,
             ..AppState::default()
         };
-        state.library.tracks = vec![track];
+        state.library.tracks = vec![track].into();
         let bridge = DeclarativeOwnedRuntimeBridge::new(
             state,
             |state| project_surface(state).into_surface(),
@@ -24417,7 +24642,7 @@ mod tests {
             workspace_mode: WorkspaceMode::Planner,
             ..AppState::default()
         };
-        state.library.tracks = vec![first_track, selected_track, favorite_track];
+        state.library.tracks = vec![first_track, selected_track, favorite_track].into();
         let mut context = ui::UiUpdateContext::default();
 
         update(
@@ -24450,6 +24675,151 @@ mod tests {
     }
 
     #[test]
+    fn selecting_the_current_review_track_is_a_complete_no_op() {
+        let mut state = audition_state(&["same-review-track"]);
+        state.selected_track_index = Some(37);
+        state.library_revision = 12;
+        state.persisted_library_revision = 11;
+        state.save_admission_pending = true;
+        state.save_in_flight = Some(LibrarySaveAttempt {
+            id: 3,
+            revision: 11,
+        });
+        state.review_cursor_millis = 740;
+        state.transport_position_millis = 740;
+        state.reference_transport_position_millis = 320;
+        state.transport_playing = true;
+        state.reference_transport_playing = true;
+        state.loop_selections.main = Some(LoopSelection {
+            start_ratio: 0.1,
+            end_ratio: 0.4,
+        });
+        state.loop_selections.reference = Some(LoopSelection {
+            start_ratio: 0.2,
+            end_ratio: 0.6,
+        });
+        state.draft_note = Some(NoteDraft {
+            owner: NoteOwner::MainTrack(String::from("same-review-track")),
+            note_id: None,
+            nonce: 1,
+            time_millis: 740,
+            body: String::from("keep me"),
+        });
+        let library_before = state.library.clone();
+        let loop_before = state.loop_selections;
+        let draft_before = state.draft_note.clone();
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::SelectTrack(String::from("same-review-track")),
+            &mut context,
+        );
+
+        assert_eq!(state.library, library_before);
+        assert_eq!(state.selected_track_index, Some(37));
+        assert_eq!(state.library_revision, 12);
+        assert_eq!(state.persisted_library_revision, 11);
+        assert!(state.save_admission_pending);
+        assert_eq!(
+            state.save_in_flight,
+            Some(LibrarySaveAttempt {
+                id: 3,
+                revision: 11
+            })
+        );
+        assert_eq!(state.loop_selections, loop_before);
+        assert_eq!(
+            state.draft_note.as_ref().map(NoteDraft::identity),
+            draft_before.as_ref().map(NoteDraft::identity)
+        );
+        assert_eq!(
+            state.draft_note.as_ref().map(|draft| draft.body.as_str()),
+            draft_before.as_ref().map(|draft| draft.body.as_str())
+        );
+        assert!(state.transport_playing);
+        assert!(state.reference_transport_playing);
+        assert_eq!(state.transport_position_millis, 740);
+        assert_eq!(state.reference_transport_position_millis, 320);
+        assert_eq!(context.into_command().repaint_scope(), None);
+    }
+
+    #[test]
+    fn planner_review_of_the_current_track_switches_reveals_and_clears_planner_transients() {
+        let first_track = audition_track("planner-same-first");
+        let selected_track = audition_track("planner-same-selected");
+        let selected_id = selected_track.id.clone();
+        let mut favorite_track = audition_track("planner-same-favorite");
+        favorite_track.favorite = true;
+        let mut state = AppState {
+            busy: false,
+            workspace_mode: WorkspaceMode::Planner,
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(selected_id.clone());
+        state.library.tracks = vec![first_track, selected_track, favorite_track].into();
+        state.library_revision = 6;
+        state.persisted_library_revision = 6;
+        state.loop_selections.main = Some(LoopSelection {
+            start_ratio: 0.15,
+            end_ratio: 0.45,
+        });
+        state.transport_position_millis = 625;
+        state.stage_menu_track_id = Some(String::from("stale-stage-menu"));
+        state.stage_menu_anchor = Some(Point::new(40.0, 50.0));
+        state.remove_confirmation_track_id = Some(String::from("stale-removal"));
+        state.planner_drag_source_track_id = Some(selected_id.clone());
+        state.planner_drag_target = Some(PlannerInsertionTarget {
+            stage: TrackStage::Production,
+            slot: 1,
+        });
+        state.planner_drag_pointer = Some(Point::new(80.0, 90.0));
+        let library_before = state.library.clone();
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::ReviewTrack(selected_id.clone()),
+            &mut context,
+        );
+
+        assert_eq!(state.workspace_mode, WorkspaceMode::Review);
+        assert_eq!(state.library, library_before);
+        assert_eq!(state.library_revision, 6);
+        assert_eq!(state.persisted_library_revision, 6);
+        assert_eq!(
+            state.loop_selections.main,
+            Some(LoopSelection {
+                start_ratio: 0.15,
+                end_ratio: 0.45,
+            })
+        );
+        assert_eq!(state.transport_position_millis, 625);
+        assert!(state.stage_menu_track_id.is_none());
+        assert!(state.stage_menu_anchor.is_none());
+        assert!(state.remove_confirmation_track_id.is_none());
+        assert!(state.planner_drag_source_track_id.is_none());
+        assert!(state.planner_drag_target.is_none());
+        assert!(state.planner_drag_pointer.is_none());
+        let command = context.into_command();
+        let card_height = library_track_card_height();
+        assert_eq!(
+            scroll_into_view_request(&command),
+            Some((
+                LIBRARY_SCROLL_VIEWPORT_ID,
+                2.0 * (card_height + TRACK_CARD_LIST_SPACING),
+                card_height,
+                LIBRARY_REVEAL_MARGIN,
+                LIBRARY_REVEAL_MARGIN,
+            ))
+        );
+        assert_eq!(
+            focus_request_id(&command),
+            Some(library_track_title_id(&selected_id))
+        );
+    }
+
+    #[test]
     fn planner_card_removal_control_opens_and_confirms_removal() {
         let mut track = audition_track("planner-remove-card");
         track.stage = TrackStage::Backlog;
@@ -24459,7 +24829,7 @@ mod tests {
             workspace_mode: WorkspaceMode::Planner,
             ..AppState::default()
         };
-        state.library.tracks = vec![track];
+        state.library.tracks = vec![track].into();
         let bridge = DeclarativeOwnedRuntimeBridge::new(
             state,
             |state| project_surface(state).into_surface(),
@@ -24757,7 +25127,7 @@ mod tests {
             ..AppState::default()
         };
         state.library.selected_track_id = Some(starred.id.clone());
-        state.library.tracks = vec![starred, unstarred];
+        state.library.tracks = vec![starred, unstarred].into();
 
         for mode in [WorkspaceMode::Review, WorkspaceMode::Planner] {
             state.workspace_mode = mode;
@@ -24975,7 +25345,7 @@ mod tests {
         selected.favorite = true;
         let unselected = audition_track("unselected-track");
         state.library.selected_track_id = Some(selected.id.clone());
-        state.library.tracks = vec![selected, unselected];
+        state.library.tracks = vec![selected, unselected].into();
 
         let frame = project_surface(&state)
             .view_frame_at_size_with_default_theme(Vector2::new(800.0, 600.0));
@@ -25273,7 +25643,7 @@ mod tests {
             ..AppState::default()
         };
         state.library.selected_track_id = Some(selected.id.clone());
-        state.library.tracks = vec![favorite.clone(), selected.clone()];
+        state.library.tracks = vec![favorite.clone(), selected.clone()].into();
         let theme = ThemeTokens::default();
         let mut expected_styles = None;
 
@@ -25360,7 +25730,7 @@ mod tests {
             ..AppState::default()
         };
         state.library.selected_track_id = Some(track_id.clone());
-        state.library.tracks = vec![audition_track(&track_id)];
+        state.library.tracks = vec![audition_track(&track_id)].into();
         let frame = project_surface(&state)
             .view_frame_at_size_with_default_theme(Vector2::new(800.0, 600.0));
         let theme = ThemeTokens::default();

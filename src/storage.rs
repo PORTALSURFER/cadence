@@ -3,8 +3,12 @@ use std::{
     collections::{HashMap, HashSet},
     env, fs,
     io::{ErrorKind, Write},
+    ops::{Deref, DerefMut},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -16,14 +20,144 @@ const MAX_TEMP_FILE_ALLOCATION_ATTEMPTS: usize = 128;
 
 static NEXT_TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
 
+/// A persistable vector whose backing allocation is shared until a mutation.
+///
+/// `SharedVec` serializes exactly like the contained `Vec`, so changing the
+/// in-memory ownership model does not change the library JSON shape.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SharedVec<T> {
+    values: Arc<Vec<T>>,
+}
+
+impl<T> SharedVec<T> {
+    pub fn new() -> Self {
+        Self {
+            values: Arc::new(Vec::new()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_storage_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.values, &other.values)
+    }
+
+    pub fn as_slice(&self) -> &[T] {
+        self.values.as_slice()
+    }
+}
+
+impl<T: Clone> SharedVec<T> {
+    pub fn as_mut_vec(&mut self) -> &mut Vec<T> {
+        Arc::make_mut(&mut self.values)
+    }
+
+    pub fn push(&mut self, value: T) {
+        self.as_mut_vec().push(value);
+    }
+
+    pub fn remove(&mut self, index: usize) -> T {
+        self.as_mut_vec().remove(index)
+    }
+
+    pub fn retain(&mut self, f: impl FnMut(&T) -> bool) {
+        self.as_mut_vec().retain(f);
+    }
+
+    pub fn clear(&mut self) {
+        self.as_mut_vec().clear();
+    }
+
+    pub fn insert(&mut self, index: usize, value: T) {
+        self.as_mut_vec().insert(index, value);
+    }
+}
+
+impl<T> From<Vec<T>> for SharedVec<T> {
+    fn from(values: Vec<T>) -> Self {
+        Self {
+            values: Arc::new(values),
+        }
+    }
+}
+
+impl<T> FromIterator<T> for SharedVec<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        Self::from(iter.into_iter().collect::<Vec<_>>())
+    }
+}
+
+impl<T: Clone> Extend<T> for SharedVec<T> {
+    fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
+        self.as_mut_vec().extend(iter);
+    }
+}
+
+impl<T> Deref for SharedVec<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl<T: Clone> DerefMut for SharedVec<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.as_mut_vec().as_mut_slice()
+    }
+}
+
+impl<T> Default for SharedVec<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T> Clone for SharedVec<T> {
+    fn clone(&self) -> Self {
+        Self {
+            values: Arc::clone(&self.values),
+        }
+    }
+}
+
+impl<'a, T> IntoIterator for &'a SharedVec<T> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<'a, T: Clone> IntoIterator for &'a mut SharedVec<T> {
+    type Item = &'a mut T;
+    type IntoIter = std::slice::IterMut<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter_mut()
+    }
+}
+
+impl<T: Serialize> Serialize for SharedVec<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.as_slice().serialize(serializer)
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for SharedVec<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Vec::<T>::deserialize(deserializer).map(Self::from)
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Library {
-    pub tracks: Vec<Track>,
+    pub tracks: SharedVec<Track>,
     pub selected_track_id: Option<String>,
     #[serde(default)]
-    pub reference_tracks: Vec<ReferenceTrack>,
+    pub reference_tracks: SharedVec<ReferenceTrack>,
     #[serde(default)]
-    pub planner_order: Vec<String>,
+    pub planner_order: SharedVec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,7 +166,7 @@ pub struct ReferenceTrack {
     #[serde(default)]
     pub source_proof: crate::source::SourceProvenance,
     #[serde(default)]
-    pub notes: Vec<Note>,
+    pub notes: SharedVec<Note>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,7 +182,7 @@ pub struct Track {
     pub size: u64,
     pub favorite: bool,
     pub stage: TrackStage,
-    pub notes: Vec<Note>,
+    pub notes: SharedVec<Note>,
 }
 
 impl Track {
@@ -354,7 +488,7 @@ fn import_into_library_at(
         size: metadata.len(),
         favorite: false,
         stage: TrackStage::Backlog,
-        notes: Vec::new(),
+        notes: SharedVec::default(),
     });
     normalize_planner_order(&mut library);
     library.selected_track_id = Some(id);
@@ -529,7 +663,7 @@ fn ensure_reference_track(library: &mut Library, path: PathBuf) {
         library.reference_tracks.push(ReferenceTrack {
             path,
             source_proof: crate::source::SourceProvenance::Unknown,
-            notes: Vec::new(),
+            notes: SharedVec::default(),
         });
     }
 }
@@ -561,7 +695,7 @@ fn ensure_reference_track_with_proof(
         library.reference_tracks.push(ReferenceTrack {
             path,
             source_proof: crate::source::SourceProvenance::Verified(source_proof),
-            notes: Vec::new(),
+            notes: SharedVec::default(),
         });
         Ok(())
     }
@@ -729,7 +863,7 @@ pub fn set_track_stage(
 /// favorite-first projection on first load; newer libraries preserve their
 /// explicit order while removing stale/duplicate IDs and appending imports.
 pub fn normalize_planner_order(library: &mut Library) {
-    library.planner_order = normalized_planner_order(library);
+    library.planner_order = normalized_planner_order(library).into();
 }
 
 fn normalized_planner_order(library: &Library) -> Vec<String> {
@@ -921,10 +1055,10 @@ pub fn move_track_to_planner_slot(
         };
     order_after_source.insert(insertion_index, source_id.to_string());
 
-    let order_changed = order_after_source != library.planner_order;
+    let order_changed = order_after_source.as_slice() != library.planner_order.as_slice();
     let stage_changed = source.stage != target_stage;
     if order_changed || stage_changed {
-        library.planner_order = order_after_source;
+        library.planner_order = order_after_source.into();
         if stage_changed
             && let Some(track) = library
                 .tracks
@@ -1218,8 +1352,10 @@ mod tests {
                     time_millis: 900,
                     body: String::from("Compare the low-end tail."),
                     done: false,
-                }],
-            }],
+                }]
+                .into(),
+            }]
+            .into(),
             selected_track_id: Some(String::from("track-1")),
             reference_tracks: vec![ReferenceTrack {
                 path: reference_path,
@@ -1229,9 +1365,11 @@ mod tests {
                     time_millis: 1_100,
                     body: String::from("Check the reference vocal."),
                     done: true,
-                }],
-            }],
-            planner_order: vec![String::from("track-1")],
+                }]
+                .into(),
+            }]
+            .into(),
+            planner_order: vec![String::from("track-1")].into(),
         }
     }
 
@@ -1613,8 +1751,9 @@ mod tests {
                 size: 42,
                 favorite: false,
                 stage: TrackStage::Backlog,
-                notes: Vec::new(),
-            }],
+                notes: SharedVec::default(),
+            }]
+            .into(),
             selected_track_id: Some(String::from("track-1")),
             reference_tracks: vec![ReferenceTrack {
                 path: PathBuf::from("/tmp/reference.wav"),
@@ -1624,9 +1763,11 @@ mod tests {
                     time_millis: 900,
                     body: String::from("Compare the low-end tail."),
                     done: false,
-                }],
-            }],
-            planner_order: Vec::new(),
+                }]
+                .into(),
+            }]
+            .into(),
+            planner_order: Vec::new().into(),
         };
 
         let (index, removed) = remove_track(&mut library, "track-1").expect("track should exist");
@@ -1649,13 +1790,13 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Backlog,
-            notes: Vec::new(),
+            notes: SharedVec::default(),
         };
         let library = Library {
-            tracks: vec![track("track-2"), track("track-3")],
+            tracks: vec![track("track-2"), track("track-3")].into(),
             selected_track_id: None,
-            reference_tracks: Vec::new(),
-            planner_order: Vec::new(),
+            reference_tracks: Vec::new().into(),
+            planner_order: Vec::new().into(),
         };
 
         assert_eq!(
@@ -1682,11 +1823,12 @@ mod tests {
                 size: 42,
                 favorite: false,
                 stage: TrackStage::Backlog,
-                notes: Vec::new(),
-            }],
+                notes: SharedVec::default(),
+            }]
+            .into(),
             selected_track_id: Some(String::from("track-1")),
-            reference_tracks: Vec::new(),
-            planner_order: Vec::new(),
+            reference_tracks: Vec::new().into(),
+            planner_order: Vec::new().into(),
         };
 
         assert!(
@@ -1711,7 +1853,7 @@ mod tests {
             size: 0,
             favorite,
             stage,
-            notes: Vec::new(),
+            notes: SharedVec::default(),
         }
     }
 
@@ -1721,21 +1863,23 @@ mod tests {
             tracks: vec![
                 planner_test_track("plain", TrackStage::Production, false),
                 planner_test_track("starred", TrackStage::Production, true),
-            ],
+            ]
+            .into(),
             selected_track_id: None,
-            reference_tracks: Vec::new(),
-            planner_order: Vec::new(),
+            reference_tracks: Vec::new().into(),
+            planner_order: Vec::new().into(),
         };
         normalize_planner_order(&mut legacy);
-        assert_eq!(legacy.planner_order, ["starred", "plain"]);
+        assert_eq!(legacy.planner_order.as_slice(), ["starred", "plain"]);
 
         legacy.planner_order = vec![
             String::from("missing"),
             String::from("plain"),
             String::from("plain"),
-        ];
+        ]
+        .into();
         normalize_planner_order(&mut legacy);
-        assert_eq!(legacy.planner_order, ["plain", "starred"]);
+        assert_eq!(legacy.planner_order.as_slice(), ["plain", "starred"]);
     }
 
     #[test]
@@ -1750,15 +1894,17 @@ mod tests {
                 first_duplicate.clone(),
                 later_duplicate.clone(),
                 planner_test_track("appended", TrackStage::Backlog, false),
-            ],
+            ]
+            .into(),
             selected_track_id: None,
-            reference_tracks: Vec::new(),
+            reference_tracks: Vec::new().into(),
             planner_order: vec![
                 String::from("missing"),
                 String::from("duplicate"),
                 String::from("duplicate"),
                 String::from("tail"),
-            ],
+            ]
+            .into(),
         };
         let projected = planner_tracks(&explicit);
 
@@ -1780,10 +1926,11 @@ mod tests {
                 planner_test_track("favorite", TrackStage::Production, true),
                 first_duplicate,
                 later_duplicate,
-            ],
+            ]
+            .into(),
             selected_track_id: None,
-            reference_tracks: Vec::new(),
-            planner_order: Vec::new(),
+            reference_tracks: Vec::new().into(),
+            planner_order: Vec::new().into(),
         };
         let legacy_projected = planner_tracks(&legacy);
         assert_eq!(
@@ -1808,24 +1955,25 @@ mod tests {
                 planner_test_track("a", TrackStage::Backlog, false),
                 planner_test_track("b", TrackStage::Production, false),
                 planner_test_track("c", TrackStage::Production, false),
-            ],
+            ]
+            .into(),
             selected_track_id: None,
-            reference_tracks: Vec::new(),
-            planner_order: vec![String::from("a"), String::from("b"), String::from("c")],
+            reference_tracks: Vec::new().into(),
+            planner_order: vec![String::from("a"), String::from("b"), String::from("c")].into(),
         };
 
         assert!(
             move_track_to_planner_slot(&mut library, "c", TrackStage::Production, 0)
                 .expect("same-stage move should validate")
         );
-        assert_eq!(library.planner_order, ["a", "c", "b"]);
+        assert_eq!(library.planner_order.as_slice(), ["a", "c", "b"]);
         assert_eq!(library.tracks[1].stage, TrackStage::Production);
 
         assert!(
             move_track_to_planner_slot(&mut library, "a", TrackStage::Production, 2)
                 .expect("cross-stage move should validate")
         );
-        assert_eq!(library.planner_order, ["c", "b", "a"]);
+        assert_eq!(library.planner_order.as_slice(), ["c", "b", "a"]);
         assert_eq!(library.tracks[0].stage, TrackStage::Production);
     }
 
@@ -1835,10 +1983,11 @@ mod tests {
             tracks: vec![
                 planner_test_track("source", TrackStage::Production, false),
                 planner_test_track("unrelated", TrackStage::Production, false),
-            ],
+            ]
+            .into(),
             selected_track_id: None,
-            reference_tracks: Vec::new(),
-            planner_order: vec![String::from("source"), String::from("unrelated")],
+            reference_tracks: Vec::new().into(),
+            planner_order: vec![String::from("source"), String::from("unrelated")].into(),
         };
         let unrelated_pointer = std::ptr::from_ref(&library.tracks[1]);
 
@@ -1846,7 +1995,7 @@ mod tests {
             move_track_to_planner_slot(&mut library, "source", TrackStage::Production, 2)
                 .expect("same-stage reorder should validate")
         );
-        assert_eq!(library.planner_order, ["unrelated", "source"]);
+        assert_eq!(library.planner_order.as_slice(), ["unrelated", "source"]);
         assert_eq!(std::ptr::from_ref(&library.tracks[1]), unrelated_pointer);
     }
 
@@ -1858,15 +2007,17 @@ mod tests {
                 planner_test_track("hidden-one", TrackStage::Production, false),
                 planner_test_track("b", TrackStage::Production, false),
                 planner_test_track("hidden-two", TrackStage::Production, false),
-            ],
+            ]
+            .into(),
             selected_track_id: None,
-            reference_tracks: Vec::new(),
+            reference_tracks: Vec::new().into(),
             planner_order: vec![
                 String::from("a"),
                 String::from("hidden-one"),
                 String::from("b"),
                 String::from("hidden-two"),
-            ],
+            ]
+            .into(),
         };
 
         assert!(
@@ -1874,7 +2025,7 @@ mod tests {
                 .expect("end target should validate")
         );
         assert_eq!(
-            library.planner_order,
+            library.planner_order.as_slice(),
             ["hidden-one", "a", "b", "hidden-two"]
         );
         assert_eq!(
@@ -1890,10 +2041,10 @@ mod tests {
     #[test]
     fn planner_move_rejects_stale_slot_without_mutating_library() {
         let mut library = Library {
-            tracks: vec![planner_test_track("a", TrackStage::Production, false)],
+            tracks: vec![planner_test_track("a", TrackStage::Production, false)].into(),
             selected_track_id: None,
-            reference_tracks: Vec::new(),
-            planner_order: vec![String::from("a")],
+            reference_tracks: Vec::new().into(),
+            planner_order: vec![String::from("a")].into(),
         };
         let before = library.clone();
 
@@ -1906,17 +2057,17 @@ mod tests {
     #[test]
     fn planner_move_accepts_an_empty_stage_target() {
         let mut library = Library {
-            tracks: vec![planner_test_track("a", TrackStage::Production, false)],
+            tracks: vec![planner_test_track("a", TrackStage::Production, false)].into(),
             selected_track_id: None,
-            reference_tracks: Vec::new(),
-            planner_order: vec![String::from("a")],
+            reference_tracks: Vec::new().into(),
+            planner_order: vec![String::from("a")].into(),
         };
 
         assert!(
             move_track_to_planner_slot(&mut library, "a", TrackStage::Mastering, 0)
                 .expect("an empty stage target should validate")
         );
-        assert_eq!(library.planner_order, ["a"]);
+        assert_eq!(library.planner_order.as_slice(), ["a"]);
         assert_eq!(library.tracks[0].stage, TrackStage::Mastering);
     }
 
@@ -1938,11 +2089,13 @@ mod tests {
                     time_millis: 1_250,
                     body: String::from("Recheck the vocal entrance."),
                     done: false,
-                }],
-            }],
+                }]
+                .into(),
+            }]
+            .into(),
             selected_track_id: Some(String::from("track-1")),
-            reference_tracks: Vec::new(),
-            planner_order: Vec::new(),
+            reference_tracks: Vec::new().into(),
+            planner_order: Vec::new().into(),
         };
 
         replace_track_metadata(
@@ -2035,7 +2188,7 @@ mod tests {
             size: 84,
             favorite: false,
             stage: TrackStage::Backlog,
-            notes: Vec::new(),
+            notes: SharedVec::default(),
         });
         library.planner_order.push(String::from("track-2"));
         library.selected_track_id = Some(String::from("track-2"));
@@ -2101,12 +2254,13 @@ mod tests {
         let directory = TestDirectory::new();
         let library_path = directory.path.join("library.json");
         let (source, decoded) = decoded_audio_fixture(&directory.path);
-        let notes = vec![Note {
+        let notes: SharedVec<Note> = vec![Note {
             id: String::from("reference-note"),
             time_millis: 125,
             body: String::from("keep this note"),
             done: false,
-        }];
+        }]
+        .into();
         let mut library = Library {
             tracks: vec![Track {
                 id: String::from("owner"),
@@ -2118,15 +2272,17 @@ mod tests {
                 size: 0,
                 favorite: false,
                 stage: TrackStage::Backlog,
-                notes: Vec::new(),
-            }],
+                notes: SharedVec::default(),
+            }]
+            .into(),
             selected_track_id: Some(String::from("owner")),
             reference_tracks: vec![ReferenceTrack {
                 path: source.clone(),
                 source_proof: crate::source::SourceProvenance::Unknown,
                 notes: notes.clone(),
-            }],
-            planner_order: vec![String::from("owner")],
+            }]
+            .into(),
+            planner_order: vec![String::from("owner")].into(),
         };
 
         let selected =
@@ -2227,15 +2383,17 @@ mod tests {
                 size: 46,
                 favorite: true,
                 stage: TrackStage::Mixdown,
-                notes: vec![main_note.clone()],
-            }],
+                notes: vec![main_note.clone()].into(),
+            }]
+            .into(),
             selected_track_id: Some(String::from("owner")),
             reference_tracks: vec![ReferenceTrack {
                 path: reference_path.clone(),
                 source_proof: crate::source::SourceProvenance::Unknown,
-                notes: vec![reference_note.clone()],
-            }],
-            planner_order: vec![String::from("owner")],
+                notes: vec![reference_note.clone()].into(),
+            }]
+            .into(),
+            planner_order: vec![String::from("owner")].into(),
         };
         persist_library_at(&library, &library_path).expect("unknown library should persist");
 
@@ -2244,8 +2402,11 @@ mod tests {
         bind_reference_source_proof(&mut library, &reference_path, proof.clone())
             .expect("reference binding should succeed");
 
-        assert_eq!(library.tracks[0].notes, vec![main_note]);
-        assert_eq!(library.reference_tracks[0].notes, vec![reference_note]);
+        assert_eq!(library.tracks[0].notes, vec![main_note].into());
+        assert_eq!(
+            library.reference_tracks[0].notes,
+            vec![reference_note].into()
+        );
         assert_eq!(
             library.tracks[0].source_proof,
             crate::source::SourceProvenance::Verified(proof.clone())
@@ -2279,8 +2440,9 @@ mod tests {
                 size: 0,
                 favorite: false,
                 stage: TrackStage::Backlog,
-                notes: Vec::new(),
-            }],
+                notes: SharedVec::default(),
+            }]
+            .into(),
             selected_track_id: Some(String::from("owner")),
             reference_tracks: vec![ReferenceTrack {
                 path: source.clone(),
@@ -2292,9 +2454,11 @@ mod tests {
                     time_millis: 1,
                     body: String::from("keep"),
                     done: true,
-                }],
-            }],
-            planner_order: vec![String::from("owner")],
+                }]
+                .into(),
+            }]
+            .into(),
+            planner_order: vec![String::from("owner")].into(),
         };
         persist_library_at(&library, &library_path).expect("original library should persist");
         let original_bytes = fs::read(&library_path).expect("original snapshot should read");
@@ -2414,17 +2578,40 @@ mod tests {
                     time_millis: 1_250,
                     body: String::from("Check the kick tail."),
                     done: false,
-                }],
-            }],
+                }]
+                .into(),
+            }]
+            .into(),
             selected_track_id: Some(String::from("track-1")),
-            reference_tracks: Vec::new(),
-            planner_order: Vec::new(),
+            reference_tracks: Vec::new().into(),
+            planner_order: Vec::new().into(),
         };
         let encoded = serde_json::to_string(&library).expect("library should encode");
         assert!(encoded.contains(r#""stage":"mixdown""#));
         assert!(!encoded.contains(r#""status""#));
         let decoded: Library = serde_json::from_str(&encoded).expect("library should decode");
         assert_eq!(decoded, library);
+    }
+
+    #[test]
+    fn shared_vec_serializes_as_an_array_and_detaches_on_mutation() {
+        let mut values = SharedVec::from(vec![String::from("first")]);
+        let snapshot = values.clone();
+
+        assert!(values.shares_storage_with(&snapshot));
+        assert_eq!(
+            serde_json::to_string(&values).expect("values should encode"),
+            r#"["first"]"#
+        );
+
+        values.push(String::from("second"));
+
+        assert_eq!(snapshot.as_slice(), ["first"]);
+        assert_eq!(values.as_slice(), ["first", "second"]);
+        assert!(!values.shares_storage_with(&snapshot));
+        let round_trip: SharedVec<String> =
+            serde_json::from_str(r#"["first","second"]"#).expect("values should decode");
+        assert_eq!(round_trip, values);
     }
 
     #[test]
@@ -2477,11 +2664,12 @@ mod tests {
                 size: 0,
                 favorite: false,
                 stage: TrackStage::Backlog,
-                notes: Vec::new(),
-            }],
+                notes: SharedVec::default(),
+            }]
+            .into(),
             selected_track_id: Some(String::from("track-1")),
-            reference_tracks: Vec::new(),
-            planner_order: Vec::new(),
+            reference_tracks: Vec::new().into(),
+            planner_order: Vec::new().into(),
         };
 
         normalize_reference_tracks(&mut library);
@@ -2509,11 +2697,12 @@ mod tests {
                 size: 42,
                 favorite: false,
                 stage: TrackStage::Backlog,
-                notes: Vec::new(),
-            }],
+                notes: SharedVec::default(),
+            }]
+            .into(),
             selected_track_id: Some(String::from("track-1")),
-            reference_tracks: Vec::new(),
-            planner_order: Vec::new(),
+            reference_tracks: Vec::new().into(),
+            planner_order: Vec::new().into(),
         };
 
         ensure_reference_track(&mut library, reference_path.clone());
@@ -2538,14 +2727,15 @@ mod tests {
             size: 0,
             favorite: false,
             stage: TrackStage::Backlog,
-            notes: Vec::new(),
+            notes: SharedVec::default(),
         };
         let mut library = Library {
             tracks: vec![
                 track("assigned-1", Some(removed_path.clone())),
                 track("assigned-2", Some(removed_path.clone())),
                 track("retained", Some(retained_path.clone())),
-            ],
+            ]
+            .into(),
             selected_track_id: Some(String::from("assigned-1")),
             reference_tracks: vec![
                 ReferenceTrack {
@@ -2556,15 +2746,17 @@ mod tests {
                         time_millis: 100,
                         body: String::from("Discard with the catalog entry."),
                         done: false,
-                    }],
+                    }]
+                    .into(),
                 },
                 ReferenceTrack {
                     path: retained_path.clone(),
                     source_proof: crate::source::SourceProvenance::Unknown,
-                    notes: Vec::new(),
+                    notes: SharedVec::default(),
                 },
-            ],
-            planner_order: Vec::new(),
+            ]
+            .into(),
+            planner_order: Vec::new().into(),
         };
 
         assert_eq!(
@@ -2599,8 +2791,9 @@ mod tests {
                 size: 0,
                 favorite: false,
                 stage: TrackStage::Backlog,
-                notes: Vec::new(),
-            }],
+                notes: SharedVec::default(),
+            }]
+            .into(),
             selected_track_id: Some(String::from("track-1")),
             reference_tracks: vec![
                 ReferenceTrack {
@@ -2611,7 +2804,8 @@ mod tests {
                         time_millis: 100,
                         body: String::from("First reference only."),
                         done: false,
-                    }],
+                    }]
+                    .into(),
                 },
                 ReferenceTrack {
                     path: second_path.clone(),
@@ -2621,10 +2815,12 @@ mod tests {
                         time_millis: 200,
                         body: String::from("Second reference only."),
                         done: false,
-                    }],
+                    }]
+                    .into(),
                 },
-            ],
-            planner_order: Vec::new(),
+            ]
+            .into(),
+            planner_order: Vec::new().into(),
         };
 
         assert!(
@@ -2658,11 +2854,13 @@ mod tests {
                     time_millis: 1_250,
                     body: String::from("Keep the vocal entrance."),
                     done: false,
-                }],
-            }],
+                }]
+                .into(),
+            }]
+            .into(),
             selected_track_id: Some(String::from("track-1")),
-            reference_tracks: Vec::new(),
-            planner_order: Vec::new(),
+            reference_tracks: Vec::new().into(),
+            planner_order: Vec::new().into(),
         };
 
         set_reference_track_metadata(

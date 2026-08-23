@@ -187,6 +187,9 @@ struct LiveCaptureSession {
     active: AtomicBool,
     analysis_frozen: AtomicBool,
     discontinuity_marked: AtomicBool,
+    analyzer_thread: Mutex<Option<thread::Thread>>,
+    #[cfg(test)]
+    analyzer_iterations: AtomicUsize,
 }
 
 impl LiveCaptureSession {
@@ -198,7 +201,44 @@ impl LiveCaptureSession {
             active: AtomicBool::new(true),
             analysis_frozen: AtomicBool::new(true),
             discontinuity_marked: AtomicBool::new(false),
+            analyzer_thread: Mutex::new(None),
+            #[cfg(test)]
+            analyzer_iterations: AtomicUsize::new(0),
         }
+    }
+
+    fn register_analyzer_thread(&self) {
+        let current = thread::current();
+        if let Ok(mut analyzer_thread) = self.analyzer_thread.lock() {
+            *analyzer_thread = Some(current.clone());
+        }
+        // A lifecycle transition can race with analyzer startup. Re-checking
+        // the published state after registration preserves the wake token
+        // instead of allowing the new thread to sleep past a transition.
+        if !self.active.load(Ordering::Acquire) || !self.analysis_frozen.load(Ordering::Acquire) {
+            current.unpark();
+        }
+    }
+
+    fn wake_analyzer(&self) {
+        let analyzer_thread = self
+            .analyzer_thread
+            .lock()
+            .ok()
+            .and_then(|thread| thread.as_ref().cloned());
+        if let Some(analyzer_thread) = analyzer_thread {
+            analyzer_thread.unpark();
+        }
+    }
+
+    #[cfg(test)]
+    fn analyzer_iteration_started(&self) {
+        self.analyzer_iterations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn analyzer_iteration_count(&self) -> usize {
+        self.analyzer_iterations.load(Ordering::Acquire)
     }
 
     fn current_epoch(&self) -> u64 {
@@ -223,6 +263,7 @@ impl LiveCaptureSession {
         self.analysis_frozen.store(true, Ordering::Release);
         self.active.store(false, Ordering::Release);
         self.discontinuity_marked.store(false, Ordering::Release);
+        self.wake_analyzer();
     }
 }
 
@@ -425,6 +466,7 @@ impl SharedSnapshot {
             return false;
         }
         session.analysis_frozen.store(frozen, Ordering::Release);
+        session.wake_analyzer();
         true
     }
 
@@ -451,6 +493,7 @@ impl SharedSnapshot {
         if let Some(session) = session {
             if session.active.load(Ordering::Acquire) {
                 session.mark_discontinuity(self);
+                session.wake_analyzer();
             }
         } else {
             self.live_epoch.fetch_add(1, Ordering::AcqRel);
@@ -1095,12 +1138,16 @@ fn run_live_analyzer(
     shared: Arc<SharedSnapshot>,
     sample_rate: u32,
 ) {
+    session.register_analyzer_thread();
     let mut analyzer = LiveAnalyzer::new(sample_rate);
     let mut observed_epoch = session.current_epoch();
     let mut published_revision = 0_u64;
     let mut next_publication_deadline = Instant::now();
 
     loop {
+        #[cfg(test)]
+        session.analyzer_iteration_started();
+
         if session.current_epoch() != observed_epoch {
             observed_epoch = session.current_epoch();
             analyzer.reset();
@@ -1118,13 +1165,21 @@ fn run_live_analyzer(
             &mut next_publication_deadline,
         );
 
+        if !session.active.load(Ordering::Acquire) {
+            break;
+        }
+
         if frozen {
             let producer_gone = consumer.is_abandoned() && consumer.is_empty();
-            if producer_gone {
+            let retired = !session.active.load(Ordering::Acquire);
+            if producer_gone || retired {
                 break;
             }
-            if !consumed {
-                thread::sleep(LIVE_ANALYZER_POLL_INTERVAL);
+            if session.analysis_frozen.load(Ordering::Acquire) {
+                // The callback never wakes this thread. A transition stores
+                // its atomic state first and then unparks us, so this park is
+                // indefinite while frozen without creating a periodic wake.
+                thread::park();
             }
             continue;
         }
@@ -1136,7 +1191,7 @@ fn run_live_analyzer(
                 if let Some(remaining) =
                     next_publication_deadline.checked_duration_since(Instant::now())
                 {
-                    thread::sleep(remaining);
+                    thread::park_timeout(remaining);
                 }
                 publish_live_frame_if_due(
                     &analyzer,
@@ -1152,7 +1207,7 @@ fn run_live_analyzer(
         }
 
         if !consumed {
-            thread::sleep(LIVE_ANALYZER_POLL_INTERVAL);
+            thread::park_timeout(LIVE_ANALYZER_POLL_INTERVAL);
         }
     }
     session.retire();
@@ -2353,7 +2408,8 @@ mod tests {
         SharedSnapshot, clamp_position, display_tilt_db, finish_analyzer_fallback, handle_command,
         is_current, live_band_ranges, live_display_frequency_bounds, live_spectrum_point_frequency,
         live_spectrum_point_mappings, load_track, normalize_output_gain, normalize_volume,
-        publish_live_frame_if_due, publish_live_frame_if_due_at, run_live_analyzer_iteration,
+        publish_live_frame_if_due, publish_live_frame_if_due_at, run_live_analyzer,
+        run_live_analyzer_iteration,
     };
     use crate::source::{AudioSourceProof, SourceFileStamp, VerifiedSourceTicket};
     use rodio::{Player, Source, buffer::SamplesBuffer, source::SeekError};
@@ -3837,6 +3893,49 @@ mod tests {
         assert!(!Arc::ptr_eq(&resumed_frame, &displayed_frame));
         assert!(!shared.live_frame_state().pending);
         session.retire();
+    }
+
+    #[test]
+    fn frozen_live_analyzer_parks_until_resume_and_retire_wakes_it() {
+        let shared = Arc::new(SharedSnapshot::new());
+        shared.requested_generation.store(12, Ordering::Release);
+        let session = Arc::new(LiveCaptureSession::new(12, 1, 1));
+        shared.begin_live_session(&session);
+        let (_producer, consumer) = super::RingBuffer::new(8);
+        let (done_sender, done_receiver) = mpsc::channel();
+        let analyzer_session = Arc::clone(&session);
+        let analyzer_shared = Arc::clone(&shared);
+        let handle = std::thread::spawn(move || {
+            run_live_analyzer(consumer, analyzer_session, analyzer_shared, 48_000);
+            done_sender
+                .send(())
+                .expect("analyzer should report retirement");
+        });
+
+        let startup_deadline = Instant::now() + Duration::from_secs(1);
+        while session.analyzer_iteration_count() == 0 {
+            assert!(Instant::now() < startup_deadline, "analyzer did not start");
+            std::thread::yield_now();
+        }
+        let frozen_iterations = session.analyzer_iteration_count();
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(session.analyzer_iteration_count(), frozen_iterations);
+        assert_eq!(session.current_epoch(), 1);
+
+        assert!(shared.set_live_analysis_frozen(&session, false));
+        let resume_deadline = Instant::now() + Duration::from_secs(1);
+        while session.analyzer_iteration_count() == frozen_iterations {
+            assert!(
+                Instant::now() < resume_deadline,
+                "resume did not wake analyzer"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(session.current_epoch(), 1);
+
+        session.retire();
+        assert!(done_receiver.recv_timeout(Duration::from_secs(1)).is_ok());
+        handle.join().expect("analyzer thread should exit cleanly");
     }
 
     fn strongest_band_for_tone(frequency: f32) -> usize {
