@@ -1506,6 +1506,33 @@ impl PendingLoad {
     }
 }
 
+#[derive(Debug, Default)]
+struct TransportWake {
+    thread: Mutex<Option<thread::Thread>>,
+    sequence: AtomicU64,
+}
+
+impl TransportWake {
+    fn register(&self) {
+        if let Ok(mut thread_handle) = self.thread.lock() {
+            *thread_handle = Some(thread::current());
+        }
+    }
+
+    fn notify(&self) {
+        self.sequence.fetch_add(1, Ordering::AcqRel);
+        if let Ok(thread) = self.thread.lock()
+            && let Some(thread) = thread.as_ref()
+        {
+            thread.unpark();
+        }
+    }
+
+    fn sequence(&self) -> u64 {
+        self.sequence.load(Ordering::Acquire)
+    }
+}
+
 impl Drop for PendingLoad {
     fn drop(&mut self) {
         let pointer = self.pointer.swap(std::ptr::null_mut(), Ordering::AcqRel);
@@ -1522,6 +1549,7 @@ pub struct AudioTransport {
     queued_commands: Arc<AtomicUsize>,
     shared: Arc<SharedSnapshot>,
     pending_load: Arc<PendingLoad>,
+    wake: Arc<TransportWake>,
     next_token: Arc<AtomicU64>,
     #[cfg(test)]
     test_next_command_error: Arc<Mutex<Option<String>>>,
@@ -1533,17 +1561,21 @@ impl AudioTransport {
         let queued_commands = Arc::new(AtomicUsize::new(0));
         let shared = Arc::new(SharedSnapshot::new());
         let pending_load = Arc::new(PendingLoad::new());
+        let wake = Arc::new(TransportWake::default());
         let thread_queued_commands = Arc::clone(&queued_commands);
         let thread_shared = Arc::clone(&shared);
         let thread_pending_load = Arc::clone(&pending_load);
+        let thread_wake = Arc::clone(&wake);
         thread::Builder::new()
             .name(String::from("cadence-audio-transport"))
             .spawn(move || {
+                thread_wake.register();
                 run_transport(
                     receiver,
                     thread_queued_commands,
                     thread_shared,
                     thread_pending_load,
+                    thread_wake,
                 )
             })
             .expect("Cadence audio transport thread should spawn");
@@ -1552,6 +1584,7 @@ impl AudioTransport {
             queued_commands,
             shared,
             pending_load,
+            wake,
             next_token: Arc::new(AtomicU64::new(1)),
             #[cfg(test)]
             test_next_command_error: Arc::new(Mutex::new(None)),
@@ -1694,18 +1727,21 @@ impl AudioTransport {
         };
         if !self.try_reserve_command_slot() {
             self.store_pending_load(command)?;
+            self.wake.notify();
             return Ok(token);
         }
         match self.commands.try_send(command) {
             Ok(()) => {
                 self.clear_pending_load(generation);
+                self.wake.notify();
                 Ok(token)
             }
-            // The transport thread will pick up the latest load intent from
-            // the coalescing slot on its next control tick.
+            // Wake the transport so it can pick up the latest load intent from
+            // the coalescing slot without waiting for a control tick.
             Err(TrySendError::Full(command)) => {
                 self.release_command_slot();
                 self.store_pending_load(command)?;
+                self.wake.notify();
                 Ok(token)
             }
             Err(TrySendError::Disconnected(_)) => {
@@ -1777,7 +1813,10 @@ impl AudioTransport {
             return Err(String::from(CONTROLS_BUSY_ERROR));
         }
         match self.commands.try_send(command) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.wake.notify();
+                Ok(())
+            }
             Err(TrySendError::Full(_)) => {
                 self.release_command_slot();
                 Err(String::from(CONTROLS_BUSY_ERROR))
@@ -1836,6 +1875,12 @@ impl AudioTransport {
     }
 }
 
+impl Drop for AudioTransport {
+    fn drop(&mut self) {
+        self.wake.notify();
+    }
+}
+
 #[derive(Clone, Debug)]
 struct LoadedTrack {
     generation: u64,
@@ -1876,6 +1921,7 @@ fn run_transport(
     queued_commands: Arc<AtomicUsize>,
     shared: Arc<SharedSnapshot>,
     pending_load: Arc<PendingLoad>,
+    wake: Arc<TransportWake>,
 ) {
     let output = match DeviceSinkBuilder::open_default_sink() {
         Ok(output) => {
@@ -1897,7 +1943,7 @@ fn run_transport(
     let mut applied_volume = None;
 
     loop {
-        if let Some(command) = take_pending_load(&pending_load) {
+        let pending_load_consumed = if let Some(command) = take_pending_load(&pending_load) {
             handle_command(
                 command,
                 &shared,
@@ -1905,24 +1951,39 @@ fn run_transport(
                 &mut player,
                 &mut loaded,
                 &mut live_session,
+                &mut applied_volume,
             );
-        }
-        match receiver.recv_timeout(CONTROL_INTERVAL) {
-            Ok(command) => {
-                release_command_slot(&queued_commands);
-                handle_command(
-                    command,
-                    &shared,
-                    output.as_ref(),
-                    &mut player,
-                    &mut loaded,
-                    &mut live_session,
-                )
+            true
+        } else {
+            false
+        };
+
+        if !pending_load_consumed {
+            match wait_for_transport_command(
+                &receiver,
+                &pending_load,
+                &wake,
+                transport_is_actively_playing(player.as_ref(), loaded.as_ref()),
+            ) {
+                TransportWaitResult::Command(command) => {
+                    release_command_slot(&queued_commands);
+                    handle_command(
+                        command,
+                        &shared,
+                        output.as_ref(),
+                        &mut player,
+                        &mut loaded,
+                        &mut live_session,
+                        &mut applied_volume,
+                    );
+                }
+                TransportWaitResult::TimedOut => {}
+                TransportWaitResult::Woken => continue,
+                TransportWaitResult::Disconnected => break,
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
 
+        let mut disconnected = false;
         loop {
             match receiver.try_recv() {
                 Ok(command) => {
@@ -1934,14 +1995,19 @@ fn run_transport(
                         &mut player,
                         &mut loaded,
                         &mut live_session,
+                        &mut applied_volume,
                     )
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    retire_live_session(&shared, &mut live_session);
-                    return;
+                    disconnected = true;
+                    break;
                 }
             }
+        }
+
+        if disconnected {
+            break;
         }
 
         reconcile_stale_track(&shared, &mut player, &mut loaded, &mut live_session);
@@ -1953,6 +2019,61 @@ fn run_transport(
     drop(player);
     drop(loaded);
     drop(output);
+}
+
+#[derive(Debug)]
+enum TransportWaitResult {
+    Command(Command),
+    TimedOut,
+    Woken,
+    Disconnected,
+}
+
+fn wait_for_transport_command(
+    receiver: &Receiver<Command>,
+    pending_load: &PendingLoad,
+    wake: &TransportWake,
+    active_playback: bool,
+) -> TransportWaitResult {
+    let observed_wake = wake.sequence();
+    let deadline = active_playback.then(|| Instant::now() + CONTROL_INTERVAL);
+
+    loop {
+        match receiver.try_recv() {
+            Ok(command) => return TransportWaitResult::Command(command),
+            Err(TryRecvError::Disconnected) => return TransportWaitResult::Disconnected,
+            Err(TryRecvError::Empty) => {}
+        }
+        if pending_load.is_pending() || wake.sequence() != observed_wake {
+            return TransportWaitResult::Woken;
+        }
+
+        match deadline {
+            None => {
+                // A quiescent transport has no timed polling deadline. The
+                // command channel and pending-load wake both unpark this
+                // thread, while the repeated checks close the race around
+                // entering the park.
+                thread::park();
+            }
+            Some(deadline) => {
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    return TransportWaitResult::TimedOut;
+                };
+                thread::park_timeout(remaining);
+                if pending_load.is_pending() || wake.sequence() != observed_wake {
+                    return TransportWaitResult::Woken;
+                }
+                if Instant::now() >= deadline {
+                    return TransportWaitResult::TimedOut;
+                }
+            }
+        }
+    }
+}
+
+fn transport_is_actively_playing(player: Option<&Player>, loaded: Option<&LoadedTrack>) -> bool {
+    loaded.is_some() && player.is_some_and(|player| !player.is_paused() && !player.empty())
 }
 
 fn release_command_slot(queued_commands: &AtomicUsize) {
@@ -1994,6 +2115,7 @@ fn handle_command(
     player: &mut Option<Player>,
     loaded: &mut Option<LoadedTrack>,
     live_session: &mut Option<Arc<LiveCaptureSession>>,
+    applied_volume: &mut Option<f32>,
 ) {
     let (token, acknowledged) = match command {
         Command::Load {
@@ -2059,6 +2181,7 @@ fn handle_command(
                         if let Some(session) = live_session.as_deref() {
                             shared.set_live_analysis_frozen(session, false);
                         }
+                        apply_requested_volume(shared, Some(player), applied_volume);
                         player.play();
                         shared.playing.store(true, Ordering::Release);
                     }
@@ -2135,6 +2258,7 @@ fn handle_command(
                                     if let Some(session) = live_session.as_deref() {
                                         shared.set_live_analysis_frozen(session, false);
                                     }
+                                    apply_requested_volume(shared, Some(player), applied_volume);
                                     player.play();
                                 } else {
                                     if let Some(session) = live_session.as_deref() {
@@ -2405,11 +2529,13 @@ mod tests {
         LIVE_SPECTRUM_DISPLAY_TILT_REFERENCE_FREQUENCY, LIVE_SPECTRUM_FFT_SIZE,
         LIVE_SPECTRUM_HOP_SIZE, LIVE_SPECTRUM_POINT_COUNT, LiveAnalysisSource, LiveAnalyzer,
         LiveCaptureSession, LiveSpectrogramFrame, LoadedTrack, MAX_OUTPUT_GAIN, PendingLoad,
-        SharedSnapshot, clamp_position, display_tilt_db, finish_analyzer_fallback, handle_command,
-        is_current, live_band_ranges, live_display_frequency_bounds, live_spectrum_point_frequency,
-        live_spectrum_point_mappings, load_track, normalize_output_gain, normalize_volume,
-        publish_live_frame_if_due, publish_live_frame_if_due_at, run_live_analyzer,
-        run_live_analyzer_iteration,
+        SharedSnapshot, TransportWaitResult, TransportWake, clamp_position, display_tilt_db,
+        finish_analyzer_fallback, handle_command, is_current, live_band_ranges,
+        live_display_frequency_bounds, live_spectrum_point_frequency, live_spectrum_point_mappings,
+        load_track, normalize_output_gain, normalize_volume, publish_live_frame_if_due,
+        publish_live_frame_if_due_at, publish_snapshot, run_live_analyzer,
+        run_live_analyzer_iteration, take_pending_load, transport_is_actively_playing,
+        wait_for_transport_command,
     };
     use crate::source::{AudioSourceProof, SourceFileStamp, VerifiedSourceTicket};
     use rodio::{Player, Source, buffer::SamplesBuffer, source::SeekError};
@@ -2505,6 +2631,7 @@ mod tests {
             queued_commands: Arc::new(AtomicUsize::new(super::COMMAND_CAPACITY)),
             shared: Arc::new(SharedSnapshot::new()),
             pending_load: Arc::new(PendingLoad::new()),
+            wake: Arc::new(super::TransportWake::default()),
             next_token: Arc::new(AtomicU64::new(1)),
             test_next_command_error: Arc::new(Mutex::new(None)),
         };
@@ -2518,6 +2645,208 @@ mod tests {
             Err(String::from(CONTROLS_BUSY_ERROR))
         );
         assert_eq!(transport.play(0), Err(String::from(CONTROLS_BUSY_ERROR)));
+    }
+
+    #[test]
+    fn quiescent_transport_parks_until_an_accepted_command_wakes_it() {
+        let (commands, receiver) = mpsc::sync_channel(1);
+        let pending_load = PendingLoad::new();
+        let wake = Arc::new(TransportWake::default());
+        let worker_wake = Arc::clone(&wake);
+        let (ready_sender, ready_receiver) = mpsc::channel();
+        let (result_sender, result_receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            worker_wake.register();
+            ready_sender
+                .send(())
+                .expect("transport wait test should start");
+            let result = wait_for_transport_command(&receiver, &pending_load, &worker_wake, false);
+            result_sender
+                .send(result)
+                .expect("transport wait test should report");
+        });
+
+        ready_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("transport wait test should register its worker");
+        assert!(
+            result_receiver
+                .recv_timeout(Duration::from_millis(20))
+                .is_err(),
+            "an unloaded or paused transport must not wake on the control interval"
+        );
+
+        commands
+            .send(Command::Unload {
+                token: 1,
+                generation: 0,
+            })
+            .expect("the test command should be accepted");
+        wake.notify();
+        assert!(matches!(
+            result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("the accepted command should wake the transport"),
+            TransportWaitResult::Command(Command::Unload {
+                token: 1,
+                generation: 0
+            })
+        ));
+        worker.join().expect("transport wait worker should exit");
+    }
+
+    #[test]
+    fn pending_load_wakes_quiescent_transport_and_is_admitted_before_drain() {
+        let (commands, receiver) = mpsc::sync_channel(1);
+        let pending_load = PendingLoad::new();
+        let wake = TransportWake::default();
+        pending_load.replace(Command::Load {
+            token: 7,
+            generation: 3,
+            ticket: test_ticket("pending-admission.wav"),
+            duration_millis: 1_000,
+        });
+        wake.notify();
+
+        assert!(matches!(
+            wait_for_transport_command(&receiver, &pending_load, &wake, false),
+            TransportWaitResult::Woken
+        ));
+        assert_eq!(
+            take_pending_load(&pending_load).and_then(|command| command.load_generation()),
+            Some(3)
+        );
+
+        commands
+            .send(Command::Unload {
+                token: 8,
+                generation: 3,
+            })
+            .expect("the queued command should remain available for the immediate drain");
+        assert!(matches!(
+            wait_for_transport_command(&receiver, &pending_load, &wake, false),
+            TransportWaitResult::Command(Command::Unload {
+                token: 8,
+                generation: 3
+            })
+        ));
+    }
+
+    #[test]
+    fn active_transport_uses_timeout_polling_and_publishes_playback_end() {
+        let (player, _queue) = Player::new();
+        player.append(SamplesBuffer::new(
+            std::num::NonZeroU16::new(1).expect("one channel is non-zero"),
+            std::num::NonZeroU32::new(48_000).expect("sample rate is non-zero"),
+            vec![0.0; 48_000],
+        ));
+        player.play();
+        let loaded = LoadedTrack {
+            generation: 3,
+            ticket: test_ticket("active.wav"),
+            duration_millis: 1_000,
+        };
+        assert!(transport_is_actively_playing(Some(&player), Some(&loaded)));
+
+        let (_sender, receiver) = mpsc::sync_channel(1);
+        let wake = TransportWake::default();
+        assert!(matches!(
+            wait_for_transport_command(&receiver, &PendingLoad::new(), &wake, true),
+            TransportWaitResult::TimedOut
+        ));
+
+        let shared = SharedSnapshot::new();
+        shared.playing.store(true, Ordering::Release);
+        let (ended_player, _ended_queue) = Player::new();
+        publish_snapshot(&shared, Some(&ended_player), Some(&loaded));
+        assert_eq!(shared.snapshot().position_millis, 1_000);
+        assert!(!shared.snapshot().playing);
+        assert!(!transport_is_actively_playing(
+            Some(&ended_player),
+            Some(&loaded)
+        ));
+    }
+
+    #[test]
+    fn requested_gain_is_applied_before_play_resume() {
+        let generation = 4;
+        let shared = Arc::new(SharedSnapshot::new());
+        shared
+            .requested_generation
+            .store(generation, Ordering::Release);
+        shared
+            .requested_volume
+            .store(2.75_f32.to_bits(), Ordering::Release);
+        let (player_handle, _queue) = Player::new();
+        player_handle.append(SamplesBuffer::new(
+            std::num::NonZeroU16::new(1).expect("one channel is non-zero"),
+            std::num::NonZeroU32::new(48_000).expect("sample rate is non-zero"),
+            vec![0.0; 48_000],
+        ));
+        player_handle.pause();
+        let mut player = Some(player_handle);
+        let mut loaded = Some(LoadedTrack {
+            generation,
+            ticket: test_ticket("gain-before-resume.wav"),
+            duration_millis: 1_000,
+        });
+        let mut live_session = None;
+        let mut applied_volume = None;
+
+        handle_command(
+            Command::Play {
+                token: 9,
+                generation,
+            },
+            &shared,
+            None,
+            &mut player,
+            &mut loaded,
+            &mut live_session,
+            &mut applied_volume,
+        );
+
+        let player = player
+            .as_ref()
+            .expect("the resumed player should remain loaded");
+        assert_eq!(player.volume(), 2.75);
+        assert!(!player.is_paused());
+        assert_eq!(shared.snapshot().acknowledged_token, 9);
+    }
+
+    #[test]
+    fn disconnected_transport_worker_exits_after_wakeup() {
+        let (commands, receiver) = mpsc::sync_channel(super::COMMAND_CAPACITY);
+        let pending_load = PendingLoad::new();
+        let wake = Arc::new(TransportWake::default());
+        let worker_wake = Arc::clone(&wake);
+        let (ready_sender, ready_receiver) = mpsc::channel();
+        let (done_sender, done_receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            worker_wake.register();
+            ready_sender
+                .send(())
+                .expect("disconnect wait test should start");
+            let result = wait_for_transport_command(&receiver, &pending_load, &worker_wake, false);
+            done_sender
+                .send(result)
+                .expect("disconnect wait test should report");
+        });
+
+        ready_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("disconnect wait test should register its worker");
+        drop(commands);
+        wake.notify();
+        assert!(matches!(
+            done_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("disconnect should wake and stop the wait"),
+            TransportWaitResult::Disconnected
+        ));
+        worker
+            .join()
+            .expect("transport wait worker should cleanly exit");
     }
 
     #[test]
@@ -2627,6 +2956,7 @@ mod tests {
             duration_millis: 1_000,
         });
         let mut live_session = Some(Arc::clone(&session));
+        let mut applied_volume = None;
 
         handle_command(
             Command::Play { token, generation },
@@ -2635,6 +2965,7 @@ mod tests {
             &mut player,
             &mut loaded,
             &mut live_session,
+            &mut applied_volume,
         );
 
         let error = shared
@@ -2669,6 +3000,7 @@ mod tests {
             duration_millis: 1_000,
         });
         let mut live_session = Some(Arc::clone(&session));
+        let mut applied_volume = None;
 
         handle_command(
             Command::Seek {
@@ -2682,6 +3014,7 @@ mod tests {
             &mut player,
             &mut loaded,
             &mut live_session,
+            &mut applied_volume,
         );
 
         let error = shared
@@ -3794,6 +4127,7 @@ mod tests {
         let mut player = None;
         let mut loaded = None;
         let mut live_session = Some(Arc::clone(&session));
+        let mut applied_volume = None;
         handle_command(
             Command::Pause {
                 token: 1,
@@ -3804,6 +4138,7 @@ mod tests {
             &mut player,
             &mut loaded,
             &mut live_session,
+            &mut applied_volume,
         );
         assert_eq!(shared.snapshot().acknowledged_token, 1);
         assert!(session.analysis_frozen.load(Ordering::Acquire));

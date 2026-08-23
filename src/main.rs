@@ -4309,7 +4309,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     "Selected comment at {}.",
                     format_timestamp(note.time_millis)
                 );
-                context.request_repaint();
+                context.repaint(ui::RepaintScope::Projection);
             }
         }
         Message::PlayComment { address } => {
@@ -4336,13 +4336,13 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 && state.hovered_note_id.as_ref() != Some(&address)
             {
                 state.hovered_note_id = Some(address);
-                context.request_repaint();
+                context.repaint(ui::RepaintScope::Projection);
             }
         }
         Message::CommentHoverEnded(address) => {
             if state.hovered_note_id.as_ref() == Some(&address) {
                 state.hovered_note_id = None;
-                context.request_repaint();
+                context.repaint(ui::RepaintScope::Projection);
             }
         }
         Message::ReferenceCommentHoverStarted(address) => {
@@ -4356,13 +4356,13 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 && state.hovered_reference_note_id.as_ref() != Some(&address)
             {
                 state.hovered_reference_note_id = Some(address);
-                context.request_repaint();
+                context.repaint(ui::RepaintScope::Projection);
             }
         }
         Message::ReferenceCommentHoverEnded(address) => {
             if state.hovered_reference_note_id.as_ref() == Some(&address) {
                 state.hovered_reference_note_id = None;
-                context.request_repaint();
+                context.repaint(ui::RepaintScope::Projection);
             }
         }
         Message::FocusCommentEditor(editor_id) => {
@@ -4518,7 +4518,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     "Selected reference comment at {}.",
                     format_timestamp(note.time_millis)
                 );
-                context.request_repaint();
+                context.repaint(ui::RepaintScope::Projection);
             }
         }
         Message::EditReferenceNote(address) => {
@@ -19943,13 +19943,130 @@ mod tests {
             ),
             Some(0.5)
         );
+        assert_eq!(
+            context.into_command().repaint_scope(),
+            Some(RepaintScope::Projection)
+        );
 
+        let mut context = ui::UiUpdateContext::default();
         update(
             &mut state,
             Message::CommentHoverEnded(NoteAddress::main("hover-track", "hover-note")),
             &mut context,
         );
         assert_eq!(state.hovered_note_id, None);
+        assert_eq!(
+            context.into_command().repaint_scope(),
+            Some(RepaintScope::Projection)
+        );
+    }
+
+    #[test]
+    fn comment_reducer_uses_projection_repaints_for_main_and_reference_selection_and_hover() {
+        let mut state = shared_reference_playback_state();
+        let track_id = state.library.tracks[0].id.clone();
+        let reference_path = state.library.tracks[0]
+            .reference_path
+            .clone()
+            .expect("the test track should have a reference path");
+        state.library.tracks[0].notes = vec![Note {
+            id: String::from("projection-main-note"),
+            time_millis: 500,
+            body: String::from("main projection"),
+            done: false,
+        }]
+        .into();
+        state.library.reference_tracks.push(ReferenceTrack {
+            path: reference_path.clone(),
+            source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
+            notes: vec![Note {
+                id: String::from("projection-reference-note"),
+                time_millis: 750,
+                body: String::from("reference projection"),
+                done: false,
+            }]
+            .into(),
+        });
+        let main_address = NoteAddress::main(track_id, "projection-main-note");
+        let reference_address = NoteAddress::reference(reference_path, "projection-reference-note");
+
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::CommentHoverStarted(main_address.clone()),
+            &mut context,
+        );
+        assert_eq!(
+            context.into_command().repaint_scope(),
+            Some(RepaintScope::Projection)
+        );
+
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::CommentHoverStarted(main_address.clone()),
+            &mut context,
+        );
+        assert_eq!(context.into_command().repaint_scope(), None);
+
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::CommentHoverEnded(main_address.clone()),
+            &mut context,
+        );
+        assert_eq!(
+            context.into_command().repaint_scope(),
+            Some(RepaintScope::Projection)
+        );
+
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::ReferenceCommentHoverStarted(reference_address.clone()),
+            &mut context,
+        );
+        assert_eq!(
+            context.into_command().repaint_scope(),
+            Some(RepaintScope::Projection)
+        );
+
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::ReferenceCommentHoverStarted(reference_address.clone()),
+            &mut context,
+        );
+        assert_eq!(context.into_command().repaint_scope(), None);
+
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::ReferenceCommentHoverEnded(reference_address.clone()),
+            &mut context,
+        );
+        assert_eq!(
+            context.into_command().repaint_scope(),
+            Some(RepaintScope::Projection)
+        );
+
+        let mut context = ui::UiUpdateContext::default();
+        update(&mut state, Message::SelectNote(main_address), &mut context);
+        assert_eq!(
+            context.into_command().repaint_scope(),
+            Some(RepaintScope::Projection)
+        );
+
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::SelectReferenceNote(reference_address),
+            &mut context,
+        );
+        assert_eq!(
+            context.into_command().repaint_scope(),
+            Some(RepaintScope::Projection)
+        );
     }
 
     #[test]
@@ -20548,6 +20665,10 @@ mod tests {
             ),
             Some(0.5)
         );
+        assert_eq!(
+            context.into_command().repaint_scope(),
+            Some(RepaintScope::Projection)
+        );
     }
 
     #[test]
@@ -20603,6 +20724,13 @@ mod tests {
             ResumeTransportCommand::Seek
         );
 
+        let selection_command = context.into_command();
+        assert_eq!(
+            selection_command.repaint_scope(),
+            Some(RepaintScope::Projection)
+        );
+
+        let mut context = ui::UiUpdateContext::default();
         update(&mut state, Message::TogglePlayback, &mut context);
 
         assert_eq!(state.transport_position_millis, 750);
@@ -20651,6 +20779,13 @@ mod tests {
             ResumeTransportCommand::Seek
         );
 
+        let selection_command = context.into_command();
+        assert_eq!(
+            selection_command.repaint_scope(),
+            Some(RepaintScope::Projection)
+        );
+
+        let mut context = ui::UiUpdateContext::default();
         update(&mut state, Message::TogglePlayback, &mut context);
 
         assert_eq!(state.reference_transport_position_millis, 2_500);
@@ -23316,8 +23451,10 @@ mod tests {
             &mut main_context,
         );
         assert!(expected_state.main_comments_window.contains(target_index));
+        let main_command = main_context.into_command();
+        assert_eq!(main_command.repaint_scope(), Some(RepaintScope::Projection));
         assert_eq!(
-            scroll_into_view_request(&main_context.into_command()),
+            scroll_into_view_request(&main_command),
             Some((
                 super::MAIN_COMMENTS_SCROLL_VIEWPORT_ID,
                 target_index as f32 * super::COMMENT_ROW_HEIGHT,
@@ -23349,8 +23486,13 @@ mod tests {
                 .reference_comments_window
                 .contains(target_index)
         );
+        let reference_command = reference_context.into_command();
         assert_eq!(
-            scroll_into_view_request(&reference_context.into_command()),
+            reference_command.repaint_scope(),
+            Some(RepaintScope::Projection)
+        );
+        assert_eq!(
+            scroll_into_view_request(&reference_command),
             Some((
                 super::REFERENCE_COMMENTS_SCROLL_VIEWPORT_ID,
                 target_index as f32 * super::COMMENT_ROW_HEIGHT,
