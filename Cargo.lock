@@ -2532,7 +2532,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 [[package]]
 name = "radiant"
 version = "0.1.0"
-source = "git+https://github.com/PORTALSURFER/radiant?rev=eee07844c4f102fbd13c059b87aacd8ac61aa678#eee07844c4f102fbd13c059b87aacd8ac61aa678"
+source = "git+https://github.com/PORTALSURFER/radiant?rev=9014ad6428387994fb870327f7538f39c29171da#9014ad6428387994fb870327f7538f39c29171da"
 dependencies = [
  "arboard",
  "block2 0.5.1",
@@ -3638,8 +3638,7 @@ dependencies = [
 [[package]]
 name = "vello"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "261359dbef879f8110ef7e1c442246c838d33d3d91cb05e0ea9288d432760c9f"
+source = "git+https://github.com/PORTALSURFER/vello.git?rev=a08d1c11641908414e5e273d18e50f0f367095a1#a08d1c11641908414e5e273d18e50f0f367095a1"
 dependencies = [
  "bytemuck",
  "futures-intrusive",
@@ -3657,8 +3656,7 @@ dependencies = [
 [[package]]
 name = "vello_encoding"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2346f5f0d7dccb3582fcd397b4a57b43165209f1424e0d76e85dd814db164af7"
+source = "git+https://github.com/PORTALSURFER/vello.git?rev=a08d1c11641908414e5e273d18e50f0f367095a1#a08d1c11641908414e5e273d18e50f0f367095a1"
 dependencies = [
  "bytemuck",
  "guillotiere",
@@ -3670,8 +3668,7 @@ dependencies = [
 [[package]]
 name = "vello_shaders"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9dd38937516fa4b47423d9255bb5e4a65e839ec9d57c38c4af6189ce56bf46b7"
+source = "git+https://github.com/PORTALSURFER/vello.git?rev=a08d1c11641908414e5e273d18e50f0f367095a1#a08d1c11641908414e5e273d18e50f0f367095a1"
 dependencies = [
  "bytemuck",
  "log",
