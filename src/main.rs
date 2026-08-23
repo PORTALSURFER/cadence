@@ -14366,7 +14366,7 @@ mod tests {
     }
 
     #[test]
-    fn reference_assignment_cache_reuses_generation_and_invalidates_after_assignment_change() {
+    fn reference_settings_projection_reuses_generation_and_invalidates_after_assignment_change() {
         let first_path = PathBuf::from("/external/first-reference.wav");
         let second_path = PathBuf::from("/external/second-reference.wav");
         let mut first = audition_track("first");
@@ -14375,33 +14375,66 @@ mod tests {
         second.reference_path = Some(first_path.clone());
         let mut third = audition_track("third");
         third.reference_path = Some(second_path.clone());
-        let mut unassigned = audition_track("unassigned");
-        unassigned.reference_path = None;
 
-        let mut shared = SharedLibrary::from(Library {
-            tracks: vec![first, second, third, unassigned].into(),
-            ..Library::default()
-        });
-        let mut cache = LibraryProjectionCache::default();
+        let mut state = AppState {
+            busy: false,
+            settings_open: true,
+            ..AppState::default()
+        };
+        state.library.tracks = vec![first, second, third].into();
+        state.library.reference_tracks = vec![
+            ReferenceTrack {
+                path: first_path.clone(),
+                source_proof: crate::source::SourceProvenance::Unknown,
+                notes: crate::storage::SharedVec::default(),
+            },
+            ReferenceTrack {
+                path: second_path.clone(),
+                source_proof: crate::source::SourceProvenance::Unknown,
+                notes: crate::storage::SharedVec::default(),
+            },
+        ]
+        .into();
 
-        cache.ensure(shared.generation(), &shared);
-        assert_eq!(cache.rebuild_count, 1);
-        assert_eq!(cache.reference_assignment_count(&first_path), Some(&2));
-        assert_eq!(cache.reference_assignment_count(&second_path), Some(&1));
+        let initial_frame = reference_settings_window_view(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(680.0, 520.0));
+        let initial_labels = initial_frame.paint_plan.text_label_strings();
+        let first_title_index = initial_labels
+            .iter()
+            .position(|label| label == "first-reference.wav")
+            .expect("the first reference row should be painted");
+        let second_title_index = initial_labels
+            .iter()
+            .position(|label| label == "second-reference.wav")
+            .expect("the second reference row should be painted");
+        assert_eq!(initial_labels[first_title_index + 1], "2 assigned");
+        assert_eq!(initial_labels[second_title_index + 1], "1 assigned");
+
+        let initial_rebuild_count = state.library_projection_cache.borrow().rebuild_count;
+        assert_eq!(initial_rebuild_count, 1);
+
+        let auxiliary_windows = reference_settings_auxiliary_windows(&mut state);
+        assert_eq!(auxiliary_windows.len(), 1);
+        let reused_frame = reference_settings_window_view(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(680.0, 520.0));
+        let reused_labels = reused_frame.paint_plan.text_label_strings();
+        assert_eq!(reused_labels[first_title_index + 1], "2 assigned");
+        assert_eq!(reused_labels[second_title_index + 1], "1 assigned");
         assert_eq!(
-            cache.reference_assignment_count(Path::new("/external/missing.wav")),
-            None
+            state.library_projection_cache.borrow().rebuild_count,
+            initial_rebuild_count
         );
 
-        cache.ensure(shared.generation(), &shared);
-        assert_eq!(cache.rebuild_count, 1);
-
-        shared.tracks[1].reference_path = Some(second_path.clone());
-        cache.ensure(shared.generation(), &shared);
-        assert_eq!(cache.rebuild_count, 2);
-
-        assert_eq!(cache.reference_assignment_count(&first_path), Some(&1));
-        assert_eq!(cache.reference_assignment_count(&second_path), Some(&2));
+        state.library.make_mut().tracks[1].reference_path = Some(second_path);
+        let updated_frame = reference_settings_window_view(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(680.0, 520.0));
+        let updated_labels = updated_frame.paint_plan.text_label_strings();
+        assert_eq!(updated_labels[first_title_index + 1], "1 assigned");
+        assert_eq!(updated_labels[second_title_index + 1], "2 assigned");
+        assert_eq!(
+            state.library_projection_cache.borrow().rebuild_count,
+            initial_rebuild_count + 1
+        );
     }
 
     #[test]
@@ -23136,48 +23169,85 @@ mod tests {
             row_height: super::COMMENT_ROW_HEIGHT,
             window: reported,
         };
-        let mut context = ui::UiUpdateContext::default();
 
         state.selected_note_id = Some(NoteAddress::main(track_id.clone(), "ordinary-main-note-0"));
-        update(
-            &mut state,
-            Message::CommentsWindowChanged {
-                source: super::CommentSource::Main,
-                change,
-            },
-            &mut context,
-        );
-        assert_eq!(state.main_comments_window, reported);
-        assert_eq!(
-            super::resolved_virtual_list_window(state.main_comments_window, 64, Some(0), false),
-            reported
-        );
-        assert_eq!(state.main_comments_window, reported);
-
-        state.comment_source = super::CommentSource::Reference;
         state.selected_reference_note_id = Some(NoteAddress::reference(
-            reference_path,
+            reference_path.clone(),
             "ordinary-reference-note-0",
         ));
-        update(
-            &mut state,
-            Message::CommentsWindowChanged {
-                source: super::CommentSource::Reference,
-                change,
+
+        let bridge = DeclarativeOwnedRuntimeBridge::new(
+            state,
+            |state| project_surface(state).into_surface(),
+            |state, message| {
+                let mut context = ui::UiUpdateContext::default();
+                update(state, message, &mut context);
             },
-            &mut context,
         );
-        assert_eq!(state.reference_comments_window, reported);
+        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1_180.0, 3_000.0));
+        let _initial_frame = runtime.frame_with_default_theme();
+
+        runtime.dispatch_message(Message::SelectCommentSource(super::CommentSource::Main));
+        runtime.dispatch_message(Message::CommentsWindowChanged {
+            source: super::CommentSource::Main,
+            change,
+        });
+        let main_frame = runtime.frame_with_default_theme();
         assert_eq!(
             super::resolved_virtual_list_window(
-                state.reference_comments_window,
+                runtime.bridge().state().main_comments_window,
                 64,
                 Some(0),
                 false,
             ),
             reported
         );
-        assert_eq!(state.reference_comments_window, reported);
+        assert_eq!(runtime.bridge().state().main_comments_window, reported);
+        assert!(
+            main_frame
+                .paint_plan
+                .text_runs()
+                .any(|run| run.text.as_str() == "ordinary-main-comment-40"),
+            "main comments paint labels: {:?}",
+            main_frame.paint_plan.text_label_strings()
+        );
+        assert!(
+            !main_frame
+                .paint_plan
+                .text_runs()
+                .any(|run| run.text.as_str() == "ordinary-main-comment-0")
+        );
+
+        runtime.dispatch_message(Message::SelectCommentSource(
+            super::CommentSource::Reference,
+        ));
+        runtime.dispatch_message(Message::CommentsWindowChanged {
+            source: super::CommentSource::Reference,
+            change,
+        });
+        let reference_frame = runtime.frame_with_default_theme();
+        assert_eq!(runtime.bridge().state().reference_comments_window, reported);
+        assert!(
+            reference_frame
+                .paint_plan
+                .text_runs()
+                .any(|run| run.text.as_str() == "ordinary-reference-comment-40")
+        );
+        assert!(
+            !reference_frame
+                .paint_plan
+                .text_runs()
+                .any(|run| run.text.as_str() == "ordinary-reference-comment-0")
+        );
+        assert_eq!(
+            super::resolved_virtual_list_window(
+                runtime.bridge().state().reference_comments_window,
+                64,
+                Some(0),
+                false,
+            ),
+            reported
+        );
     }
 
     #[test]
@@ -23222,13 +23292,30 @@ mod tests {
             track_id.clone(),
             format!("explicit-main-note-{target_index}"),
         );
+        let reference_address = NoteAddress::reference(
+            reference_path,
+            format!("explicit-reference-note-{target_index}"),
+        );
+
+        let bridge = DeclarativeOwnedRuntimeBridge::new(
+            state,
+            |state| project_surface(state).into_surface(),
+            |state, message| {
+                let mut context = ui::UiUpdateContext::default();
+                update(state, message, &mut context);
+            },
+        );
+        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1_180.0, 3_000.0));
+        let _initial_frame = runtime.frame_with_default_theme();
+
+        let mut expected_state = runtime.bridge().state().clone();
         let mut main_context = ui::UiUpdateContext::default();
         update(
-            &mut state,
-            Message::SelectNote(main_address),
+            &mut expected_state,
+            Message::SelectNote(main_address.clone()),
             &mut main_context,
         );
-        assert!(state.main_comments_window.contains(target_index));
+        assert!(expected_state.main_comments_window.contains(target_index));
         assert_eq!(
             scroll_into_view_request(&main_context.into_command()),
             Some((
@@ -23239,18 +23326,29 @@ mod tests {
                 super::LIBRARY_REVEAL_MARGIN,
             ))
         );
-
-        let reference_address = NoteAddress::reference(
-            reference_path,
-            format!("explicit-reference-note-{target_index}"),
+        runtime.dispatch_message(Message::SelectNote(main_address));
+        let main_frame = runtime.frame_with_default_theme();
+        assert!(
+            main_frame
+                .paint_plan
+                .text_runs()
+                .any(|run| run.text.as_str() == "explicit-main-comment-40"),
+            "main comments paint labels: {:?}",
+            main_frame.paint_plan.text_label_strings()
         );
+
+        let mut expected_state = runtime.bridge().state().clone();
         let mut reference_context = ui::UiUpdateContext::default();
         update(
-            &mut state,
-            Message::SelectReferenceNote(reference_address),
+            &mut expected_state,
+            Message::SelectReferenceNote(reference_address.clone()),
             &mut reference_context,
         );
-        assert!(state.reference_comments_window.contains(target_index));
+        assert!(
+            expected_state
+                .reference_comments_window
+                .contains(target_index)
+        );
         assert_eq!(
             scroll_into_view_request(&reference_context.into_command()),
             Some((
@@ -23260,6 +23358,14 @@ mod tests {
                 super::LIBRARY_REVEAL_MARGIN,
                 super::LIBRARY_REVEAL_MARGIN,
             ))
+        );
+        runtime.dispatch_message(Message::SelectReferenceNote(reference_address));
+        let reference_frame = runtime.frame_with_default_theme();
+        assert!(
+            reference_frame
+                .paint_plan
+                .text_runs()
+                .any(|run| run.text.as_str() == "explicit-reference-comment-40")
         );
     }
 
