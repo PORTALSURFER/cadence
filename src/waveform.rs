@@ -202,15 +202,16 @@ struct PreparedNoteMarker {
     first_original_index: usize,
 }
 
-#[derive(Clone, Debug, Default)]
-struct NoteMarkerIndex {
+#[derive(Clone, Debug)]
+pub struct PreparedNoteMarkers {
     revision: u64,
-    sorted: Vec<PreparedNote>,
-    coalesced: Vec<PreparedNoteMarker>,
+    note_ratios: Arc<[(f32, bool)]>,
+    sorted: Arc<[PreparedNote]>,
+    coalesced: Arc<[PreparedNoteMarker]>,
 }
 
-impl NoteMarkerIndex {
-    fn from_note_ratios(note_ratios: &[(f32, bool)]) -> Self {
+impl PreparedNoteMarkers {
+    pub(crate) fn from_note_ratios(note_ratios: &[(f32, bool)]) -> Self {
         let revision = note_ratios_revision(note_ratios);
         let mut sorted = note_ratios
             .iter()
@@ -256,8 +257,9 @@ impl NoteMarkerIndex {
 
         Self {
             revision,
-            sorted,
-            coalesced,
+            note_ratios: Arc::from(note_ratios.to_vec().into_boxed_slice()),
+            sorted: Arc::from(sorted.into_boxed_slice()),
+            coalesced: Arc::from(coalesced.into_boxed_slice()),
         }
     }
 }
@@ -363,13 +365,48 @@ pub fn view_with_source_progress_and_loop<Message: 'static>(
     visible_ratio: Option<f32>,
     map: impl Fn(WaveformInteraction) -> Message + 'static,
 ) -> ui::View<Message> {
+    view_with_prepared_source_progress_and_loop(
+        source,
+        generation,
+        waveform,
+        cursor_ratio,
+        draft_ratio,
+        Arc::new(PreparedNoteMarkers::from_note_ratios(&note_ratios)),
+        hovered_note_ratio,
+        selected_note_ratio,
+        loop_selection,
+        visible_ratio,
+        map,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn view_with_prepared_source_progress_and_loop<Message: 'static>(
+    source: WaveformSource,
+    generation: u64,
+    waveform: Arc<WaveformData>,
+    cursor_ratio: Option<f32>,
+    draft_ratio: Option<f32>,
+    prepared_markers: Arc<PreparedNoteMarkers>,
+    hovered_note_ratio: Option<f32>,
+    selected_note_ratio: Option<f32>,
+    loop_selection: Option<(f32, f32)>,
+    visible_ratio: Option<f32>,
+    map: impl Fn(WaveformInteraction) -> Message + 'static,
+) -> ui::View<Message> {
     let view = ui::custom_widget_mapped(
-        WaveformWidget::new_for_source(source, generation, waveform, cursor_ratio, note_ratios)
-            .with_draft_ratio(draft_ratio)
-            .with_external_hovered_note_ratio(hovered_note_ratio)
-            .with_external_selected_note_ratio(selected_note_ratio)
-            .with_loop_selection(loop_selection)
-            .with_visible_ratio(visible_ratio),
+        WaveformWidget::new_for_source_with_prepared(
+            source,
+            generation,
+            waveform,
+            cursor_ratio,
+            prepared_markers,
+        )
+        .with_draft_ratio(draft_ratio)
+        .with_external_hovered_note_ratio(hovered_note_ratio)
+        .with_external_selected_note_ratio(selected_note_ratio)
+        .with_loop_selection(loop_selection)
+        .with_visible_ratio(visible_ratio),
         map,
     );
     match source {
@@ -452,8 +489,7 @@ struct WaveformWidget {
     display_bar_levels_miss_count: Cell<usize>,
     cursor_ratio: Option<f32>,
     loop_selection: Option<(f32, f32)>,
-    note_ratios: Vec<(f32, bool)>,
-    note_marker_index: NoteMarkerIndex,
+    prepared_markers: Arc<PreparedNoteMarkers>,
     draft_ratio: Option<f32>,
     external_hovered_note_ratio: Option<f32>,
     external_selected_note_ratio: Option<f32>,
@@ -482,6 +518,7 @@ impl WaveformWidget {
         Self::new_for_source(WaveformSource::Main, 0, waveform, cursor_ratio, note_ratios)
     }
 
+    #[cfg(test)]
     fn new_for_source(
         source: WaveformSource,
         generation: u64,
@@ -489,12 +526,27 @@ impl WaveformWidget {
         cursor_ratio: Option<f32>,
         note_ratios: Vec<(f32, bool)>,
     ) -> Self {
+        Self::new_for_source_with_prepared(
+            source,
+            generation,
+            waveform,
+            cursor_ratio,
+            Arc::new(PreparedNoteMarkers::from_note_ratios(&note_ratios)),
+        )
+    }
+
+    fn new_for_source_with_prepared(
+        source: WaveformSource,
+        generation: u64,
+        waveform: Arc<WaveformData>,
+        cursor_ratio: Option<f32>,
+        prepared_markers: Arc<PreparedNoteMarkers>,
+    ) -> Self {
         let mut common = WidgetCommon::fixed(0, 640.0, 240.0);
         common.focus = FocusBehavior::Pointer;
         common.paint.bounds = PaintBounds::ClipToRect;
         common.paint.paints_focus = false;
         common.paint.paints_state_layers = false;
-        let note_marker_index = NoteMarkerIndex::from_note_ratios(&note_ratios);
         Self {
             common,
             timeline: TimelineSurface::new(),
@@ -506,8 +558,7 @@ impl WaveformWidget {
             display_bar_levels_miss_count: Cell::new(0),
             cursor_ratio: cursor_ratio.map(clamp_ratio),
             loop_selection: None,
-            note_ratios,
-            note_marker_index,
+            prepared_markers,
             draft_ratio: None,
             external_hovered_note_ratio: None,
             external_selected_note_ratio: None,
@@ -554,8 +605,7 @@ impl WaveformWidget {
 
     #[cfg(test)]
     fn with_note_ratios(mut self, note_ratios: Vec<(f32, bool)>) -> Self {
-        self.note_marker_index = NoteMarkerIndex::from_note_ratios(&note_ratios);
-        self.note_ratios = note_ratios;
+        self.prepared_markers = Arc::new(PreparedNoteMarkers::from_note_ratios(&note_ratios));
         self
     }
 
@@ -600,18 +650,18 @@ impl WaveformWidget {
         let lower_ratio = (pointer_ratio - ratio_radius).max(0.0);
         let upper_ratio = (pointer_ratio + ratio_radius).min(1.0);
         let start = self
-            .note_marker_index
+            .prepared_markers
             .sorted
             .partition_point(|note| note.ratio < lower_ratio);
         let end = self
-            .note_marker_index
+            .prepared_markers
             .sorted
             .partition_point(|note| note.ratio <= upper_ratio);
         let rail_y = comment_rail_y(bounds);
         let hover_radius_squared = NOTE_HOVER_RADIUS * NOTE_HOVER_RADIUS;
         let dy = position.y - rail_y;
         let mut nearest = None;
-        for note in &self.note_marker_index.sorted[start..end] {
+        for note in &self.prepared_markers.sorted[start..end] {
             let dx = position.x - self.timeline.x_at(bounds, note.ratio);
             let distance_squared = dx * dx + dy * dy;
             if distance_squared > hover_radius_squared {
@@ -637,14 +687,14 @@ impl WaveformWidget {
     fn matching_note_ratio(&self, target: Option<f32>) -> Option<f32> {
         let target = clamp_ratio(target?);
         let start = self
-            .note_marker_index
+            .prepared_markers
             .sorted
             .partition_point(|note| note.ratio < target - NOTE_RATIO_MATCH_EPSILON);
         let end = self
-            .note_marker_index
+            .prepared_markers
             .sorted
             .partition_point(|note| note.ratio <= target + NOTE_RATIO_MATCH_EPSILON);
-        self.note_marker_index.sorted[start..end]
+        self.prepared_markers.sorted[start..end]
             .iter()
             .filter(|note| (note.ratio - target).abs() <= NOTE_RATIO_MATCH_EPSILON)
             .min_by(|left, right| left.original_index.cmp(&right.original_index))
@@ -1014,11 +1064,11 @@ impl Widget for WaveformWidget {
         self.loop_drag_start_ratio = previous.loop_drag_start_ratio;
         self.loop_drag_current_ratio = previous.loop_drag_current_ratio;
         self.comment_dragging = previous.comment_dragging;
-        self.comment_drag_note_index = (self.note_marker_index.revision
-            == previous.note_marker_index.revision)
+        self.comment_drag_note_index = (self.prepared_markers.revision
+            == previous.prepared_markers.revision)
             .then_some(previous.comment_drag_note_index)
             .flatten()
-            .filter(|index| *index < self.note_ratios.len());
+            .filter(|index| *index < self.prepared_markers.note_ratios.len());
         if self.visible_ratio.is_some() {
             self.clear_pointer_state();
         }
@@ -1111,7 +1161,7 @@ impl Widget for WaveformWidget {
             self.current_external_hovered_note_ratio()
         };
         let selected_note_ratio = self.current_selected_note_ratio();
-        for marker in &self.note_marker_index.coalesced {
+        for marker in self.prepared_markers.coalesced.iter() {
             // A collocated marker is done only when every note is done, so an
             // open note always wins regardless of input order.
             let externally_highlighted =
@@ -2292,6 +2342,76 @@ mod tests {
             "external selection should not duplicate the collocated marker"
         );
         assert_eq!(highlighted_note_marker_count(&selected_paint.primitives), 1);
+    }
+
+    #[test]
+    fn prepared_markers_retain_original_indices_and_open_collocated_state() {
+        let second_ratio = 0.4 + NOTE_RATIO_MATCH_EPSILON * 0.5;
+        let prepared = PreparedNoteMarkers::from_note_ratios(&[
+            (0.8, true),
+            (0.4, true),
+            (second_ratio, false),
+        ]);
+
+        assert_eq!(
+            prepared
+                .sorted
+                .iter()
+                .map(|note| note.original_index)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 0]
+        );
+
+        let collocated = prepared
+            .coalesced
+            .iter()
+            .find(|marker| marker.first_original_index == 1)
+            .expect("collocated notes should produce one marker");
+        assert!((collocated.ratio - 0.4).abs() <= f32::EPSILON);
+        assert!(!collocated.done, "an open note must keep the marker open");
+
+        let distant = prepared
+            .coalesced
+            .iter()
+            .find(|marker| marker.first_original_index == 0)
+            .expect("the distant note should retain its original index");
+        assert!(distant.done);
+    }
+
+    #[test]
+    fn comment_drag_index_survives_matching_marker_revision_only() {
+        let bounds = Rect::from_min_max(Point::new(10.0, 20.0), Point::new(310.0, 120.0));
+        let waveform = Arc::new(test_waveform());
+        let note_ratios = vec![(0.8, false), (0.2, false), (0.5, false)];
+        let pointer = Point::new(timeline_x(bounds, 0.5), comment_rail_y(bounds));
+        let mut previous = WaveformWidget::new(Arc::clone(&waveform), None, note_ratios.clone());
+
+        assert!(matches!(
+            interaction(previous.handle_input(bounds, WidgetInput::primary_press(pointer),)),
+            WaveformInteraction::CommentDragStarted {
+                note_index: Some(2),
+                ..
+            }
+        ));
+        assert!(previous.comment_dragging);
+        assert_eq!(previous.comment_drag_note_index, Some(2));
+
+        let mut matching = WaveformWidget::new(Arc::clone(&waveform), None, note_ratios);
+        matching.synchronize_from_previous(&previous);
+        assert!(matching.comment_dragging);
+        assert_eq!(matching.comment_drag_note_index, Some(2));
+
+        let mut changed = WaveformWidget::new(
+            waveform,
+            None,
+            vec![(0.8, false), (0.2, false), (0.6, false)],
+        );
+        changed.synchronize_from_previous(&previous);
+        assert!(changed.comment_dragging);
+        assert_eq!(
+            changed.comment_drag_note_index, None,
+            "a marker revision change must invalidate the retained note index"
+        );
     }
 
     #[test]

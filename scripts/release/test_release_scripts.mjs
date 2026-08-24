@@ -18,6 +18,8 @@ const tagVerifierScript = path.join(releaseDirectory, "verify_tag_target.sh");
 const manifestScript = path.join(releaseDirectory, "create_manifest.mjs");
 const workflowPath = path.join(releaseDirectory, "..", "..", ".github", "workflows", "release.yml");
 const gitSha = "a".repeat(40);
+const screenshotSourceGitSha = "b".repeat(40);
+const introducedScreenshotSourceGitSha = "83dab42ef945d26b8e01ba48f7ce17f6bcfead63";
 const cargoPackageVersion = "0.1.9";
 const notarySubmissionId = "00000000-0000-4000-8000-000000000000";
 const png = Buffer.from("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489", "hex");
@@ -48,6 +50,7 @@ async function createManifest(directory, version, channel) {
     "--version", version,
     "--build-id", "cadence-test-build",
     "--git-sha", gitSha,
+    "--screenshot-source-git-sha", screenshotSourceGitSha,
     "--released-at", "2026-08-09T00:00:00Z",
     "--team-id", "TEAM123456",
     "--notary-submission-id", notarySubmissionId,
@@ -128,6 +131,18 @@ function prepareOutputDirectory(requested, callerDirectory) {
     buildScript,
     requested,
     callerDirectory,
+  ]);
+}
+
+function verifyScreenshotProvenance(releaseSourceSha, screenshotPath, metadataPath) {
+  return execFileAsync("bash", [
+    "-c",
+    'source "$1"; verify_release_screenshot_provenance "$2" "$3" "$4"',
+    "cadence-screenshot-provenance-test",
+    buildScript,
+    releaseSourceSha,
+    screenshotPath,
+    metadataPath,
   ]);
 }
 
@@ -235,6 +250,33 @@ test("release output cleanup keeps temporary cleanup but never removes caller ou
     script.indexOf("resolve_verified_source_sha")
       < script.indexOf('validate_release_output_dir "$output_dir" "$caller_cwd"'),
   );
+});
+
+test("checked-in release screenshot provenance validates its recorded source commit", async () => {
+  const { stdout: headOutput } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: projectDirectory });
+  const { stdout: sourceOutput } = await verifyScreenshotProvenance(
+    headOutput.trim(),
+    path.join(projectDirectory, "reference", "cadence-ui-repainted.png"),
+    path.join(projectDirectory, "reference", "cadence-ui-repainted.png.json"),
+  );
+  assert.equal(sourceOutput.trim(), introducedScreenshotSourceGitSha);
+});
+
+test("release screenshot provenance fails closed when its metadata sidecar is absent", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cadence-screenshot-provenance-test-"));
+  try {
+    const screenshotPath = path.join(root, "cadence-ui-repainted.png");
+    const metadataPath = path.join(root, "cadence-ui-repainted.png.json");
+    await fs.copyFile(path.join(projectDirectory, "reference", "cadence-ui-repainted.png"), screenshotPath);
+    const { stdout: headOutput } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: projectDirectory });
+
+    await assert.rejects(
+      verifyScreenshotProvenance(headOutput.trim(), screenshotPath, metadataPath),
+      (error) => error.code === 1 && error.stderr.includes("metadata sidecar is missing"),
+    );
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
 });
 
 test("release build rejects malformed and mismatched provenance before output or signing work", async () => {
@@ -438,6 +480,8 @@ test("release build uses verified HEAD and isolates Apple credentials from Cargo
   const decodeIndex = script.indexOf('decode_base64 "$apple_developer_id_application_cert_base64"');
   const keychainImportIndex = script.indexOf('security import "$certificate_path"');
   const outputPreparationIndex = script.indexOf('if ! output_dir="$(prepare_release_output_dir "$output_dir" "$caller_cwd")"; then');
+  const cleanCheckoutIndex = script.indexOf('if [[ -n "$(git -C "$project_dir" status --porcelain --untracked-files=all)" ]]; then');
+  const screenshotVerificationIndex = script.indexOf('if ! screenshot_source_git_sha="$(verify_release_screenshot_provenance "$source_git_sha")"; then');
   assert.ok(provenanceIndex >= 0, "the build must resolve a verified source SHA");
   assert.ok(metadataIndex > provenanceIndex, "package metadata must follow source provenance");
   assert.ok(lockVersionIndex > metadataIndex, "the lockfile version must be checked after metadata");
@@ -449,11 +493,20 @@ test("release build uses verified HEAD and isolates Apple credentials from Cargo
   assert.ok(decodeIndex > cargoIndex, "Cargo must precede certificate decoding");
   assert.ok(keychainImportIndex > cargoIndex, "Cargo must precede keychain import");
   assert.ok(outputPreparationIndex > cargoIndex, "Cargo must precede release output creation");
+  assert.ok(cleanCheckoutIndex >= 0, "the build must require a clean checkout");
+  assert.ok(screenshotVerificationIndex > cleanCheckoutIndex, "screenshot provenance must use a clean checkout");
+  assert.ok(cargoIndex > screenshotVerificationIndex, "screenshot provenance must precede the signed build");
   assert.match(script, /head_sha=.*rev-parse --verify HEAD\^\{commit\}/);
   assert.match(script, /provided_sha=.*GITHUB_SHA/);
   assert.match(script, /tr '\[:upper:\]' '\[:lower:\]'/);
   assert.match(script, /GITHUB_SHA does not match the checked-out repository HEAD/);
   assert.match(script, /--git-sha "\$source_git_sha"/);
+  assert.match(script, /--screenshot-source-git-sha "\$screenshot_source_git_sha"/);
+  assert.match(script, /reference\/cadence-ui-repainted\.png\.json/);
+  assert.match(script, /shasum -a 256 "\$screenshot_path"/);
+  assert.match(script, /sips -g pixelWidth -g pixelHeight/);
+  assert.match(script, /merge-base --is-ancestor/);
+  assert.match(script, /cp "\$project_dir\/reference\/cadence-ui-repainted\.png"/);
   assert.match(script, /apple_developer_id_application_cert_base64="\$\{APPLE_DEVELOPER_ID_APPLICATION_CERT_BASE64:-\}"/);
   assert.match(script, /apple_developer_id_application_cert_password="\$\{APPLE_DEVELOPER_ID_APPLICATION_CERT_PASSWORD:-\}"/);
   assert.match(script, /unset \\\n(?:.*\\\n){5}/);
@@ -474,6 +527,9 @@ test("manifest preserves the stable default and emits supported channels", async
         const manifest = await createManifest(directory, version, channel);
         assert.equal(manifest.channel, channel || "stable");
         assert.equal(manifest.version, version);
+        assert.equal(manifest.source.git_sha, gitSha);
+        assert.equal(manifest.screenshot.source_git_sha, screenshotSourceGitSha);
+        assert.notEqual(manifest.source.git_sha, manifest.screenshot.source_git_sha);
       } finally {
         await fs.rm(directory, { recursive: true, force: true });
       }
@@ -493,6 +549,7 @@ test("manifest rejects unknown channels and mismatched channel versions", async 
           "--channel", channel,
           "--build-id", "cadence-test-build",
           "--git-sha", gitSha,
+          "--screenshot-source-git-sha", screenshotSourceGitSha,
           "--released-at", "2026-08-09T00:00:00Z",
           "--team-id", "TEAM123456",
           "--notary-submission-id", notarySubmissionId,
@@ -669,7 +726,7 @@ test("release workflow reserves nightly versions before immutable builds", async
   assert.match(buildJob, /runs-on: macos-14/);
   assert.match(buildJob, /environment: cadence-production/);
   assert.match(buildJob, /\n    permissions:\n      contents: read\n      actions: read\n/);
-  assert.match(buildJob, /- name: Check out source\n        uses: actions\/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4\.4\.0\n        with:\n          ref: \$\{\{ needs\.prepare\.outputs\.source_sha \}\}\n          persist-credentials: false/);
+  assert.match(buildJob, /- name: Check out source\n        uses: actions\/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4\.4\.0\n        with:\n          ref: \$\{\{ needs\.prepare\.outputs\.source_sha \}\}\n          fetch-depth: 0\n          persist-credentials: false/);
   assert.doesNotMatch(buildJob, /Select release metadata|github\.event_name|steps\.release/);
   assert.match(buildJob, /GITHUB_SHA: \$\{\{ needs\.prepare\.outputs\.source_sha \}\}/);
   assert.match(buildJob, /export GITHUB_SHA=/);
