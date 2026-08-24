@@ -1653,6 +1653,7 @@ fn animation_requested(state: &AppState) -> bool {
         || state.transport_polling
         || state.reference_transport_playing
         || state.reference_transport_polling
+        || state.reference_transport_unload_token.is_some()
         || live_animation_requested(&state.transport, state.live_spectrogram_revision)
         || state.reference_transport.as_ref().is_some_and(|transport| {
             live_animation_requested(transport, state.reference_live_spectrogram_revision)
@@ -5323,16 +5324,14 @@ fn seek_synchronized_positions(
             "Reference source verification is still pending.",
         ));
     }
+    if reference_details.is_some() {
+        reconcile_reference_transport_retirement(state)?;
+    }
     if !state.transport.has_command_capacity(1) {
         return Err(String::from(transport::CONTROLS_BUSY_ERROR));
     }
     let reference_was_loaded = state.reference_transport_loaded;
     if reference_details.is_some() {
-        if !reference_was_loaded {
-            state
-                .reference_transport
-                .get_or_insert_with(transport::AudioTransport::spawn);
-        }
         let reference_transport = state
             .reference_transport
             .get_or_insert_with(transport::AudioTransport::spawn);
@@ -5370,7 +5369,8 @@ fn seek_synchronized_positions(
         let reference_gain = reference_output_gain(state);
         let reference_transport = state
             .reference_transport
-            .get_or_insert_with(transport::AudioTransport::spawn);
+            .as_ref()
+            .expect("reference transport was admitted before the synchronized seek");
         reference_transport.set_output_gain(reference_gain);
         if !reference_was_loaded {
             match reference_transport.load(
@@ -5460,6 +5460,11 @@ fn seek_reference_waveform_position(
         context.request_repaint();
         return;
     };
+    if let Err(error) = reconcile_reference_transport_retirement(state) {
+        state.status = error;
+        context.request_repaint();
+        return;
+    }
     state.loop_selections.clear(PlaybackSource::Reference);
     set_playback_source(state, PlaybackSource::Reference);
     if let Some(reference_transport) = state.reference_transport.as_ref()
@@ -5606,6 +5611,7 @@ fn seek_loop_owner(
             begin_transport_polling(state, token);
         }
         PlaybackSource::Reference => {
+            reconcile_reference_transport_retirement(state)?;
             let Some(reference_transport) = state.reference_transport.as_ref() else {
                 return Err(String::from(transport::CONTROLS_BUSY_ERROR));
             };
@@ -5884,6 +5890,7 @@ fn start_source_alongside_active(
                 .ok_or_else(|| String::from("Import and analyze a reference track first."))?;
             let reference_ticket = reference_source_ticket_for_path(state, &path)
                 .ok_or_else(|| String::from("Reference source verification is still pending."))?;
+            reconcile_reference_transport_retirement(state)?;
             let reference_was_loaded = state.reference_transport_loaded;
             let pending_intent_millis = pending_seek_intent(state, PlaybackSource::Reference);
             let reference_uses_resume_seek = pending_intent_millis.is_some();
@@ -6096,6 +6103,7 @@ fn admit_pause_for_active_transports(state: &mut AppState) -> Result<bool, Strin
         return Err(String::from(transport::CONTROLS_BUSY_ERROR));
     }
     if reference_active {
+        reconcile_reference_transport_retirement(state)?;
         let Some(reference_transport) = state.reference_transport.as_ref() else {
             return Err(String::from(transport::CONTROLS_BUSY_ERROR));
         };
@@ -6284,6 +6292,11 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
         }
         if reference_details.is_some() {
             let reference_uses_resume_seek = pending_reference_intent_millis.is_some();
+            if let Err(error) = reconcile_reference_transport_retirement(state) {
+                state.status = error;
+                context.request_repaint();
+                return;
+            }
             let reference_transport = state
                 .reference_transport
                 .get_or_insert_with(transport::AudioTransport::spawn);
@@ -6362,7 +6375,8 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
             }
             let reference_transport = state
                 .reference_transport
-                .get_or_insert_with(transport::AudioTransport::spawn);
+                .as_ref()
+                .expect("reference transport was admitted before the playback restart");
             reference_transport.set_output_gain(reference_gain);
             if !state.reference_transport_loaded {
                 if let Err(error) = reference_transport.load(
@@ -8486,6 +8500,28 @@ fn reset_reference_transport(state: &mut AppState) {
     sync_playback_output_gains(state);
 }
 
+fn reconcile_reference_transport_retirement(state: &mut AppState) -> Result<(), String> {
+    let Some(unload_token) = state.reference_transport_unload_token else {
+        return Ok(());
+    };
+    let Some(snapshot) = state
+        .reference_transport
+        .as_ref()
+        .map(transport::AudioTransport::snapshot)
+    else {
+        state.reference_transport_unload_token = None;
+        return Ok(());
+    };
+    if snapshot.generation != state.reference_transport_generation
+        || !transport_command_is_confirmed(snapshot, unload_token)
+    {
+        return Err(String::from(transport::CONTROLS_BUSY_ERROR));
+    }
+    state.reference_transport_unload_token = None;
+    state.reference_transport = None;
+    Ok(())
+}
+
 fn begin_transport_polling(state: &mut AppState, token: u64) {
     state.transport_waiting_token = Some(token);
     state.transport_polling = true;
@@ -8506,21 +8542,8 @@ fn apply_transport_snapshot(state: &mut AppState, snapshot: transport::Snapshot)
 }
 
 fn update_reference_transport(state: &mut AppState) {
-    if let Some(unload_token) = state.reference_transport_unload_token {
-        let Some(snapshot) = state
-            .reference_transport
-            .as_ref()
-            .map(transport::AudioTransport::snapshot)
-        else {
-            state.reference_transport_unload_token = None;
-            return;
-        };
-        if snapshot.generation == state.reference_transport_generation
-            && transport_command_is_confirmed(snapshot, unload_token)
-        {
-            state.reference_transport_unload_token = None;
-            state.reference_transport = None;
-        }
+    if state.reference_transport_unload_token.is_some() {
+        let _ = reconcile_reference_transport_retirement(state);
         return;
     }
     let Some(snapshot) = state
@@ -17021,6 +17044,140 @@ mod tests {
                 playing: false,
                 ready: false,
             });
+    }
+
+    #[test]
+    fn reference_transport_reset_keeps_idle_acknowledgement_frames_scheduled() {
+        let mut state = shared_reference_playback_state();
+
+        super::reset_reference_transport(&mut state);
+
+        assert!(state.reference_transport_unload_token.is_some());
+        assert!(animation_requested(&state));
+    }
+
+    #[test]
+    fn reference_transport_idle_frame_drops_acknowledged_retirement() {
+        let mut state = shared_reference_playback_state();
+        let retired_transport = state
+            .reference_transport
+            .as_ref()
+            .expect("the fixture should have a reference transport")
+            .clone();
+
+        super::reset_reference_transport(&mut state);
+        let unload_token = state
+            .reference_transport_unload_token
+            .expect("reset should record the accepted unload");
+        retired_transport.set_snapshot_for_test(Snapshot {
+            generation: state.reference_transport_generation,
+            acknowledged_token: unload_token,
+            position_millis: 0,
+            playing: false,
+            ready: false,
+        });
+
+        update(
+            &mut state,
+            Message::Frame,
+            &mut ui::UiUpdateContext::default(),
+        );
+
+        assert!(state.reference_transport.is_none());
+        assert!(state.reference_transport_unload_token.is_none());
+        assert!(!animation_requested(&state));
+    }
+
+    #[test]
+    fn reference_transport_restart_before_unload_ack_does_not_command_retiring_handle() {
+        let mut state = shared_reference_playback_state();
+        let retiring_transport = state
+            .reference_transport
+            .as_ref()
+            .expect("the fixture should have a reference transport")
+            .clone();
+
+        super::reset_reference_transport(&mut state);
+        let unload_token = state
+            .reference_transport_unload_token
+            .expect("reset should record the accepted unload");
+        retiring_transport.set_snapshot_for_test(Snapshot {
+            generation: state.reference_transport_generation,
+            acknowledged_token: unload_token.saturating_sub(1),
+            position_millis: 0,
+            playing: false,
+            ready: false,
+        });
+
+        update(
+            &mut state,
+            Message::TogglePlayback,
+            &mut ui::UiUpdateContext::default(),
+        );
+
+        assert_eq!(state.status, transport::CONTROLS_BUSY_ERROR);
+        assert_eq!(state.reference_transport_unload_token, Some(unload_token));
+        assert!(
+            state
+                .reference_transport
+                .as_ref()
+                .is_some_and(|transport| !transport.has_pending_load())
+        );
+        assert!(state.reference_transport_waiting_token.is_none());
+    }
+
+    #[test]
+    fn acknowledged_reference_transport_restart_replaces_handle_before_later_frame() {
+        let mut state = shared_reference_playback_state();
+        let retired_transport = state
+            .reference_transport
+            .as_ref()
+            .expect("the fixture should have a reference transport")
+            .clone();
+
+        super::reset_reference_transport(&mut state);
+        let unload_token = state
+            .reference_transport_unload_token
+            .expect("reset should record the accepted unload");
+        retired_transport.set_snapshot_for_test(Snapshot {
+            generation: state.reference_transport_generation,
+            acknowledged_token: unload_token,
+            position_millis: 0,
+            playing: false,
+            ready: false,
+        });
+
+        update(
+            &mut state,
+            Message::TogglePlayback,
+            &mut ui::UiUpdateContext::default(),
+        );
+
+        assert!(state.reference_transport_unload_token.is_none());
+        assert!(state.reference_transport_loaded);
+        assert_eq!(state.reference_transport_waiting_token, Some(3));
+
+        let replacement_transport = state
+            .reference_transport
+            .as_ref()
+            .expect("acknowledged retirement should create a replacement")
+            .clone();
+        replacement_transport.set_snapshot_for_test(Snapshot {
+            generation: state.reference_transport_generation,
+            acknowledged_token: unload_token,
+            position_millis: 0,
+            playing: false,
+            ready: false,
+        });
+
+        update(
+            &mut state,
+            Message::Frame,
+            &mut ui::UiUpdateContext::default(),
+        );
+
+        assert!(state.reference_transport.is_some());
+        assert!(state.reference_transport_unload_token.is_none());
     }
 
     fn reference_comment_drag_state() -> (AppState, String) {

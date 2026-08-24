@@ -726,7 +726,7 @@ test("release workflow reserves nightly versions before immutable builds", async
   assert.match(buildJob, /runs-on: macos-14/);
   assert.match(buildJob, /environment: cadence-production/);
   assert.match(buildJob, /\n    permissions:\n      contents: read\n      actions: read\n/);
-  assert.match(buildJob, /- name: Check out source\n        uses: actions\/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4\.4\.0\n        with:\n          ref: \$\{\{ needs\.prepare\.outputs\.source_sha \}\}\n          persist-credentials: false/);
+  assert.match(buildJob, /- name: Check out source\n        uses: actions\/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4\.4\.0\n        with:\n          ref: \$\{\{ needs\.prepare\.outputs\.source_sha \}\}\n          fetch-depth: 0\n          persist-credentials: false/);
   assert.doesNotMatch(buildJob, /Select release metadata|github\.event_name|steps\.release/);
   assert.match(buildJob, /GITHUB_SHA: \$\{\{ needs\.prepare\.outputs\.source_sha \}\}/);
   assert.match(buildJob, /export GITHUB_SHA=/);

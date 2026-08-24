@@ -857,17 +857,70 @@ pub fn add_reference_track(
 }
 
 /// Commit one logical main-track import batch through one durable library
-/// replacement. Candidates are revalidated in original order immediately
-/// before they are applied; a changed candidate is retained as a per-file
-/// error while other candidates may still commit atomically.
+/// replacement. Candidates are provisionally validated without changing the
+/// staged library, then revalidated in original order immediately before they
+/// are applied; a changed candidate is retained as a per-file error while
+/// other candidates may still commit atomically.
 pub fn import_verified_batch(
-    mut library: Library,
+    library: Library,
     candidates: Vec<VerifiedImportCandidate>,
     library_path: &Path,
 ) -> BatchImportReport {
-    let mut accepted_paths = Vec::with_capacity(candidates.len());
+    let prepared =
+        import_verified_batch_inner(library, candidates, |_| {}, apply_main_track_import);
+    persist_batch_library(
+        prepared.library,
+        prepared.accepted_paths,
+        prepared.errors,
+        library_path,
+    )
+}
+
+#[cfg(test)]
+fn import_verified_batch_with_final_fence_hook(
+    library: Library,
+    candidates: Vec<VerifiedImportCandidate>,
+    library_path: &Path,
+    hook: impl FnMut(&VerifiedImportCandidate),
+) -> BatchImportReport {
+    let prepared = import_verified_batch_inner(library, candidates, hook, apply_main_track_import);
+    persist_batch_library(
+        prepared.library,
+        prepared.accepted_paths,
+        prepared.errors,
+        library_path,
+    )
+}
+
+struct PreparedImportBatch {
+    library: Library,
+    accepted_paths: Vec<PathBuf>,
+    errors: Vec<BatchImportError>,
+}
+
+fn import_verified_batch_inner(
+    mut library: Library,
+    candidates: Vec<VerifiedImportCandidate>,
+    mut before_final_validation: impl FnMut(&VerifiedImportCandidate),
+    mut apply_candidate: impl FnMut(
+        &mut Library,
+        VerifiedImportCandidate,
+        fs::Metadata,
+    ) -> Result<(), String>,
+) -> PreparedImportBatch {
+    let mut provisional = Vec::with_capacity(candidates.len());
     let mut errors = Vec::new();
     for candidate in candidates {
+        let path = candidate.path.clone();
+        match validate_import_candidate(&candidate) {
+            Ok(_) => provisional.push(candidate),
+            Err(error) => errors.push(BatchImportError { path, error }),
+        }
+    }
+
+    let mut final_successes = Vec::with_capacity(provisional.len());
+    for candidate in provisional {
+        before_final_validation(&candidate);
         let path = candidate.path.clone();
         let metadata = match validate_import_candidate(&candidate) {
             Ok(metadata) => metadata,
@@ -876,46 +929,76 @@ pub fn import_verified_batch(
                 continue;
             }
         };
-        let original_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("Untitled track")
-            .to_string();
-        let title = path
-            .file_stem()
-            .and_then(|name| name.to_str())
-            .unwrap_or("Untitled track")
-            .replace(['_', '-'], " ");
-        let id = allocate_track_id(&library);
-        library.tracks.push(Track {
-            id: id.clone(),
-            title: if title.trim().is_empty() {
-                String::from("Untitled track")
-            } else {
-                title
-            },
-            original_name,
-            path: path.clone(),
-            source_proof: crate::source::SourceProvenance::Verified(candidate.source_proof),
-            reference_path: None,
-            size: metadata.len(),
-            favorite: false,
-            stage: TrackStage::Backlog,
-            notes: SharedVec::default(),
-        });
-        normalize_planner_order(&mut library);
-        library.selected_track_id = Some(id);
-        accepted_paths.push(path);
+        final_successes.push((candidate, metadata));
     }
 
-    persist_batch_library(library, accepted_paths, errors, library_path)
+    let mut accepted_paths = Vec::with_capacity(final_successes.len());
+    for (candidate, metadata) in final_successes {
+        let path = candidate.path.clone();
+        match apply_candidate(&mut library, candidate, metadata) {
+            Ok(()) => accepted_paths.push(path),
+            Err(error) => errors.push(BatchImportError { path, error }),
+        }
+    }
+
+    PreparedImportBatch {
+        library,
+        accepted_paths,
+        errors,
+    }
+}
+
+fn apply_main_track_import(
+    library: &mut Library,
+    candidate: VerifiedImportCandidate,
+    metadata: fs::Metadata,
+) -> Result<(), String> {
+    let path = candidate.path.clone();
+    let original_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("Untitled track")
+        .to_string();
+    let title = path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("Untitled track")
+        .replace(['_', '-'], " ");
+    let id = allocate_track_id(library);
+    library.tracks.push(Track {
+        id: id.clone(),
+        title: if title.trim().is_empty() {
+            String::from("Untitled track")
+        } else {
+            title
+        },
+        original_name,
+        path,
+        source_proof: crate::source::SourceProvenance::Verified(candidate.source_proof),
+        reference_path: None,
+        size: metadata.len(),
+        favorite: false,
+        stage: TrackStage::Backlog,
+        notes: SharedVec::default(),
+    });
+    normalize_planner_order(library);
+    library.selected_track_id = Some(id);
+    Ok(())
+}
+
+fn apply_reference_import(
+    library: &mut Library,
+    candidate: VerifiedImportCandidate,
+    _metadata: fs::Metadata,
+) -> Result<(), String> {
+    ensure_reference_track_with_proof(library, candidate.path, candidate.source_proof)
 }
 
 /// Commit one assigned-reference import batch through one durable library
 /// replacement. The first accepted path becomes the assigned selection,
 /// matching the historical multi-file interaction without a second save.
 pub fn assign_reference_verified_batch(
-    mut library: Library,
+    library: Library,
     track_id: &str,
     candidates: Vec<VerifiedImportCandidate>,
     library_path: &Path,
@@ -927,62 +1010,43 @@ pub fn assign_reference_verified_batch(
         );
     }
 
-    let mut accepted_paths = Vec::with_capacity(candidates.len());
-    let mut errors = Vec::new();
-    for candidate in candidates {
-        let path = candidate.path.clone();
-        if let Err(error) = validate_import_candidate(&candidate) {
-            errors.push(BatchImportError { path, error });
-            continue;
-        }
-        if let Err(error) =
-            ensure_reference_track_with_proof(&mut library, path.clone(), candidate.source_proof)
-        {
-            errors.push(BatchImportError { path, error });
-            continue;
-        }
-        accepted_paths.push(path);
-    }
+    let mut prepared =
+        import_verified_batch_inner(library, candidates, |_| {}, apply_reference_import);
 
-    if let Some(first_path) = accepted_paths.first().cloned()
-        && let Err(error) = set_reference_track_selection(&mut library, track_id, first_path)
+    if let Some(first_path) = prepared.accepted_paths.first().cloned()
+        && let Err(error) =
+            set_reference_track_selection(&mut prepared.library, track_id, first_path)
     {
-        errors.push(BatchImportError {
+        prepared.errors.push(BatchImportError {
             path: PathBuf::from(track_id),
             error,
         });
-        accepted_paths.clear();
+        prepared.accepted_paths.clear();
     }
 
-    persist_batch_library(library, accepted_paths, errors, library_path)
+    persist_batch_library(
+        prepared.library,
+        prepared.accepted_paths,
+        prepared.errors,
+        library_path,
+    )
 }
 
 /// Commit one reference-catalog import batch through one durable library
 /// replacement. The catalog keeps the candidate order and rejects duplicate
 /// proof conflicts without persisting an all-failed batch.
 pub fn add_reference_verified_batch(
-    mut library: Library,
+    library: Library,
     candidates: Vec<VerifiedImportCandidate>,
     library_path: &Path,
 ) -> BatchImportReport {
-    let mut accepted_paths = Vec::with_capacity(candidates.len());
-    let mut errors = Vec::new();
-    for candidate in candidates {
-        let path = candidate.path.clone();
-        if let Err(error) = validate_import_candidate(&candidate) {
-            errors.push(BatchImportError { path, error });
-            continue;
-        }
-        if let Err(error) =
-            ensure_reference_track_with_proof(&mut library, path.clone(), candidate.source_proof)
-        {
-            errors.push(BatchImportError { path, error });
-            continue;
-        }
-        accepted_paths.push(path);
-    }
-
-    persist_batch_library(library, accepted_paths, errors, library_path)
+    let prepared = import_verified_batch_inner(library, candidates, |_| {}, apply_reference_import);
+    persist_batch_library(
+        prepared.library,
+        prepared.accepted_paths,
+        prepared.errors,
+        library_path,
+    )
 }
 
 fn validate_import_candidate(candidate: &VerifiedImportCandidate) -> Result<fs::Metadata, String> {
@@ -1847,7 +1911,14 @@ mod tests {
     }
 
     fn decoded_audio_fixture(directory: &Path) -> (PathBuf, crate::audio::DecodedAudioFile) {
-        let source = directory.join("source.wav");
+        decoded_audio_fixture_named(directory, "source.wav")
+    }
+
+    fn decoded_audio_fixture_named(
+        directory: &Path,
+        file_name: &str,
+    ) -> (PathBuf, crate::audio::DecodedAudioFile) {
+        let source = directory.join(file_name);
         fs::write(&source, tiny_pcm_wav()).expect("valid audio fixture should be writable");
         let decoded = crate::audio::decode_audio_file(&source)
             .expect("valid audio fixture should pass preflight");
@@ -2169,6 +2240,209 @@ mod tests {
         assert!(library.tracks.iter().any(|track| track.path == valid_path));
         assert_eq!(
             load_library_at(&library_path).expect("batch should reload"),
+            *library
+        );
+        assert!(temporary_paths(&directory.path).is_empty());
+    }
+
+    #[test]
+    fn import_verified_batch_final_fence_rejects_changed_early_candidate() {
+        let directory = TestDirectory::new();
+        let library_path = directory.path.join("library.json");
+        let (early_path, early_decoded) = decoded_audio_fixture_named(&directory.path, "early.wav");
+        let (late_path, late_decoded) = decoded_audio_fixture_named(&directory.path, "late.wav");
+        let early_path_for_hook = early_path.clone();
+        let mut final_fence_paths = Vec::new();
+
+        let report = import_verified_batch_with_final_fence_hook(
+            persistence_fixture(),
+            vec![
+                VerifiedImportCandidate::from_decoded(&early_decoded),
+                VerifiedImportCandidate::from_decoded(&late_decoded),
+            ],
+            &library_path,
+            |candidate| {
+                final_fence_paths.push(candidate.path.clone());
+                if candidate.path == early_path_for_hook {
+                    // This runs after the complete provisional pass and before
+                    // the early candidate's final source fence.
+                    fs::write(&early_path_for_hook, b"source changed before final fence")
+                        .expect("the early source should be replaceable by the test hook");
+                }
+            },
+        );
+
+        assert_eq!(
+            final_fence_paths,
+            vec![early_path.clone(), late_path.clone()]
+        );
+        let library = report
+            .library
+            .as_ref()
+            .expect("the unchanged later candidate should persist");
+        assert_eq!(report.imported_paths, vec![late_path.clone()]);
+        assert_eq!(report.errors.len(), 1);
+        assert_eq!(report.errors[0].path, early_path);
+        assert!(report.errors[0].error.contains("changed after preflight"));
+        assert!(!library.tracks.iter().any(|track| track.path == early_path));
+        assert!(library.tracks.iter().any(|track| track.path == late_path));
+        assert_eq!(
+            load_library_at(&library_path).expect("the final snapshot should reload"),
+            *library
+        );
+        assert!(temporary_paths(&directory.path).is_empty());
+    }
+
+    #[test]
+    fn assign_reference_verified_batch_reloads_partial_success_in_catalog_order() {
+        let directory = TestDirectory::new();
+        let library_path = directory.path.join("library.json");
+        let (changed_path, changed_decoded) =
+            decoded_audio_fixture_named(&directory.path, "changed-reference.wav");
+        let (first_path, first_decoded) =
+            decoded_audio_fixture_named(&directory.path, "first-reference.wav");
+        let (second_path, second_decoded) =
+            decoded_audio_fixture_named(&directory.path, "second-reference.wav");
+        let original = persistence_fixture();
+        persist_library_at(&original, &library_path).expect("the original snapshot should save");
+        fs::write(&changed_path, b"reference source changed before import")
+            .expect("the changed reference should be replaceable");
+
+        let report = assign_reference_verified_batch(
+            original,
+            "track-1",
+            vec![
+                VerifiedImportCandidate::from_decoded(&changed_decoded),
+                VerifiedImportCandidate::from_decoded(&first_decoded),
+                VerifiedImportCandidate::from_decoded(&second_decoded),
+            ],
+            &library_path,
+        );
+
+        let library = report
+            .library
+            .as_ref()
+            .expect("valid references should persist atomically");
+        assert_eq!(
+            report.imported_paths,
+            vec![first_path.clone(), second_path.clone()]
+        );
+        assert_eq!(report.errors.len(), 1);
+        assert_eq!(report.errors[0].path, changed_path);
+        assert!(report.errors[0].error.contains("changed after preflight"));
+        assert_eq!(library.tracks[0].reference_path, Some(first_path.clone()));
+        assert_eq!(
+            library
+                .reference_tracks
+                .iter()
+                .map(|reference| reference.path.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                PathBuf::from("/external/reference.wav"),
+                first_path,
+                second_path,
+            ]
+        );
+        assert_eq!(
+            load_library_at(&library_path).expect("the assigned snapshot should reload"),
+            *library
+        );
+        assert!(temporary_paths(&directory.path).is_empty());
+    }
+
+    #[test]
+    fn assign_reference_verified_batch_keeps_existing_selection_when_all_candidates_fail() {
+        let directory = TestDirectory::new();
+        let library_path = directory.path.join("library.json");
+        let (changed_path, changed_decoded) =
+            decoded_audio_fixture_named(&directory.path, "changed-reference.wav");
+        let (deleted_path, deleted_decoded) =
+            decoded_audio_fixture_named(&directory.path, "deleted-reference.wav");
+        let original = persistence_fixture();
+        persist_library_at(&original, &library_path).expect("the original snapshot should save");
+        let original_bytes = fs::read(&library_path).expect("the original bytes should read");
+        fs::write(&changed_path, b"reference source changed before import")
+            .expect("the changed reference should be replaceable");
+        fs::remove_file(&deleted_path).expect("the deleted reference should be removable");
+
+        let report = assign_reference_verified_batch(
+            original.clone(),
+            "track-1",
+            vec![
+                VerifiedImportCandidate::from_decoded(&changed_decoded),
+                VerifiedImportCandidate::from_decoded(&deleted_decoded),
+            ],
+            &library_path,
+        );
+
+        assert!(report.library.is_none());
+        assert!(report.imported_paths.is_empty());
+        assert_eq!(report.errors.len(), 2);
+        assert_eq!(
+            load_library_at(&library_path).expect("the unchanged snapshot should reload"),
+            original
+        );
+        assert_eq!(
+            fs::read(&library_path).expect("the unchanged bytes should read"),
+            original_bytes
+        );
+        assert!(temporary_paths(&directory.path).is_empty());
+    }
+
+    #[test]
+    fn add_reference_verified_batch_reloads_partial_success_in_catalog_order() {
+        let directory = TestDirectory::new();
+        let library_path = directory.path.join("library.json");
+        let (changed_path, changed_decoded) =
+            decoded_audio_fixture_named(&directory.path, "changed-catalog-reference.wav");
+        let (first_path, first_decoded) =
+            decoded_audio_fixture_named(&directory.path, "first-catalog-reference.wav");
+        let (second_path, second_decoded) =
+            decoded_audio_fixture_named(&directory.path, "second-catalog-reference.wav");
+        let original = persistence_fixture();
+        persist_library_at(&original, &library_path).expect("the original snapshot should save");
+        fs::write(&changed_path, b"reference source changed before import")
+            .expect("the changed reference should be replaceable");
+
+        let report = add_reference_verified_batch(
+            original,
+            vec![
+                VerifiedImportCandidate::from_decoded(&changed_decoded),
+                VerifiedImportCandidate::from_decoded(&first_decoded),
+                VerifiedImportCandidate::from_decoded(&second_decoded),
+            ],
+            &library_path,
+        );
+
+        let library = report
+            .library
+            .as_ref()
+            .expect("valid catalog references should persist atomically");
+        assert_eq!(
+            report.imported_paths,
+            vec![first_path.clone(), second_path.clone()]
+        );
+        assert_eq!(report.errors.len(), 1);
+        assert_eq!(report.errors[0].path, changed_path);
+        assert!(report.errors[0].error.contains("changed after preflight"));
+        assert_eq!(
+            library.tracks[0].reference_path,
+            Some(PathBuf::from("/external/reference.wav"))
+        );
+        assert_eq!(
+            library
+                .reference_tracks
+                .iter()
+                .map(|reference| reference.path.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                PathBuf::from("/external/reference.wav"),
+                first_path,
+                second_path,
+            ]
+        );
+        assert_eq!(
+            load_library_at(&library_path).expect("the catalog snapshot should reload"),
             *library
         );
         assert!(temporary_paths(&directory.path).is_empty());
