@@ -42,6 +42,7 @@ struct PlannerInsertionTarget {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[allow(dead_code)]
 enum Message {
     ImportPressed,
     FilePicked(PlatformResult),
@@ -61,6 +62,9 @@ enum Message {
         path: PathBuf,
         result: Result<storage::Library, String>,
     },
+    ReferenceCatalogImportBatchCompleted {
+        report: storage::BatchImportReport,
+    },
     FileDropped(ui::NativeFileDrop),
     LibraryLoaded(Result<storage::Library, String>),
     RetryLibraryLoad,
@@ -69,6 +73,7 @@ enum Message {
     AdmitLibrarySave,
     RetryLibrarySave,
     ImportCompleted(Result<storage::Library, String>),
+    ImportBatchCompleted(storage::BatchImportReport),
     ReplaceCompleted {
         track_id: String,
         result: Result<storage::Library, String>,
@@ -77,6 +82,10 @@ enum Message {
         track_id: String,
         path: PathBuf,
         result: Result<storage::Library, String>,
+    },
+    ReferenceImportBatchCompleted {
+        track_id: String,
+        report: storage::BatchImportReport,
     },
     ReferenceSelectionCompleted {
         request_id: u64,
@@ -1053,6 +1062,171 @@ impl LibraryProjectionCache {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct WaveformMarkerProjectionKey {
+    owner_id: String,
+    reference_path: Option<PathBuf>,
+    library_generation: u64,
+    waveform_generation: u64,
+    duration_millis: u64,
+    annotations_available: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedWaveformMarkerProjection {
+    key: WaveformMarkerProjectionKey,
+    markers: Arc<waveform::PreparedNoteMarkers>,
+    addresses: Arc<[NoteAddress]>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct WaveformMarkerProjectionCache {
+    main: Option<PreparedWaveformMarkerProjection>,
+    reference: Option<PreparedWaveformMarkerProjection>,
+    #[cfg(test)]
+    rebuild_count: usize,
+}
+
+impl WaveformMarkerProjectionCache {
+    fn main(
+        &mut self,
+        key: WaveformMarkerProjectionKey,
+        track: &storage::Track,
+        waveform: &audio::WaveformData,
+    ) -> PreparedWaveformMarkerProjection {
+        if let Some(cached) = self.main.as_ref().filter(|cached| cached.key == key) {
+            return cached.clone();
+        }
+        let (ratios, addresses) = main_marker_inputs(track, waveform, key.annotations_available);
+        let projection = PreparedWaveformMarkerProjection {
+            key,
+            markers: Arc::new(waveform::PreparedNoteMarkers::from_note_ratios(&ratios)),
+            addresses: Arc::from(addresses.into_boxed_slice()),
+        };
+        #[cfg(test)]
+        {
+            self.rebuild_count += 1;
+        }
+        self.main = Some(projection.clone());
+        projection
+    }
+
+    fn reference(
+        &mut self,
+        key: WaveformMarkerProjectionKey,
+        track: &storage::Track,
+        waveform: &audio::WaveformData,
+        library: &storage::Library,
+    ) -> PreparedWaveformMarkerProjection {
+        if let Some(cached) = self.reference.as_ref().filter(|cached| cached.key == key) {
+            return cached.clone();
+        }
+        let (ratios, addresses) =
+            reference_marker_inputs(track, waveform, library, key.annotations_available);
+        let projection = PreparedWaveformMarkerProjection {
+            key,
+            markers: Arc::new(waveform::PreparedNoteMarkers::from_note_ratios(&ratios)),
+            addresses: Arc::from(addresses.into_boxed_slice()),
+        };
+        #[cfg(test)]
+        {
+            self.rebuild_count += 1;
+        }
+        self.reference = Some(projection.clone());
+        projection
+    }
+}
+
+fn main_marker_inputs(
+    track: &storage::Track,
+    waveform: &audio::WaveformData,
+    annotations_available: bool,
+) -> (Vec<(f32, bool)>, Vec<NoteAddress>) {
+    if !annotations_available {
+        return (Vec::new(), Vec::new());
+    }
+    track
+        .notes
+        .iter()
+        .filter_map(|note| {
+            waveform::ratio_for_millis(note.time_millis, waveform.duration_millis).map(|ratio| {
+                (
+                    (ratio, note.done),
+                    NoteAddress::main(track.id.clone(), note.id.clone()),
+                )
+            })
+        })
+        .unzip()
+}
+
+fn reference_marker_inputs(
+    track: &storage::Track,
+    waveform: &audio::WaveformData,
+    library: &storage::Library,
+    annotations_available: bool,
+) -> (Vec<(f32, bool)>, Vec<NoteAddress>) {
+    let Some(reference_path) = track.reference_path.as_ref() else {
+        return (Vec::new(), Vec::new());
+    };
+    if !annotations_available {
+        return (Vec::new(), Vec::new());
+    }
+    let notes = reference_notes_for_track(library, track);
+    notes
+        .iter()
+        .filter_map(|note| {
+            waveform::ratio_for_millis(note.time_millis, waveform.duration_millis).map(|ratio| {
+                (
+                    (ratio, note.done),
+                    NoteAddress::reference(reference_path.clone(), note.id.clone()),
+                )
+            })
+        })
+        .unzip()
+}
+
+fn prepared_main_marker_projection(
+    state: &AppState,
+    track: &storage::Track,
+    waveform: &audio::WaveformData,
+) -> PreparedWaveformMarkerProjection {
+    let annotations_available = !state.waveform_busy
+        && state.waveform_track_id.as_deref() == Some(track.id.as_str())
+        && track.source_provenance().verified_proof().is_some();
+    let key = WaveformMarkerProjectionKey {
+        owner_id: track.id.clone(),
+        reference_path: None,
+        library_generation: state.library.generation(),
+        waveform_generation: state.waveform_generation,
+        duration_millis: waveform.duration_millis,
+        annotations_available,
+    };
+    state
+        .waveform_marker_projection_cache
+        .borrow_mut()
+        .main(key, track, waveform)
+}
+
+fn prepared_reference_marker_projection(
+    state: &AppState,
+    track: &storage::Track,
+    waveform: &audio::WaveformData,
+    annotations_available: bool,
+) -> PreparedWaveformMarkerProjection {
+    let key = WaveformMarkerProjectionKey {
+        owner_id: track.id.clone(),
+        reference_path: track.reference_path.clone(),
+        library_generation: state.library.generation(),
+        waveform_generation: state.reference_waveform_generation,
+        duration_millis: waveform.duration_millis,
+        annotations_available,
+    };
+    state
+        .waveform_marker_projection_cache
+        .borrow_mut()
+        .reference(key, track, waveform, &state.library)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct WaveformDecodeRequest {
     track_id: String,
     path: PathBuf,
@@ -1105,10 +1279,14 @@ struct AudioImportRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 enum PendingImportCommit {
     Main,
+    MainBatch,
     AssignedReference { track_id: String, path: PathBuf },
+    AssignedReferenceBatch { track_id: String },
     Catalog { path: PathBuf },
+    CatalogBatch,
     ReferenceSelection { request_id: u64 },
     Replacement { track_id: String },
 }
@@ -1152,6 +1330,8 @@ enum PairedPlaybackGuard {
 struct AppState {
     library: SharedLibrary,
     library_projection_cache: RefCell<LibraryProjectionCache>,
+    waveform_marker_projection_cache: RefCell<WaveformMarkerProjectionCache>,
+    lufs_meter_overlay_cache: chrome::LufsMeterOverlayCache,
     selected_track_index: Option<usize>,
     library_load_state: LibraryLoadState,
     workspace_mode: WorkspaceMode,
@@ -1209,6 +1389,7 @@ struct AppState {
     reference_transport_playing: bool,
     reference_transport_polling: bool,
     reference_transport_waiting_token: Option<u64>,
+    reference_transport_unload_token: Option<u64>,
     reference_transport_loaded: bool,
     reference_only_playback: bool,
     paired_playback_guard: PairedPlaybackGuard,
@@ -1239,6 +1420,12 @@ struct AppState {
     reference_comments_window: ui::VirtualListWindow,
     audio_import_in_flight: Option<AudioImportRequest>,
     pending_import_commit: Option<PendingImportCommit>,
+    pending_main_import_candidates: Vec<storage::VerifiedImportCandidate>,
+    pending_main_import_errors: Vec<storage::BatchImportError>,
+    pending_reference_import_candidates: Vec<storage::VerifiedImportCandidate>,
+    pending_reference_import_errors: Vec<storage::BatchImportError>,
+    pending_reference_catalog_candidates: Vec<storage::VerifiedImportCandidate>,
+    pending_reference_catalog_errors: Vec<storage::BatchImportError>,
     historical_binding_confirmation: Option<HistoricalBindingCandidate>,
     historical_binding_in_flight: Option<HistoricalBindingRequest>,
     historical_binding_cancellation: Option<ui::CancellationToken>,
@@ -1300,6 +1487,8 @@ impl Default for AppState {
         Self {
             library: SharedLibrary::default(),
             library_projection_cache: RefCell::new(LibraryProjectionCache::default()),
+            waveform_marker_projection_cache: RefCell::new(WaveformMarkerProjectionCache::default()),
+            lufs_meter_overlay_cache: chrome::LufsMeterOverlayCache::default(),
             selected_track_index: None,
             library_load_state: LibraryLoadState::Ready,
             workspace_mode: WorkspaceMode::Review,
@@ -1357,6 +1546,7 @@ impl Default for AppState {
             reference_transport_playing: false,
             reference_transport_polling: false,
             reference_transport_waiting_token: None,
+            reference_transport_unload_token: None,
             reference_transport_loaded: false,
             reference_only_playback: false,
             paired_playback_guard: PairedPlaybackGuard::Idle,
@@ -1387,6 +1577,12 @@ impl Default for AppState {
             reference_comments_window: ui::VirtualListWindow::default(),
             audio_import_in_flight: None,
             pending_import_commit: None,
+            pending_main_import_candidates: Vec::new(),
+            pending_main_import_errors: Vec::new(),
+            pending_reference_import_candidates: Vec::new(),
+            pending_reference_import_errors: Vec::new(),
+            pending_reference_catalog_candidates: Vec::new(),
+            pending_reference_catalog_errors: Vec::new(),
             historical_binding_confirmation: None,
             historical_binding_in_flight: None,
             historical_binding_cancellation: None,
@@ -1613,11 +1809,13 @@ fn paint_live_playback_overlay(
         if state.transport_playing
             && let Some(bounds) = chrome::lufs_meter_bounds(context.plan, MAIN_LUFS_METER_ID)
         {
+            let value = current_lufs_meter_value(state, track_id);
             chrome::paint_lufs_meter_overlay(
+                &mut state.lufs_meter_overlay_cache,
                 primitives,
                 bounds,
                 MAIN_LUFS_METER_ID,
-                current_lufs_meter_value(state, track_id),
+                value,
                 state.waveform_busy,
                 &theme,
             );
@@ -1625,11 +1823,13 @@ fn paint_live_playback_overlay(
         if state.reference_transport_playing
             && let Some(bounds) = chrome::lufs_meter_bounds(context.plan, REFERENCE_LUFS_METER_ID)
         {
+            let value = current_reference_lufs_meter_value(state, track_id);
             chrome::paint_lufs_meter_overlay(
+                &mut state.lufs_meter_overlay_cache,
                 primitives,
                 bounds,
                 REFERENCE_LUFS_METER_ID,
-                current_reference_lufs_meter_value(state, track_id),
+                value,
                 state.reference_waveform_busy,
                 &theme,
             );
@@ -1783,6 +1983,7 @@ fn activate_loaded_library(
 ) {
     state.audio_import_in_flight = None;
     state.pending_import_commit = None;
+    clear_import_batch_buffers(state);
     state.library.replace(library);
     reset_comments_windows(state);
     state.library_revision = 0;
@@ -1974,6 +2175,7 @@ fn mark_reference_transport_source_mismatch(state: &mut AppState) {
     state.reference_transport_playing = false;
     state.reference_transport_polling = false;
     state.reference_transport_waiting_token = None;
+    state.reference_transport_unload_token = None;
     state.reference_transport_loaded = false;
     state.reference_only_playback = false;
     state.reference_match_enabled = false;
@@ -2651,13 +2853,27 @@ fn current_reference_lufs_meter_value(state: &AppState, track_id: &str) -> Optio
 }
 
 fn reference_output_gain(state: &AppState) -> f32 {
-    reference_output_gain_for_source(state, state.playback_source)
+    if cleanup_any_active(state) {
+        return 0.0;
+    }
+    reference_output_gain_without_cleanup(state)
 }
 
 fn reference_output_gain_for_source(state: &AppState, source: PlaybackSource) -> f32 {
     if cleanup_any_active(state) {
         return 0.0;
     }
+    reference_output_gain_without_cleanup_for_source(state, source)
+}
+
+fn reference_output_gain_without_cleanup(state: &AppState) -> f32 {
+    reference_output_gain_without_cleanup_for_source(state, state.playback_source)
+}
+
+fn reference_output_gain_without_cleanup_for_source(
+    state: &AppState,
+    source: PlaybackSource,
+) -> f32 {
     let match_gain = state
         .reference_match_enabled
         .then(|| current_loudness_match_gain_db(state))
@@ -2822,6 +3038,9 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
             context.request_repaint();
         }
+        Message::ReferenceCatalogImportBatchCompleted { mut report } => {
+            complete_reference_catalog_batch(state, context, &mut report);
+        }
         Message::AudioImportPreflightCompleted { request, result } => {
             complete_audio_import_preflight(state, context, request, result);
         }
@@ -2971,6 +3190,9 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             schedule_next_pending_library_operation(state, context);
             context.request_repaint();
         }
+        Message::ImportBatchCompleted(mut report) => {
+            complete_main_import_batch(state, context, &mut report);
+        }
         Message::ReplaceCompleted { track_id, result } => {
             if state.pending_import_commit.as_ref()
                 != Some(&PendingImportCommit::Replacement {
@@ -3093,6 +3315,12 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
             close_reference_menu(state);
             context.request_repaint();
+        }
+        Message::ReferenceImportBatchCompleted {
+            track_id,
+            mut report,
+        } => {
+            complete_reference_import_batch(state, context, track_id, &mut report);
         }
         Message::ReferenceSelectionCompleted {
             request_id,
@@ -3549,7 +3777,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
         Message::ToggleFavorite(id) => {
             if library_is_ready(state)
                 && !state.busy
-                && let Some(track) = state.library.tracks.iter_mut().find(|track| track.id == id)
+                && let Some(track) = state.library.tracks.find_mut(|track| track.id == id)
             {
                 track.favorite = !track.favorite;
                 schedule_library_save(state, context);
@@ -4987,29 +5215,47 @@ fn progress_paired_playback_cleanup_with_reference_retry(
 }
 
 fn progress_reference_unload(
-    state: &AppState,
+    state: &mut AppState,
     unload: ReferenceUnloadState,
     retry_admission: bool,
 ) -> ReferenceUnloadState {
-    let Some(reference_transport) = state.reference_transport.as_ref() else {
+    if state.reference_transport.is_none() {
         return ReferenceUnloadState::Complete;
-    };
+    }
     match unload {
         ReferenceUnloadState::Complete => ReferenceUnloadState::Complete,
         ReferenceUnloadState::PendingAdmission => {
             if !retry_admission {
                 return ReferenceUnloadState::PendingAdmission;
             }
-            match reference_transport.unload(state.reference_transport_generation) {
+            match state
+                .reference_transport
+                .as_ref()
+                .expect("reference transport exists while unloading")
+                .unload(state.reference_transport_generation)
+            {
                 Ok(token) => ReferenceUnloadState::AwaitingAcknowledgement(token),
                 Err(_) => ReferenceUnloadState::PendingAdmission,
             }
         }
         ReferenceUnloadState::AwaitingAcknowledgement(token) => {
-            let snapshot = reference_transport.snapshot();
+            let snapshot = state
+                .reference_transport
+                .as_ref()
+                .expect("reference transport exists while unloading")
+                .snapshot();
             if snapshot.generation == state.reference_transport_generation
                 && transport_command_is_confirmed(snapshot, token)
             {
+                // The acknowledged transport is retired here, so restore its
+                // idle output contract before dropping the handle. The next
+                // reference playback will create a clean transport.
+                let restored_gain = reference_output_gain_without_cleanup(state);
+                if let Some(reference_transport) = state.reference_transport.as_ref() {
+                    reference_transport.set_output_gain(restored_gain);
+                }
+                state.reference_transport = None;
+                state.reference_transport_unload_token = None;
                 ReferenceUnloadState::Complete
             } else {
                 ReferenceUnloadState::AwaitingAcknowledgement(token)
@@ -6959,11 +7205,248 @@ fn record_import_attempt(state: &mut AppState, failed: bool) {
         return;
     }
     if let Some(batch) = state.import_batch.as_mut() {
+        if batch.completed >= batch.total {
+            return;
+        }
         batch.completed = batch.completed.saturating_add(1).min(batch.total);
         if failed {
             batch.failed = batch.failed.saturating_add(1).min(batch.completed);
         }
     }
+}
+
+fn record_batch_commit_errors(state: &mut AppState, error_count: usize) {
+    if let Some(batch) = state.import_batch.as_mut() {
+        batch.failed = batch.failed.saturating_add(error_count).min(batch.total);
+    }
+}
+
+fn clear_import_batch_buffers(state: &mut AppState) {
+    state.pending_main_import_candidates.clear();
+    state.pending_main_import_errors.clear();
+    state.pending_reference_import_candidates.clear();
+    state.pending_reference_import_errors.clear();
+    state.pending_reference_catalog_candidates.clear();
+    state.pending_reference_catalog_errors.clear();
+}
+
+fn batch_error_summary(errors: &[storage::BatchImportError]) -> String {
+    if errors.is_empty() {
+        return String::from("No import candidate was accepted.");
+    }
+    errors
+        .iter()
+        .map(|error| format!("{}: {}", error.path.display(), error.error))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn merge_batch_errors(
+    report: &mut storage::BatchImportReport,
+    pending: &mut Vec<storage::BatchImportError>,
+) {
+    report.errors.append(pending);
+}
+
+fn complete_main_import_batch(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    report: &mut storage::BatchImportReport,
+) {
+    if state.pending_import_commit != Some(PendingImportCommit::MainBatch) {
+        return;
+    }
+    state.pending_import_commit = None;
+    state.busy = false;
+    if !library_is_ready(state) {
+        state.status = library_unavailable_status(state).to_string();
+        clear_import_batch_buffers(state);
+        context.request_repaint();
+        return;
+    }
+
+    let preflight_error_count = state.pending_main_import_errors.len();
+    merge_batch_errors(report, &mut state.pending_main_import_errors);
+    record_batch_commit_errors(
+        state,
+        report.errors.len().saturating_sub(preflight_error_count),
+    );
+    let imported_count = report.imported_paths.len();
+    let error_summary = batch_error_summary(&report.errors);
+    clear_planner_drag(state);
+    if let Some(library) = report.library.take() {
+        state.library.replace(library);
+        reset_comments_windows(state);
+        refresh_selected_track_index(state);
+        mark_library_snapshot_persisted(state);
+        state.review_cursor_millis = 0;
+        state.draft_note = None;
+        state.reference_draft_note = None;
+        rollback_persisted_note_drag(state);
+        rollback_reference_persisted_note_drag(state);
+        state.reference_playhead_drag_active = false;
+        state.selected_note_id = None;
+        state.hovered_note_id = None;
+        state.selected_reference_note_id = None;
+        state.hovered_reference_note_id = None;
+        state.comment_source = CommentSource::Main;
+        state.comment_source_explicit = false;
+        close_stage_menu(state);
+        close_reference_menu(state);
+        state.remove_confirmation_track_id = None;
+        reset_transport(state);
+        reset_reference_transport(state);
+        state.reference_match_enabled = false;
+        state.status = if report.errors.is_empty() {
+            format!(
+                "{} local track{} — all changes saved.",
+                state.library.tracks.len(),
+                plural(state.library.tracks.len())
+            )
+        } else {
+            format!("Imported {imported_count} file(s); some files failed: {error_summary}")
+        };
+        schedule_selected_waveform_decode(state, context);
+        schedule_selected_reference_decode(state, context);
+    } else {
+        state.status = error_summary;
+    }
+    finish_import_batch(state);
+    clear_import_batch_buffers(state);
+    schedule_next_pending_library_operation(state, context);
+    context.request_repaint();
+}
+
+fn complete_reference_import_batch(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    track_id: String,
+    report: &mut storage::BatchImportReport,
+) {
+    if state.pending_import_commit
+        != Some(PendingImportCommit::AssignedReferenceBatch {
+            track_id: track_id.clone(),
+        })
+    {
+        return;
+    }
+    state.pending_import_commit = None;
+    state.busy = false;
+    if !library_is_ready(state) {
+        state.status = library_unavailable_status(state).to_string();
+        clear_import_batch_buffers(state);
+        context.request_repaint();
+        return;
+    }
+
+    let preflight_error_count = state.pending_reference_import_errors.len();
+    merge_batch_errors(report, &mut state.pending_reference_import_errors);
+    record_batch_commit_errors(
+        state,
+        report.errors.len().saturating_sub(preflight_error_count),
+    );
+    let imported_count = report.imported_paths.len();
+    let error_summary = batch_error_summary(&report.errors);
+    if let Some(library) = report.library.take() {
+        state.library.replace(library);
+        reset_comments_windows(state);
+        refresh_selected_track_index(state);
+        mark_library_snapshot_persisted(state);
+        state.reference_import_selected_path = None;
+        let title = state
+            .library
+            .tracks
+            .iter()
+            .find(|track| track.id == track_id)
+            .map(|track| track.title.clone())
+            .unwrap_or_else(|| String::from("track"));
+        state.status = if report.errors.is_empty() {
+            format!("Added {imported_count} reference track(s) for {title}.")
+        } else {
+            format!(
+                "Added {imported_count} reference track(s) for {title}; some files failed: {error_summary}"
+            )
+        };
+        if state.library.selected_track_id.as_deref() == Some(track_id.as_str()) {
+            reset_reference_transport(state);
+            state.reference_match_enabled = false;
+            schedule_selected_reference_decode(state, context);
+        }
+    } else {
+        state.reference_import_selected_path = None;
+        state.status = error_summary;
+    }
+    state.pending_reference_track_id = None;
+    finish_import_batch(state);
+    clear_import_batch_buffers(state);
+    close_reference_menu(state);
+    schedule_next_pending_library_operation(state, context);
+    context.request_repaint();
+}
+
+fn complete_reference_catalog_batch(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    report: &mut storage::BatchImportReport,
+) {
+    if state.pending_import_commit != Some(PendingImportCommit::CatalogBatch) {
+        return;
+    }
+    state.pending_import_commit = None;
+    state.busy = false;
+    if !library_is_ready(state) {
+        state.status = library_unavailable_status(state).to_string();
+        clear_import_batch_buffers(state);
+        context.request_repaint();
+        return;
+    }
+
+    let preflight_error_count = state.pending_reference_catalog_errors.len();
+    merge_batch_errors(report, &mut state.pending_reference_catalog_errors);
+    state.reference_catalog_import_completed = report.imported_paths.len();
+    state.reference_catalog_import_failed = report.errors.len();
+    let error_summary = batch_error_summary(&report.errors);
+    if let Some(library) = report.library.take() {
+        state.library.replace(library);
+        reset_comments_windows(state);
+        refresh_selected_track_index(state);
+        mark_library_snapshot_persisted(state);
+        state.status = if report.errors.is_empty() {
+            format!(
+                "Added {} reference track(s) to the catalog.",
+                report.imported_paths.len()
+            )
+        } else {
+            format!(
+                "Added {} reference track(s); some files failed: {error_summary}",
+                report.imported_paths.len()
+            )
+        };
+    } else {
+        state.status = error_summary;
+    }
+    let _ = preflight_error_count;
+    if state.pending_reference_catalog_paths.is_empty() {
+        let total = state.reference_catalog_import_total;
+        let failed = state.reference_catalog_import_failed;
+        if total > 1 {
+            state.status = format!(
+                "Added {} of {} reference tracks; {} failed.",
+                total.saturating_sub(failed),
+                total,
+                failed
+            );
+        }
+        state.reference_catalog_import_total = 0;
+        state.reference_catalog_import_completed = 0;
+        state.reference_catalog_import_failed = 0;
+        clear_import_batch_buffers(state);
+        schedule_next_pending_library_operation(state, context);
+    } else {
+        clear_import_batch_buffers(state);
+        schedule_next_reference_catalog_import(state, context);
+    }
+    context.request_repaint();
 }
 
 fn finish_import_batch(state: &mut AppState) {
@@ -7035,65 +7518,97 @@ fn start_audio_import_preflight(
         );
 }
 
-fn start_import_commit(
+fn start_main_import_batch_commit(
     state: &mut AppState,
     context: &mut ui::UiUpdateContext<Message>,
-    decoded: audio::DecodedAudioFile,
 ) {
-    state.pending_import_commit = Some(PendingImportCommit::Main);
+    state.pending_import_commit = Some(PendingImportCommit::MainBatch);
+    if state.pending_main_import_candidates.is_empty() {
+        let report = storage::BatchImportReport {
+            library: None,
+            imported_paths: Vec::new(),
+            errors: Vec::new(),
+        };
+        update(state, Message::ImportBatchCompleted(report), context);
+        return;
+    }
+    let candidates = std::mem::take(&mut state.pending_main_import_candidates);
     let library = state.library.snapshot();
+    let library_path = storage::library_path();
     context.business().blocking_io("cadence-import-track").run(
-        move |_| storage::import_into_library(Arc::unwrap_or_clone(library), decoded),
-        Message::ImportCompleted,
+        move |_| {
+            storage::import_verified_batch(Arc::unwrap_or_clone(library), candidates, &library_path)
+        },
+        Message::ImportBatchCompleted,
     );
 }
 
-fn start_reference_commit(
+fn start_reference_import_batch_commit(
     state: &mut AppState,
     context: &mut ui::UiUpdateContext<Message>,
     track_id: String,
-    path: PathBuf,
-    decoded: audio::DecodedAudioFile,
 ) {
-    state.pending_import_commit = Some(PendingImportCommit::AssignedReference {
+    state.pending_import_commit = Some(PendingImportCommit::AssignedReferenceBatch {
         track_id: track_id.clone(),
-        path: path.clone(),
     });
+    if state.pending_reference_import_candidates.is_empty() {
+        let report = storage::BatchImportReport::default();
+        update(
+            state,
+            Message::ReferenceImportBatchCompleted { track_id, report },
+            context,
+        );
+        return;
+    }
+    let candidates = std::mem::take(&mut state.pending_reference_import_candidates);
     let library = state.library.snapshot();
+    let library_path = storage::library_path();
     let commit_track_id = track_id.clone();
     context
         .business()
         .blocking_io("cadence-import-reference")
         .run(
             move |_| {
-                storage::set_reference_track(
+                storage::assign_reference_verified_batch(
                     Arc::unwrap_or_clone(library),
                     &commit_track_id,
-                    decoded,
+                    candidates,
+                    &library_path,
                 )
             },
-            move |result| Message::ReferenceImportCompleted {
-                track_id,
-                path,
-                result,
-            },
+            move |report| Message::ReferenceImportBatchCompleted { track_id, report },
         );
 }
 
-fn start_reference_catalog_commit(
+fn start_reference_catalog_batch_commit(
     state: &mut AppState,
     context: &mut ui::UiUpdateContext<Message>,
-    path: PathBuf,
-    decoded: audio::DecodedAudioFile,
 ) {
-    state.pending_import_commit = Some(PendingImportCommit::Catalog { path: path.clone() });
+    state.pending_import_commit = Some(PendingImportCommit::CatalogBatch);
+    if state.pending_reference_catalog_candidates.is_empty() {
+        let report = storage::BatchImportReport::default();
+        update(
+            state,
+            Message::ReferenceCatalogImportBatchCompleted { report },
+            context,
+        );
+        return;
+    }
+    let candidates = std::mem::take(&mut state.pending_reference_catalog_candidates);
     let library = state.library.snapshot();
+    let library_path = storage::library_path();
     context
         .business()
         .blocking_io("cadence-import-reference-catalog")
         .run(
-            move |_| storage::add_reference_track(Arc::unwrap_or_clone(library), decoded),
-            move |result| Message::ReferenceCatalogImportCompleted { path, result },
+            move |_| {
+                storage::add_reference_verified_batch(
+                    Arc::unwrap_or_clone(library),
+                    candidates,
+                    &library_path,
+                )
+            },
+            move |report| Message::ReferenceCatalogImportBatchCompleted { report },
         );
 }
 
@@ -7282,12 +7797,41 @@ fn complete_audio_import_preflight(
         Err(library_unavailable_status(state).to_string())
     };
     match (target, result) {
-        (AudioImportTarget::Main, Ok(decoded)) => start_import_commit(state, context, decoded),
+        (AudioImportTarget::Main, Ok(decoded)) => {
+            record_import_attempt(state, false);
+            state
+                .pending_main_import_candidates
+                .push(storage::VerifiedImportCandidate::from_decoded(&decoded));
+            if let Some(next_path) = state.pending_import_paths.pop_front() {
+                start_import(state, context, next_path);
+            } else {
+                start_main_import_batch_commit(state, context);
+            }
+        }
         (AudioImportTarget::AssignedReference { track_id }, Ok(decoded)) => {
-            start_reference_commit(state, context, track_id, path, decoded);
+            record_import_attempt(state, false);
+            state
+                .pending_reference_import_candidates
+                .push(storage::VerifiedImportCandidate::from_decoded(&decoded));
+            if let Some(next_path) = state.pending_reference_paths.pop_front() {
+                start_reference_preflight(state, context, track_id, next_path);
+            } else {
+                start_reference_import_batch_commit(state, context, track_id);
+            }
         }
         (AudioImportTarget::Catalog, Ok(decoded)) => {
-            start_reference_catalog_commit(state, context, path, decoded);
+            state.reference_catalog_import_completed = state
+                .reference_catalog_import_completed
+                .saturating_add(1)
+                .min(state.reference_catalog_import_total);
+            state
+                .pending_reference_catalog_candidates
+                .push(storage::VerifiedImportCandidate::from_decoded(&decoded));
+            if let Some(next_path) = state.pending_reference_catalog_paths.pop_front() {
+                start_reference_catalog_import(state, context, next_path);
+            } else {
+                start_reference_catalog_batch_commit(state, context);
+            }
         }
         (
             AudioImportTarget::ReferenceSelection {
@@ -7311,23 +7855,32 @@ fn complete_audio_import_preflight(
             start_replace_commit(state, context, track_id, decoded);
         }
         (AudioImportTarget::Main, Err(error)) => {
-            state.pending_import_commit = Some(PendingImportCommit::Main);
-            update(state, Message::ImportCompleted(Err(error)), context);
+            record_import_attempt(state, true);
+            state
+                .pending_main_import_errors
+                .push(storage::BatchImportError {
+                    path: path.clone(),
+                    error,
+                });
+            if let Some(next_path) = state.pending_import_paths.pop_front() {
+                start_import(state, context, next_path);
+            } else {
+                start_main_import_batch_commit(state, context);
+            }
         }
         (AudioImportTarget::AssignedReference { track_id }, Err(error)) => {
-            state.pending_import_commit = Some(PendingImportCommit::AssignedReference {
-                track_id: track_id.clone(),
-                path: path.clone(),
-            });
-            update(
-                state,
-                Message::ReferenceImportCompleted {
-                    track_id,
-                    path,
-                    result: Err(error),
-                },
-                context,
-            );
+            record_import_attempt(state, true);
+            state
+                .pending_reference_import_errors
+                .push(storage::BatchImportError {
+                    path: path.clone(),
+                    error,
+                });
+            if let Some(next_path) = state.pending_reference_paths.pop_front() {
+                start_reference_preflight(state, context, track_id, next_path);
+            } else {
+                start_reference_import_batch_commit(state, context, track_id);
+            }
         }
         (AudioImportTarget::Replacement { track_id }, Err(error)) => {
             state.pending_import_commit = Some(PendingImportCommit::Replacement {
@@ -7343,15 +7896,22 @@ fn complete_audio_import_preflight(
             );
         }
         (AudioImportTarget::Catalog, Err(error)) => {
-            state.pending_import_commit = Some(PendingImportCommit::Catalog { path: path.clone() });
-            update(
-                state,
-                Message::ReferenceCatalogImportCompleted {
-                    path,
-                    result: Err(error),
-                },
-                context,
-            );
+            state.reference_catalog_import_completed = state
+                .reference_catalog_import_completed
+                .saturating_add(1)
+                .min(state.reference_catalog_import_total);
+            state.reference_catalog_import_failed = state
+                .reference_catalog_import_failed
+                .saturating_add(1)
+                .min(state.reference_catalog_import_completed);
+            state
+                .pending_reference_catalog_errors
+                .push(storage::BatchImportError { path, error });
+            if let Some(next_path) = state.pending_reference_catalog_paths.pop_front() {
+                start_reference_catalog_import(state, context, next_path);
+            } else {
+                start_reference_catalog_batch_commit(state, context);
+            }
         }
     }
 }
@@ -7617,6 +8177,8 @@ fn schedule_reference_import(
     }
     state.pending_reference_paths = paths.into();
     state.pending_reference_track_id = Some(track_id);
+    state.pending_reference_import_candidates.clear();
+    state.pending_reference_import_errors.clear();
     state.reference_import_selected_path = None;
     state.reference_draft_note = None;
     state.selected_reference_note_id = None;
@@ -7655,6 +8217,8 @@ fn schedule_reference_catalog_import(
         return;
     }
     state.pending_reference_catalog_paths = paths.into();
+    state.pending_reference_catalog_candidates.clear();
+    state.pending_reference_catalog_errors.clear();
     state.reference_catalog_import_total = state.pending_reference_catalog_paths.len();
     state.reference_catalog_import_completed = 0;
     state.reference_catalog_import_failed = 0;
@@ -7764,6 +8328,16 @@ fn schedule_reference(
         context.request_repaint();
         return;
     }
+    start_reference_preflight(state, context, track_id, path);
+    context.request_repaint();
+}
+
+fn start_reference_preflight(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    track_id: String,
+    path: PathBuf,
+) {
     state.busy = true;
     state.status = format!("Importing reference {}…", path.display());
     let request = AudioImportRequest {
@@ -7772,7 +8346,6 @@ fn schedule_reference(
     };
     state.audio_import_in_flight = Some(request.clone());
     start_audio_import_preflight(context, request);
-    context.request_repaint();
 }
 
 fn library_dirty(state: &AppState) -> bool {
@@ -7903,9 +8476,12 @@ fn reset_reference_transport(state: &mut AppState) {
     state.reference_transport_polling = false;
     state.reference_transport_waiting_token = None;
     state.reference_transport_loaded = false;
+    state.reference_transport_unload_token = None;
     state.reference_only_playback = false;
     if let Some(reference_transport) = state.reference_transport.as_ref() {
-        let _ = reference_transport.unload(state.reference_transport_generation);
+        state.reference_transport_unload_token = reference_transport
+            .unload(state.reference_transport_generation)
+            .ok();
     }
     sync_playback_output_gains(state);
 }
@@ -7930,6 +8506,23 @@ fn apply_transport_snapshot(state: &mut AppState, snapshot: transport::Snapshot)
 }
 
 fn update_reference_transport(state: &mut AppState) {
+    if let Some(unload_token) = state.reference_transport_unload_token {
+        let Some(snapshot) = state
+            .reference_transport
+            .as_ref()
+            .map(transport::AudioTransport::snapshot)
+        else {
+            state.reference_transport_unload_token = None;
+            return;
+        };
+        if snapshot.generation == state.reference_transport_generation
+            && transport_command_is_confirmed(snapshot, unload_token)
+        {
+            state.reference_transport_unload_token = None;
+            state.reference_transport = None;
+        }
+        return;
+    }
     let Some(snapshot) = state
         .reference_transport
         .as_ref()
@@ -10347,44 +10940,11 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
         return workspace_surface(content);
     };
 
-    let note_ratios = state
+    let main_marker_projection = state
         .waveform
         .as_ref()
-        .filter(|_| {
-            !state.waveform_busy
-                && state.waveform_track_id.as_deref() == Some(track.id.as_str())
-                && track.source_provenance().verified_proof().is_some()
-        })
-        .map(|waveform| {
-            track
-                .notes
-                .iter()
-                .filter_map(|note| {
-                    waveform::ratio_for_millis(note.time_millis, waveform.duration_millis)
-                        .map(|ratio| (ratio, note.done))
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let main_note_addresses = state
-        .waveform
-        .as_ref()
-        .filter(|_| {
-            !state.waveform_busy
-                && state.waveform_track_id.as_deref() == Some(track.id.as_str())
-                && track.source_provenance().verified_proof().is_some()
-        })
-        .map(|waveform| {
-            track
-                .notes
-                .iter()
-                .filter_map(|note| {
-                    waveform::ratio_for_millis(note.time_millis, waveform.duration_millis)
-                        .map(|_| NoteAddress::main(track.id.clone(), note.id.clone()))
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+        .filter(|_| state.waveform_track_id.as_deref() == Some(track.id.as_str()))
+        .map(|waveform| prepared_main_marker_projection(state, track, waveform));
     let hovered_note_ratio = note_ratio_for_address(state, track, state.hovered_note_id.as_ref());
     let selected_note_ratio = note_ratio_for_address(state, track, state.selected_note_id.as_ref());
     let cursor_ratio = state
@@ -10423,14 +10983,17 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
         .as_ref()
         .filter(|_| state.waveform_track_id.as_deref() == Some(track.id.as_str()))
     {
-        let main_note_addresses_for_drag = main_note_addresses.clone();
-        waveform::view_with_source_progress_and_loop(
+        let projection = main_marker_projection
+            .as_ref()
+            .expect("matching waveform should have a marker projection");
+        let main_note_addresses_for_drag = Arc::clone(&projection.addresses);
+        waveform::view_with_prepared_source_progress_and_loop(
             waveform::WaveformSource::Main,
             state.waveform_generation,
             Arc::new(waveform.clone()),
             cursor_ratio,
             draft_ratio,
-            note_ratios,
+            Arc::clone(&projection.markers),
             hovered_note_ratio,
             selected_note_ratio,
             loop_selection,
@@ -10803,7 +11366,6 @@ fn reference_waveform_section(state: &AppState, track: &storage::Track) -> ui::V
             .loop_selections
             .get(PlaybackSource::Reference)
             .map(|selection| (selection.start_ratio, selection.end_ratio));
-        let notes = reference_notes_for_track(&state.library, track);
         let reference_annotations_available = track
             .reference_path
             .as_ref()
@@ -10815,30 +11377,12 @@ fn reference_waveform_section(state: &AppState, track: &storage::Track) -> ui::V
                     .find(|reference| &reference.path == path)
             })
             .is_some_and(|reference| reference.source_provenance().verified_proof().is_some());
-        let note_ratios = notes
-            .iter()
-            .filter(|_| reference_annotations_available)
-            .filter_map(|note| {
-                waveform::ratio_for_millis(note.time_millis, waveform.duration_millis)
-                    .map(|ratio| (ratio, note.done))
-            })
-            .collect::<Vec<_>>();
-        let reference_note_addresses = notes
-            .iter()
-            .filter(|_| reference_annotations_available)
-            .filter_map(|note| {
-                waveform::ratio_for_millis(note.time_millis, waveform.duration_millis).map(|_| {
-                    NoteAddress::reference(
-                        track
-                            .reference_path
-                            .as_ref()
-                            .expect("reference notes require a catalog path")
-                            .clone(),
-                        note.id.clone(),
-                    )
-                })
-            })
-            .collect::<Vec<_>>();
+        let reference_marker_projection = prepared_reference_marker_projection(
+            state,
+            track,
+            waveform,
+            reference_annotations_available,
+        );
         let draft_ratio = state
             .reference_draft_note
             .as_ref()
@@ -10851,14 +11395,14 @@ fn reference_waveform_section(state: &AppState, track: &storage::Track) -> ui::V
             track,
             state.hovered_reference_note_id.as_ref(),
         );
-        let reference_note_addresses_for_drag = reference_note_addresses.clone();
-        waveform::view_with_source_progress_and_loop(
+        let reference_note_addresses_for_drag = Arc::clone(&reference_marker_projection.addresses);
+        waveform::view_with_prepared_source_progress_and_loop(
             waveform::WaveformSource::Reference,
             state.reference_waveform_generation,
             Arc::new(waveform.clone()),
             reference_cursor_ratio,
             draft_ratio,
-            note_ratios,
+            Arc::clone(&reference_marker_projection.markers),
             hovered_note_ratio,
             reference_note_ratio_for_address(
                 state,
@@ -11969,9 +12513,10 @@ mod tests {
         SETTINGS_REFERENCE_ROW_TEXT_HEIGHT, SETTINGS_REFERENCE_ROW_TEXT_SPACING,
         SETTINGS_REFERENCE_ROW_TITLE_HEIGHT, STATUS_BAR_VERSION_WIDTH, SharedLibrary,
         TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER, TRACK_CARD_LIST_SPACING, TRACK_CARD_SELECTED_CORAL,
-        WAVEFORM_HEIGHT, WaveformDecodeRequest, WorkspaceMode, animation_requested,
-        apply_transport_snapshot, cleanup_reference_transport_failure,
-        current_live_frame_for_source, current_loudness_match_gain_db, current_lufs_meter_value,
+        WAVEFORM_HEIGHT, WaveformDecodeRequest, WaveformMarkerProjectionCache,
+        WaveformMarkerProjectionKey, WorkspaceMode, animation_requested, apply_transport_snapshot,
+        cleanup_reference_transport_failure, current_live_frame_for_source,
+        current_loudness_match_gain_db, current_lufs_meter_value,
         current_reference_lufs_meter_value, decode_result_is_current, enforce_loop,
         favorite_toggle, frame_surface_revisions, library_dirty, library_track_card_height,
         library_track_title_id, live_frame_matches_current_session,
@@ -12267,13 +12812,27 @@ mod tests {
     #[test]
     fn shared_library_snapshot_isolated_from_later_mutation() {
         let mut shared = SharedLibrary::from(Library {
-            tracks: vec![audition_track("snapshot")].into(),
+            tracks: vec![audition_track("snapshot"), audition_track("unrelated")].into(),
             ..Library::default()
         });
         let snapshot = shared.snapshot();
 
         assert!(Arc::ptr_eq(&snapshot, &shared.snapshot()));
         assert!(snapshot.tracks.shares_storage_with(&shared.tracks));
+        assert!(
+            snapshot
+                .tracks
+                .shares_entity_storage_with(&shared.tracks, 0)
+        );
+        assert!(
+            snapshot
+                .tracks
+                .shares_entity_storage_with(&shared.tracks, 1)
+        );
+        assert_eq!(
+            snapshot.tracks.entity_pointer(1),
+            shared.tracks.entity_pointer(1)
+        );
         assert!(
             snapshot
                 .reference_tracks
@@ -12295,6 +12854,16 @@ mod tests {
         assert_eq!(snapshot.tracks[0].title, "snapshot");
         assert_eq!(shared.tracks[0].title, "mutated");
         assert!(!snapshot.tracks.shares_storage_with(&shared.tracks));
+        assert!(
+            !snapshot
+                .tracks
+                .shares_entity_storage_with(&shared.tracks, 0)
+        );
+        assert!(
+            snapshot
+                .tracks
+                .shares_entity_storage_with(&shared.tracks, 1)
+        );
         assert!(
             snapshot.tracks[0]
                 .notes
@@ -12349,6 +12918,60 @@ mod tests {
 
         cache.ensure(5, &library);
         assert_eq!(cache.rebuild_count, 2);
+    }
+
+    #[test]
+    fn waveform_marker_projection_cache_reuses_and_invalidates_by_key() {
+        let mut track = audition_track("marker-cache");
+        track.notes = vec![
+            Note {
+                id: String::from("first-note"),
+                time_millis: 100,
+                body: String::from("first"),
+                done: false,
+            },
+            Note {
+                id: String::from("second-note"),
+                time_millis: 700,
+                body: String::from("second"),
+                done: true,
+            },
+        ]
+        .into();
+        let waveform = audition_waveform();
+        let key = WaveformMarkerProjectionKey {
+            owner_id: track.id.clone(),
+            reference_path: None,
+            library_generation: 4,
+            waveform_generation: 7,
+            duration_millis: waveform.duration_millis,
+            annotations_available: true,
+        };
+        let mut cache = WaveformMarkerProjectionCache::default();
+
+        let first = cache.main(key.clone(), &track, &waveform);
+        let reused = cache.main(key.clone(), &track, &waveform);
+        assert_eq!(cache.rebuild_count, 1);
+        assert!(Arc::ptr_eq(&first.markers, &reused.markers));
+        assert!(Arc::ptr_eq(&first.addresses, &reused.addresses));
+
+        let mut changed_generation = key.clone();
+        changed_generation.library_generation += 1;
+        let rebuilt_for_generation = cache.main(changed_generation.clone(), &track, &waveform);
+        assert_eq!(cache.rebuild_count, 2);
+        assert!(!Arc::ptr_eq(
+            &first.markers,
+            &rebuilt_for_generation.markers
+        ));
+
+        let mut changed_identity = changed_generation;
+        changed_identity.owner_id = String::from("different-owner");
+        let rebuilt_for_identity = cache.main(changed_identity, &track, &waveform);
+        assert_eq!(cache.rebuild_count, 3);
+        assert!(!Arc::ptr_eq(
+            &rebuilt_for_generation.markers,
+            &rebuilt_for_identity.markers
+        ));
     }
 
     fn reference_removal_state() -> AppState {

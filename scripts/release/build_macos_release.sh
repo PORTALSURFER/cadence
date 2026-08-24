@@ -8,6 +8,7 @@ version="${CADENCE_RELEASE_VERSION:-}"
 channel="${CADENCE_RELEASE_CHANNEL:-stable}"
 build_id="${CADENCE_RELEASE_BUILD_ID:-}"
 source_git_sha=""
+screenshot_source_git_sha=""
 base_version_re='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
 
 usage() {
@@ -162,6 +163,100 @@ resolve_verified_source_sha() {
     fi
 
     printf '%s\n' "$head_sha"
+}
+
+verify_release_screenshot_provenance() {
+    local release_source_sha="${1:-}"
+    local screenshot_path="${2:-$project_dir/reference/cadence-ui-repainted.png}"
+    local metadata_path="${3:-$project_dir/reference/cadence-ui-repainted.png.json}"
+    local metadata_sha256
+    local metadata_dimensions
+    local metadata_source_git_sha
+    local screenshot_sha256
+    local screenshot_dimensions
+    local screenshot_width
+    local screenshot_height
+
+    if [[ ! "$release_source_sha" =~ ^[0-9a-f]{40}$ ]]; then
+        echo "release source SHA must be a 40-character lowercase commit SHA before screenshot verification." >&2
+        return 1
+    fi
+    if [[ ! -f "$screenshot_path" || -L "$screenshot_path" ]]; then
+        echo "release screenshot must be a checked-in regular file: $screenshot_path" >&2
+        return 1
+    fi
+    if [[ ! -f "$metadata_path" || -L "$metadata_path" ]]; then
+        echo "release screenshot metadata sidecar is missing: $metadata_path" >&2
+        return 1
+    fi
+
+    if ! metadata_sha256="$(jq -er '
+        if type == "object"
+           and (.sha256 | type) == "string"
+           and (.sha256 | test("^[0-9a-f]{64}$"))
+        then .sha256
+        else error("sha256 must be a 64-character lowercase hexadecimal string")
+        end
+    ' "$metadata_path")"; then
+        echo "release screenshot metadata sidecar has invalid sha256: $metadata_path" >&2
+        return 1
+    fi
+    if ! metadata_dimensions="$(jq -er '
+        if type == "object" and .width == 1594 and .height == 987
+        then "\(.width) \(.height)"
+        else error("width and height must be 1594 and 987")
+        end
+    ' "$metadata_path")"; then
+        echo "release screenshot metadata sidecar has invalid dimensions: $metadata_path" >&2
+        return 1
+    fi
+    if ! metadata_source_git_sha="$(jq -er '
+        if type == "object"
+           and (.source_git_sha | type) == "string"
+           and (.source_git_sha | test("^[0-9a-f]{40}$"))
+        then .source_git_sha
+        else error("source_git_sha must be a 40-character lowercase commit SHA")
+        end
+    ' "$metadata_path")"; then
+        echo "release screenshot metadata sidecar has invalid source_git_sha: $metadata_path" >&2
+        return 1
+    fi
+
+    if ! screenshot_sha256="$(shasum -a 256 "$screenshot_path" | awk '{print $1}')"; then
+        echo "could not hash the release screenshot: $screenshot_path" >&2
+        return 1
+    fi
+    if [[ "$screenshot_sha256" != "$metadata_sha256" ]]; then
+        echo "release screenshot SHA-256 does not match its metadata sidecar." >&2
+        return 1
+    fi
+
+    if ! screenshot_dimensions="$(
+        sips -g pixelWidth -g pixelHeight "$screenshot_path" 2>/dev/null |
+            awk '
+                $1 == "pixelWidth:" { width = $2 }
+                $1 == "pixelHeight:" { height = $2 }
+                END {
+                    if (width !~ /^[0-9]+$/ || height !~ /^[0-9]+$/) exit 1
+                    print width, height
+                }
+            '
+    )"; then
+        echo "could not read release screenshot dimensions: $screenshot_path" >&2
+        return 1
+    fi
+    read -r screenshot_width screenshot_height <<< "$screenshot_dimensions"
+    if [[ "$screenshot_width $screenshot_height" != "$metadata_dimensions" ]]; then
+        echo "release screenshot dimensions do not match its metadata sidecar." >&2
+        return 1
+    fi
+
+    if ! git -C "$project_dir" merge-base --is-ancestor "$metadata_source_git_sha" "$release_source_sha" >/dev/null 2>&1; then
+        echo "release screenshot source commit $metadata_source_git_sha is not an ancestor of release source SHA $release_source_sha." >&2
+        return 1
+    fi
+
+    printf '%s\n' "$metadata_source_git_sha"
 }
 
 resolve_root_cargo_package_version() {
@@ -362,6 +457,9 @@ if [[ -n "$(git -C "$project_dir" status --porcelain --untracked-files=all)" ]];
     echo "production release builds require a clean checkout" >&2
     exit 1
 fi
+if ! screenshot_source_git_sha="$(verify_release_screenshot_provenance "$source_git_sha")"; then
+    exit 1
+fi
 if [[ -z "$build_id" ]]; then
     release_run_id="${GITHUB_RUN_NUMBER:-$(date -u +%Y%m%d%H%M%S)}"
     if [[ "$channel" == stable ]]; then
@@ -542,6 +640,7 @@ node "$project_dir/scripts/release/create_manifest.mjs" \
     --channel "$channel" \
     --build-id "$build_id" \
     --git-sha "$source_git_sha" \
+    --screenshot-source-git-sha "$screenshot_source_git_sha" \
     --released-at "$released_at" \
     --team-id "$team_id" \
     --notary-submission-id "$notary_submission_id"

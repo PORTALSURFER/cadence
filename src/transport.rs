@@ -327,6 +327,7 @@ struct SharedSnapshot {
     live_pending: AtomicBool,
     live_frame: Mutex<Option<Arc<LiveSpectrogramFrame>>>,
     live_session: Mutex<Option<Weak<LiveCaptureSession>>>,
+    control_thread: Mutex<Option<thread::Thread>>,
 }
 
 impl SharedSnapshot {
@@ -350,6 +351,24 @@ impl SharedSnapshot {
             live_pending: AtomicBool::new(false),
             live_frame: Mutex::new(None),
             live_session: Mutex::new(None),
+            control_thread: Mutex::new(None),
+        }
+    }
+
+    fn register_control_thread(&self) {
+        if let Ok(mut control_thread) = self.control_thread.lock() {
+            *control_thread = Some(thread::current());
+        }
+    }
+
+    fn wake_control_thread(&self) {
+        let control_thread = self
+            .control_thread
+            .lock()
+            .ok()
+            .and_then(|thread| thread.as_ref().cloned());
+        if let Some(control_thread) = control_thread {
+            control_thread.unpark();
         }
     }
 
@@ -1527,6 +1546,12 @@ pub struct AudioTransport {
     test_next_command_error: Arc<Mutex<Option<String>>>,
 }
 
+impl Drop for AudioTransport {
+    fn drop(&mut self) {
+        self.shared.wake_control_thread();
+    }
+}
+
 impl AudioTransport {
     pub fn spawn() -> Self {
         let (commands, receiver) = mpsc::sync_channel(COMMAND_CAPACITY);
@@ -1699,6 +1724,7 @@ impl AudioTransport {
         match self.commands.try_send(command) {
             Ok(()) => {
                 self.clear_pending_load(generation);
+                self.shared.wake_control_thread();
                 Ok(token)
             }
             // The transport thread will pick up the latest load intent from
@@ -1777,7 +1803,10 @@ impl AudioTransport {
             return Err(String::from(CONTROLS_BUSY_ERROR));
         }
         match self.commands.try_send(command) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.shared.wake_control_thread();
+                Ok(())
+            }
             Err(TrySendError::Full(_)) => {
                 self.release_command_slot();
                 Err(String::from(CONTROLS_BUSY_ERROR))
@@ -1828,6 +1857,7 @@ impl AudioTransport {
 
     fn store_pending_load(&self, command: Command) -> Result<(), String> {
         self.pending_load.replace(command);
+        self.shared.wake_control_thread();
         Ok(())
     }
 
@@ -1877,6 +1907,7 @@ fn run_transport(
     shared: Arc<SharedSnapshot>,
     pending_load: Arc<PendingLoad>,
 ) {
+    shared.register_control_thread();
     let output = match DeviceSinkBuilder::open_default_sink() {
         Ok(output) => {
             let mut output = output;
@@ -1897,18 +1928,8 @@ fn run_transport(
     let mut applied_volume = None;
 
     loop {
-        if let Some(command) = take_pending_load(&pending_load) {
-            handle_command(
-                command,
-                &shared,
-                output.as_ref(),
-                &mut player,
-                &mut loaded,
-                &mut live_session,
-            );
-        }
-        match receiver.recv_timeout(CONTROL_INTERVAL) {
-            Ok(command) => {
+        match wait_for_transport_work(&receiver, &shared, &pending_load) {
+            TransportWork::Command(command) => {
                 release_command_slot(&queued_commands);
                 handle_command(
                     command,
@@ -1919,8 +1940,16 @@ fn run_transport(
                     &mut live_session,
                 )
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            TransportWork::PendingLoad(command) => handle_command(
+                command,
+                &shared,
+                output.as_ref(),
+                &mut player,
+                &mut loaded,
+                &mut live_session,
+            ),
+            TransportWork::Tick => {}
+            TransportWork::Disconnected => break,
         }
 
         loop {
@@ -1955,13 +1984,51 @@ fn run_transport(
     drop(output);
 }
 
+#[derive(Debug)]
+enum TransportWork {
+    Command(Command),
+    PendingLoad(Command),
+    Tick,
+    Disconnected,
+}
+
+fn transport_cadence_active(shared: &SharedSnapshot) -> bool {
+    shared.playing.load(Ordering::Acquire)
+        || shared.generation.load(Ordering::Acquire)
+            != shared.requested_generation.load(Ordering::Acquire)
+}
+
+fn wait_for_transport_work(
+    receiver: &Receiver<Command>,
+    shared: &SharedSnapshot,
+    pending_load: &PendingLoad,
+) -> TransportWork {
+    let deadline = transport_cadence_active(shared).then(|| Instant::now() + CONTROL_INTERVAL);
+    loop {
+        if let Some(command) = pending_load.take() {
+            return TransportWork::PendingLoad(command);
+        }
+        match receiver.try_recv() {
+            Ok(command) => return TransportWork::Command(command),
+            Err(TryRecvError::Disconnected) => return TransportWork::Disconnected,
+            Err(TryRecvError::Empty) => {}
+        }
+
+        if let Some(deadline) = deadline {
+            let now = Instant::now();
+            if now >= deadline {
+                return TransportWork::Tick;
+            }
+            thread::park_timeout(deadline.saturating_duration_since(now));
+        } else {
+            thread::park();
+        }
+    }
+}
+
 fn release_command_slot(queued_commands: &AtomicUsize) {
     let previous = queued_commands.fetch_sub(1, Ordering::AcqRel);
     debug_assert!(previous > 0);
-}
-
-fn take_pending_load(pending_load: &PendingLoad) -> Option<Command> {
-    pending_load.take()
 }
 
 fn reconcile_stale_track(
@@ -2397,19 +2464,20 @@ pub fn normalize_output_gain(gain: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        AudioTransport, CONTROLS_BUSY_ERROR, CaptureFrame, Command, DEFAULT_VOLUME,
-        LIVE_PUBLICATION_FPS, LIVE_PUBLICATION_INTERVAL, LIVE_SPECTROGRAM_BAND_COUNT,
-        LIVE_SPECTROGRAM_MAX_HISTORY, LIVE_SPECTRUM_DISPLAY_CEILING_DB,
-        LIVE_SPECTRUM_DISPLAY_FLOOR_DB, LIVE_SPECTRUM_DISPLAY_MAX_FREQUENCY,
-        LIVE_SPECTRUM_DISPLAY_MIN_FREQUENCY, LIVE_SPECTRUM_DISPLAY_TILT_DB_PER_OCTAVE,
-        LIVE_SPECTRUM_DISPLAY_TILT_REFERENCE_FREQUENCY, LIVE_SPECTRUM_FFT_SIZE,
-        LIVE_SPECTRUM_HOP_SIZE, LIVE_SPECTRUM_POINT_COUNT, LiveAnalysisSource, LiveAnalyzer,
-        LiveCaptureSession, LiveSpectrogramFrame, LoadedTrack, MAX_OUTPUT_GAIN, PendingLoad,
-        SharedSnapshot, clamp_position, display_tilt_db, finish_analyzer_fallback, handle_command,
-        is_current, live_band_ranges, live_display_frequency_bounds, live_spectrum_point_frequency,
-        live_spectrum_point_mappings, load_track, normalize_output_gain, normalize_volume,
-        publish_live_frame_if_due, publish_live_frame_if_due_at, run_live_analyzer,
-        run_live_analyzer_iteration,
+        AudioTransport, CONTROL_INTERVAL, CONTROLS_BUSY_ERROR, CaptureFrame, Command,
+        DEFAULT_VOLUME, LIVE_PUBLICATION_FPS, LIVE_PUBLICATION_INTERVAL,
+        LIVE_SPECTROGRAM_BAND_COUNT, LIVE_SPECTROGRAM_MAX_HISTORY,
+        LIVE_SPECTRUM_DISPLAY_CEILING_DB, LIVE_SPECTRUM_DISPLAY_FLOOR_DB,
+        LIVE_SPECTRUM_DISPLAY_MAX_FREQUENCY, LIVE_SPECTRUM_DISPLAY_MIN_FREQUENCY,
+        LIVE_SPECTRUM_DISPLAY_TILT_DB_PER_OCTAVE, LIVE_SPECTRUM_DISPLAY_TILT_REFERENCE_FREQUENCY,
+        LIVE_SPECTRUM_FFT_SIZE, LIVE_SPECTRUM_HOP_SIZE, LIVE_SPECTRUM_POINT_COUNT,
+        LiveAnalysisSource, LiveAnalyzer, LiveCaptureSession, LiveSpectrogramFrame, LoadedTrack,
+        MAX_OUTPUT_GAIN, PendingLoad, SharedSnapshot, TransportWork, clamp_position,
+        display_tilt_db, finish_analyzer_fallback, handle_command, is_current, live_band_ranges,
+        live_display_frequency_bounds, live_spectrum_point_frequency, live_spectrum_point_mappings,
+        load_track, normalize_output_gain, normalize_volume, publish_live_frame_if_due,
+        publish_live_frame_if_due_at, run_live_analyzer, run_live_analyzer_iteration,
+        transport_cadence_active, wait_for_transport_work,
     };
     use crate::source::{AudioSourceProof, SourceFileStamp, VerifiedSourceTicket};
     use rodio::{Player, Source, buffer::SamplesBuffer, source::SeekError};
@@ -2419,7 +2487,7 @@ mod tests {
         mpsc,
     };
     use std::time::{Duration, Instant};
-    use std::{fs, path::PathBuf};
+    use std::{fs, path::PathBuf, thread};
 
     fn test_ticket(path: &str) -> VerifiedSourceTicket {
         VerifiedSourceTicket::new(
@@ -2541,6 +2609,123 @@ mod tests {
                 ready: false,
             }
         );
+    }
+
+    #[test]
+    fn transport_cadence_is_active_only_while_playing_or_transitioning() {
+        let shared = SharedSnapshot::new();
+
+        assert!(!transport_cadence_active(&shared));
+
+        shared.playing.store(true, Ordering::Release);
+        assert!(transport_cadence_active(&shared));
+
+        shared.playing.store(false, Ordering::Release);
+        shared.generation.store(3, Ordering::Release);
+        assert!(transport_cadence_active(&shared));
+
+        shared.requested_generation.store(3, Ordering::Release);
+        assert!(!transport_cadence_active(&shared));
+    }
+
+    #[test]
+    fn wait_for_transport_work_stays_idle_until_a_command_wakes_it() {
+        let (commands, receiver) = mpsc::sync_channel(1);
+        let shared = Arc::new(SharedSnapshot::new());
+        let pending_load = Arc::new(PendingLoad::new());
+        let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+        let (work_sender, work_receiver) = mpsc::sync_channel(1);
+        let waiter_shared = Arc::clone(&shared);
+        let waiter_pending_load = Arc::clone(&pending_load);
+        let waiter = thread::spawn(move || {
+            waiter_shared.register_control_thread();
+            ready_sender.send(()).expect("waiter should become ready");
+            let work = wait_for_transport_work(&receiver, &waiter_shared, &waiter_pending_load);
+            work_sender
+                .send(work)
+                .expect("waiter result should be delivered");
+        });
+
+        ready_receiver
+            .recv_timeout(Duration::from_millis(100))
+            .expect("waiter should register its control thread");
+        assert!(
+            work_receiver
+                .recv_timeout(CONTROL_INTERVAL.saturating_mul(2))
+                .is_err(),
+            "an idle transport must not emit control ticks"
+        );
+
+        commands
+            .send(Command::Pause {
+                token: 7,
+                generation: 3,
+            })
+            .expect("bounded command channel should accept the command");
+        shared.wake_control_thread();
+
+        let work = work_receiver
+            .recv_timeout(Duration::from_millis(100))
+            .expect("a command should wake the idle waiter");
+        assert!(matches!(
+            work,
+            TransportWork::Command(Command::Pause {
+                token: 7,
+                generation: 3
+            })
+        ));
+        waiter.join().expect("waiter should exit cleanly");
+    }
+
+    #[test]
+    fn wait_for_transport_work_wakes_for_a_pending_load_without_an_idle_tick() {
+        let (_commands, receiver) = mpsc::sync_channel(1);
+        let shared = Arc::new(SharedSnapshot::new());
+        let pending_load = Arc::new(PendingLoad::new());
+        let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+        let (work_sender, work_receiver) = mpsc::sync_channel(1);
+        let waiter_shared = Arc::clone(&shared);
+        let waiter_pending_load = Arc::clone(&pending_load);
+        let waiter = thread::spawn(move || {
+            waiter_shared.register_control_thread();
+            ready_sender.send(()).expect("waiter should become ready");
+            let work = wait_for_transport_work(&receiver, &waiter_shared, &waiter_pending_load);
+            work_sender
+                .send(work)
+                .expect("waiter result should be delivered");
+        });
+
+        ready_receiver
+            .recv_timeout(Duration::from_millis(100))
+            .expect("waiter should register its control thread");
+        assert!(
+            work_receiver
+                .recv_timeout(CONTROL_INTERVAL.saturating_mul(2))
+                .is_err(),
+            "an idle transport must not emit control ticks"
+        );
+
+        pending_load.replace(Command::Load {
+            token: 9,
+            generation: 4,
+            ticket: test_ticket("pending-load.wav"),
+            duration_millis: 2_000,
+        });
+        shared.wake_control_thread();
+
+        let work = work_receiver
+            .recv_timeout(Duration::from_millis(100))
+            .expect("a pending load should wake the idle waiter");
+        assert!(matches!(
+            work,
+            TransportWork::PendingLoad(Command::Load {
+                token: 9,
+                generation: 4,
+                duration_millis: 2_000,
+                ..
+            })
+        ));
+        waiter.join().expect("waiter should exit cleanly");
     }
 
     #[test]

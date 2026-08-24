@@ -17,7 +17,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-
 
 function usage(message) {
   if (message) console.error(`error: ${message}`);
-  console.error("usage: create_manifest.mjs --output-dir DIR --version VERSION --channel stable|rc|nightly --build-id ID --git-sha SHA --released-at ISO --team-id TEAM --notary-submission-id UUID");
+  console.error("usage: create_manifest.mjs --output-dir DIR --version VERSION --channel stable|rc|nightly --build-id ID --git-sha SHA --screenshot-source-git-sha SHA --released-at ISO --team-id TEAM --notary-submission-id UUID");
   process.exit(2);
 }
 
@@ -34,6 +34,7 @@ const version = String(values.version || "");
 const channel = String(values.channel || "stable");
 const buildId = String(values.buildId || "");
 const gitSha = String(values.gitSha || "").toLowerCase();
+const screenshotSourceGitSha = String(values.screenshotSourceGitSha || "").toLowerCase();
 const releasedAt = String(values.releasedAt || "");
 const teamId = String(values.teamId || "");
 const notarySubmissionId = String(values.notarySubmissionId || "").toLowerCase();
@@ -42,6 +43,7 @@ if (!RELEASE_CHANNELS.has(channel)) usage("channel must be stable, rc, or nightl
 if (!CHANNEL_VERSION_RES[channel].test(version)) usage(`${channel} version must use its matching semantic version syntax`);
 if (!/^[a-z0-9][a-z0-9._-]{1,127}$/.test(buildId)) usage("build-id is not safe for the release API");
 if (!SHA_RE.test(gitSha)) usage("git-sha must be a 40-character lowercase commit SHA");
+if (!SHA_RE.test(screenshotSourceGitSha)) usage("screenshot-source-git-sha must be a 40-character lowercase commit SHA");
 if (Number.isNaN(new Date(releasedAt).getTime())) usage("released-at must be an ISO timestamp");
 if (!TEAM_ID_RE.test(teamId)) usage("team-id must be ten uppercase letters or digits");
 if (!UUID_RE.test(notarySubmissionId)) usage("notary-submission-id must be a UUID");
@@ -105,7 +107,7 @@ const manifest = {
     logical_width: dimensions.width,
     logical_height: dimensions.height,
     dpi_scale: 1.0,
-    source_git_sha: gitSha,
+    source_git_sha: screenshotSourceGitSha,
   },
   changelog,
 };
