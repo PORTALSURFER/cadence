@@ -86,6 +86,31 @@ struct OverlayGeometryKey {
     theme: [[u8; 4]; 5],
 }
 
+#[derive(Clone, Debug, Default)]
+struct OverlayGeometryStorage {
+    waterfall_rects: [Vec<Rect>; PALETTE.len()],
+    waterfall_batches: [Option<Arc<[Rect]>>; PALETTE.len()],
+    spectrum_curve: Vec<Point>,
+    spectrum_area: Vec<Point>,
+    spectrum_ribbon: Vec<Point>,
+    spectrum_area_points: Option<Arc<[Point]>>,
+    spectrum_ribbon_points: Option<Arc<[Point]>>,
+}
+
+fn refresh_arc_buffer<T: Clone>(slot: &mut Option<Arc<[T]>>, values: &[T]) -> Arc<[T]> {
+    if let Some(buffer) = slot.as_mut()
+        && buffer.len() == values.len()
+        && let Some(slice) = Arc::get_mut(buffer)
+    {
+        slice.clone_from_slice(values);
+        return Arc::clone(buffer);
+    }
+
+    let replacement = Arc::from(values.to_vec().into_boxed_slice());
+    *slot = Some(Arc::clone(&replacement));
+    replacement
+}
+
 /// Reusable shape geometry for the playback-owned live overlay.
 ///
 /// The retained spectrogram widget has its own GPU surface cache. This cache is
@@ -96,6 +121,7 @@ struct OverlayGeometryKey {
 pub(crate) struct OverlayGeometryCache {
     key: Option<OverlayGeometryKey>,
     primitives: Vec<PaintPrimitive>,
+    storage: OverlayGeometryStorage,
 }
 
 impl OverlayGeometryCache {
@@ -147,6 +173,7 @@ impl OverlayGeometryCache {
                 bounds,
                 &mut self.primitives,
                 theme,
+                &mut self.storage,
             );
             self.key = Some(key);
         }
@@ -932,6 +959,7 @@ fn append_overlay_waterfall(
     history_scale: f32,
     primitives: &mut Vec<PaintPrimitive>,
     widget_id: u64,
+    storage: &mut OverlayGeometryStorage,
 ) {
     if frame.row_count == 0 || !plot.has_finite_positive_area() {
         return;
@@ -945,7 +973,9 @@ fn append_overlay_waterfall(
     let rows = visible_rows.min(OVERLAY_MAX_WATERFALL_ROWS);
     let rendered_height = (visible_rows as f32 * scale).min(plot.height());
     let rendered_top = plot.max.y - rendered_height;
-    let mut rectangles: [Vec<Rect>; PALETTE.len()] = std::array::from_fn(|_| Vec::new());
+    for rectangles in &mut storage.waterfall_rects {
+        rectangles.clear();
+    }
 
     for display_row in 0..rows {
         let source_row = frame.row_count - visible_rows
@@ -982,7 +1012,7 @@ fn append_overlay_waterfall(
             if bucket != run_bucket {
                 let left = plot.min.x + plot.width() * run_start as f32 / columns as f32;
                 let right = plot.min.x + plot.width() * column as f32 / columns as f32;
-                rectangles[run_bucket].push(Rect::from_min_max(
+                storage.waterfall_rects[run_bucket].push(Rect::from_min_max(
                     Point::new(left, top),
                     Point::new(right, bottom),
                 ));
@@ -992,14 +1022,16 @@ fn append_overlay_waterfall(
         }
     }
 
-    for (palette_index, rects) in rectangles.into_iter().enumerate() {
+    for (palette_index, color) in PALETTE.iter().copied().enumerate() {
+        let rects = storage.waterfall_rects[palette_index].as_slice();
         if rects.is_empty() {
             continue;
         }
+        let batch = refresh_arc_buffer(&mut storage.waterfall_batches[palette_index], rects);
         primitives.push(PaintPrimitive::FillRectBatch(PaintFillRectBatch {
             widget_id,
-            rects: Arc::from(rects.into_boxed_slice()),
-            color: PALETTE[palette_index],
+            rects: batch,
+            color,
         }));
     }
 }
@@ -1010,63 +1042,82 @@ fn append_overlay_spectrum(
     primitives: &mut Vec<PaintPrimitive>,
     widget_id: u64,
     theme: &ThemeTokens,
-) -> Option<Vec<Point>> {
+    storage: &mut OverlayGeometryStorage,
+) -> bool {
+    storage.spectrum_curve.clear();
+    storage.spectrum_area.clear();
+    storage.spectrum_ribbon.clear();
     if frame.spectrum_values.is_empty() || !plot.has_finite_positive_area() {
-        return None;
+        return false;
     }
 
     let point_count = (plot.width().round().max(2.0) as usize)
         .min(OVERLAY_MAX_SPECTRUM_POINTS)
         .min(frame.spectrum_values.len())
         .max(2);
-    let mut curve = Vec::with_capacity(point_count);
+    storage.spectrum_curve.reserve(point_count);
     for point in 0..point_count {
         let source_index = point * (frame.spectrum_values.len() - 1) / (point_count - 1);
         let level = frame.spectrum_values[source_index] as f32 / u8::MAX as f32;
         let x = plot.min.x + plot.width() * point as f32 / (point_count - 1) as f32;
         let y = plot.max.y - plot.height() * level.clamp(0.0, 1.0);
-        curve.push(Point::new(x, y.clamp(plot.min.y, plot.max.y)));
+        storage
+            .spectrum_curve
+            .push(Point::new(x, y.clamp(plot.min.y, plot.max.y)));
     }
 
-    let mut area = curve.clone();
-    area.push(Point::new(plot.max.x, plot.max.y));
-    area.push(Point::new(plot.min.x, plot.max.y));
+    storage
+        .spectrum_area
+        .extend_from_slice(&storage.spectrum_curve);
+    storage.spectrum_area.extend([
+        Point::new(plot.max.x, plot.max.y),
+        Point::new(plot.min.x, plot.max.y),
+    ]);
+    let area = refresh_arc_buffer(
+        &mut storage.spectrum_area_points,
+        storage.spectrum_area.as_slice(),
+    );
     primitives.push(PaintPrimitive::FillPolygon(PaintFillPolygon {
         widget_id,
-        points: Arc::from(area.into_boxed_slice()),
+        points: area,
         color: theme.highlight_orange.with_alpha(SPECTRUM_AREA_ALPHA),
     }));
-    Some(curve)
+    true
 }
 
 fn append_overlay_spectrum_ribbon(
-    curve: &[Point],
     plot: Rect,
     primitives: &mut Vec<PaintPrimitive>,
     widget_id: u64,
     theme: &ThemeTokens,
+    storage: &mut OverlayGeometryStorage,
 ) {
+    let curve = storage.spectrum_curve.as_slice();
     if curve.is_empty() {
         return;
     }
 
     let half_width = SPECTRUM_RIBBON_WIDTH * 0.5;
-    let mut ribbon = Vec::with_capacity(curve.len() * 2);
-    ribbon.extend(curve.iter().map(|point| {
-        Point::new(
+    storage.spectrum_ribbon.reserve(curve.len() * 2);
+    for point in curve {
+        storage.spectrum_ribbon.push(Point::new(
             point.x,
             (point.y - half_width).clamp(plot.min.y, plot.max.y),
-        )
-    }));
-    ribbon.extend(curve.iter().rev().map(|point| {
-        Point::new(
+        ));
+    }
+    for point in curve.iter().rev() {
+        storage.spectrum_ribbon.push(Point::new(
             point.x,
             (point.y + half_width).clamp(plot.min.y, plot.max.y),
-        )
-    }));
+        ));
+    }
+    let ribbon = refresh_arc_buffer(
+        &mut storage.spectrum_ribbon_points,
+        storage.spectrum_ribbon.as_slice(),
+    );
     primitives.push(PaintPrimitive::FillPolygon(PaintFillPolygon {
         widget_id,
-        points: Arc::from(ribbon.into_boxed_slice()),
+        points: ribbon,
         color: theme.highlight_orange,
     }));
 }
@@ -1135,6 +1186,7 @@ fn append_overlay_primitives(
     bounds: Rect,
     primitives: &mut Vec<PaintPrimitive>,
     theme: &ThemeTokens,
+    storage: &mut OverlayGeometryStorage,
 ) {
     if !frame.is_valid() || !bounds.has_finite_positive_area() {
         return;
@@ -1159,7 +1211,7 @@ fn append_overlay_primitives(
                 crate::LiveSpectrogramMode::Spectrum => SPECTRUM_PLOT_BACKGROUND,
             },
         }));
-        let spectrum_curve = match mode {
+        let spectrum_available = match mode {
             crate::LiveSpectrogramMode::Waterfall => {
                 append_overlay_waterfall(
                     frame,
@@ -1167,8 +1219,9 @@ fn append_overlay_primitives(
                     history_scale,
                     primitives,
                     LIVE_SPECTROGRAM_OVERLAY_WIDGET_ID,
+                    storage,
                 );
-                None
+                false
             }
             crate::LiveSpectrogramMode::Spectrum => append_overlay_spectrum(
                 frame,
@@ -1176,6 +1229,7 @@ fn append_overlay_primitives(
                 primitives,
                 LIVE_SPECTROGRAM_OVERLAY_WIDGET_ID,
                 theme,
+                storage,
             ),
         };
         append_overlay_grid(
@@ -1185,13 +1239,13 @@ fn append_overlay_primitives(
             LIVE_SPECTROGRAM_OVERLAY_WIDGET_ID,
             theme,
         );
-        if let Some(curve) = spectrum_curve {
+        if spectrum_available {
             append_overlay_spectrum_ribbon(
-                &curve,
                 plot,
                 primitives,
                 LIVE_SPECTROGRAM_OVERLAY_WIDGET_ID,
                 theme,
+                storage,
             );
         }
         primitives.push(PaintPrimitive::StrokeRect(PaintStrokeRect {
@@ -1298,6 +1352,22 @@ mod tests {
                 Arc::from(spectrum_values.into_boxed_slice()),
             )
             .expect("valid live spectrogram test frame"),
+        )
+    }
+
+    fn test_frame_revision(revision: u64) -> Arc<LiveSpectrogramFrame> {
+        let frame = test_frame();
+        Arc::new(
+            LiveSpectrogramFrame::from_values(
+                frame.generation,
+                frame.epoch,
+                revision,
+                frame.sample_rate,
+                frame.row_count,
+                Arc::clone(&frame.values),
+                Arc::clone(&frame.spectrum_values),
+            )
+            .expect("valid live spectrogram test frame revision"),
         )
     }
 
@@ -1889,6 +1959,143 @@ mod tests {
         );
         assert_eq!(cache.primitives_ptr(), Some(mode_changed));
         assert_ne!(cache.key, first_key);
+    }
+
+    #[test]
+    fn overlay_geometry_cache_reuses_nested_waterfall_backing_across_revisions() {
+        let bounds = bounds();
+        let theme = ThemeTokens::default();
+        let mut cache = OverlayGeometryCache::default();
+        let mut primitives = Vec::new();
+
+        paint_overlay_cached(
+            test_frame_revision(1),
+            LiveSpectrogramMode::Waterfall,
+            DEFAULT_HISTORY_SCALE,
+            bounds,
+            &mut primitives,
+            &theme,
+            &mut cache,
+        );
+        let first_batch = primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                PaintPrimitive::FillRectBatch(batch) => Some(batch.rects.as_ptr()),
+                _ => None,
+            })
+            .expect("waterfall batch");
+        primitives.clear();
+
+        paint_overlay_cached(
+            test_frame_revision(2),
+            LiveSpectrogramMode::Waterfall,
+            DEFAULT_HISTORY_SCALE,
+            bounds,
+            &mut primitives,
+            &theme,
+            &mut cache,
+        );
+        let second_batch = primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                PaintPrimitive::FillRectBatch(batch) => Some(batch.rects.as_ptr()),
+                _ => None,
+            })
+            .expect("waterfall batch after revision");
+        assert_eq!(first_batch, second_batch);
+    }
+
+    #[test]
+    fn overlay_geometry_cache_reuses_nested_spectrum_backing_across_revisions() {
+        let bounds = bounds();
+        let theme = ThemeTokens::default();
+        let mut cache = OverlayGeometryCache::default();
+        let mut primitives = Vec::new();
+
+        paint_overlay_cached(
+            test_frame_revision(1),
+            LiveSpectrogramMode::Spectrum,
+            DEFAULT_HISTORY_SCALE,
+            bounds,
+            &mut primitives,
+            &theme,
+            &mut cache,
+        );
+        let first_polygons = primitives
+            .iter()
+            .filter_map(|primitive| match primitive {
+                PaintPrimitive::FillPolygon(fill) => Some(fill.points.as_ptr()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(first_polygons.len(), 2);
+        primitives.clear();
+
+        paint_overlay_cached(
+            test_frame_revision(2),
+            LiveSpectrogramMode::Spectrum,
+            DEFAULT_HISTORY_SCALE,
+            bounds,
+            &mut primitives,
+            &theme,
+            &mut cache,
+        );
+        let second_polygons = primitives
+            .iter()
+            .filter_map(|primitive| match primitive {
+                PaintPrimitive::FillPolygon(fill) => Some(fill.points.as_ptr()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(second_polygons, first_polygons);
+    }
+
+    #[test]
+    fn overlay_geometry_cache_uses_cow_for_outstanding_waterfall_submission() {
+        let bounds = bounds();
+        let theme = ThemeTokens::default();
+        let mut cache = OverlayGeometryCache::default();
+        let mut primitives = Vec::new();
+
+        paint_overlay_cached(
+            test_frame_revision(1),
+            LiveSpectrogramMode::Waterfall,
+            DEFAULT_HISTORY_SCALE,
+            bounds,
+            &mut primitives,
+            &theme,
+            &mut cache,
+        );
+        let prior_submission = primitives.clone();
+        let prior_batch = prior_submission
+            .iter()
+            .find_map(|primitive| match primitive {
+                PaintPrimitive::FillRectBatch(batch) => Some(batch.rects.as_ptr()),
+                _ => None,
+            })
+            .expect("prior waterfall batch");
+        primitives.clear();
+
+        paint_overlay_cached(
+            test_frame_revision(2),
+            LiveSpectrogramMode::Waterfall,
+            DEFAULT_HISTORY_SCALE,
+            bounds,
+            &mut primitives,
+            &theme,
+            &mut cache,
+        );
+        let refreshed_batch = primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                PaintPrimitive::FillRectBatch(batch) => Some(batch.rects.as_ptr()),
+                _ => None,
+            })
+            .expect("refreshed waterfall batch");
+        assert_ne!(prior_batch, refreshed_batch);
+        assert!(prior_submission.iter().any(|primitive| {
+            matches!(primitive, PaintPrimitive::FillRectBatch(batch) if !batch.rects.is_empty())
+        }));
     }
 
     #[test]
