@@ -2,10 +2,12 @@
 
 import crypto from "node:crypto";
 import { execFile } from "node:child_process";
+import fsStreams from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { finished } from "node:stream/promises";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -107,7 +109,27 @@ async function runCommand(command, args, description) {
   }
 }
 
-async function readRegularFile(root, name) {
+async function closeReadStream(stream) {
+  if (!stream.destroyed) stream.destroy();
+  if (!stream.closed) await finished(stream).catch(() => {});
+}
+
+async function hashArtifact(filePath) {
+  const stream = fsStreams.createReadStream(filePath);
+  const hash = crypto.createHash("sha256");
+  let size = 0;
+  try {
+    for await (const chunk of stream) {
+      size += chunk.length;
+      hash.update(chunk);
+    }
+    return { digest: hash.digest("hex"), size };
+  } finally {
+    await closeReadStream(stream);
+  }
+}
+
+async function readRegularFile(root, name, { readBytes = false } = {}) {
   const filePath = path.join(root, name);
   let stats;
   try {
@@ -117,7 +139,7 @@ async function readRegularFile(root, name) {
     throw error;
   }
   expectRegularFileStats(stats, name);
-  return { path: filePath, bytes: await fs.readFile(filePath), stats };
+  return { path: filePath, bytes: readBytes ? await fs.readFile(filePath) : undefined, stats };
 }
 
 function descriptorShape(descriptor, name, mediaType) {
@@ -316,7 +338,7 @@ async function verifyCandidate(values) {
     expect(entry.isFile() && !entry.isSymbolicLink(), `${entry.name} must be a regular file`);
   }
 
-  const manifestFile = await readRegularFile(root, MANIFEST_NAME);
+  const manifestFile = await readRegularFile(root, MANIFEST_NAME, { readBytes: true });
   let manifest;
   try {
     manifest = JSON.parse(manifestFile.bytes.toString("utf8"));
@@ -325,16 +347,16 @@ async function verifyCandidate(values) {
   }
   verifyProductionProvenance(manifest, expected);
   const descriptors = verifyDescriptors(manifest, expected);
-  const screenshotFile = await readRegularFile(root, SCREENSHOT_NAME);
+  const screenshotFile = await readRegularFile(root, SCREENSHOT_NAME, { readBytes: true });
   const screenshotDimensions = pngDimensions(screenshotFile.bytes, SCREENSHOT_NAME);
   expect(screenshotDimensions.width === descriptors.screenshot.width && screenshotDimensions.height === descriptors.screenshot.height, "screenshot dimensions do not match the manifest");
-  const sumsFile = await readRegularFile(root, SUMS_NAME);
+  const sumsFile = await readRegularFile(root, SUMS_NAME, { readBytes: true });
   verifySha256Sums(sumsFile.bytes, [descriptors.artifact, descriptors.screenshot, descriptors.changelog]);
 
   for (const descriptor of [descriptors.artifact, descriptors.screenshot, descriptors.changelog]) {
     const file = await readRegularFile(root, descriptor.name);
-    expect(file.bytes.length === descriptor.size_bytes, `${descriptor.name} size does not match the manifest`);
-    const digest = crypto.createHash("sha256").update(file.bytes).digest("hex");
+    const { digest, size } = await hashArtifact(file.path);
+    expect(size === descriptor.size_bytes, `${descriptor.name} size does not match the manifest`);
     expect(digest === descriptor.sha256, `${descriptor.name} SHA-256 does not match the manifest`);
     if (descriptor === descriptors.artifact) await verifyReleaseBundle(file.path, expected);
   }

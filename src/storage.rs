@@ -938,6 +938,17 @@ fn import_verified_batch_inner(
     for candidate in provisional {
         before_final_validation(&candidate);
         let path = candidate.path.clone();
+        match validate_import_candidate(&candidate) {
+            Ok(_) => final_successes.push(candidate),
+            Err(error) => {
+                errors.push(BatchImportError { path, error });
+            }
+        }
+    }
+
+    let mut accepted_paths = Vec::with_capacity(final_successes.len());
+    for candidate in final_successes {
+        let path = candidate.path.clone();
         let metadata = match validate_import_candidate(&candidate) {
             Ok(metadata) => metadata,
             Err(error) => {
@@ -945,12 +956,6 @@ fn import_verified_batch_inner(
                 continue;
             }
         };
-        final_successes.push((candidate, metadata));
-    }
-
-    let mut accepted_paths = Vec::with_capacity(final_successes.len());
-    for (candidate, metadata) in final_successes {
-        let path = candidate.path.clone();
         match apply_candidate(&mut library, candidate, metadata) {
             Ok(()) => accepted_paths.push(path),
             Err(error) => errors.push(BatchImportError { path, error }),
@@ -2357,6 +2362,57 @@ mod tests {
                     // the early candidate's final source fence.
                     fs::write(&early_path_for_hook, b"source changed before final fence")
                         .expect("the early source should be replaceable by the test hook");
+                }
+            },
+        );
+
+        assert_eq!(
+            final_fence_paths,
+            vec![early_path.clone(), late_path.clone()]
+        );
+        let library = report
+            .library
+            .as_ref()
+            .expect("the unchanged later candidate should persist");
+        assert_eq!(report.imported_paths, vec![late_path.clone()]);
+        assert_eq!(report.errors.len(), 1);
+        assert_eq!(report.errors[0].path, early_path);
+        assert!(report.errors[0].error.contains("changed after preflight"));
+        assert!(!library.tracks.iter().any(|track| track.path == early_path));
+        assert!(library.tracks.iter().any(|track| track.path == late_path));
+        assert_eq!(
+            load_library_at(&library_path).expect("the final snapshot should reload"),
+            *library
+        );
+        assert!(temporary_paths(&directory.path).is_empty());
+    }
+
+    #[test]
+    fn import_verified_batch_rechecks_early_candidate_after_late_final_fence() {
+        let directory = TestDirectory::new();
+        let library_path = directory.path.join("library.json");
+        let (early_path, early_decoded) = decoded_audio_fixture_named(&directory.path, "early.wav");
+        let (late_path, late_decoded) = decoded_audio_fixture_named(&directory.path, "late.wav");
+        let early_path_for_hook = early_path.clone();
+        let mut final_fence_paths = Vec::new();
+
+        let report = import_verified_batch_with_final_fence_hook(
+            persistence_fixture(),
+            vec![
+                VerifiedImportCandidate::from_decoded(&early_decoded),
+                VerifiedImportCandidate::from_decoded(&late_decoded),
+            ],
+            &library_path,
+            |candidate| {
+                final_fence_paths.push(candidate.path.clone());
+                if candidate.path == late_path {
+                    // The early candidate has already passed its final fence
+                    // when this hook runs for the late candidate.
+                    fs::write(
+                        &early_path_for_hook,
+                        b"source changed after early final fence",
+                    )
+                    .expect("the early source should be replaceable by the test hook");
                 }
             },
         );
