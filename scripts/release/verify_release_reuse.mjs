@@ -1,8 +1,16 @@
 #!/usr/bin/env node
 
 import crypto from "node:crypto";
+import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
+const releaseDirectory = path.dirname(fileURLToPath(import.meta.url));
+const architectureVerifierScript = path.join(releaseDirectory, "verify_macos_architecture.sh");
 
 const SHA256_RE = /^[0-9a-f]{64}$/;
 const SHA_RE = /^[0-9a-f]{40}$/;
@@ -19,6 +27,7 @@ const MANIFEST_NAME = "cadence-release-manifest.json";
 const SCREENSHOT_NAME = "cadence-default-ui-1594x987.png";
 const CHANGELOG_NAME = "CHANGELOG.md";
 const SUMS_NAME = "SHA256SUMS.txt";
+const BUNDLE_IDENTIFIER = "org.portalsurfer.cadence";
 
 function usage(message) {
   if (message) console.error(`error: ${message}`);
@@ -54,6 +63,48 @@ function expectObject(value, label) {
 
 function expectRegularFileStats(stats, name) {
   expect(stats.isFile() && !stats.isSymbolicLink(), `${name} must be a regular file`);
+}
+
+async function expectDirectory(directory, name) {
+  let stats;
+  try {
+    stats = await fs.lstat(directory);
+  } catch (error) {
+    if (error?.code === "ENOENT") fail(`${name} is missing`);
+    throw error;
+  }
+  expect(stats.isDirectory() && !stats.isSymbolicLink(), `${name} must be a real directory`);
+}
+
+async function expectRegularFile(filePath, name) {
+  let stats;
+  try {
+    stats = await fs.lstat(filePath);
+  } catch (error) {
+    if (error?.code === "ENOENT") fail(`${name} is missing`);
+    throw error;
+  }
+  expectRegularFileStats(stats, name);
+  return stats;
+}
+
+async function expectExecutable(filePath, name) {
+  const stats = await expectRegularFile(filePath, name);
+  expect((stats.mode & 0o111) !== 0, `${name} must be executable`);
+}
+
+function commandErrorDetail(error) {
+  const detail = [error?.stderr, error?.stdout, error?.message]
+    .find((value) => typeof value === "string" && value.trim().length > 0);
+  return detail ? `: ${detail.trim()}` : "";
+}
+
+async function runCommand(command, args, description) {
+  try {
+    return await execFileAsync(command, args, { maxBuffer: 1024 * 1024 });
+  } catch (error) {
+    fail(`${description}${commandErrorDetail(error)}`);
+  }
 }
 
 async function readRegularFile(root, name) {
@@ -153,6 +204,81 @@ function verifySha256Sums(bytes, descriptors) {
   expect(seen.size === expected.size, `${SUMS_NAME} is missing a release descriptor`);
 }
 
+function expectedBundleMetadata(expected) {
+  const shortVersion = expected.version.split("-", 1)[0];
+  const buildNumber = expected.channel === "stable"
+    ? shortVersion
+    : expected.version.slice(expected.version.lastIndexOf(".") + 1);
+  return {
+    CFBundleIdentifier: BUNDLE_IDENTIFIER,
+    CFBundleName: "Cadence",
+    CFBundleExecutable: "Cadence",
+    CFBundlePackageType: "APPL",
+    CFBundleShortVersionString: shortVersion,
+    CFBundleVersion: buildNumber,
+  };
+}
+
+async function verifyBundleMetadata(infoPlistPath, expected) {
+  const { stdout } = await runCommand(
+    "/usr/bin/plutil",
+    ["-convert", "json", "-o", "-", "--", infoPlistPath],
+    "Cadence.app Info.plist is invalid",
+  );
+  let metadata;
+  try {
+    metadata = JSON.parse(stdout);
+  } catch (error) {
+    fail(`Cadence.app Info.plist did not convert to valid JSON: ${error.message}`);
+  }
+  expectObject(metadata, "Cadence.app Info.plist");
+  for (const [key, value] of Object.entries(expectedBundleMetadata(expected))) {
+    expect(metadata[key] === value, `Cadence.app Info.plist ${key} must be ${value}`);
+  }
+}
+
+async function verifyReleaseBundle(artifactPath, expected) {
+  expect(process.platform === "darwin", "release reuse verification requires macOS");
+  const extractionDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "cadence-release-reuse-"));
+  try {
+    await runCommand(
+      "/usr/bin/ditto",
+      ["-x", "-k", artifactPath, extractionDirectory],
+      "artifact archive is not a valid ZIP",
+    );
+
+    const appPath = path.join(extractionDirectory, "Cadence.app");
+    const contentsPath = path.join(appPath, "Contents");
+    const macosPath = path.join(contentsPath, "MacOS");
+    const executablePath = path.join(macosPath, "Cadence");
+    const infoPlistPath = path.join(contentsPath, "Info.plist");
+    await expectDirectory(appPath, "Cadence.app bundle");
+    await expectDirectory(contentsPath, "Cadence.app Contents directory");
+    await expectDirectory(macosPath, "Cadence.app MacOS directory");
+    await expectExecutable(executablePath, "Cadence.app executable");
+    await expectRegularFile(infoPlistPath, "Cadence.app Info.plist");
+    await verifyBundleMetadata(infoPlistPath, expected);
+
+    await runCommand(
+      "/bin/bash",
+      [architectureVerifierScript, executablePath],
+      "Cadence.app executable architecture verification failed",
+    );
+    await runCommand(
+      "codesign",
+      ["--verify", "--strict", "--verbose=2", executablePath],
+      "Cadence.app executable codesign verification failed",
+    );
+    await runCommand(
+      "codesign",
+      ["--verify", "--deep", "--strict", "--verbose=2", appPath],
+      "Cadence.app bundle codesign verification failed",
+    );
+  } finally {
+    await fs.rm(extractionDirectory, { recursive: true, force: true });
+  }
+}
+
 async function verifyCandidate(values) {
   const expected = {
     version: String(values.version),
@@ -210,6 +336,7 @@ async function verifyCandidate(values) {
     expect(file.bytes.length === descriptor.size_bytes, `${descriptor.name} size does not match the manifest`);
     const digest = crypto.createHash("sha256").update(file.bytes).digest("hex");
     expect(digest === descriptor.sha256, `${descriptor.name} SHA-256 does not match the manifest`);
+    if (descriptor === descriptors.artifact) await verifyReleaseBundle(file.path, expected);
   }
 
   console.log(JSON.stringify({ verified: true, build_id: expected.buildId, root }, null, 2));

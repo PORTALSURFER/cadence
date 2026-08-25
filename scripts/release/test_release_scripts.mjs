@@ -39,7 +39,50 @@ function allocateNightlyVersion(cargoBaseVersion, releaseNames) {
 
 async function createInputDirectory(version) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cadence-manifest-test-"));
-  await fs.writeFile(path.join(directory, `cadence-v${version}-macos-arm64.zip`), "zip fixture\n");
+  const appPath = path.join(directory, "Cadence.app");
+  const contentsPath = path.join(appPath, "Contents");
+  const executablePath = path.join(contentsPath, "MacOS", "Cadence");
+  const shortVersion = version.split("-", 1)[0];
+  const buildNumber = version === shortVersion ? shortVersion : version.slice(version.lastIndexOf(".") + 1);
+  await fs.mkdir(path.dirname(executablePath), { recursive: true });
+  await fs.mkdir(path.join(contentsPath, "Resources"), { recursive: true });
+  await fs.writeFile(
+    path.join(contentsPath, "Info.plist"),
+    `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDisplayName</key>
+  <string>Cadence</string>
+  <key>CFBundleExecutable</key>
+  <string>Cadence</string>
+  <key>CFBundleIdentifier</key>
+  <string>org.portalsurfer.cadence</string>
+  <key>CFBundleName</key>
+  <string>Cadence</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>${shortVersion}</string>
+  <key>CFBundleVersion</key>
+  <string>${buildNumber}</string>
+</dict>
+</plist>
+`,
+  );
+  await fs.writeFile(executablePath, "synthetic arm64 Cadence executable\n");
+  await fs.chmod(executablePath, 0o755);
+  await fs.writeFile(path.join(contentsPath, "PkgInfo"), "APPL????");
+  await fs.writeFile(path.join(contentsPath, "Resources", "Cadence.icns"), "synthetic Cadence icon\n");
+  await execFileAsync("/usr/bin/ditto", [
+    "-c",
+    "-k",
+    "--sequesterRsrc",
+    "--keepParent",
+    appPath,
+    path.join(directory, `cadence-v${version}-macos-arm64.zip`),
+  ]);
+  await fs.rm(appPath, { recursive: true, force: true });
   await fs.writeFile(path.join(directory, "cadence-default-ui-1594x987.png"), png);
   await fs.writeFile(path.join(directory, "CHANGELOG.md"), "# Test release\n");
   return directory;
@@ -66,6 +109,43 @@ async function createReuseFixture() {
   const version = "0.1.0";
   const directory = await createInputDirectory(version);
   const manifest = await createManifest(directory, version);
+  await writeReuseSums(directory, manifest);
+  const commandStubs = await createReuseCommandStubs();
+  return {
+    directory,
+    manifest,
+    version,
+    commandStubs,
+    environment: {
+      ...process.env,
+      PATH: `${commandStubs}${path.delimiter}${process.env.PATH || ""}`,
+    },
+  };
+}
+
+async function createReuseCommandStubs() {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cadence-reuse-command-stubs-"));
+  await fs.writeFile(path.join(directory, "lipo"), `#!/bin/sh
+set -eu
+[ "$#" -eq 2 ] && [ "$1" = "-archs" ] && [ -f "$2" ]
+printf '%s\\n' "\${CADENCE_TEST_LIPO_ARCHS:-arm64}"
+`);
+  await fs.writeFile(path.join(directory, "codesign"), `#!/bin/sh
+set -eu
+last_argument=""
+for argument in "$@"; do last_argument="$argument"; done
+[ "$1" = "--verify" ] && [ -e "$last_argument" ]
+if [ "\${CADENCE_TEST_CODESIGN_FAILURE:-0}" = "1" ]; then
+  echo "synthetic codesign failure" >&2
+  exit 1
+fi
+`);
+  await fs.chmod(path.join(directory, "lipo"), 0o755);
+  await fs.chmod(path.join(directory, "codesign"), 0o755);
+  return directory;
+}
+
+async function writeReuseSums(directory, manifest) {
   const descriptorNames = [
     manifest.artifacts[0].name,
     manifest.screenshot.name,
@@ -77,26 +157,45 @@ async function createReuseFixture() {
     sums.push(`${crypto.createHash("sha256").update(bytes).digest("hex")}  ${name}`);
   }
   await fs.writeFile(path.join(directory, "SHA256SUMS.txt"), `${sums.join("\n")}\n`);
-  return { directory, manifest, version };
 }
 
-function verifyReuseFixture(directory, overrides = {}) {
+async function refreshReuseArtifactDescriptor(fixture, bytes) {
+  const artifact = fixture.manifest.artifacts[0];
+  await fs.writeFile(path.join(fixture.directory, artifact.name), bytes);
+  artifact.size_bytes = bytes.length;
+  artifact.sha256 = crypto.createHash("sha256").update(bytes).digest("hex");
+  await fs.writeFile(
+    path.join(fixture.directory, "cadence-release-manifest.json"),
+    `${JSON.stringify(fixture.manifest, null, 2)}\n`,
+  );
+  await writeReuseSums(fixture.directory, fixture.manifest);
+}
+
+function verifyReuseFixture(fixture, overrides = {}) {
+  const { env: environmentOverrides = {}, ...valueOverrides } = overrides;
   const values = {
     version: "0.1.0",
     channel: "stable",
     buildId: "cadence-test-build",
     sourceSha: gitSha,
     repository: "PORTALSURFER/cadence",
-    ...overrides,
+    ...valueOverrides,
   };
   return execFileAsync(process.execPath, [
     reuseVerifierScript,
-    "--root", directory,
+    "--root", fixture.directory,
     "--version", values.version,
     "--channel", values.channel,
     "--build-id", values.buildId,
     "--source-sha", values.sourceSha,
     "--repository", values.repository,
+  ], { env: { ...fixture.environment, ...environmentOverrides } });
+}
+
+async function cleanupReuseFixture(fixture) {
+  await Promise.all([
+    fs.rm(fixture.directory, { recursive: true, force: true }),
+    fs.rm(fixture.commandStubs, { recursive: true, force: true }),
   ]);
 }
 
@@ -605,11 +704,11 @@ test("manifest rejects unknown channels and mismatched channel versions", async 
 test("release reuse verifier accepts a complete production candidate", async () => {
   const fixture = await createReuseFixture();
   try {
-    const result = await verifyReuseFixture(fixture.directory);
+    const result = await verifyReuseFixture(fixture);
     assert.match(result.stdout, /"verified": true/);
     assert.match(result.stdout, /"build_id": "cadence-test-build"/);
   } finally {
-    await fs.rm(fixture.directory, { recursive: true, force: true });
+    await cleanupReuseFixture(fixture);
   }
 });
 
@@ -618,11 +717,11 @@ test("release reuse verifier rejects a missing required file", async () => {
   try {
     await fs.rm(path.join(fixture.directory, fixture.manifest.artifacts[0].name));
     await assert.rejects(
-      verifyReuseFixture(fixture.directory),
+      verifyReuseFixture(fixture),
       (error) => error.code === 1 && error.stderr.includes("required file is missing"),
     );
   } finally {
-    await fs.rm(fixture.directory, { recursive: true, force: true });
+    await cleanupReuseFixture(fixture);
   }
 });
 
@@ -631,11 +730,11 @@ test("release reuse verifier rejects malformed manifest JSON", async () => {
   try {
     await fs.writeFile(path.join(fixture.directory, "cadence-release-manifest.json"), "{not-json\n");
     await assert.rejects(
-      verifyReuseFixture(fixture.directory),
+      verifyReuseFixture(fixture),
       (error) => error.code === 1 && error.stderr.includes("manifest is not valid JSON"),
     );
   } finally {
-    await fs.rm(fixture.directory, { recursive: true, force: true });
+    await cleanupReuseFixture(fixture);
   }
 });
 
@@ -648,11 +747,11 @@ test("release reuse verifier rejects provenance mismatches", async () => {
       `${JSON.stringify(fixture.manifest, null, 2)}\n`,
     );
     await assert.rejects(
-      verifyReuseFixture(fixture.directory),
+      verifyReuseFixture(fixture),
       (error) => error.code === 1 && error.stderr.includes("source repository does not match"),
     );
   } finally {
-    await fs.rm(fixture.directory, { recursive: true, force: true });
+    await cleanupReuseFixture(fixture);
   }
 });
 
@@ -664,11 +763,50 @@ test("release reuse verifier rejects descriptor hash mismatches", async () => {
     artifact[0] ^= 0xff;
     await fs.writeFile(artifactPath, artifact);
     await assert.rejects(
-      verifyReuseFixture(fixture.directory),
+      verifyReuseFixture(fixture),
       (error) => error.code === 1 && error.stderr.includes("SHA-256 does not match"),
     );
   } finally {
-    await fs.rm(fixture.directory, { recursive: true, force: true });
+    await cleanupReuseFixture(fixture);
+  }
+});
+
+test("release reuse verifier rejects non-ZIP artifact bytes with self-consistent metadata", async () => {
+  const fixture = await createReuseFixture();
+  try {
+    await refreshReuseArtifactDescriptor(fixture, Buffer.from("not a ZIP archive\n"));
+    await assert.rejects(
+      verifyReuseFixture(fixture),
+      (error) => error.code === 1 && error.stderr.includes("artifact archive is not a valid ZIP"),
+    );
+  } finally {
+    await cleanupReuseFixture(fixture);
+  }
+});
+
+test("release reuse verifier rejects a truncated ZIP with self-consistent metadata", async () => {
+  const fixture = await createReuseFixture();
+  try {
+    const archive = await fs.readFile(path.join(fixture.directory, fixture.manifest.artifacts[0].name));
+    await refreshReuseArtifactDescriptor(fixture, archive.subarray(0, Math.max(1, Math.floor(archive.length / 2))));
+    await assert.rejects(
+      verifyReuseFixture(fixture),
+      (error) => error.code === 1 && error.stderr.includes("artifact archive is not a valid ZIP"),
+    );
+  } finally {
+    await cleanupReuseFixture(fixture);
+  }
+});
+
+test("release reuse verifier rejects signature verification failure", async () => {
+  const fixture = await createReuseFixture();
+  try {
+    await assert.rejects(
+      verifyReuseFixture(fixture, { env: { CADENCE_TEST_CODESIGN_FAILURE: "1" } }),
+      (error) => error.code === 1 && error.stderr.includes("codesign verification failed"),
+    );
+  } finally {
+    await cleanupReuseFixture(fixture);
   }
 });
 
