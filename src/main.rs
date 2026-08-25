@@ -15134,6 +15134,7 @@ mod tests {
             })
         );
 
+        let mut context = ui::UiUpdateContext::default();
         update(
             &mut state,
             Message::ResizeLiveSpectrogram(ui::DragHandleMessage::moved(Point::new(
@@ -15146,7 +15147,12 @@ mod tests {
             state.live_spectrogram_height,
             super::spectrogram::MAX_HEIGHT
         );
+        assert_eq!(
+            context.into_command().repaint_scope(),
+            Some(RepaintScope::Surface)
+        );
 
+        let mut context = ui::UiUpdateContext::default();
         update(
             &mut state,
             Message::ResizeLiveSpectrogram(ui::DragHandleMessage::ended(origin)),
