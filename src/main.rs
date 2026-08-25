@@ -1484,6 +1484,22 @@ struct PendingCommentPlayback {
 
 impl Default for AppState {
     fn default() -> Self {
+        Self::with_transport_factory(transport::AudioTransport::try_spawn)
+    }
+}
+
+impl AppState {
+    fn with_transport_factory<F>(transport_factory: F) -> Self
+    where
+        F: FnOnce() -> Result<transport::AudioTransport, String>,
+    {
+        let (transport, status) = match transport_factory() {
+            Ok(transport) => (transport, String::from("Ready — import a track to begin.")),
+            Err(error) => (
+                transport::AudioTransport::unavailable(),
+                format!("Audio playback unavailable at startup: {error}"),
+            ),
+        };
         Self {
             library: SharedLibrary::default(),
             library_projection_cache: RefCell::new(LibraryProjectionCache::default()),
@@ -1492,7 +1508,7 @@ impl Default for AppState {
             selected_track_index: None,
             library_load_state: LibraryLoadState::Ready,
             workspace_mode: WorkspaceMode::Review,
-            status: String::from("Ready — import a track to begin."),
+            status,
             busy: false,
             library_revision: 0,
             persisted_library_revision: 0,
@@ -1532,7 +1548,7 @@ impl Default for AppState {
             review_cursor_millis: 0,
             playhead_drag_active: false,
             reference_playhead_drag_active: false,
-            transport: transport::AudioTransport::spawn(),
+            transport,
             transport_generation: 0,
             transport_position_millis: 0,
             transport_playing: false,
@@ -1607,12 +1623,39 @@ impl Default for AppState {
 
 impl AppState {
     fn loading() -> Self {
-        Self {
-            library_load_state: LibraryLoadState::Loading,
-            status: String::from("Loading local library…"),
-            ..Self::default()
-        }
+        Self::loading_with_transport_factory(transport::AudioTransport::try_spawn)
     }
+
+    fn loading_with_transport_factory<F>(transport_factory: F) -> Self
+    where
+        F: FnOnce() -> Result<transport::AudioTransport, String>,
+    {
+        let mut state = Self::with_transport_factory(transport_factory);
+        state.library_load_state = LibraryLoadState::Loading;
+        if state.status == "Ready — import a track to begin." {
+            state.status = String::from("Loading local library…");
+        }
+        state
+    }
+}
+
+fn ensure_reference_transport(state: &mut AppState) -> Result<(), String> {
+    ensure_reference_transport_with(state, transport::AudioTransport::try_spawn)
+}
+
+fn ensure_reference_transport_with<F>(
+    state: &mut AppState,
+    transport_factory: F,
+) -> Result<(), String>
+where
+    F: FnOnce() -> Result<transport::AudioTransport, String>,
+{
+    if state.reference_transport.is_none() {
+        let reference_transport = transport_factory()
+            .map_err(|error| format!("Reference audio transport unavailable: {error}"))?;
+        state.reference_transport = Some(reference_transport);
+    }
+    Ok(())
 }
 
 fn ensure_library_projection_cache(state: &AppState) {
@@ -5332,9 +5375,11 @@ fn seek_synchronized_positions(
     }
     let reference_was_loaded = state.reference_transport_loaded;
     if reference_details.is_some() {
+        ensure_reference_transport(state)?;
         let reference_transport = state
             .reference_transport
-            .get_or_insert_with(transport::AudioTransport::spawn);
+            .as_ref()
+            .ok_or_else(|| String::from("Reference audio transport is unavailable."))?;
         if reference_transport.has_pending_load() {
             return Err(String::from(transport::CONTROLS_BUSY_ERROR));
         }
@@ -5495,9 +5540,16 @@ fn seek_reference_waveform_position(
     if !state.reference_transport_loaded {
         clear_live_spectrogram(state, PlaybackSource::Reference);
     }
-    let reference_transport = state
-        .reference_transport
-        .get_or_insert_with(transport::AudioTransport::spawn);
+    if let Err(error) = ensure_reference_transport(state) {
+        state.status = error;
+        context.request_repaint();
+        return;
+    }
+    let Some(reference_transport) = state.reference_transport.as_ref() else {
+        state.status = String::from("Reference audio transport is unavailable.");
+        context.request_repaint();
+        return;
+    };
     reference_transport.set_output_gain(reference_gain);
     if !state.reference_transport_loaded {
         if let Err(error) = reference_transport.load(
@@ -5909,9 +5961,11 @@ fn start_source_alongside_active(
                 loop_bounds,
             );
             let reference_gain = reference_output_gain_for_source(state, PlaybackSource::Reference);
+            ensure_reference_transport(state)?;
             let reference_transport = state
                 .reference_transport
-                .get_or_insert_with(transport::AudioTransport::spawn);
+                .as_ref()
+                .ok_or_else(|| String::from("Reference audio transport is unavailable."))?;
             if reference_transport.has_pending_load() {
                 return Err(String::from(transport::CONTROLS_BUSY_ERROR));
             }
@@ -6297,9 +6351,15 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
                 context.request_repaint();
                 return;
             }
+            if let Err(error) = ensure_reference_transport(state) {
+                state.status = error;
+                context.request_repaint();
+                return;
+            }
             let reference_transport = state
                 .reference_transport
-                .get_or_insert_with(transport::AudioTransport::spawn);
+                .as_ref()
+                .expect("reference transport was admitted before playback");
             if reference_transport.has_pending_load() {
                 state.status = String::from(transport::CONTROLS_BUSY_ERROR);
                 context.request_repaint();
@@ -12541,8 +12601,8 @@ mod tests {
         cleanup_reference_transport_failure, current_live_frame_for_source,
         current_loudness_match_gain_db, current_lufs_meter_value,
         current_reference_lufs_meter_value, decode_result_is_current, enforce_loop,
-        favorite_toggle, frame_surface_revisions, library_dirty, library_track_card_height,
-        library_track_title_id, live_frame_matches_current_session,
+        ensure_reference_transport_with, favorite_toggle, frame_surface_revisions, library_dirty,
+        library_track_card_height, library_track_title_id, live_frame_matches_current_session,
         live_spectrogram_display_sample_rate, loop_bounds, main_output_gain, native_launch_options,
         note_editor, note_ratio_for_id, owned_tracks_in_stage, paint_live_playback_overlay,
         planner_insertion_target_is_valid, planner_stage_index, planner_tracks_with_favorites,
@@ -13290,6 +13350,58 @@ mod tests {
             )
             .expect("valid live spectrogram test frame"),
         )
+    }
+
+    #[test]
+    fn app_startup_falls_back_to_unavailable_main_transport_with_error_status() {
+        let error = String::from("injected thread creation failure");
+        let state = AppState::loading_with_transport_factory(|| Err(error.clone()));
+
+        assert_eq!(state.library_load_state, LibraryLoadState::Loading);
+        assert!(
+            state
+                .status
+                .contains("Audio playback unavailable at startup")
+        );
+        assert!(state.status.contains(&error));
+        assert_eq!(
+            state.transport.play(0),
+            Err(String::from("The audio transport is no longer available."))
+        );
+    }
+
+    #[test]
+    fn successful_app_startup_preserves_ready_status() {
+        let state =
+            AppState::with_transport_factory(|| Ok(transport::AudioTransport::unavailable()));
+
+        assert_eq!(state.library_load_state, LibraryLoadState::Ready);
+        assert_eq!(state.status, "Ready — import a track to begin.");
+    }
+
+    #[test]
+    fn failed_reference_transport_creation_is_retryable_without_inserting_handle() {
+        let mut state =
+            AppState::with_transport_factory(|| Ok(transport::AudioTransport::unavailable()));
+        let error = String::from("injected reference thread creation failure");
+
+        let failure = ensure_reference_transport_with(&mut state, || Err(error.clone()));
+
+        assert_eq!(
+            failure.unwrap_err(),
+            "Reference audio transport unavailable: injected reference thread creation failure"
+        );
+        assert!(state.reference_transport.is_none());
+
+        let mut retried = false;
+        let success = ensure_reference_transport_with(&mut state, || {
+            retried = true;
+            Ok(transport::AudioTransport::unavailable())
+        });
+
+        assert!(success.is_ok());
+        assert!(retried);
+        assert!(state.reference_transport.is_some());
     }
 
     #[test]

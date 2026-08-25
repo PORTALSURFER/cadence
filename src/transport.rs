@@ -1553,7 +1553,20 @@ impl Drop for AudioTransport {
 }
 
 impl AudioTransport {
-    pub fn spawn() -> Self {
+    pub fn try_spawn() -> Result<Self, String> {
+        Self::try_spawn_with(|worker| {
+            thread::Builder::new()
+                .name(String::from("cadence-audio-transport"))
+                .spawn(worker)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    fn try_spawn_with<F>(spawn: F) -> Result<Self, String>
+    where
+        F: FnOnce(Box<dyn FnOnce() + Send + 'static>) -> Result<(), String>,
+    {
         let (commands, receiver) = mpsc::sync_channel(COMMAND_CAPACITY);
         let queued_commands = Arc::new(AtomicUsize::new(0));
         let shared = Arc::new(SharedSnapshot::new());
@@ -1561,17 +1574,41 @@ impl AudioTransport {
         let thread_queued_commands = Arc::clone(&queued_commands);
         let thread_shared = Arc::clone(&shared);
         let thread_pending_load = Arc::clone(&pending_load);
-        thread::Builder::new()
-            .name(String::from("cadence-audio-transport"))
-            .spawn(move || {
-                run_transport(
-                    receiver,
-                    thread_queued_commands,
-                    thread_shared,
-                    thread_pending_load,
-                )
-            })
-            .expect("Cadence audio transport thread should spawn");
+        let worker = Box::new(move || {
+            run_transport(
+                receiver,
+                thread_queued_commands,
+                thread_shared,
+                thread_pending_load,
+            )
+        });
+        spawn(worker)
+            .map_err(|error| format!("Could not spawn the audio transport thread: {error}"))?;
+        Ok(Self::from_parts(
+            commands,
+            queued_commands,
+            shared,
+            pending_load,
+        ))
+    }
+
+    pub fn unavailable() -> Self {
+        let (commands, receiver) = mpsc::sync_channel(COMMAND_CAPACITY);
+        drop(receiver);
+        Self::from_parts(
+            commands,
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(SharedSnapshot::new()),
+            Arc::new(PendingLoad::new()),
+        )
+    }
+
+    fn from_parts(
+        commands: SyncSender<Command>,
+        queued_commands: Arc<AtomicUsize>,
+        shared: Arc<SharedSnapshot>,
+        pending_load: Arc<PendingLoad>,
+    ) -> Self {
         Self {
             commands,
             queued_commands,
@@ -1581,6 +1618,11 @@ impl AudioTransport {
             #[cfg(test)]
             test_next_command_error: Arc::new(Mutex::new(None)),
         }
+    }
+
+    #[cfg(test)]
+    pub fn spawn() -> Self {
+        Self::try_spawn().expect("Cadence audio transport thread should spawn")
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -2544,6 +2586,17 @@ mod tests {
             MAX_OUTPUT_GAIN
         );
         assert_eq!(normalize_output_gain(f32::NAN), 1.0);
+    }
+
+    #[test]
+    fn try_spawn_reports_injected_thread_creation_failure() {
+        let error = String::from("injected thread creation failure");
+        let result = AudioTransport::try_spawn_with(|_| Err(error.clone()));
+
+        assert_eq!(
+            result.unwrap_err(),
+            "Could not spawn the audio transport thread: injected thread creation failure"
+        );
     }
 
     #[test]
