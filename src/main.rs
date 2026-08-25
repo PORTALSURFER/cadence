@@ -863,6 +863,7 @@ struct LibrarySaveAttempt {
 enum LibraryMutationScope {
     PersistedOnly,
     Projection,
+    Comments,
     Markers,
     ProjectionAndMarkers,
 }
@@ -874,6 +875,13 @@ impl LibraryMutationScope {
 
     const fn affects_markers(self) -> bool {
         matches!(self, Self::Markers | Self::ProjectionAndMarkers)
+    }
+
+    const fn affects_comments(self) -> bool {
+        matches!(
+            self,
+            Self::Comments | Self::Markers | Self::ProjectionAndMarkers
+        )
     }
 }
 
@@ -887,6 +895,7 @@ struct SharedLibrary {
     value: Arc<storage::Library>,
     projection_revision: u64,
     marker_revision: u64,
+    comment_revision: u64,
 }
 
 impl Default for SharedLibrary {
@@ -923,6 +932,7 @@ impl SharedLibrary {
             value: Arc::new(library),
             projection_revision: 0,
             marker_revision: 0,
+            comment_revision: 0,
         }
     }
 
@@ -936,6 +946,10 @@ impl SharedLibrary {
 
     fn marker_revision(&self) -> u64 {
         self.marker_revision
+    }
+
+    fn comment_revision(&self) -> u64 {
+        self.comment_revision
     }
 
     fn mutate<R>(
@@ -971,6 +985,9 @@ impl SharedLibrary {
         if scope.affects_markers() {
             self.marker_revision = self.marker_revision.wrapping_add(1);
         }
+        if scope.affects_comments() {
+            self.comment_revision = self.comment_revision.wrapping_add(1);
+        }
     }
 }
 
@@ -985,6 +1002,13 @@ impl DerefMut for SharedLibrary {
 }
 
 #[derive(Clone, Debug, Default)]
+struct CommentOwnerProjection {
+    note_indices: HashMap<String, usize>,
+    note_count: usize,
+    open_count: usize,
+}
+
+#[derive(Clone, Debug, Default)]
 struct LibraryProjectionCache {
     projection_revision: Option<u64>,
     id_to_library_index: HashMap<String, usize>,
@@ -992,8 +1016,14 @@ struct LibraryProjectionCache {
     planner_indices: Vec<usize>,
     planner_stage_indices: [Vec<usize>; 4],
     reference_assignment_counts: HashMap<PathBuf, usize>,
+    reference_track_indices: HashMap<PathBuf, usize>,
+    comment_revision: Option<(u64, u64)>,
+    main_comment_projections: HashMap<String, CommentOwnerProjection>,
+    reference_comment_projections: HashMap<PathBuf, CommentOwnerProjection>,
     #[cfg(test)]
     rebuild_count: usize,
+    #[cfg(test)]
+    comment_rebuild_count: usize,
 }
 
 impl LibraryProjectionCache {
@@ -1079,6 +1109,14 @@ impl LibraryProjectionCache {
         self.reference_assignment_counts.clear();
         self.reference_assignment_counts
             .reserve(library.tracks.len());
+        self.reference_track_indices.clear();
+        self.reference_track_indices
+            .reserve(library.reference_tracks.len());
+        for (index, reference) in library.reference_tracks.iter().enumerate() {
+            self.reference_track_indices
+                .entry(reference.path.clone())
+                .or_insert(index);
+        }
         for track in &library.tracks {
             if let Some(path) = track.reference_path.as_ref() {
                 *self
@@ -1091,6 +1129,43 @@ impl LibraryProjectionCache {
         #[cfg(test)]
         {
             self.rebuild_count += 1;
+        }
+    }
+
+    fn ensure_comments(
+        &mut self,
+        projection_revision: u64,
+        comment_revision: u64,
+        library: &storage::Library,
+    ) {
+        let key = (projection_revision, comment_revision);
+        if self.comment_revision == Some(key) {
+            return;
+        }
+
+        self.comment_revision = Some(key);
+        self.main_comment_projections.clear();
+        self.main_comment_projections.reserve(library.tracks.len());
+        for track in &library.tracks {
+            self.main_comment_projections.insert(
+                track.id.clone(),
+                CommentOwnerProjection::from_notes(&track.notes),
+            );
+        }
+
+        self.reference_comment_projections.clear();
+        self.reference_comment_projections
+            .reserve(library.reference_tracks.len());
+        for reference in &library.reference_tracks {
+            self.reference_comment_projections.insert(
+                reference.path.clone(),
+                CommentOwnerProjection::from_notes(&reference.notes),
+            );
+        }
+
+        #[cfg(test)]
+        {
+            self.comment_rebuild_count += 1;
         }
     }
 
@@ -1112,6 +1187,75 @@ impl LibraryProjectionCache {
 
     fn reference_assignment_count(&self, path: &Path) -> Option<&usize> {
         self.reference_assignment_counts.get(path)
+    }
+
+    fn reference_track_index(&self, path: &Path) -> Option<usize> {
+        self.reference_track_indices.get(path).copied()
+    }
+
+    fn comment_note_index(&self, owner: &NoteOwner, note_id: &str) -> Option<usize> {
+        match owner {
+            NoteOwner::MainTrack(track_id) => self
+                .main_comment_projections
+                .get(track_id)
+                .and_then(|projection| projection.note_indices.get(note_id))
+                .copied(),
+            NoteOwner::ReferenceTrack(path) => self
+                .reference_comment_projections
+                .get(path)
+                .and_then(|projection| projection.note_indices.get(note_id))
+                .copied(),
+        }
+    }
+
+    fn main_comment_open_count(&self, track_id: &str) -> usize {
+        self.main_comment_projections
+            .get(track_id)
+            .map_or(0, |projection| projection.open_count)
+    }
+
+    fn reference_comment_open_count(&self, path: &Path) -> usize {
+        self.reference_comment_projections
+            .get(path)
+            .map_or(0, |projection| projection.open_count)
+    }
+
+    fn comment_open_count(&self, owner: &NoteOwner) -> usize {
+        match owner {
+            NoteOwner::MainTrack(track_id) => self.main_comment_open_count(track_id),
+            NoteOwner::ReferenceTrack(path) => self.reference_comment_open_count(path),
+        }
+    }
+
+    fn comment_count(&self, owner: &NoteOwner) -> usize {
+        match owner {
+            NoteOwner::MainTrack(track_id) => self
+                .main_comment_projections
+                .get(track_id)
+                .map_or(0, |projection| projection.note_count),
+            NoteOwner::ReferenceTrack(path) => self
+                .reference_comment_projections
+                .get(path)
+                .map_or(0, |projection| projection.note_count),
+        }
+    }
+}
+
+impl CommentOwnerProjection {
+    fn from_notes(notes: &[storage::Note]) -> Self {
+        let mut note_indices = HashMap::with_capacity(notes.len());
+        let mut open_count = 0;
+        for (index, note) in notes.iter().enumerate() {
+            note_indices.entry(note.id.clone()).or_insert(index);
+            if !note.done {
+                open_count += 1;
+            }
+        }
+        Self {
+            note_indices,
+            note_count: notes.len(),
+            open_count,
+        }
     }
 }
 
@@ -1169,13 +1313,13 @@ impl WaveformMarkerProjectionCache {
         key: WaveformMarkerProjectionKey,
         track: &storage::Track,
         waveform: &audio::WaveformData,
-        library: &storage::Library,
+        notes: &[storage::Note],
     ) -> PreparedWaveformMarkerProjection {
         if let Some(cached) = self.reference.as_ref().filter(|cached| cached.key == key) {
             return cached.clone();
         }
         let (ratios, addresses) =
-            reference_marker_inputs(track, waveform, library, key.annotations_available);
+            reference_marker_inputs(track, waveform, notes, key.annotations_available);
         let projection = PreparedWaveformMarkerProjection {
             key,
             markers: Arc::new(waveform::PreparedNoteMarkers::from_note_ratios(&ratios)),
@@ -1215,7 +1359,7 @@ fn main_marker_inputs(
 fn reference_marker_inputs(
     track: &storage::Track,
     waveform: &audio::WaveformData,
-    library: &storage::Library,
+    notes: &[storage::Note],
     annotations_available: bool,
 ) -> (Vec<(f32, bool)>, Vec<NoteAddress>) {
     let Some(reference_path) = track.reference_path.as_ref() else {
@@ -1224,7 +1368,6 @@ fn reference_marker_inputs(
     if !annotations_available {
         return (Vec::new(), Vec::new());
     }
-    let notes = reference_notes_for_track(library, track);
     notes
         .iter()
         .filter_map(|note| {
@@ -1274,10 +1417,11 @@ fn prepared_reference_marker_projection(
         duration_millis: waveform.duration_millis,
         annotations_available,
     };
+    let notes = reference_notes_for_track_cached(state, track);
     state
         .waveform_marker_projection_cache
         .borrow_mut()
-        .reference(key, track, waveform, &state.library)
+        .reference(key, track, waveform, notes)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1717,10 +1861,13 @@ where
 }
 
 fn ensure_library_projection_cache(state: &AppState) {
-    state
-        .library_projection_cache
-        .borrow_mut()
-        .ensure(state.library.projection_revision(), &state.library);
+    let mut cache = state.library_projection_cache.borrow_mut();
+    cache.ensure(state.library.projection_revision(), &state.library);
+    cache.ensure_comments(
+        state.library.projection_revision(),
+        state.library.comment_revision(),
+        &state.library,
+    );
 }
 
 fn allocate_note_draft_nonce(state: &mut AppState) -> u64 {
@@ -2363,14 +2510,8 @@ fn main_annotations_available(state: &AppState) -> bool {
 
 fn reference_annotations_available(state: &AppState) -> bool {
     selected_track(state)
-        .and_then(|track| track.reference_path.as_ref())
-        .and_then(|path| {
-            state
-                .library
-                .reference_tracks
-                .iter()
-                .find(|reference| &reference.path == path)
-        })
+        .and_then(|track| track.reference_path.as_deref())
+        .and_then(|path| reference_track_for_path(state, path))
         .is_some_and(|reference| reference.source_provenance().verified_proof().is_some())
 }
 
@@ -2421,12 +2562,7 @@ fn reject_unknown_reference_source(
     let Some(path) = track.reference_path.as_ref() else {
         return false;
     };
-    let Some(reference) = state
-        .library
-        .reference_tracks
-        .iter()
-        .find(|reference| &reference.path == path)
-    else {
+    let Some(reference) = reference_track_for_path(state, path) else {
         return false;
     };
     if !reference.source_provenance().is_unknown() {
@@ -2467,11 +2603,7 @@ fn historical_binding_candidate(
         }
         HistoricalBindingOwner::Reference { path } => {
             let track = selected_track(state)?;
-            let reference = state
-                .library
-                .reference_tracks
-                .iter()
-                .find(|reference| reference.path == path)?;
+            let reference = reference_track_for_path(state, &path)?;
             let ticket = state.reference_waveform_source_ticket.as_ref()?;
             (track.reference_path.as_ref() == Some(&path)
                 && state.reference_waveform_track_id.as_deref() == Some(track.id.as_str())
@@ -3431,10 +3563,11 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 let selected_path = state.reference_import_selected_path.take();
                 state.pending_reference_track_id = None;
                 if let Some(path) = selected_path {
+                    let catalog_had_path = reference_track_for_path(state, &path).is_some();
                     let result = state.library.mutate_with(
-                        LibraryMutationScope::Projection,
+                        LibraryMutationScope::ProjectionAndMarkers,
                         |library| storage::set_reference_track_selection(library, &track_id, path),
-                        |result| result.is_ok(),
+                        |result| matches!(result, Ok(changed) if *changed || !catalog_had_path),
                     );
                     match result {
                         Ok(changed) if changed => schedule_library_save(state, context),
@@ -3828,11 +3961,11 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
         }
         Message::ToggleLiveSpectrogramMode => {
             state.live_spectrogram_mode = state.live_spectrogram_mode.toggled();
-            context.request_repaint();
+            context.repaint(ui::RepaintScope::Projection);
         }
         Message::SetLiveSpectrogramHistoryScale(scale) => {
             state.live_spectrogram_history_scale = spectrogram::clamp_history_scale(scale);
-            context.request_repaint();
+            context.repaint(ui::RepaintScope::Projection);
         }
         Message::ResizeLiveSpectrogram(message) => {
             update_live_spectrogram_resize(state, message);
@@ -4005,7 +4138,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 .and_then(|track| track.reference_path.as_ref())
                 .is_some_and(|selected_path| selected_path == &path);
             let result = state.library.mutate_with(
-                LibraryMutationScope::Projection,
+                LibraryMutationScope::ProjectionAndMarkers,
                 |library| storage::remove_reference_track(library, &path),
                 |result| result.is_ok(),
             );
@@ -4294,7 +4427,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
             let selected = state.library.selected_track_id.as_deref() == Some(id.as_str());
             let result = state.library.mutate_with(
-                LibraryMutationScope::Projection,
+                LibraryMutationScope::ProjectionAndMarkers,
                 |library| storage::remove_track(library, &id),
                 |result| result.is_ok(),
             );
@@ -4745,9 +4878,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             state.comment_source = CommentSource::Main;
             state.comment_source_explicit = true;
             rollback_persisted_note_drag(state);
-            let note = selected_track(state)
-                .and_then(|track| track.notes.iter().find(|note| note.id == address.note_id))
-                .cloned();
+            let note = cached_note_for_owner(state, &address.owner, &address.note_id).cloned();
             if let Some(note) = note {
                 state.selected_note_id = Some(address.clone());
                 set_pending_seek_intent(state, PlaybackSource::Main, note.time_millis);
@@ -4832,9 +4963,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             state.comment_source = CommentSource::Main;
             state.comment_source_explicit = true;
             rollback_persisted_note_drag(state);
-            let note = selected_track(state)
-                .and_then(|track| track.notes.iter().find(|note| note.id == address.note_id))
-                .cloned();
+            let note = cached_note_for_owner(state, &address.owner, &address.note_id).cloned();
             if let Some(note) = note {
                 let editor_id = main_inline_comment_editor_id(&address);
                 let nonce = allocate_note_draft_nonce(state);
@@ -4966,10 +5095,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             state.comment_source = CommentSource::Reference;
             state.comment_source_explicit = true;
             rollback_reference_persisted_note_drag(state);
-            let note = selected_reference_notes(state)
-                .iter()
-                .find(|note| note.id == address.note_id)
-                .cloned();
+            let note = cached_note_for_owner(state, &address.owner, &address.note_id).cloned();
             if let Some(note) = note {
                 state.selected_reference_note_id = Some(address.clone());
                 set_pending_seek_intent(state, PlaybackSource::Reference, note.time_millis);
@@ -4996,10 +5122,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             state.comment_source = CommentSource::Reference;
             state.comment_source_explicit = true;
             rollback_reference_persisted_note_drag(state);
-            let note = selected_reference_notes(state)
-                .iter()
-                .find(|note| note.id == address.note_id)
-                .cloned();
+            let note = cached_note_for_owner(state, &address.owner, &address.note_id).cloned();
             if let Some(note) = note {
                 let editor_id = reference_inline_comment_editor_id(&address);
                 let nonce = allocate_note_draft_nonce(state);
@@ -6790,14 +6913,14 @@ fn save_draft_note(
         return;
     };
     let scope = if draft.note_id.is_some() {
-        LibraryMutationScope::PersistedOnly
+        LibraryMutationScope::Comments
     } else {
         LibraryMutationScope::Markers
     };
     let note_id = draft.note_id.clone();
     let result = state.library.mutate_with(
         scope,
-        |library| {
+        |library| -> Result<bool, String> {
             let track = library
                 .tracks
                 .find_mut(|track| track.id == track_id)
@@ -6808,6 +6931,9 @@ fn save_draft_note(
                     .iter_mut()
                     .find(|note| note.id == note_id)
                     .ok_or_else(|| String::from("That comment no longer exists."))?;
+                if note.body == body {
+                    return Ok(false);
+                }
                 note.body = body;
             } else {
                 let note_id = storage::allocate_note_id(&track.notes);
@@ -6819,18 +6945,23 @@ fn save_draft_note(
                 });
                 track.notes.sort_by_key(|note| note.time_millis);
             }
-            Ok(())
+            Ok(true)
         },
-        |result: &Result<(), String>| result.is_ok(),
+        |result: &Result<bool, String>| matches!(result, Ok(true)),
     );
-    if let Err(error) = result {
-        state.status = error;
-        context.request_repaint();
-        return;
-    }
+    let changed = match result {
+        Ok(changed) => changed,
+        Err(error) => {
+            state.status = error;
+            context.request_repaint();
+            return;
+        }
+    };
     state.draft_note = None;
     state.status = String::from("Comment saved locally.");
-    schedule_library_save(state, context);
+    if changed {
+        schedule_library_save(state, context);
+    }
     context.request_repaint();
 }
 
@@ -6928,14 +7059,14 @@ fn save_reference_draft_note(
         return;
     };
     let scope = if draft.note_id.is_some() {
-        LibraryMutationScope::PersistedOnly
+        LibraryMutationScope::Comments
     } else {
         LibraryMutationScope::Markers
     };
     let note_id = draft.note_id.clone();
     let result = state.library.mutate_with(
         scope,
-        |library| {
+        |library| -> Result<bool, String> {
             let reference = library
                 .reference_tracks
                 .find_mut(|reference| reference.path == reference_path)
@@ -6946,6 +7077,9 @@ fn save_reference_draft_note(
                     .iter_mut()
                     .find(|note| note.id == note_id)
                     .ok_or_else(|| String::from("That reference comment no longer exists."))?;
+                if note.body == body {
+                    return Ok(false);
+                }
                 note.body = body;
             } else {
                 let note_id = storage::allocate_note_id(&reference.notes);
@@ -6957,18 +7091,23 @@ fn save_reference_draft_note(
                 });
                 reference.notes.sort_by_key(|note| note.time_millis);
             }
-            Ok(())
+            Ok(true)
         },
-        |result: &Result<(), String>| result.is_ok(),
+        |result: &Result<bool, String>| matches!(result, Ok(true)),
     );
-    if let Err(error) = result {
-        state.status = error;
-        context.request_repaint();
-        return;
-    }
+    let changed = match result {
+        Ok(changed) => changed,
+        Err(error) => {
+            state.status = error;
+            context.request_repaint();
+            return;
+        }
+    };
     state.reference_draft_note = None;
     state.status = String::from("Reference comment saved locally.");
-    schedule_library_save(state, context);
+    if changed {
+        schedule_library_save(state, context);
+    }
     context.request_repaint();
 }
 
@@ -7021,19 +7160,15 @@ fn start_persisted_note_drag(
     };
     let waveform_is_current =
         state.waveform.is_some() && state.waveform_track_id.as_deref() == Some(track_id.as_str());
-    let Some((_, time_millis)) = state
-        .library
-        .tracks
-        .iter()
-        .find(|track| track.id == track_id)
-        .filter(|_| waveform_is_current)
-        .and_then(|track| track.notes.iter().find(|note| note.id == address.note_id))
-        .map(|note| (note.id.clone(), note.time_millis))
+    let Some(note) = waveform_is_current
+        .then(|| cached_note_for_owner(state, &address.owner, &address.note_id))
+        .flatten()
     else {
         state.status = String::from("That comment no longer exists.");
         context.request_repaint();
         return;
     };
+    let time_millis = note.time_millis;
 
     if state
         .draft_note
@@ -7200,23 +7335,15 @@ fn start_reference_persisted_note_drag(
     let waveform_is_current = state.reference_waveform.is_some()
         && state.reference_waveform_track_id.as_deref() == Some(track_id.as_str())
         && !state.reference_waveform_busy;
-    let Some((_, time_millis)) = state
-        .library
-        .tracks
-        .iter()
-        .find(|track| track.id == track_id)
-        .filter(|_| waveform_is_current)
-        .and_then(|track| {
-            reference_notes_for_track(&state.library, track)
-                .iter()
-                .find(|note| note.id == address.note_id)
-                .map(|note| (note.id.clone(), note.time_millis))
-        })
+    let Some(note) = waveform_is_current
+        .then(|| cached_note_for_owner(state, &address.owner, &address.note_id))
+        .flatten()
     else {
         state.status = String::from("That reference comment no longer exists.");
         context.request_repaint();
         return;
     };
+    let time_millis = note.time_millis;
 
     if state
         .reference_draft_note
@@ -7961,11 +8088,7 @@ fn reference_selection_catalog_matches(
     path: &Path,
     expected_proof: Option<&crate::source::AudioSourceProof>,
 ) -> bool {
-    state
-        .library
-        .reference_tracks
-        .iter()
-        .find(|reference| reference.path == path)
+    reference_track_for_path(state, path)
         .is_some_and(|reference| reference.source_provenance().verified_proof() == expected_proof)
 }
 
@@ -9180,28 +9303,16 @@ fn seek_review_position(
 
 fn comment_time_for_address(state: &AppState, address: &NoteAddress) -> Option<u64> {
     match &address.owner {
-        NoteOwner::MainTrack(track_id) => state
-            .library
-            .tracks
-            .iter()
-            .find(|track| {
-                track.id == *track_id && track.source_provenance().verified_proof().is_some()
-            })?
-            .notes
-            .iter()
-            .find(|note| note.id == address.note_id)
-            .map(|note| note.time_millis),
-        NoteOwner::ReferenceTrack(path) => state
-            .library
-            .reference_tracks
-            .iter()
-            .find(|reference| {
-                reference.path == *path && reference.source_provenance().verified_proof().is_some()
-            })?
-            .notes
-            .iter()
-            .find(|note| note.id == address.note_id)
-            .map(|note| note.time_millis),
+        NoteOwner::MainTrack(track_id) => {
+            let track = cached_track_for_id(state, track_id)?;
+            track.source_provenance().verified_proof()?;
+            Some(cached_note_for_owner(state, &address.owner, &address.note_id)?.time_millis)
+        }
+        NoteOwner::ReferenceTrack(path) => {
+            let reference = reference_track_for_path(state, path)?;
+            reference.source_provenance().verified_proof()?;
+            Some(cached_note_for_owner(state, &address.owner, &address.note_id)?.time_millis)
+        }
     }
 }
 
@@ -9878,19 +9989,24 @@ fn planner_board_surface(content: ui::View<Message>) -> ui::View<Message> {
 }
 
 fn project_surface(state: &AppState) -> ui::View<Message> {
+    ensure_library_projection_cache(state);
     let workspace = {
-        let mut projection_cache = state.library_projection_cache.borrow_mut();
-        projection_cache.ensure(state.library.projection_revision(), &state.library);
         match state.workspace_mode {
-            WorkspaceMode::Review => ui::row([
-                library_panel(state, &projection_cache)
-                    .width(LIBRARY_WIDTH)
-                    .fill_height(),
-                review_panel(state).fill(),
-            ])
-            .spacing(10.0)
-            .fill(),
-            WorkspaceMode::Planner => planner_panel(state, &projection_cache).fill(),
+            WorkspaceMode::Review => {
+                let library = {
+                    let projection_cache = state.library_projection_cache.borrow();
+                    library_panel(state, &projection_cache)
+                        .width(LIBRARY_WIDTH)
+                        .fill_height()
+                };
+                ui::row([library, review_panel(state).fill()])
+                    .spacing(10.0)
+                    .fill()
+            }
+            WorkspaceMode::Planner => {
+                let projection_cache = state.library_projection_cache.borrow();
+                planner_panel(state, &projection_cache).fill()
+            }
         }
     };
 
@@ -10088,6 +10204,7 @@ fn planner_panel(state: &AppState, projection: &LibraryProjectionCache) -> ui::V
         planner_column(
             stage,
             &state.library,
+            projection,
             projection.planner_stage_indices(stage),
             PlannerColumnContext {
                 selected_id: state.library.selected_track_id.as_deref(),
@@ -10151,6 +10268,7 @@ struct PlannerColumnContext<'a> {
 fn planner_column(
     stage: storage::TrackStage,
     library: &storage::Library,
+    projection: &LibraryProjectionCache,
     track_indices: &[usize],
     context: PlannerColumnContext<'_>,
     current_window: ui::VirtualListWindow,
@@ -10212,6 +10330,7 @@ fn planner_column(
                 planner_card_drop_row(
                     planner_card(
                         track,
+                        projection.main_comment_open_count(&track.id),
                         selected_id,
                         stage_menu_track_id,
                         remove_confirmation_track_id,
@@ -10414,6 +10533,7 @@ fn planner_stage_visual_color(stage: storage::TrackStage, theme: &ThemeTokens) -
 
 fn planner_card(
     track: &storage::Track,
+    open_comments: usize,
     selected_id: Option<&str>,
     stage_menu_track_id: Option<&str>,
     remove_confirmation_track_id: Option<&str>,
@@ -10422,6 +10542,7 @@ fn planner_card(
     let card_key = format!("planner-card-{}", track.id);
     planner_card_with_key(
         track,
+        open_comments,
         selected_id,
         stage_menu_track_id,
         remove_confirmation_track_id,
@@ -10434,6 +10555,7 @@ fn planner_card(
 #[allow(clippy::too_many_arguments)]
 fn planner_card_with_key(
     track: &storage::Track,
+    open_comments: usize,
     selected_id: Option<&str>,
     stage_menu_track_id: Option<&str>,
     remove_confirmation_track_id: Option<&str>,
@@ -10462,7 +10584,7 @@ fn planner_card_with_key(
         .tooltip("Remove track")
         .size(28.0, 24.0);
     let open_comments = if track.source_provenance().verified_proof().is_some() {
-        track.notes.iter().filter(|note| !note.done).count()
+        open_comments
     } else {
         0
     };
@@ -11796,14 +11918,8 @@ fn reference_waveform_section(state: &AppState, track: &storage::Track) -> ui::V
             .map(|selection| (selection.start_ratio, selection.end_ratio));
         let reference_annotations_available = track
             .reference_path
-            .as_ref()
-            .and_then(|path| {
-                state
-                    .library
-                    .reference_tracks
-                    .iter()
-                    .find(|reference| &reference.path == path)
-            })
+            .as_deref()
+            .and_then(|path| reference_track_for_path(state, path))
             .is_some_and(|reference| reference.source_provenance().verified_proof().is_some());
         let reference_marker_projection = prepared_reference_marker_projection(
             state,
@@ -11941,18 +12057,12 @@ fn reference_waveform_section(state: &AppState, track: &storage::Track) -> ui::V
 
 fn comments_panel(state: &AppState, track: &storage::Track) -> ui::View<Message> {
     let reference_available = track.reference_path.is_some();
-    let reference_notes = reference_notes_for_track(&state.library, track);
+    let reference_notes = reference_notes_for_track_cached(state, track);
     let main_unknown = track.source_provenance().is_unknown();
     let reference_unknown = track
         .reference_path
         .as_ref()
-        .and_then(|path| {
-            state
-                .library
-                .reference_tracks
-                .iter()
-                .find(|reference| &reference.path == path)
-        })
+        .and_then(|path| reference_track_for_path(state, path))
         .is_some_and(|reference| reference.source_provenance().is_unknown());
     let source = if reference_available {
         if state.comment_source == CommentSource::Reference
@@ -11987,7 +12097,16 @@ fn comments_panel(state: &AppState, track: &storage::Track) -> ui::View<Message>
             "Click the lower reference waveform rail to add a comment for this file.",
         ),
     };
-    let open_count = notes.iter().filter(|note| !note.done).count();
+    let open_count = match source {
+        CommentSource::Main if main_unknown => 0,
+        CommentSource::Main => {
+            cached_comment_open_count(state, &NoteOwner::MainTrack(track.id.clone()))
+        }
+        CommentSource::Reference if reference_unknown => 0,
+        CommentSource::Reference => track.reference_path.as_ref().map_or(0, |path| {
+            cached_comment_open_count(state, &NoteOwner::ReferenceTrack(path.clone()))
+        }),
+    };
     let unknown_owner = match source {
         CommentSource::Main if main_unknown => Some(HistoricalBindingOwner::Main {
             track_id: track.id.clone(),
@@ -12050,12 +12169,9 @@ fn comments_panel(state: &AppState, track: &storage::Track) -> ui::View<Message>
         };
         let retained_count = match &owner {
             HistoricalBindingOwner::Main { .. } => track.notes.len(),
-            HistoricalBindingOwner::Reference { path } => state
-                .library
-                .reference_tracks
-                .iter()
-                .find(|reference| &reference.path == path)
-                .map_or(0, |reference| reference.notes.len()),
+            HistoricalBindingOwner::Reference { path } => {
+                cached_comment_count(state, &NoteOwner::ReferenceTrack(path.clone()))
+            }
         };
         let warning = historical_source_warning(&owner, &path, retained_count);
         let binding_control = if state
@@ -12122,7 +12238,7 @@ fn comments_panel(state: &AppState, track: &storage::Track) -> ui::View<Message>
                 .filter(|draft| draft.note_id.is_some()),
         };
         let focused_index = comment_note_index(
-            notes,
+            state,
             selected_note_id,
             source,
             &track.id,
@@ -12134,7 +12250,7 @@ fn comments_panel(state: &AppState, track: &storage::Track) -> ui::View<Message>
                 .as_ref()
                 .and_then(|address| {
                     comment_note_index(
-                        notes,
+                        state,
                         Some(address),
                         source,
                         &track.id,
@@ -12222,7 +12338,7 @@ fn comments_panel(state: &AppState, track: &storage::Track) -> ui::View<Message>
 }
 
 fn comment_note_index(
-    notes: &[storage::Note],
+    state: &AppState,
     address: Option<&NoteAddress>,
     source: CommentSource,
     track_id: &str,
@@ -12236,7 +12352,7 @@ fn comment_note_index(
         }
         _ => false,
     };
-    owner_matches.then(|| notes.iter().position(|note| note.id == address.note_id))?
+    owner_matches.then(|| cached_comment_note_index(state, &address.owner, &address.note_id))?
 }
 
 fn reveal_comment_row(
@@ -12245,21 +12361,25 @@ fn reveal_comment_row(
     source: CommentSource,
     address: &NoteAddress,
 ) {
-    let Some((index, total_items)) = selected_track(state).and_then(|track| {
-        let notes = match source {
-            CommentSource::Main => track.notes.as_slice(),
-            CommentSource::Reference => reference_notes_for_track(&state.library, track),
-        };
-        comment_note_index(
-            notes,
-            Some(address),
-            source,
-            &track.id,
-            track.reference_path.as_deref(),
-        )
-        .map(|index| (index, notes.len()))
-    }) else {
+    let Some(track) = selected_track(state) else {
         return;
+    };
+    let track_id = track.id.clone();
+    let reference_path = track.reference_path.clone();
+    let Some(index) = comment_note_index(
+        state,
+        Some(address),
+        source,
+        &track_id,
+        reference_path.as_deref(),
+    ) else {
+        return;
+    };
+    let total_items = match source {
+        CommentSource::Main => cached_comment_count(state, &NoteOwner::MainTrack(track_id)),
+        CommentSource::Reference => reference_path.map_or(0, |path| {
+            cached_comment_count(state, &NoteOwner::ReferenceTrack(path))
+        }),
     };
     let window = match source {
         CommentSource::Main => &mut state.main_comments_window,
@@ -12710,24 +12830,87 @@ fn normalize_startup_track_selection(library: &mut storage::Library) -> (Option<
     (startup_track_id, selection_changed)
 }
 
-fn reference_notes_for_track<'a>(
-    library: &'a storage::Library,
+fn reference_track_for_path<'a>(
+    state: &'a AppState,
+    path: &Path,
+) -> Option<&'a storage::ReferenceTrack> {
+    ensure_library_projection_cache(state);
+    let index = state
+        .library_projection_cache
+        .borrow()
+        .reference_track_index(path)?;
+    state.library.reference_tracks.get(index)
+}
+
+fn reference_notes_for_track_cached<'a>(
+    state: &'a AppState,
     track: &storage::Track,
 ) -> &'a [storage::Note] {
-    let Some(path) = track.reference_path.as_ref() else {
-        return &[];
-    };
-    library
-        .reference_tracks
-        .iter()
-        .find(|reference| reference.path == *path)
+    track
+        .reference_path
+        .as_deref()
+        .and_then(|path| reference_track_for_path(state, path))
         .map_or(&[], |reference| reference.notes.as_slice())
 }
 
+#[cfg(test)]
 fn selected_reference_notes(state: &AppState) -> &[storage::Note] {
     selected_track(state)
-        .map(|track| reference_notes_for_track(&state.library, track))
+        .map(|track| reference_notes_for_track_cached(state, track))
         .unwrap_or(&[])
+}
+
+fn cached_comment_note_index(state: &AppState, owner: &NoteOwner, note_id: &str) -> Option<usize> {
+    ensure_library_projection_cache(state);
+    state
+        .library_projection_cache
+        .borrow()
+        .comment_note_index(owner, note_id)
+}
+
+fn cached_comment_count(state: &AppState, owner: &NoteOwner) -> usize {
+    ensure_library_projection_cache(state);
+    state.library_projection_cache.borrow().comment_count(owner)
+}
+
+fn cached_comment_open_count(state: &AppState, owner: &NoteOwner) -> usize {
+    ensure_library_projection_cache(state);
+    state
+        .library_projection_cache
+        .borrow()
+        .comment_open_count(owner)
+}
+
+fn cached_track_for_id<'a>(state: &'a AppState, track_id: &str) -> Option<&'a storage::Track> {
+    ensure_library_projection_cache(state);
+    let index = state
+        .library_projection_cache
+        .borrow()
+        .library_index(track_id)?;
+    state.library.tracks.get(index)
+}
+
+fn cached_note_for_owner<'a>(
+    state: &'a AppState,
+    owner: &NoteOwner,
+    note_id: &str,
+) -> Option<&'a storage::Note> {
+    let note_index = cached_comment_note_index(state, owner, note_id)?;
+    match owner {
+        NoteOwner::MainTrack(track_id) => {
+            let track_index = {
+                ensure_library_projection_cache(state);
+                state
+                    .library_projection_cache
+                    .borrow()
+                    .library_index(track_id)?
+            };
+            state.library.tracks.get(track_index)?.notes.get(note_index)
+        }
+        NoteOwner::ReferenceTrack(path) => {
+            reference_track_for_path(state, path)?.notes.get(note_index)
+        }
+    }
 }
 
 fn is_current_main_owner(state: &AppState, owner: &NoteOwner) -> bool {
@@ -12749,15 +12932,12 @@ fn is_current_reference_owner(state: &AppState, owner: &NoteOwner) -> bool {
 
 fn is_current_main_note_address(state: &AppState, address: &NoteAddress) -> bool {
     is_current_main_owner(state, &address.owner)
-        && selected_track(state)
-            .is_some_and(|track| track.notes.iter().any(|note| note.id == address.note_id))
+        && cached_comment_note_index(state, &address.owner, &address.note_id).is_some()
 }
 
 fn is_current_reference_note_address(state: &AppState, address: &NoteAddress) -> bool {
     is_current_reference_owner(state, &address.owner)
-        && selected_reference_notes(state)
-            .iter()
-            .any(|note| note.id == address.note_id)
+        && cached_comment_note_index(state, &address.owner, &address.note_id).is_some()
 }
 
 fn note_address_for_owner(owner: &NoteOwner, note_id: &str) -> NoteAddress {
@@ -12784,7 +12964,7 @@ fn note_ratio_for_address(
     let address = address.filter(
         |address| matches!(&address.owner, NoteOwner::MainTrack(track_id) if track_id == &track.id),
     )?;
-    let note = track.notes.iter().find(|note| note.id == address.note_id)?;
+    let note = cached_note_for_owner(state, &address.owner, &address.note_id)?;
     let waveform = state
         .waveform
         .as_ref()
@@ -12811,17 +12991,12 @@ fn reference_note_ratio_for_address(
     let address = address.filter(|address| {
         matches!(&address.owner, NoteOwner::ReferenceTrack(path) if path == reference_path)
     })?;
-    let reference = state
-        .library
-        .reference_tracks
-        .iter()
-        .find(|reference| &reference.path == reference_path)?;
+    let reference = reference_track_for_path(state, reference_path)?;
     if reference.source_provenance().is_unknown() {
         return None;
     }
-    let note = reference_notes_for_track(&state.library, track)
-        .iter()
-        .find(|note| note.id == address.note_id)?;
+    let note_index = cached_comment_note_index(state, &address.owner, &address.note_id)?;
+    let note = reference.notes.get(note_index)?;
     let waveform = state
         .reference_waveform
         .as_ref()
@@ -13297,22 +13472,426 @@ mod tests {
         let mut shared = SharedLibrary::default();
         assert_eq!(shared.projection_revision(), 0);
         assert_eq!(shared.marker_revision(), 0);
+        assert_eq!(shared.comment_revision(), 0);
 
         shared.mutate(LibraryMutationScope::PersistedOnly, |_| {});
         assert_eq!(shared.projection_revision(), 0);
         assert_eq!(shared.marker_revision(), 0);
+        assert_eq!(shared.comment_revision(), 0);
 
         shared.mutate(LibraryMutationScope::Projection, |_| {});
         assert_eq!(shared.projection_revision(), 1);
         assert_eq!(shared.marker_revision(), 0);
+        assert_eq!(shared.comment_revision(), 0);
+
+        shared.mutate(LibraryMutationScope::Comments, |_| {});
+        assert_eq!(shared.projection_revision(), 1);
+        assert_eq!(shared.marker_revision(), 0);
+        assert_eq!(shared.comment_revision(), 1);
 
         shared.mutate(LibraryMutationScope::Markers, |_| {});
         assert_eq!(shared.projection_revision(), 1);
         assert_eq!(shared.marker_revision(), 1);
+        assert_eq!(shared.comment_revision(), 2);
 
         shared.mutate(LibraryMutationScope::ProjectionAndMarkers, |_| {});
         assert_eq!(shared.projection_revision(), 2);
         assert_eq!(shared.marker_revision(), 2);
+        assert_eq!(shared.comment_revision(), 3);
+    }
+
+    #[test]
+    fn comment_projection_cache_reuses_and_updates_each_owner_projection() {
+        let mut state = reference_removal_state();
+        let main_track_id = state.library.tracks[0].id.clone();
+        let reference_path = state.library.reference_tracks[0].path.clone();
+        state.library.tracks[0].notes = vec![
+            Note {
+                id: String::from("main-first"),
+                time_millis: 100,
+                body: String::from("Main first"),
+                done: false,
+            },
+            Note {
+                id: String::from("main-second"),
+                time_millis: 800,
+                body: String::from("Main second"),
+                done: true,
+            },
+        ]
+        .into();
+
+        let main_owner = NoteOwner::MainTrack(main_track_id.clone());
+        let reference_owner = NoteOwner::ReferenceTrack(reference_path.clone());
+        ensure_library_projection_cache(&state);
+        {
+            let cache = state.library_projection_cache.borrow();
+            assert_eq!(cache.comment_rebuild_count, 1);
+            assert_eq!(cache.comment_note_index(&main_owner, "main-first"), Some(0));
+            assert_eq!(
+                cache.comment_note_index(&main_owner, "main-second"),
+                Some(1)
+            );
+            assert_eq!(cache.comment_count(&main_owner), 2);
+            assert_eq!(cache.comment_open_count(&main_owner), 1);
+            assert_eq!(
+                cache.comment_note_index(&reference_owner, "shared-reference-note"),
+                Some(0)
+            );
+            assert_eq!(cache.comment_count(&reference_owner), 1);
+            assert_eq!(cache.comment_open_count(&reference_owner), 1);
+        }
+
+        ensure_library_projection_cache(&state);
+        assert_eq!(
+            state
+                .library_projection_cache
+                .borrow()
+                .comment_rebuild_count,
+            1
+        );
+
+        state
+            .library
+            .mutate(LibraryMutationScope::PersistedOnly, |library| {
+                library.selected_track_id = Some(main_track_id.clone());
+            });
+        ensure_library_projection_cache(&state);
+        assert_eq!(
+            state
+                .library_projection_cache
+                .borrow()
+                .comment_rebuild_count,
+            1
+        );
+
+        let comment_revision_before_body_edit = state.library.comment_revision();
+        let marker_revision_before_body_edit = state.library.marker_revision();
+        state
+            .library
+            .mutate(LibraryMutationScope::Comments, |library| {
+                library.tracks[0].notes[0].body = String::from("Main body changed");
+            });
+        assert_eq!(
+            state.library.comment_revision(),
+            comment_revision_before_body_edit + 1
+        );
+        assert_eq!(
+            state.library.marker_revision(),
+            marker_revision_before_body_edit
+        );
+        ensure_library_projection_cache(&state);
+        {
+            let cache = state.library_projection_cache.borrow();
+            assert_eq!(cache.comment_rebuild_count, 2);
+            assert_eq!(cache.comment_note_index(&main_owner, "main-first"), Some(0));
+            assert_eq!(cache.comment_count(&main_owner), 2);
+            assert_eq!(cache.comment_open_count(&main_owner), 1);
+            assert_eq!(
+                cache.comment_note_index(&reference_owner, "shared-reference-note"),
+                Some(0)
+            );
+            assert_eq!(cache.comment_count(&reference_owner), 1);
+            assert_eq!(cache.comment_open_count(&reference_owner), 1);
+        }
+        assert_eq!(
+            super::cached_note_for_owner(&state, &main_owner, "main-first")
+                .map(|note| note.body.as_str()),
+            Some("Main body changed")
+        );
+
+        state
+            .library
+            .mutate(LibraryMutationScope::Markers, |library| {
+                let note = &mut library.tracks[0].notes[0];
+                note.time_millis = 900;
+                library.tracks[0].notes.sort_by_key(|note| note.time_millis);
+            });
+        ensure_library_projection_cache(&state);
+        {
+            let cache = state.library_projection_cache.borrow();
+            assert_eq!(cache.comment_rebuild_count, 3);
+            assert_eq!(
+                cache.comment_note_index(&main_owner, "main-second"),
+                Some(0)
+            );
+            assert_eq!(cache.comment_note_index(&main_owner, "main-first"), Some(1));
+            assert_eq!(cache.comment_count(&main_owner), 2);
+            assert_eq!(cache.comment_open_count(&main_owner), 1);
+        }
+
+        state
+            .library
+            .mutate(LibraryMutationScope::Markers, |library| {
+                library.reference_tracks[0].notes[0].done = true;
+            });
+        ensure_library_projection_cache(&state);
+        {
+            let cache = state.library_projection_cache.borrow();
+            assert_eq!(cache.comment_rebuild_count, 4);
+            assert_eq!(
+                cache.comment_note_index(&reference_owner, "shared-reference-note"),
+                Some(0)
+            );
+            assert_eq!(cache.comment_count(&reference_owner), 1);
+            assert_eq!(cache.comment_open_count(&reference_owner), 0);
+        }
+
+        let comment_revision_before_noop = state.library.comment_revision();
+        let marker_revision_before_noop = state.library.marker_revision();
+        let no_op = state.library.mutate_with(
+            LibraryMutationScope::Comments,
+            |_library| false,
+            |changed| *changed,
+        );
+        assert!(!no_op);
+        assert_eq!(
+            state.library.comment_revision(),
+            comment_revision_before_noop
+        );
+        assert_eq!(state.library.marker_revision(), marker_revision_before_noop);
+
+        let rejected = state.library.mutate_with(
+            LibraryMutationScope::Comments,
+            |_library| Err::<(), _>("rejected"),
+            |result| result.is_ok(),
+        );
+        assert_eq!(rejected, Err("rejected"));
+        assert_eq!(
+            state.library.comment_revision(),
+            comment_revision_before_noop
+        );
+        assert_eq!(state.library.marker_revision(), marker_revision_before_noop);
+        ensure_library_projection_cache(&state);
+        assert_eq!(
+            state
+                .library_projection_cache
+                .borrow()
+                .comment_rebuild_count,
+            4
+        );
+    }
+
+    #[test]
+    fn saving_existing_comments_rebuilds_comment_projection_without_marker_revision() {
+        let mut state = reference_removal_state();
+        let main_track_id = state.library.tracks[0].id.clone();
+        let reference_path = state.library.reference_tracks[0].path.clone();
+        state.library.tracks[0].notes.push(Note {
+            id: String::from("main-edit"),
+            time_millis: 250,
+            body: String::from("before main edit"),
+            done: false,
+        });
+        state.library.reference_tracks[0].notes[0].body = String::from("before reference edit");
+        ensure_library_projection_cache(&state);
+        let initial_comment_rebuild_count = state
+            .library_projection_cache
+            .borrow()
+            .comment_rebuild_count;
+        let initial_comment_revision = state.library.comment_revision();
+        let initial_marker_revision = state.library.marker_revision();
+
+        state.draft_note = Some(NoteDraft {
+            owner: NoteOwner::MainTrack(main_track_id.clone()),
+            note_id: Some(String::from("main-edit")),
+            nonce: 1,
+            time_millis: 250,
+            body: String::from("after main edit"),
+        });
+        let identity = state
+            .draft_note
+            .as_ref()
+            .expect("main edit draft should exist")
+            .identity();
+        let mut context = ui::UiUpdateContext::default();
+        update(&mut state, Message::SaveDraftNote(identity), &mut context);
+
+        assert_eq!(
+            state.library.comment_revision(),
+            initial_comment_revision + 1
+        );
+        assert_eq!(state.library.marker_revision(), initial_marker_revision);
+        ensure_library_projection_cache(&state);
+        assert_eq!(
+            state
+                .library_projection_cache
+                .borrow()
+                .comment_rebuild_count,
+            initial_comment_rebuild_count + 1
+        );
+        assert_eq!(
+            super::cached_note_for_owner(
+                &state,
+                &NoteOwner::MainTrack(main_track_id.clone()),
+                "main-edit"
+            )
+            .map(|note| note.body.as_str()),
+            Some("after main edit")
+        );
+
+        state.reference_draft_note = Some(NoteDraft {
+            owner: NoteOwner::ReferenceTrack(reference_path.clone()),
+            note_id: Some(String::from("shared-reference-note")),
+            nonce: 2,
+            time_millis: 500,
+            body: String::from("after reference edit"),
+        });
+        let identity = state
+            .reference_draft_note
+            .as_ref()
+            .expect("reference edit draft should exist")
+            .identity();
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::SaveReferenceDraftNote(identity),
+            &mut context,
+        );
+
+        assert_eq!(
+            state.library.comment_revision(),
+            initial_comment_revision + 2
+        );
+        assert_eq!(state.library.marker_revision(), initial_marker_revision);
+        ensure_library_projection_cache(&state);
+        assert_eq!(
+            state
+                .library_projection_cache
+                .borrow()
+                .comment_rebuild_count,
+            initial_comment_rebuild_count + 2
+        );
+        assert_eq!(
+            super::cached_note_for_owner(
+                &state,
+                &NoteOwner::ReferenceTrack(reference_path),
+                "shared-reference-note"
+            )
+            .map(|note| note.body.as_str()),
+            Some("after reference edit")
+        );
+
+        let comment_revision_before_noop = state.library.comment_revision();
+        let marker_revision_before_noop = state.library.marker_revision();
+        state.draft_note = Some(NoteDraft {
+            owner: NoteOwner::MainTrack(main_track_id.clone()),
+            note_id: Some(String::from("main-edit")),
+            nonce: 3,
+            time_millis: 250,
+            body: String::from("after main edit"),
+        });
+        let identity = state
+            .draft_note
+            .as_ref()
+            .expect("same-body edit draft should exist")
+            .identity();
+        let mut context = ui::UiUpdateContext::default();
+        update(&mut state, Message::SaveDraftNote(identity), &mut context);
+        assert!(state.draft_note.is_none());
+        assert_eq!(
+            state.library.comment_revision(),
+            comment_revision_before_noop
+        );
+        assert_eq!(state.library.marker_revision(), marker_revision_before_noop);
+        ensure_library_projection_cache(&state);
+        assert_eq!(
+            state
+                .library_projection_cache
+                .borrow()
+                .comment_rebuild_count,
+            initial_comment_rebuild_count + 2
+        );
+
+        state.draft_note = Some(NoteDraft {
+            owner: NoteOwner::MainTrack(main_track_id),
+            note_id: Some(String::from("missing-main-edit")),
+            nonce: 4,
+            time_millis: 250,
+            body: String::from("missing comment"),
+        });
+        let identity = state
+            .draft_note
+            .as_ref()
+            .expect("rejected edit draft should exist")
+            .identity();
+        let mut context = ui::UiUpdateContext::default();
+        update(&mut state, Message::SaveDraftNote(identity), &mut context);
+        assert!(state.draft_note.is_some());
+        assert_eq!(
+            state.library.comment_revision(),
+            comment_revision_before_noop
+        );
+        assert_eq!(state.library.marker_revision(), marker_revision_before_noop);
+        ensure_library_projection_cache(&state);
+        assert_eq!(
+            state
+                .library_projection_cache
+                .borrow()
+                .comment_rebuild_count,
+            initial_comment_rebuild_count + 2
+        );
+    }
+
+    #[test]
+    fn reference_path_reassignment_and_full_replacement_invalidate_comment_projections() {
+        let mut state = reference_removal_state();
+        let first_path = state.library.reference_tracks[0].path.clone();
+        let second_path = state.library.reference_tracks[1].path.clone();
+        let first_owner = NoteOwner::ReferenceTrack(first_path.clone());
+        let second_owner = NoteOwner::ReferenceTrack(second_path.clone());
+        ensure_library_projection_cache(&state);
+        assert_eq!(
+            state
+                .library_projection_cache
+                .borrow()
+                .comment_note_index(&first_owner, "shared-reference-note"),
+            Some(0)
+        );
+        let initial_rebuild_count = state
+            .library_projection_cache
+            .borrow()
+            .comment_rebuild_count;
+
+        state
+            .library
+            .mutate(LibraryMutationScope::ProjectionAndMarkers, |library| {
+                library.tracks[0].reference_path = Some(second_path.clone());
+            });
+        ensure_library_projection_cache(&state);
+        {
+            let cache = state.library_projection_cache.borrow();
+            assert_eq!(cache.comment_rebuild_count, initial_rebuild_count + 1);
+            assert_eq!(cache.comment_count(&first_owner), 1);
+            assert_eq!(cache.comment_count(&second_owner), 1);
+            assert_eq!(cache.comment_open_count(&second_owner), 1);
+        }
+        assert_eq!(
+            super::reference_notes_for_track_cached(&state, &state.library.tracks[0])[0].body,
+            "B reference comment"
+        );
+
+        let mut replacement = (*state.library.snapshot()).clone();
+        replacement.reference_tracks[1].notes.push(Note {
+            id: String::from("replacement-note"),
+            time_millis: 900,
+            body: String::from("replacement reference comment"),
+            done: false,
+        });
+        state
+            .library
+            .replace(replacement, LibraryMutationScope::ProjectionAndMarkers);
+        ensure_library_projection_cache(&state);
+        {
+            let cache = state.library_projection_cache.borrow();
+            assert_eq!(cache.comment_rebuild_count, initial_rebuild_count + 2);
+            assert_eq!(cache.comment_count(&second_owner), 2);
+            assert_eq!(cache.comment_open_count(&second_owner), 2);
+            assert_eq!(
+                cache.comment_note_index(&second_owner, "replacement-note"),
+                Some(1)
+            );
+        }
     }
 
     #[test]
@@ -14475,8 +15054,18 @@ mod tests {
         assert_eq!(state.live_spectrogram_mode, LiveSpectrogramMode::Waterfall);
         update(&mut state, Message::ToggleLiveSpectrogramMode, &mut context);
         assert_eq!(state.live_spectrogram_mode, LiveSpectrogramMode::Spectrum);
+        assert_eq!(
+            context.into_command().repaint_scope(),
+            Some(RepaintScope::Projection)
+        );
+
+        let mut context = ui::UiUpdateContext::default();
         update(&mut state, Message::ToggleLiveSpectrogramMode, &mut context);
         assert_eq!(state.live_spectrogram_mode, LiveSpectrogramMode::Waterfall);
+        assert_eq!(
+            context.into_command().repaint_scope(),
+            Some(RepaintScope::Projection)
+        );
     }
 
     #[test]
@@ -14500,7 +15089,7 @@ mod tests {
         );
         assert_eq!(
             context.into_command().repaint_scope(),
-            Some(RepaintScope::Surface)
+            Some(RepaintScope::Projection)
         );
 
         let after = frame_surface_revisions(&mut state);
@@ -14522,7 +15111,7 @@ mod tests {
         );
         assert_eq!(
             context.into_command().repaint_scope(),
-            Some(RepaintScope::Surface)
+            Some(RepaintScope::Projection)
         );
     }
 
@@ -14545,6 +15134,7 @@ mod tests {
             })
         );
 
+        let mut context = ui::UiUpdateContext::default();
         update(
             &mut state,
             Message::ResizeLiveSpectrogram(ui::DragHandleMessage::moved(Point::new(
@@ -14557,7 +15147,12 @@ mod tests {
             state.live_spectrogram_height,
             super::spectrogram::MAX_HEIGHT
         );
+        assert_eq!(
+            context.into_command().repaint_scope(),
+            Some(RepaintScope::Surface)
+        );
 
+        let mut context = ui::UiUpdateContext::default();
         update(
             &mut state,
             Message::ResizeLiveSpectrogram(ui::DragHandleMessage::ended(origin)),
