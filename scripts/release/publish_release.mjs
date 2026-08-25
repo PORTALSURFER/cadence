@@ -1,11 +1,34 @@
 #!/usr/bin/env node
 
 import crypto from "node:crypto";
+import fsStreams from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { finished } from "node:stream/promises";
 
 const MANIFEST_CONTENT_TYPE = "application/vnd.portalsurfer.release-manifest+json;version=2";
+const MAX_MANIFEST_BYTES = 4 * 1024 * 1024;
 const SHA_RE = /^[0-9a-f]{64}$/;
+
+async function closeReadStream(stream) {
+  if (!stream.destroyed) stream.destroy();
+  if (!stream.closed) await finished(stream).catch(() => {});
+}
+
+async function hashArtifact(filePath) {
+  const stream = fsStreams.createReadStream(filePath);
+  const hash = crypto.createHash("sha256");
+  let size = 0;
+  try {
+    for await (const chunk of stream) {
+      size += chunk.length;
+      hash.update(chunk);
+    }
+    return { digest: hash.digest("hex"), size };
+  } finally {
+    await closeReadStream(stream);
+  }
+}
 
 function usage(message) {
   if (message) console.error(`error: ${message}`);
@@ -35,7 +58,10 @@ const token = String(values.token || process.env.CADENCE_RELEASE_UPLOAD_TOKEN ||
 if (!token) usage("an upload token is required");
 const manifestPath = path.resolve(values.manifest);
 const root = path.resolve(values.root || path.dirname(manifestPath));
+const manifestStat = await fs.stat(manifestPath);
+if (!manifestStat.isFile() || !Number.isSafeInteger(manifestStat.size) || manifestStat.size <= 0 || manifestStat.size > MAX_MANIFEST_BYTES) usage("manifest must be a regular file within the safe size limit");
 const manifestBytes = await fs.readFile(manifestPath);
+if (manifestBytes.length !== manifestStat.size) usage("manifest changed while it was being read");
 const manifest = JSON.parse(manifestBytes.toString("utf8"));
 if (!manifest || manifest.schema_version !== 2 || manifest.product !== "cadence" || !manifest.build_id) usage("manifest must be Cadence schema 2");
 const descriptors = [...(manifest.artifacts || []), manifest.screenshot, manifest.changelog];
@@ -54,18 +80,25 @@ const metadata = {
   "X-PortalSurfer-Released-At": String(manifest.released_at || ""),
 };
 for (const descriptor of descriptors) {
-  if (!descriptor?.name || path.basename(descriptor.name) !== descriptor.name || descriptor.name.startsWith(".") || !SHA_RE.test(descriptor.sha256) || !Number.isInteger(descriptor.size_bytes) || descriptor.size_bytes <= 0) usage(`invalid descriptor for ${descriptor?.name || "unnamed file"}`);
+  if (!descriptor?.name || path.basename(descriptor.name) !== descriptor.name || descriptor.name.startsWith(".") || !SHA_RE.test(descriptor.sha256) || !Number.isSafeInteger(descriptor.size_bytes) || descriptor.size_bytes <= 0) usage(`invalid descriptor for ${descriptor?.name || "unnamed file"}`);
   const filePath = path.join(root, descriptor.name);
-  const bytes = await fs.readFile(filePath);
-  const digest = crypto.createHash("sha256").update(bytes).digest("hex");
-  if (digest !== descriptor.sha256 || bytes.length !== descriptor.size_bytes) throw new Error(`manifest metadata does not match ${descriptor.name}`);
+  const fileStat = await fs.stat(filePath);
+  if (!fileStat.isFile() || !Number.isSafeInteger(fileStat.size) || fileStat.size <= 0) throw new Error(`artifact ${descriptor.name} must be a regular file with a safe positive size`);
+  const { digest, size } = await hashArtifact(filePath);
+  if (digest !== descriptor.sha256 || size !== descriptor.size_bytes || fileStat.size !== size) throw new Error(`manifest metadata does not match ${descriptor.name}`);
   const url = `${endpoint}/plugins/api/v1/products/cadence/release-uploads/${encodeURIComponent(manifest.build_id)}/staging/files/${encodeURIComponent(descriptor.name)}`;
-  const response = await fetch(url, {
-    method: "PUT",
-    headers: { ...metadata, "Content-Type": "application/octet-stream", "Content-Length": String(bytes.length), "X-PortalSurfer-Sha256": digest },
-    body: bytes,
-  });
-  if (!response.ok) throw new Error(`staging ${descriptor.name} failed (${response.status}): ${await response.text()}`);
+  const uploadStream = fsStreams.createReadStream(filePath);
+  try {
+    const response = await fetch(url, {
+      method: "PUT",
+      headers: { ...metadata, "Content-Type": "application/octet-stream", "Content-Length": String(size), "X-PortalSurfer-Sha256": digest },
+      body: uploadStream,
+      duplex: "half",
+    });
+    if (!response.ok) throw new Error(`staging ${descriptor.name} failed (${response.status}): ${await response.text()}`);
+  } finally {
+    await closeReadStream(uploadStream);
+  }
 }
 
 const manifestSha256 = crypto.createHash("sha256").update(manifestBytes).digest("hex");

@@ -7,7 +7,7 @@ mod transport;
 mod waveform;
 
 use radiant::{
-    application::{AnchoredPopoverParts, IntoView, anchored_popover_from_parts},
+    application::{AnchoredPopoverParts, IntoView, Subscription, anchored_popover_from_parts},
     gui::{
         list::DenseRowMarkerParts,
         types::{Point, Rect, Vector2},
@@ -31,7 +31,11 @@ use std::{
     fmt::Write as _,
     ops::Deref,
     path::{Path, PathBuf},
-    sync::Arc,
+    rc::Rc,
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, Sender},
+    },
     time::Duration,
 };
 
@@ -277,6 +281,21 @@ enum Message {
 enum NoteOwner {
     MainTrack(String),
     ReferenceTrack(PathBuf),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum CommentProjectionOwnerKey {
+    MainTrack(String),
+    ReferencePath(PathBuf),
+}
+
+impl From<&NoteOwner> for CommentProjectionOwnerKey {
+    fn from(owner: &NoteOwner) -> Self {
+        match owner {
+            NoteOwner::MainTrack(track_id) => Self::MainTrack(track_id.clone()),
+            NoteOwner::ReferenceTrack(path) => Self::ReferencePath(path.clone()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -859,6 +878,25 @@ struct LibrarySaveAttempt {
     revision: u64,
 }
 
+#[derive(Debug)]
+struct CloseSaveRequest {
+    attempt: LibrarySaveAttempt,
+    library: Arc<storage::Library>,
+}
+
+#[derive(Debug)]
+struct CloseSaveCompletion {
+    attempt: LibrarySaveAttempt,
+    result: Result<(), String>,
+}
+
+type CloseSaveRequestReceiver = Rc<RefCell<Option<Receiver<CloseSaveRequest>>>>;
+
+fn new_close_save_protocol() -> (Sender<CloseSaveRequest>, CloseSaveRequestReceiver) {
+    let (sender, receiver) = mpsc::channel();
+    (sender, Rc::new(RefCell::new(Some(receiver))))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LibraryMutationScope {
     PersistedOnly,
@@ -876,13 +914,6 @@ impl LibraryMutationScope {
     const fn affects_markers(self) -> bool {
         matches!(self, Self::Markers | Self::ProjectionAndMarkers)
     }
-
-    const fn affects_comments(self) -> bool {
-        matches!(
-            self,
-            Self::Comments | Self::Markers | Self::ProjectionAndMarkers
-        )
-    }
 }
 
 /// UI-owned library state is shared with blocking workers through an immutable
@@ -895,7 +926,6 @@ struct SharedLibrary {
     value: Arc<storage::Library>,
     projection_revision: u64,
     marker_revision: u64,
-    comment_revision: u64,
 }
 
 impl Default for SharedLibrary {
@@ -932,7 +962,6 @@ impl SharedLibrary {
             value: Arc::new(library),
             projection_revision: 0,
             marker_revision: 0,
-            comment_revision: 0,
         }
     }
 
@@ -946,10 +975,6 @@ impl SharedLibrary {
 
     fn marker_revision(&self) -> u64 {
         self.marker_revision
-    }
-
-    fn comment_revision(&self) -> u64 {
-        self.comment_revision
     }
 
     fn mutate<R>(
@@ -985,9 +1010,6 @@ impl SharedLibrary {
         if scope.affects_markers() {
             self.marker_revision = self.marker_revision.wrapping_add(1);
         }
-        if scope.affects_comments() {
-            self.comment_revision = self.comment_revision.wrapping_add(1);
-        }
     }
 }
 
@@ -1017,13 +1039,16 @@ struct LibraryProjectionCache {
     planner_stage_indices: [Vec<usize>; 4],
     reference_assignment_counts: HashMap<PathBuf, usize>,
     reference_track_indices: HashMap<PathBuf, usize>,
-    comment_revision: Option<(u64, u64)>,
+    comment_projection_revision: Option<u64>,
+    dirty_comment_owners: HashSet<CommentProjectionOwnerKey>,
     main_comment_projections: HashMap<String, CommentOwnerProjection>,
     reference_comment_projections: HashMap<PathBuf, CommentOwnerProjection>,
     #[cfg(test)]
     rebuild_count: usize,
     #[cfg(test)]
     comment_rebuild_count: usize,
+    #[cfg(test)]
+    comment_owner_rebuild_counts: HashMap<CommentProjectionOwnerKey, usize>,
 }
 
 impl LibraryProjectionCache {
@@ -1132,18 +1157,24 @@ impl LibraryProjectionCache {
         }
     }
 
-    fn ensure_comments(
-        &mut self,
-        projection_revision: u64,
-        comment_revision: u64,
-        library: &storage::Library,
-    ) {
-        let key = (projection_revision, comment_revision);
-        if self.comment_revision == Some(key) {
+    fn ensure_comments(&mut self, projection_revision: u64, library: &storage::Library) {
+        if self.comment_projection_revision == Some(projection_revision) {
+            if self.dirty_comment_owners.is_empty() {
+                return;
+            }
+            let dirty_owners = std::mem::take(&mut self.dirty_comment_owners);
+            for owner in dirty_owners {
+                self.rebuild_comment_owner(owner, library);
+            }
+            #[cfg(test)]
+            {
+                self.comment_rebuild_count += 1;
+            }
             return;
         }
 
-        self.comment_revision = Some(key);
+        self.comment_projection_revision = Some(projection_revision);
+        self.dirty_comment_owners.clear();
         self.main_comment_projections.clear();
         self.main_comment_projections.reserve(library.tracks.len());
         for track in &library.tracks {
@@ -1167,6 +1198,55 @@ impl LibraryProjectionCache {
         {
             self.comment_rebuild_count += 1;
         }
+    }
+
+    fn mark_comment_owner_dirty(&mut self, owner: &NoteOwner) {
+        self.dirty_comment_owners.insert(owner.into());
+    }
+
+    fn rebuild_comment_owner(
+        &mut self,
+        owner: CommentProjectionOwnerKey,
+        library: &storage::Library,
+    ) {
+        match &owner {
+            CommentProjectionOwnerKey::MainTrack(track_id) => {
+                if let Some(track) = library.tracks.iter().find(|track| track.id == *track_id) {
+                    self.main_comment_projections.insert(
+                        track_id.clone(),
+                        CommentOwnerProjection::from_notes(&track.notes),
+                    );
+                } else {
+                    self.main_comment_projections.remove(track_id);
+                }
+            }
+            CommentProjectionOwnerKey::ReferencePath(path) => {
+                if let Some(reference) = library
+                    .reference_tracks
+                    .iter()
+                    .find(|reference| reference.path == *path)
+                {
+                    self.reference_comment_projections.insert(
+                        path.clone(),
+                        CommentOwnerProjection::from_notes(&reference.notes),
+                    );
+                } else {
+                    self.reference_comment_projections.remove(path);
+                }
+            }
+        }
+        #[cfg(test)]
+        {
+            *self.comment_owner_rebuild_counts.entry(owner).or_default() += 1;
+        }
+    }
+
+    #[cfg(test)]
+    fn comment_owner_rebuild_count(&self, owner: &NoteOwner) -> usize {
+        self.comment_owner_rebuild_counts
+            .get(&CommentProjectionOwnerKey::from(owner))
+            .copied()
+            .unwrap_or_default()
     }
 
     fn library_index(&self, track_id: &str) -> Option<usize> {
@@ -1538,6 +1618,9 @@ struct AppState {
     library_revision: u64,
     persisted_library_revision: u64,
     save_in_flight: Option<LibrarySaveAttempt>,
+    close_after_save: bool,
+    close_save_request_sender: Sender<CloseSaveRequest>,
+    close_save_request_receiver: Rc<RefCell<Option<Receiver<CloseSaveRequest>>>>,
     save_admission_pending: bool,
     selection_save_latest: ui::LatestTask,
     selection_save_pending: bool,
@@ -1693,6 +1776,7 @@ impl AppState {
     where
         F: FnOnce() -> Result<transport::AudioTransport, String>,
     {
+        let (close_save_request_sender, close_save_request_receiver) = new_close_save_protocol();
         let (transport, status) = match transport_factory() {
             Ok(transport) => (transport, String::from("Ready — import a track to begin.")),
             Err(error) => {
@@ -1713,6 +1797,9 @@ impl AppState {
             library_revision: 0,
             persisted_library_revision: 0,
             save_in_flight: None,
+            close_after_save: false,
+            close_save_request_sender,
+            close_save_request_receiver,
             save_admission_pending: false,
             selection_save_latest: ui::LatestTask::new(),
             selection_save_pending: false,
@@ -1863,11 +1950,14 @@ where
 fn ensure_library_projection_cache(state: &AppState) {
     let mut cache = state.library_projection_cache.borrow_mut();
     cache.ensure(state.library.projection_revision(), &state.library);
-    cache.ensure_comments(
-        state.library.projection_revision(),
-        state.library.comment_revision(),
-        &state.library,
-    );
+    cache.ensure_comments(state.library.projection_revision(), &state.library);
+}
+
+fn mark_comment_projection_dirty(state: &AppState, owner: &NoteOwner) {
+    state
+        .library_projection_cache
+        .borrow_mut()
+        .mark_comment_owner_dirty(owner);
 }
 
 fn allocate_note_draft_nonce(state: &mut AppState) -> u64 {
@@ -2117,19 +2207,22 @@ fn paint_live_playback_overlay(
         current_live_frame_for_source(state, &track.id, source)
     });
     let Some(bounds) = context.plan.first_widget_rect(LIVE_SPECTROGRAM_BODY_ID) else {
+        state.live_spectrogram_overlay_cache.clear();
         return;
     };
-    if let Some(frame) = frame {
-        spectrogram::paint_overlay_cached(
-            frame,
-            state.live_spectrogram_mode,
-            state.live_spectrogram_history_scale,
-            bounds,
-            primitives,
-            &theme,
-            &mut state.live_spectrogram_overlay_cache,
-        );
-    }
+    let Some(frame) = frame.filter(|frame| frame.is_valid()) else {
+        state.live_spectrogram_overlay_cache.clear();
+        return;
+    };
+    spectrogram::paint_overlay_cached(
+        frame,
+        state.live_spectrogram_mode,
+        state.live_spectrogram_history_scale,
+        bounds,
+        primitives,
+        &theme,
+        &mut state.live_spectrogram_overlay_cache,
+    );
 }
 
 fn workspace_mode_key(mode: WorkspaceMode) -> u64 {
@@ -2172,6 +2265,40 @@ fn native_launch_options() -> NativeRunOptions {
     options
 }
 
+fn close_save_subscriptions(state: &mut AppState) -> Subscription<Message> {
+    let Some(request_receiver) = state.close_save_request_receiver.borrow_mut().take() else {
+        return Subscription::none();
+    };
+    let (completion_sender, completion_receiver) = mpsc::channel::<CloseSaveCompletion>();
+    let worker = std::thread::Builder::new()
+        .name(String::from("cadence-close-save"))
+        .spawn(move || {
+            while let Ok(request) = request_receiver.recv() {
+                let result = storage::persist_library(&request.library);
+                if completion_sender
+                    .send(CloseSaveCompletion {
+                        attempt: request.attempt,
+                        result,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+    if worker.is_err() {
+        return Subscription::none();
+    }
+    Subscription::worker_payload(
+        "cadence-close-save-completion",
+        completion_receiver,
+        |completion| Message::LibrarySaved {
+            attempt: completion.attempt,
+            result: completion.result,
+        },
+    )
+}
+
 fn main() -> radiant::Result {
     let _instance_lock = match storage::acquire_instance_lock() {
         Ok(lock) => lock,
@@ -2198,6 +2325,7 @@ fn main() -> radiant::Result {
                 )
                 .transient_overlay(live_playback_overlay()),
         )
+        .subscriptions(close_save_subscriptions)
         .on_startup(|_state, context| schedule_library_load(context))
         .on_close_requested(handle_close_requested)
         .on_shutdown(handle_shutdown)
@@ -3994,21 +4122,52 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             match result {
                 Ok(()) => {
                     state.persisted_library_revision = attempt.revision;
-                    if !main_source_is_mismatched(state)
-                        && !reference_source_is_mismatched(state)
-                        && !library_dirty(state)
-                        && !selection_save_debounce_active(state)
-                    {
-                        state.status = String::from("All changes saved locally.");
-                    }
-                    if library_dirty(state) {
-                        request_library_save_admission(state, context);
+                    if state.close_after_save {
+                        if library_dirty(state) {
+                            match dispatch_close_library_save(state) {
+                                Ok(true) => {
+                                    state.status = String::from(
+                                        "Saving the latest library changes before closing…",
+                                    );
+                                }
+                                Ok(false) => {
+                                    state.close_after_save = false;
+                                    context.exit();
+                                }
+                                Err(error) => {
+                                    state.close_after_save = false;
+                                    state.status = format!(
+                                        "Could not save the library before closing: {error}"
+                                    );
+                                }
+                            }
+                        } else {
+                            state.close_after_save = false;
+                            context.exit();
+                        }
                     } else {
-                        schedule_next_pending_library_operation(state, context);
+                        if !main_source_is_mismatched(state)
+                            && !reference_source_is_mismatched(state)
+                            && !library_dirty(state)
+                            && !selection_save_debounce_active(state)
+                        {
+                            state.status = String::from("All changes saved locally.");
+                        }
+                        if library_dirty(state) {
+                            request_library_save_admission(state, context);
+                        } else {
+                            schedule_next_pending_library_operation(state, context);
+                        }
                     }
                 }
                 Err(error) => {
-                    if main_source_is_mismatched(state) || reference_source_is_mismatched(state) {
+                    if state.close_after_save {
+                        state.close_after_save = false;
+                        state.status =
+                            format!("Could not save the library before closing: {error}");
+                    } else if main_source_is_mismatched(state)
+                        || reference_source_is_mismatched(state)
+                    {
                         preserve_source_mismatch_status(state);
                     } else {
                         state.status = error;
@@ -5020,6 +5179,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 |removed| removed.is_some(),
             );
             if removed.is_some() {
+                mark_comment_projection_dirty(state, &address.owner);
                 if state.hovered_note_id.as_ref() == Some(&address) {
                     state.hovered_note_id = None;
                 }
@@ -5179,6 +5339,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 |removed| removed.is_some(),
             );
             if removed.is_some() {
+                mark_comment_projection_dirty(state, &address.owner);
                 if state.selected_reference_note_id.as_ref() == Some(&address) {
                     state.selected_reference_note_id = None;
                     clear_pending_seek_intent(state, PlaybackSource::Reference);
@@ -6960,6 +7121,9 @@ fn save_draft_note(
     state.draft_note = None;
     state.status = String::from("Comment saved locally.");
     if changed {
+        if draft.note_id.is_none() {
+            mark_comment_projection_dirty(state, &NoteOwner::MainTrack(track_id));
+        }
         schedule_library_save(state, context);
     }
     context.request_repaint();
@@ -7106,6 +7270,9 @@ fn save_reference_draft_note(
     state.reference_draft_note = None;
     state.status = String::from("Reference comment saved locally.");
     if changed {
+        if draft.note_id.is_none() {
+            mark_comment_projection_dirty(state, &NoteOwner::ReferenceTrack(reference_path));
+        }
         schedule_library_save(state, context);
     }
     context.request_repaint();
@@ -7275,6 +7442,7 @@ fn finish_persisted_note_drag(
         )
     };
     if changed {
+        mark_comment_projection_dirty(state, &drag.address.owner);
         schedule_library_save(state, context);
     }
     context.request_repaint();
@@ -7456,6 +7624,7 @@ fn finish_reference_persisted_note_drag(
         )
     };
     if changed {
+        mark_comment_projection_dirty(state, &drag.address.owner);
         schedule_library_save(state, context);
     }
     context.request_repaint();
@@ -8860,6 +9029,31 @@ fn dispatch_library_save(state: &mut AppState, context: &mut ui::UiUpdateContext
     true
 }
 
+fn dispatch_close_library_save(state: &mut AppState) -> Result<bool, String> {
+    if !library_is_ready(state) || !library_dirty(state) || state.save_in_flight.is_some() {
+        return Ok(false);
+    }
+    let revision = state.library_revision;
+    let id = state
+        .last_save_attempt_id
+        .checked_add(1)
+        .expect("library save attempt id overflow");
+    let attempt = LibrarySaveAttempt { id, revision };
+    let request = CloseSaveRequest {
+        attempt,
+        library: state.library.snapshot(),
+    };
+    state
+        .close_save_request_sender
+        .send(request)
+        .map_err(|_| String::from("background close-save worker disconnected"))?;
+    state.last_save_attempt_id = id;
+    state.save_in_flight = Some(attempt);
+    state.save_admission_pending = false;
+    state.selection_save_pending = false;
+    Ok(true)
+}
+
 fn schedule_library_save(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
     if !library_is_ready(state) {
         return;
@@ -8903,23 +9097,29 @@ fn persist_latest_snapshot_if_dirty(
 }
 
 fn handle_close_requested(state: &mut AppState) -> bool {
-    handle_close_requested_with(state, storage::persist_library)
-}
-
-fn handle_close_requested_with(
-    state: &mut AppState,
-    persist: impl FnOnce(&storage::Library) -> Result<(), String>,
-) -> bool {
     cancel_selection_save_debounce(state);
     state.save_admission_pending = false;
     if state.save_in_flight.is_some() {
+        state.close_after_save = true;
         state.status = String::from("Saving the library — try closing again when it finishes.");
         return false;
     }
-
-    match persist_latest_snapshot_if_dirty(state, persist) {
-        Ok(_) => true,
+    if !library_dirty(state) {
+        state.close_after_save = false;
+        return true;
+    }
+    state.close_after_save = true;
+    match dispatch_close_library_save(state) {
+        Ok(true) => {
+            state.status = String::from("Saving the library before closing…");
+            false
+        }
+        Ok(false) => {
+            state.close_after_save = false;
+            true
+        }
         Err(error) => {
+            state.close_after_save = false;
             state.status = format!("Could not save the library before closing: {error}");
             false
         }
@@ -9835,6 +10035,9 @@ fn rollback_persisted_note_drag(state: &mut AppState) {
         state.review_cursor_millis = drag.original_time_millis;
         state.transport_position_millis = drag.original_time_millis;
     }
+    if note_restored {
+        mark_comment_projection_dirty(state, &drag.address.owner);
+    }
     if let Some(draft) = state
         .draft_note
         .as_mut()
@@ -9880,6 +10083,9 @@ fn rollback_reference_persisted_note_drag(state: &mut AppState) {
         .is_some_and(|path| path == reference_path);
     if note_restored && selected_reference_matches {
         state.reference_transport_position_millis = drag.original_time_millis;
+    }
+    if note_restored {
+        mark_comment_projection_dirty(state, &drag.address.owner);
     }
     if let Some(draft) = state
         .reference_draft_note
@@ -13089,18 +13295,18 @@ mod tests {
         current_loudness_match_gain_db, current_lufs_meter_value,
         current_reference_lufs_meter_value, decode_result_is_current, enforce_loop,
         ensure_library_projection_cache, ensure_reference_transport_with, favorite_toggle,
-        frame_surface_revisions, handle_close_requested_with, handle_shutdown_with, library_dirty,
+        frame_surface_revisions, handle_close_requested, handle_shutdown_with, library_dirty,
         library_track_card_height, library_track_title_id, live_frame_matches_current_session,
-        live_spectrogram_display_sample_rate, loop_bounds, main_output_gain, native_launch_options,
-        note_editor, note_ratio_for_id, owned_tracks_in_stage, paint_live_playback_overlay,
-        planner_insertion_target_is_valid, planner_stage_index, planner_tracks_with_favorites,
-        playback_shortcut, prepared_main_marker_projection, progress_paired_playback_cleanup,
-        project_surface, qualified_note_identity_key, reference_decode_result_is_current,
-        reference_dropdown_paths, reference_menu_available, reference_output_gain,
-        reference_settings_auxiliary_windows, reference_settings_window_view,
-        refresh_live_spectrogram, refresh_live_spectrograms, resume_transport_command,
-        review_spectrogram_source, schedule_import, schedule_library_save,
-        schedule_reference_catalog_import, schedule_reference_import,
+        live_spectrogram_display_sample_rate, loop_bounds, main_output_gain,
+        mark_comment_projection_dirty, native_launch_options, note_editor, note_ratio_for_id,
+        owned_tracks_in_stage, paint_live_playback_overlay, planner_insertion_target_is_valid,
+        planner_stage_index, planner_tracks_with_favorites, playback_shortcut,
+        prepared_main_marker_projection, progress_paired_playback_cleanup, project_surface,
+        qualified_note_identity_key, reference_decode_result_is_current, reference_dropdown_paths,
+        reference_menu_available, reference_output_gain, reference_settings_auxiliary_windows,
+        reference_settings_window_view, refresh_live_spectrogram, refresh_live_spectrograms,
+        resume_transport_command, review_spectrogram_source, schedule_import,
+        schedule_library_save, schedule_reference_catalog_import, schedule_reference_import,
         schedule_reference_waveform_decode, schedule_replace, schedule_waveform_decode,
         seek_synchronized_positions, selected_reference_notes, selected_track,
         selection_save_debounce_active, stage_dropdown, stage_menu_anchor_from_pointer,
@@ -13472,32 +13678,26 @@ mod tests {
         let mut shared = SharedLibrary::default();
         assert_eq!(shared.projection_revision(), 0);
         assert_eq!(shared.marker_revision(), 0);
-        assert_eq!(shared.comment_revision(), 0);
 
         shared.mutate(LibraryMutationScope::PersistedOnly, |_| {});
         assert_eq!(shared.projection_revision(), 0);
         assert_eq!(shared.marker_revision(), 0);
-        assert_eq!(shared.comment_revision(), 0);
 
         shared.mutate(LibraryMutationScope::Projection, |_| {});
         assert_eq!(shared.projection_revision(), 1);
         assert_eq!(shared.marker_revision(), 0);
-        assert_eq!(shared.comment_revision(), 0);
 
         shared.mutate(LibraryMutationScope::Comments, |_| {});
         assert_eq!(shared.projection_revision(), 1);
         assert_eq!(shared.marker_revision(), 0);
-        assert_eq!(shared.comment_revision(), 1);
 
         shared.mutate(LibraryMutationScope::Markers, |_| {});
         assert_eq!(shared.projection_revision(), 1);
         assert_eq!(shared.marker_revision(), 1);
-        assert_eq!(shared.comment_revision(), 2);
 
         shared.mutate(LibraryMutationScope::ProjectionAndMarkers, |_| {});
         assert_eq!(shared.projection_revision(), 2);
         assert_eq!(shared.marker_revision(), 2);
-        assert_eq!(shared.comment_revision(), 3);
     }
 
     #[test]
@@ -13534,6 +13734,7 @@ mod tests {
             );
             assert_eq!(cache.comment_count(&main_owner), 2);
             assert_eq!(cache.comment_open_count(&main_owner), 1);
+            assert_eq!(cache.comment_owner_rebuild_count(&main_owner), 0);
             assert_eq!(
                 cache.comment_note_index(&reference_owner, "shared-reference-note"),
                 Some(0)
@@ -13565,7 +13766,6 @@ mod tests {
             1
         );
 
-        let comment_revision_before_body_edit = state.library.comment_revision();
         let marker_revision_before_body_edit = state.library.marker_revision();
         state
             .library
@@ -13573,20 +13773,17 @@ mod tests {
                 library.tracks[0].notes[0].body = String::from("Main body changed");
             });
         assert_eq!(
-            state.library.comment_revision(),
-            comment_revision_before_body_edit + 1
-        );
-        assert_eq!(
             state.library.marker_revision(),
             marker_revision_before_body_edit
         );
         ensure_library_projection_cache(&state);
         {
             let cache = state.library_projection_cache.borrow();
-            assert_eq!(cache.comment_rebuild_count, 2);
+            assert_eq!(cache.comment_rebuild_count, 1);
             assert_eq!(cache.comment_note_index(&main_owner, "main-first"), Some(0));
             assert_eq!(cache.comment_count(&main_owner), 2);
             assert_eq!(cache.comment_open_count(&main_owner), 1);
+            assert_eq!(cache.comment_owner_rebuild_count(&main_owner), 0);
             assert_eq!(
                 cache.comment_note_index(&reference_owner, "shared-reference-note"),
                 Some(0)
@@ -13607,10 +13804,11 @@ mod tests {
                 note.time_millis = 900;
                 library.tracks[0].notes.sort_by_key(|note| note.time_millis);
             });
+        mark_comment_projection_dirty(&state, &main_owner);
         ensure_library_projection_cache(&state);
         {
             let cache = state.library_projection_cache.borrow();
-            assert_eq!(cache.comment_rebuild_count, 3);
+            assert_eq!(cache.comment_rebuild_count, 2);
             assert_eq!(
                 cache.comment_note_index(&main_owner, "main-second"),
                 Some(0)
@@ -13618,6 +13816,7 @@ mod tests {
             assert_eq!(cache.comment_note_index(&main_owner, "main-first"), Some(1));
             assert_eq!(cache.comment_count(&main_owner), 2);
             assert_eq!(cache.comment_open_count(&main_owner), 1);
+            assert_eq!(cache.comment_owner_rebuild_count(&main_owner), 1);
         }
 
         state
@@ -13625,31 +13824,26 @@ mod tests {
             .mutate(LibraryMutationScope::Markers, |library| {
                 library.reference_tracks[0].notes[0].done = true;
             });
+        mark_comment_projection_dirty(&state, &reference_owner);
         ensure_library_projection_cache(&state);
         {
             let cache = state.library_projection_cache.borrow();
-            assert_eq!(cache.comment_rebuild_count, 4);
+            assert_eq!(cache.comment_rebuild_count, 3);
             assert_eq!(
                 cache.comment_note_index(&reference_owner, "shared-reference-note"),
                 Some(0)
             );
             assert_eq!(cache.comment_count(&reference_owner), 1);
             assert_eq!(cache.comment_open_count(&reference_owner), 0);
+            assert_eq!(cache.comment_owner_rebuild_count(&reference_owner), 1);
         }
 
-        let comment_revision_before_noop = state.library.comment_revision();
-        let marker_revision_before_noop = state.library.marker_revision();
         let no_op = state.library.mutate_with(
             LibraryMutationScope::Comments,
             |_library| false,
             |changed| *changed,
         );
         assert!(!no_op);
-        assert_eq!(
-            state.library.comment_revision(),
-            comment_revision_before_noop
-        );
-        assert_eq!(state.library.marker_revision(), marker_revision_before_noop);
 
         let rejected = state.library.mutate_with(
             LibraryMutationScope::Comments,
@@ -13657,23 +13851,18 @@ mod tests {
             |result| result.is_ok(),
         );
         assert_eq!(rejected, Err("rejected"));
-        assert_eq!(
-            state.library.comment_revision(),
-            comment_revision_before_noop
-        );
-        assert_eq!(state.library.marker_revision(), marker_revision_before_noop);
         ensure_library_projection_cache(&state);
         assert_eq!(
             state
                 .library_projection_cache
                 .borrow()
                 .comment_rebuild_count,
-            4
+            3
         );
     }
 
     #[test]
-    fn saving_existing_comments_rebuilds_comment_projection_without_marker_revision() {
+    fn saving_existing_comment_bodies_keeps_projection_and_live_lookup() {
         let mut state = reference_removal_state();
         let main_track_id = state.library.tracks[0].id.clone();
         let reference_path = state.library.reference_tracks[0].path.clone();
@@ -13689,7 +13878,6 @@ mod tests {
             .library_projection_cache
             .borrow()
             .comment_rebuild_count;
-        let initial_comment_revision = state.library.comment_revision();
         let initial_marker_revision = state.library.marker_revision();
 
         state.draft_note = Some(NoteDraft {
@@ -13707,10 +13895,6 @@ mod tests {
         let mut context = ui::UiUpdateContext::default();
         update(&mut state, Message::SaveDraftNote(identity), &mut context);
 
-        assert_eq!(
-            state.library.comment_revision(),
-            initial_comment_revision + 1
-        );
         assert_eq!(state.library.marker_revision(), initial_marker_revision);
         ensure_library_projection_cache(&state);
         assert_eq!(
@@ -13718,7 +13902,7 @@ mod tests {
                 .library_projection_cache
                 .borrow()
                 .comment_rebuild_count,
-            initial_comment_rebuild_count + 1
+            initial_comment_rebuild_count
         );
         assert_eq!(
             super::cached_note_for_owner(
@@ -13749,10 +13933,6 @@ mod tests {
             &mut context,
         );
 
-        assert_eq!(
-            state.library.comment_revision(),
-            initial_comment_revision + 2
-        );
         assert_eq!(state.library.marker_revision(), initial_marker_revision);
         ensure_library_projection_cache(&state);
         assert_eq!(
@@ -13760,7 +13940,7 @@ mod tests {
                 .library_projection_cache
                 .borrow()
                 .comment_rebuild_count,
-            initial_comment_rebuild_count + 2
+            initial_comment_rebuild_count
         );
         assert_eq!(
             super::cached_note_for_owner(
@@ -13772,7 +13952,6 @@ mod tests {
             Some("after reference edit")
         );
 
-        let comment_revision_before_noop = state.library.comment_revision();
         let marker_revision_before_noop = state.library.marker_revision();
         state.draft_note = Some(NoteDraft {
             owner: NoteOwner::MainTrack(main_track_id.clone()),
@@ -13789,10 +13968,6 @@ mod tests {
         let mut context = ui::UiUpdateContext::default();
         update(&mut state, Message::SaveDraftNote(identity), &mut context);
         assert!(state.draft_note.is_none());
-        assert_eq!(
-            state.library.comment_revision(),
-            comment_revision_before_noop
-        );
         assert_eq!(state.library.marker_revision(), marker_revision_before_noop);
         ensure_library_projection_cache(&state);
         assert_eq!(
@@ -13800,7 +13975,7 @@ mod tests {
                 .library_projection_cache
                 .borrow()
                 .comment_rebuild_count,
-            initial_comment_rebuild_count + 2
+            initial_comment_rebuild_count
         );
 
         state.draft_note = Some(NoteDraft {
@@ -13818,10 +13993,6 @@ mod tests {
         let mut context = ui::UiUpdateContext::default();
         update(&mut state, Message::SaveDraftNote(identity), &mut context);
         assert!(state.draft_note.is_some());
-        assert_eq!(
-            state.library.comment_revision(),
-            comment_revision_before_noop
-        );
         assert_eq!(state.library.marker_revision(), marker_revision_before_noop);
         ensure_library_projection_cache(&state);
         assert_eq!(
@@ -13829,8 +14000,59 @@ mod tests {
                 .library_projection_cache
                 .borrow()
                 .comment_rebuild_count,
-            initial_comment_rebuild_count + 2
+            initial_comment_rebuild_count
         );
+    }
+
+    #[test]
+    fn comment_projection_dirty_owners_coalesce_and_rebuild_independently() {
+        let mut state = reference_removal_state();
+        let main_owner = NoteOwner::MainTrack(state.library.tracks[0].id.clone());
+        let reference_owner =
+            NoteOwner::ReferenceTrack(state.library.reference_tracks[0].path.clone());
+        state.library.tracks[0].notes.push(Note {
+            id: String::from("owner-local-main"),
+            time_millis: 100,
+            body: String::from("owner local"),
+            done: false,
+        });
+        ensure_library_projection_cache(&state);
+        let initial_rebuild_count = state
+            .library_projection_cache
+            .borrow()
+            .comment_rebuild_count;
+
+        state
+            .library
+            .mutate(LibraryMutationScope::Markers, |library| {
+                library.tracks[0].notes[0].done = true;
+                library.reference_tracks[0].notes[0].done = true;
+            });
+        mark_comment_projection_dirty(&state, &main_owner);
+        mark_comment_projection_dirty(&state, &main_owner);
+        mark_comment_projection_dirty(&state, &reference_owner);
+        mark_comment_projection_dirty(&state, &reference_owner);
+        ensure_library_projection_cache(&state);
+        {
+            let cache = state.library_projection_cache.borrow();
+            assert_eq!(cache.comment_rebuild_count, initial_rebuild_count + 1);
+            assert_eq!(cache.comment_owner_rebuild_count(&main_owner), 1);
+            assert_eq!(cache.comment_owner_rebuild_count(&reference_owner), 1);
+            assert_eq!(cache.comment_open_count(&main_owner), 0);
+            assert_eq!(cache.comment_open_count(&reference_owner), 0);
+        }
+
+        state
+            .library
+            .mutate(LibraryMutationScope::Markers, |library| {
+                library.tracks[0].notes[0].time_millis = 900;
+            });
+        mark_comment_projection_dirty(&state, &main_owner);
+        ensure_library_projection_cache(&state);
+        let cache = state.library_projection_cache.borrow();
+        assert_eq!(cache.comment_rebuild_count, initial_rebuild_count + 2);
+        assert_eq!(cache.comment_owner_rebuild_count(&main_owner), 2);
+        assert_eq!(cache.comment_owner_rebuild_count(&reference_owner), 1);
     }
 
     #[test]
@@ -14846,6 +15068,65 @@ mod tests {
     }
 
     #[test]
+    fn live_spectrogram_overlay_clears_cached_geometry_when_frame_disappears_or_source_switches() {
+        let mut state = audition_state(&["main"]);
+        state.transport_playing = true;
+        state.live_spectrogram = Some(live_frame(0, 0, 1));
+        state.live_spectrogram_revision = 1;
+        state.transport.set_live_state_for_test(LiveFrameState {
+            generation: 0,
+            epoch: 0,
+            revision: 1,
+            pending: false,
+        });
+        let frame = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1100.0));
+        let context = TransientOverlayContext::new(
+            &frame.paint_plan,
+            Vector2::new(1180.0, 1100.0),
+            Duration::ZERO,
+        );
+        paint_live_playback_overlay(&mut state, context, &mut Vec::new());
+        assert!(!state.live_spectrogram_overlay_cache.is_empty());
+
+        state.live_spectrogram = None;
+        state.live_spectrogram_revision = 0;
+        let context = TransientOverlayContext::new(
+            &frame.paint_plan,
+            Vector2::new(1180.0, 1100.0),
+            Duration::ZERO,
+        );
+        paint_live_playback_overlay(&mut state, context, &mut Vec::new());
+        assert!(state.live_spectrogram_overlay_cache.is_empty());
+
+        state.live_spectrogram = Some(live_frame(0, 0, 2));
+        state.live_spectrogram_revision = 2;
+        state.transport.set_live_state_for_test(LiveFrameState {
+            generation: 0,
+            epoch: 0,
+            revision: 2,
+            pending: false,
+        });
+        let context = TransientOverlayContext::new(
+            &frame.paint_plan,
+            Vector2::new(1180.0, 1100.0),
+            Duration::ZERO,
+        );
+        paint_live_playback_overlay(&mut state, context, &mut Vec::new());
+        assert!(!state.live_spectrogram_overlay_cache.is_empty());
+
+        state.transport_playing = false;
+        state.playback_source = PlaybackSource::Reference;
+        let context = TransientOverlayContext::new(
+            &frame.paint_plan,
+            Vector2::new(1180.0, 1100.0),
+            Duration::ZERO,
+        );
+        paint_live_playback_overlay(&mut state, context, &mut Vec::new());
+        assert!(state.live_spectrogram_overlay_cache.is_empty());
+    }
+
+    #[test]
     fn live_spectrogram_display_sample_rate_uses_matching_metadata_until_frame_arrives() {
         let mut state = audition_state(&["main"]);
         let track = selected_track(&state).expect("selected test track").clone();
@@ -15215,6 +15496,14 @@ mod tests {
             assert!(frame.layout.rects.values().any(|rect| {
                 (rect.width() - 92.0).abs() < 0.01 && (rect.height() - 22.0).abs() < 0.01
             }));
+        }
+    }
+
+    fn command_has_exit(command: &radiant::runtime::Command<Message>) -> bool {
+        match command {
+            radiant::runtime::Command::Exit => true,
+            radiant::runtime::Command::Batch(commands) => commands.iter().any(command_has_exit),
+            _ => false,
         }
     }
 
@@ -28831,7 +29120,7 @@ mod tests {
     }
 
     #[test]
-    fn close_flush_success_persists_latest_selection_and_blocks_queued_admission() {
+    fn close_enqueues_snapshot_and_exits_after_matching_async_completion() {
         let mut state = audition_state(&["close-first", "close-second"]);
         let mut context = ui::UiUpdateContext::default();
         update(
@@ -28843,40 +29132,45 @@ mod tests {
             .selection_save_latest
             .active()
             .expect("the selection should have a pending debounce");
-        state.save_admission_pending = true;
         let revision = state.library_revision;
-        let mut saved = None;
 
-        let accepted = handle_close_requested_with(&mut state, |library| {
-            saved = Some(library.clone());
-            Ok(())
-        });
-
-        assert!(accepted);
+        assert!(!handle_close_requested(&mut state));
+        let request = state
+            .close_save_request_receiver
+            .borrow_mut()
+            .as_ref()
+            .expect("close worker receiver")
+            .try_recv()
+            .expect("close should enqueue one request");
+        assert_eq!(request.attempt.revision, revision);
         assert_eq!(
-            saved
-                .as_ref()
-                .and_then(|library| library.selected_track_id.as_deref()),
+            request.library.selected_track_id.as_deref(),
             Some("close-second")
         );
-        assert_eq!(state.persisted_library_revision, revision);
-        assert!(!library_dirty(&state));
+        assert_eq!(state.save_in_flight, Some(request.attempt));
+        assert!(state.close_after_save);
         assert!(!selection_save_debounce_active(&state));
-        assert!(!state.selection_save_pending);
-        assert!(!state.save_admission_pending);
-        assert!(state.save_in_flight.is_none());
 
         update(
             &mut state,
             Message::AdmitSelectionSave(stale_ticket),
             &mut context,
         );
-        update(&mut state, Message::AdmitLibrarySave, &mut context);
-        assert!(state.save_in_flight.is_none());
+        update(
+            &mut state,
+            Message::LibrarySaved {
+                attempt: request.attempt,
+                result: Ok(()),
+            },
+            &mut context,
+        );
+        assert!(!library_dirty(&state));
+        assert!(!state.close_after_save);
+        assert!(command_has_exit(&context.into_command()));
     }
 
     #[test]
-    fn close_flush_failure_keeps_dirty_latest_snapshot_and_cancels_admission() {
+    fn close_completion_failure_keeps_dirty_library_open() {
         let mut state = audition_state(&["close-failure-first", "close-failure-second"]);
         let mut context = ui::UiUpdateContext::default();
         update(
@@ -28884,32 +29178,32 @@ mod tests {
             Message::SelectTrack(String::from("close-failure-second")),
             &mut context,
         );
-        state.save_admission_pending = true;
-        let revision = state.library_revision;
-        let mut called = false;
 
-        let accepted = handle_close_requested_with(&mut state, |_| {
-            called = true;
-            Err(String::from("disk full"))
-        });
+        assert!(!handle_close_requested(&mut state));
+        let attempt = state
+            .save_in_flight
+            .expect("close save should be in flight");
+        update(
+            &mut state,
+            Message::LibrarySaved {
+                attempt,
+                result: Err(String::from("disk full")),
+            },
+            &mut context,
+        );
 
-        assert!(!accepted);
-        assert!(called);
-        assert_eq!(state.library_revision, revision);
-        assert_eq!(state.persisted_library_revision, 0);
         assert!(library_dirty(&state));
+        assert!(state.save_in_flight.is_none());
+        assert!(!state.close_after_save);
         assert_eq!(
             state.status,
             "Could not save the library before closing: disk full"
         );
-        assert!(!selection_save_debounce_active(&state));
-        assert!(!state.selection_save_pending);
-        assert!(!state.save_admission_pending);
-        assert!(state.save_in_flight.is_none());
+        assert!(!command_has_exit(&context.into_command()));
     }
 
     #[test]
-    fn close_request_vetoes_in_flight_save_without_sync_flush() {
+    fn close_request_does_not_duplicate_active_save_and_catches_newer_revision() {
         let mut state = audition_state(&["close-in-flight-first", "close-in-flight-second"]);
         let mut context = ui::UiUpdateContext::default();
         update(
@@ -28918,31 +29212,143 @@ mod tests {
             &mut context,
         );
         let revision = state.library_revision;
-        let attempt = LibrarySaveAttempt { id: 7, revision: 0 };
-        state.save_in_flight = Some(attempt);
+        let active_attempt = LibrarySaveAttempt { id: 7, revision };
+        state.save_in_flight = Some(active_attempt);
         state.save_admission_pending = true;
-        let mut called = false;
 
-        let accepted = handle_close_requested_with(&mut state, |_| {
-            called = true;
-            Ok(())
-        });
-
-        assert!(!accepted);
+        assert!(!handle_close_requested(&mut state));
+        assert_eq!(state.save_in_flight, Some(active_attempt));
+        assert!(state.close_after_save);
         assert!(
-            !called,
-            "close must not start a concurrent synchronous write"
+            state
+                .close_save_request_receiver
+                .borrow_mut()
+                .as_ref()
+                .expect("close worker receiver")
+                .try_recv()
+                .is_err()
+        );
+
+        update(
+            &mut state,
+            Message::LibrarySaved {
+                attempt: active_attempt,
+                result: Ok(()),
+            },
+            &mut context,
+        );
+        assert!(command_has_exit(&context.into_command()));
+    }
+
+    #[test]
+    fn close_completion_requeues_newer_revision_before_exit() {
+        let mut state = audition_state(&["close-newer-first", "close-newer-second"]);
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::SelectTrack(String::from("close-newer-second")),
+            &mut context,
+        );
+        assert!(!handle_close_requested(&mut state));
+        let first_request = state
+            .close_save_request_receiver
+            .borrow_mut()
+            .as_ref()
+            .expect("close worker receiver")
+            .try_recv()
+            .expect("first close request");
+
+        state
+            .library
+            .mutate(LibraryMutationScope::PersistedOnly, |library| {
+                library.selected_track_id = Some(String::from("close-newer-first"));
+            });
+        schedule_library_save(&mut state, &mut context);
+        assert!(state.library_revision > first_request.attempt.revision);
+
+        update(
+            &mut state,
+            Message::LibrarySaved {
+                attempt: first_request.attempt,
+                result: Ok(()),
+            },
+            &mut context,
+        );
+        assert!(!command_has_exit(&context.into_command()));
+        let second_request = state
+            .close_save_request_receiver
+            .borrow_mut()
+            .as_ref()
+            .expect("close worker receiver")
+            .try_recv()
+            .expect("newer revision should be queued before exit");
+        assert!(second_request.attempt.revision > first_request.attempt.revision);
+        assert_eq!(state.save_in_flight, Some(second_request.attempt));
+        assert!(library_dirty(&state));
+
+        let mut completion_context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::LibrarySaved {
+                attempt: second_request.attempt,
+                result: Ok(()),
+            },
+            &mut completion_context,
+        );
+        assert!(!library_dirty(&state));
+        assert!(command_has_exit(&completion_context.into_command()));
+    }
+
+    #[test]
+    fn stale_close_completion_cannot_exit_or_retire_newer_attempt() {
+        let mut state = audition_state(&["close-stale-first", "close-stale-second"]);
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::SelectTrack(String::from("close-stale-second")),
+            &mut context,
+        );
+        assert!(!handle_close_requested(&mut state));
+        let attempt = state
+            .save_in_flight
+            .expect("close save should be in flight");
+        let stale = LibrarySaveAttempt {
+            id: attempt.id + 1,
+            revision: attempt.revision,
+        };
+        update(
+            &mut state,
+            Message::LibrarySaved {
+                attempt: stale,
+                result: Ok(()),
+            },
+            &mut context,
         );
         assert_eq!(state.save_in_flight, Some(attempt));
-        assert_eq!(state.library_revision, revision);
+        assert!(state.close_after_save);
         assert!(library_dirty(&state));
+        assert!(!command_has_exit(&context.into_command()));
+    }
+
+    #[test]
+    fn close_enqueue_disconnect_keeps_window_open_without_inline_persistence() {
+        let mut state = audition_state(&["close-disconnect-first", "close-disconnect-second"]);
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::SelectTrack(String::from("close-disconnect-second")),
+            &mut context,
+        );
+        state.close_save_request_receiver.borrow_mut().take();
+
+        assert!(!handle_close_requested(&mut state));
+        assert!(library_dirty(&state));
+        assert!(state.save_in_flight.is_none());
+        assert!(!state.close_after_save);
         assert_eq!(
             state.status,
-            "Saving the library — try closing again when it finishes."
+            "Could not save the library before closing: background close-save worker disconnected"
         );
-        assert!(!selection_save_debounce_active(&state));
-        assert!(!state.selection_save_pending);
-        assert!(!state.save_admission_pending);
     }
 
     #[test]

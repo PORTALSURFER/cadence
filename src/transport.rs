@@ -80,18 +80,18 @@ impl LiveSpectrogramFrame {
         if sample_rate == 0 || row_count == 0 || row_count > LIVE_SPECTROGRAM_MAX_HISTORY {
             return None;
         }
-        let mut values = Vec::with_capacity(row_count * LIVE_SPECTROGRAM_BAND_COUNT);
-        for row in oldest_rows.iter().chain(wrapped_rows.iter()) {
-            values.extend_from_slice(row);
-        }
         Self::from_values(
             generation,
             epoch,
             revision,
             sample_rate,
             row_count,
-            Arc::from(values.into_boxed_slice()),
-            Arc::from(spectrum_values.to_vec().into_boxed_slice()),
+            oldest_rows
+                .iter()
+                .chain(wrapped_rows.iter())
+                .flat_map(|row| row.iter().copied())
+                .collect(),
+            spectrum_values.iter().copied().collect(),
         )
     }
 
@@ -623,7 +623,8 @@ struct LiveAnalysisSource<S> {
     shared: Arc<SharedSnapshot>,
     frame_channels: usize,
     frame_channel: usize,
-    frame_sum: f32,
+    frame_representative: f32,
+    frame_has_finite_sample: bool,
 }
 
 impl<S> LiveAnalysisSource<S>
@@ -644,13 +645,15 @@ where
             shared,
             frame_channels: frame_channels.max(1),
             frame_channel: 0,
-            frame_sum: 0.0,
+            frame_representative: 0.0,
+            frame_has_finite_sample: false,
         }
     }
 
     fn reset_frame_accumulator(&mut self) {
         self.frame_channel = 0;
-        self.frame_sum = 0.0;
+        self.frame_representative = 0.0;
+        self.frame_has_finite_sample = false;
         self.frame_channels = self.inner.channels().get() as usize;
         self.frame_channels = self.frame_channels.max(1);
     }
@@ -694,24 +697,28 @@ where
         if channels != self.frame_channels {
             self.frame_channels = channels.max(1);
             self.frame_channel = 0;
-            self.frame_sum = 0.0;
+            self.frame_representative = 0.0;
+            self.frame_has_finite_sample = false;
         }
 
-        if self.frame_channel == 0 {
-            self.frame_sum = sample;
-        } else {
-            self.frame_sum += sample;
+        if sample.is_finite()
+            && (!self.frame_has_finite_sample || sample.abs() > self.frame_representative.abs())
+        {
+            // Strictly greater preserves the earliest channel on ties.
+            self.frame_representative = sample;
+            self.frame_has_finite_sample = true;
         }
         self.frame_channel += 1;
         if self.frame_channel >= self.frame_channels {
-            let mono = if self.frame_sum.is_finite() {
-                self.frame_sum / self.frame_channels as f32
+            let representative = if self.frame_has_finite_sample {
+                self.frame_representative
             } else {
                 0.0
             };
             self.frame_channel = 0;
-            self.frame_sum = 0.0;
-            self.push_analysis_frame(mono);
+            self.frame_representative = 0.0;
+            self.frame_has_finite_sample = false;
+            self.push_analysis_frame(representative);
         }
 
         Some(sample)
@@ -3238,24 +3245,82 @@ mod tests {
         }
     }
 
-    #[test]
-    fn analysis_source_downmixes_complete_frames_without_output_gain() {
+    fn analysis_source_samples(channels: u16, samples: Vec<f32>) -> (Vec<f32>, Vec<f32>) {
         let (shared, session) = active_test_session(3);
         shared
             .requested_volume
             .store(0.25_f32.to_bits(), Ordering::Release);
         let (producer, mut consumer) = super::RingBuffer::new(8);
         let source = SamplesBuffer::new(
-            std::num::NonZeroU16::new(2).expect("non-zero channel count"),
+            std::num::NonZeroU16::new(channels).expect("non-zero channel count"),
             std::num::NonZeroU32::new(48_000).expect("non-zero sample rate"),
-            vec![1.0, -1.0, 0.25, 0.75],
+            samples,
         );
         let mut adapter = LiveAnalysisSource::new(source, producer, session, shared);
         let output = adapter.by_ref().collect::<Vec<_>>();
-        assert_eq!(output, vec![1.0, -1.0, 0.25, 0.75]);
-        assert_eq!(consumer.pop().expect("first mono frame").sample, 0.0);
-        assert_eq!(consumer.pop().expect("second mono frame").sample, 0.5);
-        assert!(consumer.pop().is_err());
+        let analysis = std::iter::from_fn(|| consumer.pop().ok().map(|frame| frame.sample))
+            .collect::<Vec<_>>();
+        (output, analysis)
+    }
+
+    #[test]
+    fn analysis_source_uses_finite_peak_representatives_without_output_gain() {
+        let (output, analysis) = analysis_source_samples(1, vec![0.75]);
+        assert_eq!(output, vec![0.75]);
+        assert_eq!(analysis, vec![0.75]);
+
+        let (_, analysis) = analysis_source_samples(2, vec![0.5, 0.5]);
+        assert_eq!(
+            analysis,
+            vec![0.5],
+            "equal in-phase channels keep their value"
+        );
+
+        let (_, analysis) = analysis_source_samples(2, vec![1.0, -1.0]);
+        assert_eq!(
+            analysis,
+            vec![1.0],
+            "anti-phase ties keep the earliest channel"
+        );
+
+        let (_, analysis) = analysis_source_samples(3, vec![0.25, -0.25, 0.25]);
+        assert_eq!(
+            analysis,
+            vec![0.25],
+            "equal-magnitude ties keep the earliest channel"
+        );
+
+        let (_, analysis) = analysis_source_samples(3, vec![0.1, -0.8, 0.3]);
+        assert_eq!(
+            analysis,
+            vec![-0.8],
+            "the dominant signed channel represents the frame"
+        );
+    }
+
+    #[test]
+    fn analysis_source_waits_for_complete_frames_and_sanitizes_non_finite_analysis() {
+        let (output, analysis) = analysis_source_samples(2, vec![1.0, -2.0, 3.0]);
+        assert_eq!(output, vec![1.0, -2.0, 3.0]);
+        assert_eq!(
+            analysis,
+            vec![-2.0],
+            "the incomplete trailing frame is not analyzed"
+        );
+
+        let (output, analysis) = analysis_source_samples(2, vec![f32::NAN, 0.75]);
+        assert!(output[0].is_nan(), "playback output must remain untouched");
+        assert_eq!(output[1], 0.75);
+        assert_eq!(analysis, vec![0.75]);
+
+        let (output, analysis) = analysis_source_samples(2, vec![f32::INFINITY, f32::NEG_INFINITY]);
+        assert!(output[0].is_infinite());
+        assert!(output[1].is_infinite());
+        assert_eq!(
+            analysis,
+            vec![0.0],
+            "a frame with no finite sample analyzes as zero"
+        );
     }
 
     #[test]
