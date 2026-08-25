@@ -6903,12 +6903,7 @@ fn finish_persisted_note_drag(
         return;
     };
     let time_millis = waveform::millis_for_ratio(ratio, duration_millis);
-    let Some(track) = state
-        .library
-        .tracks
-        .iter_mut()
-        .find(|track| track.id == *track_id)
-    else {
+    let Some(track) = state.library.tracks.find_mut(|track| track.id == *track_id) else {
         state.status = String::from("That track is no longer in the library.");
         context.request_repaint();
         return;
@@ -9384,11 +9379,7 @@ fn rollback_persisted_note_drag(state: &mut AppState) {
     };
 
     let mut note_restored = false;
-    if let Some(track) = state
-        .library
-        .tracks
-        .iter_mut()
-        .find(|track| track.id == *track_id)
+    if let Some(track) = state.library.tracks.find_mut(|track| track.id == *track_id)
         && let Some(note) = track
             .notes
             .iter_mut()
@@ -9423,8 +9414,7 @@ fn rollback_reference_persisted_note_drag(state: &mut AppState) {
     if let Some(reference) = state
         .library
         .reference_tracks
-        .iter_mut()
-        .find(|reference| reference.path == *reference_path)
+        .find_mut(|reference| reference.path == *reference_path)
         && let Some(note) = reference
             .notes
             .iter_mut()
@@ -12411,8 +12401,7 @@ fn selected_reference_track_mut(state: &mut AppState) -> Option<&mut storage::Re
     state
         .library
         .reference_tracks
-        .iter_mut()
-        .find(|reference| reference.path == path)
+        .find_mut(|reference| reference.path == path)
 }
 
 fn is_current_main_owner(state: &AppState, owner: &NoteOwner) -> bool {
@@ -12528,8 +12517,7 @@ fn selected_track_mut(state: &mut AppState) -> Option<&mut storage::Track> {
     state
         .library
         .tracks
-        .iter_mut()
-        .find(|track| track.id == selected_id)
+        .find_mut(|track| track.id == selected_id)
 }
 
 fn decode_result_is_current(state: &AppState, track_id: &str, generation: u64) -> bool {
@@ -13183,14 +13171,12 @@ mod tests {
         let mut library = Arc::unwrap_or_clone(state.library.snapshot());
         library
             .tracks
-            .iter_mut()
-            .find(|track| track.id == track_id)
+            .find_mut(|track| track.id == track_id)
             .expect("reference selection fixture should contain its track")
             .reference_path = Some(path.to_path_buf());
         library
             .reference_tracks
-            .iter_mut()
-            .find(|reference| reference.path == path)
+            .find_mut(|reference| reference.path == path)
             .expect("reference selection fixture should contain its catalog path")
             .source_proof = crate::source::SourceProvenance::Verified(proof.clone());
         library
