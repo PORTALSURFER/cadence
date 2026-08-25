@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 
 import crypto from "node:crypto";
+import fsStreams from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { finished } from "node:stream/promises";
 
 const BASE_VERSION_RE = "(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)";
 const CHANNEL_VERSION_RES = {
@@ -53,13 +55,42 @@ const screenshotName = "cadence-default-ui-1594x987.png";
 const changelogName = "CHANGELOG.md";
 const manifestName = "cadence-release-manifest.json";
 
+async function closeReadStream(stream) {
+  if (!stream.destroyed) stream.destroy();
+  if (!stream.closed) await finished(stream).catch(() => {});
+}
+
+async function hashArtifact(filePath) {
+  const stream = fsStreams.createReadStream(filePath);
+  const hash = crypto.createHash("sha256");
+  let size = 0;
+  try {
+    for await (const chunk of stream) {
+      size += chunk.length;
+      hash.update(chunk);
+    }
+    return { digest: hash.digest("hex"), size };
+  } finally {
+    await closeReadStream(stream);
+  }
+}
+
 async function descriptor(name, mediaType) {
-  const bytes = await fs.readFile(path.join(outputDir, name));
+  const filePath = path.join(outputDir, name);
+  let digest;
+  let size;
+  if (name === artifactName) {
+    ({ digest, size } = await hashArtifact(filePath));
+  } else {
+    const bytes = await fs.readFile(filePath);
+    digest = crypto.createHash("sha256").update(bytes).digest("hex");
+    size = bytes.length;
+  }
   return {
     name,
     media_type: mediaType,
-    sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
-    size_bytes: bytes.length,
+    sha256: digest,
+    size_bytes: size,
   };
 }
 

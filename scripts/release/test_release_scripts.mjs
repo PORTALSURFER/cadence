@@ -91,7 +91,7 @@ async function createInputDirectory(version) {
   return directory;
 }
 
-async function createManifest(directory, version, channel) {
+async function createManifest(directory, version, channel, { env } = {}) {
   const args = [
     manifestScript,
     "--output-dir", directory,
@@ -104,8 +104,61 @@ async function createManifest(directory, version, channel) {
     "--notary-submission-id", notarySubmissionId,
   ];
   if (channel) args.push("--channel", channel);
-  await execFileAsync(process.execPath, args);
+  await execFileAsync(process.execPath, args, env ? { env } : undefined);
   return JSON.parse(await fs.readFile(path.join(directory, "cadence-release-manifest.json"), "utf8"));
+}
+
+async function createBufferedReadGuard(filePath) {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cadence-buffered-read-guard-"));
+  const guardPath = path.join(directory, "guard.cjs");
+  await fs.writeFile(guardPath, [
+    'const fs = require("node:fs");',
+    'const fsPromises = require("node:fs/promises");',
+    'const path = require("node:path");',
+    "",
+    "const target = path.resolve(process.env.CADENCE_TEST_BUFFERED_READ_PATH);",
+    "function rejectBufferedRead(filePath) {",
+    "  if (typeof filePath === \"string\" && path.resolve(filePath) === target) {",
+    "    throw new Error(\"buffered read guard rejected \" + target);",
+    "  }",
+    "}",
+    "",
+    "const originalPromisesReadFile = fsPromises.readFile;",
+    "fsPromises.readFile = function guardedPromisesReadFile(filePath, ...args) {",
+    "  rejectBufferedRead(filePath);",
+    "  return originalPromisesReadFile.call(this, filePath, ...args);",
+    "};",
+    "const originalReadFile = fs.readFile;",
+    "fs.readFile = function guardedReadFile(filePath, ...args) {",
+    "  rejectBufferedRead(filePath);",
+    "  return originalReadFile.call(this, filePath, ...args);",
+    "};",
+    "const originalReadFileSync = fs.readFileSync;",
+    "fs.readFileSync = function guardedReadFileSync(filePath, ...args) {",
+    "  rejectBufferedRead(filePath);",
+    "  return originalReadFileSync.call(this, filePath, ...args);",
+    "};",
+    "",
+  ].join("\n"));
+  const nodeOptions = [process.env.NODE_OPTIONS, "--require=" + guardPath]
+    .filter((value) => value)
+    .join(" ");
+  return {
+    environment: {
+      ...process.env,
+      CADENCE_TEST_BUFFERED_READ_PATH: filePath,
+      NODE_OPTIONS: nodeOptions,
+    },
+    cleanup: () => fs.rm(directory, { recursive: true, force: true }),
+  };
+}
+
+function forceBufferedRead(filePath, environment) {
+  return execFileAsync(process.execPath, [
+    "-e",
+    "require('node:fs/promises').readFile(process.argv[1])",
+    filePath,
+  ], { env: environment });
 }
 
 async function startReleaseServer({ failStageName } = {}) {
@@ -877,6 +930,36 @@ test("release reuse verifier accepts a complete production candidate", async () 
     assert.match(result.stdout, /"build_id": "cadence-test-build"/);
   } finally {
     await cleanupReuseFixture(fixture);
+  }
+});
+
+test("manifest creation and reuse verification stream the ZIP without buffered reads", async () => {
+  const version = "0.1.0";
+  const directory = await createInputDirectory(version);
+  const artifactPath = path.join(directory, `cadence-v${version}-macos-arm64.zip`);
+  const guard = await createBufferedReadGuard(artifactPath);
+  let commandStubs;
+  try {
+    await assert.rejects(
+      forceBufferedRead(artifactPath, guard.environment),
+      (error) => error.code === 1 && error.stderr.includes("buffered read guard rejected"),
+      "the guard must catch a forced buffered ZIP read",
+    );
+
+    const manifest = await createManifest(directory, version, undefined, { env: guard.environment });
+    await writeReuseSums(directory, manifest);
+    commandStubs = await createReuseCommandStubs();
+    const environment = {
+      ...guard.environment,
+      PATH: `${commandStubs}${path.delimiter}${guard.environment.PATH || ""}`,
+    };
+    const fixture = { directory, manifest, version, commandStubs, environment };
+    const result = await verifyReuseFixture(fixture);
+    assert.match(result.stdout, /"verified": true/);
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+    if (commandStubs) await fs.rm(commandStubs, { recursive: true, force: true });
+    await guard.cleanup();
   }
 });
 
