@@ -29,7 +29,7 @@ use std::{
     cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
     fmt::Write as _,
-    ops::{Deref, DerefMut},
+    ops::Deref,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -71,6 +71,7 @@ enum Message {
     PreserveLibraryAndStartFresh,
     LibraryRecoveryCompleted(Result<PathBuf, String>),
     AdmitLibrarySave,
+    AdmitSelectionSave(ui::TaskTicket),
     RetryLibrarySave,
     ImportCompleted(Result<storage::Library, String>),
     ImportBatchCompleted(storage::BatchImportReport),
@@ -858,15 +859,34 @@ struct LibrarySaveAttempt {
     revision: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LibraryMutationScope {
+    PersistedOnly,
+    Projection,
+    Markers,
+    ProjectionAndMarkers,
+}
+
+impl LibraryMutationScope {
+    const fn affects_projection(self) -> bool {
+        matches!(self, Self::Projection | Self::ProjectionAndMarkers)
+    }
+
+    const fn affects_markers(self) -> bool {
+        matches!(self, Self::Markers | Self::ProjectionAndMarkers)
+    }
+}
+
 /// UI-owned library state is shared with blocking workers through an immutable
-/// Arc snapshot. A mutable dereference is the single COW boundary: it only
-/// clones when an in-flight worker still owns an older snapshot. In particular,
-/// save admission captures `snapshot()` and never clones the full library on
-/// the UI thread.
+/// Arc snapshot. Mutation scopes are the explicit invalidation boundary: they
+/// only clone when an in-flight worker still owns an older snapshot. In
+/// particular, save admission captures `snapshot()` and never clones the full
+/// library on the UI thread.
 #[derive(Clone, Debug)]
 struct SharedLibrary {
     value: Arc<storage::Library>,
-    generation: u64,
+    projection_revision: u64,
+    marker_revision: u64,
 }
 
 impl Default for SharedLibrary {
@@ -897,18 +917,12 @@ impl Deref for SharedLibrary {
     }
 }
 
-impl DerefMut for SharedLibrary {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.generation = self.generation.wrapping_add(1);
-        Arc::make_mut(&mut self.value)
-    }
-}
-
 impl SharedLibrary {
     fn new(library: storage::Library) -> Self {
         Self {
             value: Arc::new(library),
-            generation: 0,
+            projection_revision: 0,
+            marker_revision: 0,
         }
     }
 
@@ -916,23 +930,63 @@ impl SharedLibrary {
         Arc::clone(&self.value)
     }
 
-    fn generation(&self) -> u64 {
-        self.generation
+    fn projection_revision(&self) -> u64 {
+        self.projection_revision
     }
 
-    fn make_mut(&mut self) -> &mut storage::Library {
-        self.deref_mut()
+    fn marker_revision(&self) -> u64 {
+        self.marker_revision
     }
 
-    fn replace(&mut self, library: storage::Library) {
+    fn mutate<R>(
+        &mut self,
+        scope: LibraryMutationScope,
+        mutation: impl FnOnce(&mut storage::Library) -> R,
+    ) -> R {
+        self.mutate_with(scope, mutation, |_| true)
+    }
+
+    fn mutate_with<R>(
+        &mut self,
+        scope: LibraryMutationScope,
+        mutation: impl FnOnce(&mut storage::Library) -> R,
+        changed: impl FnOnce(&R) -> bool,
+    ) -> R {
+        let result = mutation(Arc::make_mut(&mut self.value));
+        if changed(&result) {
+            self.bump(scope);
+        }
+        result
+    }
+
+    fn replace(&mut self, library: storage::Library, scope: LibraryMutationScope) {
         self.value = Arc::new(library);
-        self.generation = self.generation.wrapping_add(1);
+        self.bump(scope);
+    }
+
+    fn bump(&mut self, scope: LibraryMutationScope) {
+        if scope.affects_projection() {
+            self.projection_revision = self.projection_revision.wrapping_add(1);
+        }
+        if scope.affects_markers() {
+            self.marker_revision = self.marker_revision.wrapping_add(1);
+        }
+    }
+}
+
+#[cfg(test)]
+use std::ops::DerefMut;
+
+#[cfg(test)]
+impl DerefMut for SharedLibrary {
+    fn deref_mut(&mut self) -> &mut storage::Library {
+        Arc::make_mut(&mut self.value)
     }
 }
 
 #[derive(Clone, Debug, Default)]
 struct LibraryProjectionCache {
-    generation: Option<u64>,
+    projection_revision: Option<u64>,
     id_to_library_index: HashMap<String, usize>,
     review_indices: Vec<usize>,
     planner_indices: Vec<usize>,
@@ -943,12 +997,12 @@ struct LibraryProjectionCache {
 }
 
 impl LibraryProjectionCache {
-    fn ensure(&mut self, generation: u64, library: &storage::Library) {
-        if self.generation == Some(generation) {
+    fn ensure(&mut self, projection_revision: u64, library: &storage::Library) {
+        if self.projection_revision == Some(projection_revision) {
             return;
         }
 
-        self.generation = Some(generation);
+        self.projection_revision = Some(projection_revision);
         self.id_to_library_index.clear();
         self.id_to_library_index.reserve(library.tracks.len());
         for (index, track) in library.tracks.iter().enumerate() {
@@ -1065,7 +1119,7 @@ impl LibraryProjectionCache {
 struct WaveformMarkerProjectionKey {
     owner_id: String,
     reference_path: Option<PathBuf>,
-    library_generation: u64,
+    marker_revision: u64,
     waveform_generation: u64,
     duration_millis: u64,
     annotations_available: bool,
@@ -1195,7 +1249,7 @@ fn prepared_main_marker_projection(
     let key = WaveformMarkerProjectionKey {
         owner_id: track.id.clone(),
         reference_path: None,
-        library_generation: state.library.generation(),
+        marker_revision: state.library.marker_revision(),
         waveform_generation: state.waveform_generation,
         duration_millis: waveform.duration_millis,
         annotations_available,
@@ -1215,7 +1269,7 @@ fn prepared_reference_marker_projection(
     let key = WaveformMarkerProjectionKey {
         owner_id: track.id.clone(),
         reference_path: track.reference_path.clone(),
-        library_generation: state.library.generation(),
+        marker_revision: state.library.marker_revision(),
         waveform_generation: state.reference_waveform_generation,
         duration_millis: waveform.duration_millis,
         annotations_available,
@@ -1341,6 +1395,8 @@ struct AppState {
     persisted_library_revision: u64,
     save_in_flight: Option<LibrarySaveAttempt>,
     save_admission_pending: bool,
+    selection_save_latest: ui::LatestTask,
+    selection_save_pending: bool,
     last_save_attempt_id: u64,
     waveform: Option<audio::WaveformData>,
     waveform_source_ticket: Option<crate::source::VerifiedSourceTicket>,
@@ -1514,6 +1570,8 @@ impl AppState {
             persisted_library_revision: 0,
             save_in_flight: None,
             save_admission_pending: false,
+            selection_save_latest: ui::LatestTask::new(),
+            selection_save_pending: false,
             last_save_attempt_id: 0,
             waveform: None,
             waveform_source_ticket: None,
@@ -1662,7 +1720,7 @@ fn ensure_library_projection_cache(state: &AppState) {
     state
         .library_projection_cache
         .borrow_mut()
-        .ensure(state.library.generation(), &state.library);
+        .ensure(state.library.projection_revision(), &state.library);
 }
 
 fn allocate_note_draft_nonce(state: &mut AppState) -> u64 {
@@ -1994,6 +2052,8 @@ fn main() -> radiant::Result {
                 .transient_overlay(live_playback_overlay()),
         )
         .on_startup(|_state, context| schedule_library_load(context))
+        .on_close_requested(handle_close_requested)
+        .on_shutdown(handle_shutdown)
         .shortcuts(|state, _pending, press, _focus| playback_shortcut(state, press))
         .handle_message(update)
         .run()
@@ -2038,15 +2098,24 @@ fn activate_loaded_library(
     state.audio_import_in_flight = None;
     state.pending_import_commit = None;
     clear_import_batch_buffers(state);
-    state.library.replace(library);
+    state
+        .library
+        .replace(library, LibraryMutationScope::ProjectionAndMarkers);
     reset_comments_windows(state);
     state.library_revision = 0;
     state.persisted_library_revision = 0;
     state.save_in_flight = None;
     state.save_admission_pending = false;
-    storage::normalize_planner_order(state.library.make_mut());
-    let (startup_track_id, startup_selection_changed) =
-        normalize_startup_track_selection(state.library.make_mut());
+    state.selection_save_latest.cancel();
+    state.selection_save_pending = false;
+    state.library.mutate(
+        LibraryMutationScope::Projection,
+        storage::normalize_planner_order,
+    );
+    let (startup_track_id, startup_selection_changed) = state.library.mutate(
+        LibraryMutationScope::PersistedOnly,
+        normalize_startup_track_selection,
+    );
     refresh_selected_track_index(state);
     state.status = if state.library.tracks.is_empty() {
         String::from("Ready — import a track to begin.")
@@ -3062,7 +3131,9 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
             match result {
                 Ok(library) => {
-                    state.library.replace(library);
+                    state
+                        .library
+                        .replace(library, LibraryMutationScope::ProjectionAndMarkers);
                     reset_comments_windows(state);
                     refresh_selected_track_index(state);
                     mark_library_snapshot_persisted(state);
@@ -3216,7 +3287,9 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                         library.tracks.len(),
                         plural(library.tracks.len())
                     );
-                    state.library.replace(library);
+                    state
+                        .library
+                        .replace(library, LibraryMutationScope::ProjectionAndMarkers);
                     reset_comments_windows(state);
                     refresh_selected_track_index(state);
                     mark_library_snapshot_persisted(state);
@@ -3276,7 +3349,9 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                         .find(|track| track.id == track_id)
                         .map(|track| track.title.clone())
                         .unwrap_or_else(|| String::from("track"));
-                    state.library.replace(library);
+                    state
+                        .library
+                        .replace(library, LibraryMutationScope::ProjectionAndMarkers);
                     reset_comments_windows(state);
                     refresh_selected_track_index(state);
                     mark_library_snapshot_persisted(state);
@@ -3329,7 +3404,9 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             record_import_attempt(state, failed);
             match result {
                 Ok(library) => {
-                    state.library.replace(library);
+                    state
+                        .library
+                        .replace(library, LibraryMutationScope::ProjectionAndMarkers);
                     reset_comments_windows(state);
                     refresh_selected_track_index(state);
                     mark_library_snapshot_persisted(state);
@@ -3354,11 +3431,12 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 let selected_path = state.reference_import_selected_path.take();
                 state.pending_reference_track_id = None;
                 if let Some(path) = selected_path {
-                    match storage::set_reference_track_selection(
-                        &mut state.library,
-                        &track_id,
-                        path,
-                    ) {
+                    let result = state.library.mutate_with(
+                        LibraryMutationScope::Projection,
+                        |library| storage::set_reference_track_selection(library, &track_id, path),
+                        |result| result.is_ok(),
+                    );
+                    match result {
                         Ok(changed) if changed => schedule_library_save(state, context),
                         Ok(_) => {}
                         Err(error) => state.status = error,
@@ -3761,11 +3839,18 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             context.request_repaint();
         }
         Message::AdmitLibrarySave => {
-            if !state.save_admission_pending {
+            if selection_save_debounce_active(state) || !state.save_admission_pending {
                 return;
             }
             state.save_admission_pending = false;
             dispatch_library_save(state, context);
+        }
+        Message::AdmitSelectionSave(ticket) => {
+            if !state.selection_save_latest.finish(ticket) || !state.selection_save_pending {
+                return;
+            }
+            state.save_admission_pending = false;
+            let _ = dispatch_library_save(state, context);
         }
         Message::RetryLibrarySave => retry_library_save(state, context),
         Message::LibrarySaved { attempt, result } => {
@@ -3776,7 +3861,11 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             match result {
                 Ok(()) => {
                     state.persisted_library_revision = attempt.revision;
-                    if !main_source_is_mismatched(state) && !reference_source_is_mismatched(state) {
+                    if !main_source_is_mismatched(state)
+                        && !reference_source_is_mismatched(state)
+                        && !library_dirty(state)
+                        && !selection_save_debounce_active(state)
+                    {
                         state.status = String::from("All changes saved locally.");
                     }
                     if library_dirty(state) {
@@ -3834,12 +3923,22 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
         }
         Message::ToggleFavorite(id) => {
-            if library_is_ready(state)
-                && !state.busy
-                && let Some(track) = state.library.tracks.find_mut(|track| track.id == id)
-            {
-                track.favorite = !track.favorite;
-                schedule_library_save(state, context);
+            if library_is_ready(state) && !state.busy {
+                let changed = state.library.mutate_with(
+                    LibraryMutationScope::Projection,
+                    |library| {
+                        library
+                            .tracks
+                            .find_mut(|track| track.id == id)
+                            .map(|track| {
+                                track.favorite = !track.favorite;
+                            })
+                    },
+                    |changed| changed.is_some(),
+                );
+                if changed.is_some() {
+                    schedule_library_save(state, context);
+                }
             }
         }
         Message::ToggleStageMenu(id) => {
@@ -3876,7 +3975,12 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
         }
         Message::SetStage { track_id, stage } => {
             if library_is_ready(state) && !state.busy {
-                let changed = match storage::set_track_stage(&mut state.library, &track_id, stage) {
+                let result = state.library.mutate_with(
+                    LibraryMutationScope::Projection,
+                    |library| storage::set_track_stage(library, &track_id, stage),
+                    |result| matches!(result, Ok(true)),
+                );
+                let changed = match result {
                     Ok(changed) => changed,
                     Err(error) => {
                         state.status = error;
@@ -3900,15 +4004,19 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             let selected_affected = selected_track(state)
                 .and_then(|track| track.reference_path.as_ref())
                 .is_some_and(|selected_path| selected_path == &path);
-            let cleared_assignments =
-                match storage::remove_reference_track(&mut state.library, &path) {
-                    Ok(cleared_assignments) => cleared_assignments,
-                    Err(error) => {
-                        state.status = error;
-                        context.request_repaint();
-                        return;
-                    }
-                };
+            let result = state.library.mutate_with(
+                LibraryMutationScope::Projection,
+                |library| storage::remove_reference_track(library, &path),
+                |result| result.is_ok(),
+            );
+            let cleared_assignments = match result {
+                Ok(cleared_assignments) => cleared_assignments,
+                Err(error) => {
+                    state.status = error;
+                    context.request_repaint();
+                    return;
+                }
+            };
             close_stage_menu(state);
             close_reference_menu(state);
             if selected_affected {
@@ -4097,7 +4205,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             };
             if !valid {
                 if state.planner_drag_target.take().is_some() {
-                    context.request_repaint();
+                    context.repaint(ui::RepaintScope::Projection);
                 }
                 return;
             }
@@ -4106,17 +4214,17 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
             state.planner_drag_target = Some(target.clone());
             state.status = status.expect("valid Planner target has a status message");
-            context.request_repaint();
+            context.repaint(ui::RepaintScope::Projection);
         }
         Message::PlannerInsertionHoverCleared(target) => {
             if state.planner_drag_target.as_ref() == Some(&target) {
                 state.planner_drag_target = None;
-                context.request_repaint();
+                context.repaint(ui::RepaintScope::Projection);
             }
         }
         Message::PlannerInsertionCleared => {
             if state.planner_drag_target.take().is_some() {
-                context.request_repaint();
+                context.repaint(ui::RepaintScope::Projection);
             }
         }
         Message::PlannerInsertionDropped(target) => {
@@ -4131,12 +4239,19 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             };
             context.end_drag();
             clear_planner_drag(state);
-            match storage::move_track_to_planner_slot(
-                &mut state.library,
-                &source_id,
-                target.stage,
-                target.slot,
-            ) {
+            let result = state.library.mutate_with(
+                LibraryMutationScope::Projection,
+                |library| {
+                    storage::move_track_to_planner_slot(
+                        library,
+                        &source_id,
+                        target.stage,
+                        target.slot,
+                    )
+                },
+                |result| matches!(result, Ok(true)),
+            );
+            match result {
                 Ok(true) => {
                     close_stage_menu(state);
                     let status_target = PlannerInsertionTarget {
@@ -4178,7 +4293,12 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 return;
             }
             let selected = state.library.selected_track_id.as_deref() == Some(id.as_str());
-            let removed = match storage::remove_track(&mut state.library, &id) {
+            let result = state.library.mutate_with(
+                LibraryMutationScope::Projection,
+                |library| storage::remove_track(library, &id),
+                |result| result.is_ok(),
+            );
+            let removed = match result {
                 Ok(removed) => removed,
                 Err(error) => {
                     state.remove_confirmation_track_id = None;
@@ -4205,8 +4325,13 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 state.hovered_reference_note_id = None;
                 state.comment_source = CommentSource::Main;
                 state.comment_source_explicit = false;
-                state.library.selected_track_id =
+                let next_selected_track_id =
                     storage::selection_after_removal(&state.library, removed.0);
+                state
+                    .library
+                    .mutate(LibraryMutationScope::PersistedOnly, |library| {
+                        library.selected_track_id = next_selected_track_id;
+                    });
                 refresh_selected_track_index(state);
                 close_reference_menu(state);
                 reset_waveform_decode(state);
@@ -4661,13 +4786,13 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 && state.hovered_note_id.as_ref() != Some(&address)
             {
                 state.hovered_note_id = Some(address);
-                context.request_repaint();
+                context.repaint(ui::RepaintScope::Projection);
             }
         }
         Message::CommentHoverEnded(address) => {
             if state.hovered_note_id.as_ref() == Some(&address) {
                 state.hovered_note_id = None;
-                context.request_repaint();
+                context.repaint(ui::RepaintScope::Projection);
             }
         }
         Message::ReferenceCommentHoverStarted(address) => {
@@ -4681,13 +4806,13 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 && state.hovered_reference_note_id.as_ref() != Some(&address)
             {
                 state.hovered_reference_note_id = Some(address);
-                context.request_repaint();
+                context.repaint(ui::RepaintScope::Projection);
             }
         }
         Message::ReferenceCommentHoverEnded(address) => {
             if state.hovered_reference_note_id.as_ref() == Some(&address) {
                 state.hovered_reference_note_id = None;
-                context.request_repaint();
+                context.repaint(ui::RepaintScope::Projection);
             }
         }
         Message::FocusCommentEditor(editor_id) => {
@@ -4746,13 +4871,25 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 return;
             }
             rollback_persisted_note_drag(state);
-            let removed = selected_track_mut(state).and_then(|track| {
-                track
-                    .notes
-                    .iter()
-                    .position(|note| note.id == address.note_id)
-                    .map(|index| track.notes.remove(index))
-            });
+            let NoteOwner::MainTrack(track_id) = &address.owner else {
+                return;
+            };
+            let removed = state.library.mutate_with(
+                LibraryMutationScope::Markers,
+                |library| {
+                    library
+                        .tracks
+                        .find_mut(|track| track.id == *track_id)
+                        .and_then(|track| {
+                            track
+                                .notes
+                                .iter()
+                                .position(|note| note.id == address.note_id)
+                                .map(|index| track.notes.remove(index))
+                        })
+                },
+                |removed| removed.is_some(),
+            );
             if removed.is_some() {
                 if state.hovered_note_id.as_ref() == Some(&address) {
                     state.hovered_note_id = None;
@@ -4899,13 +5036,25 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             if !is_current_reference_note_address(state, &address) {
                 return;
             }
-            let removed = selected_reference_track_mut(state).and_then(|reference| {
-                reference
-                    .notes
-                    .iter()
-                    .position(|note| note.id == address.note_id)
-                    .map(|index| reference.notes.remove(index))
-            });
+            let NoteOwner::ReferenceTrack(reference_path) = &address.owner else {
+                return;
+            };
+            let removed = state.library.mutate_with(
+                LibraryMutationScope::Markers,
+                |library| {
+                    library
+                        .reference_tracks
+                        .find_mut(|reference| reference.path == *reference_path)
+                        .and_then(|reference| {
+                            reference
+                                .notes
+                                .iter()
+                                .position(|note| note.id == address.note_id)
+                                .map(|index| reference.notes.remove(index))
+                        })
+                },
+                |removed| removed.is_some(),
+            );
             if removed.is_some() {
                 if state.selected_reference_note_id.as_ref() == Some(&address) {
                     state.selected_reference_note_id = None;
@@ -6637,28 +6786,47 @@ fn save_draft_note(
         context.request_repaint();
         return;
     }
-    let Some(track) = selected_track_mut(state) else {
-        state.status = String::from("Select a track before saving a comment.");
-        context.request_repaint();
+    let NoteOwner::MainTrack(track_id) = draft.owner.clone() else {
         return;
     };
-    if let Some(note_id) = draft.note_id {
-        if let Some(note) = track.notes.iter_mut().find(|note| note.id == note_id) {
-            note.body = body;
-        } else {
-            state.status = String::from("That comment no longer exists.");
-            context.request_repaint();
-            return;
-        }
+    let scope = if draft.note_id.is_some() {
+        LibraryMutationScope::PersistedOnly
     } else {
-        let note_id = storage::allocate_note_id(&track.notes);
-        track.notes.push(storage::Note {
-            id: note_id,
-            time_millis: draft.time_millis,
-            body,
-            done: false,
-        });
-        track.notes.sort_by_key(|note| note.time_millis);
+        LibraryMutationScope::Markers
+    };
+    let note_id = draft.note_id.clone();
+    let result = state.library.mutate_with(
+        scope,
+        |library| {
+            let track = library
+                .tracks
+                .find_mut(|track| track.id == track_id)
+                .ok_or_else(|| String::from("Select a track before saving a comment."))?;
+            if let Some(note_id) = note_id {
+                let note = track
+                    .notes
+                    .iter_mut()
+                    .find(|note| note.id == note_id)
+                    .ok_or_else(|| String::from("That comment no longer exists."))?;
+                note.body = body;
+            } else {
+                let note_id = storage::allocate_note_id(&track.notes);
+                track.notes.push(storage::Note {
+                    id: note_id,
+                    time_millis: draft.time_millis,
+                    body,
+                    done: false,
+                });
+                track.notes.sort_by_key(|note| note.time_millis);
+            }
+            Ok(())
+        },
+        |result: &Result<(), String>| result.is_ok(),
+    );
+    if let Err(error) = result {
+        state.status = error;
+        context.request_repaint();
+        return;
     }
     state.draft_note = None;
     state.status = String::from("Comment saved locally.");
@@ -6756,28 +6924,47 @@ fn save_reference_draft_note(
         context.request_repaint();
         return;
     }
-    let Some(reference) = selected_reference_track_mut(state) else {
-        state.status = String::from("Select a reference track before saving a comment.");
-        context.request_repaint();
+    let NoteOwner::ReferenceTrack(reference_path) = draft.owner.clone() else {
         return;
     };
-    if let Some(note_id) = draft.note_id {
-        if let Some(note) = reference.notes.iter_mut().find(|note| note.id == note_id) {
-            note.body = body;
-        } else {
-            state.status = String::from("That reference comment no longer exists.");
-            context.request_repaint();
-            return;
-        }
+    let scope = if draft.note_id.is_some() {
+        LibraryMutationScope::PersistedOnly
     } else {
-        let note_id = storage::allocate_note_id(&reference.notes);
-        reference.notes.push(storage::Note {
-            id: note_id,
-            time_millis: draft.time_millis,
-            body,
-            done: false,
-        });
-        reference.notes.sort_by_key(|note| note.time_millis);
+        LibraryMutationScope::Markers
+    };
+    let note_id = draft.note_id.clone();
+    let result = state.library.mutate_with(
+        scope,
+        |library| {
+            let reference = library
+                .reference_tracks
+                .find_mut(|reference| reference.path == reference_path)
+                .ok_or_else(|| String::from("Select a reference track before saving a comment."))?;
+            if let Some(note_id) = note_id {
+                let note = reference
+                    .notes
+                    .iter_mut()
+                    .find(|note| note.id == note_id)
+                    .ok_or_else(|| String::from("That reference comment no longer exists."))?;
+                note.body = body;
+            } else {
+                let note_id = storage::allocate_note_id(&reference.notes);
+                reference.notes.push(storage::Note {
+                    id: note_id,
+                    time_millis: draft.time_millis,
+                    body,
+                    done: false,
+                });
+                reference.notes.sort_by_key(|note| note.time_millis);
+            }
+            Ok(())
+        },
+        |result: &Result<(), String>| result.is_ok(),
+    );
+    if let Err(error) = result {
+        state.status = error;
+        context.request_repaint();
+        return;
     }
     state.reference_draft_note = None;
     state.status = String::from("Reference comment saved locally.");
@@ -6903,26 +7090,34 @@ fn finish_persisted_note_drag(
         return;
     };
     let time_millis = waveform::millis_for_ratio(ratio, duration_millis);
-    let Some(track) = state.library.tracks.find_mut(|track| track.id == *track_id) else {
-        state.status = String::from("That track is no longer in the library.");
-        context.request_repaint();
-        return;
+    let result = state.library.mutate_with(
+        LibraryMutationScope::Markers,
+        |library| {
+            let track = library
+                .tracks
+                .find_mut(|track| track.id == *track_id)
+                .ok_or_else(|| String::from("That track is no longer in the library."))?;
+            let note = track
+                .notes
+                .iter_mut()
+                .find(|note| note.id == drag.address.note_id)
+                .ok_or_else(|| String::from("That comment no longer exists."))?;
+            note.time_millis = time_millis;
+            let final_time_millis = note.time_millis;
+            let changed = final_time_millis != drag.original_time_millis;
+            track.notes.sort_by_key(|note| note.time_millis);
+            Ok((final_time_millis, changed))
+        },
+        |result: &Result<(u64, bool), String>| result.as_ref().is_ok_and(|(_, changed)| *changed),
+    );
+    let (final_time_millis, changed) = match result {
+        Ok(result) => result,
+        Err(error) => {
+            state.status = error;
+            context.request_repaint();
+            return;
+        }
     };
-    let Some(note) = track
-        .notes
-        .iter_mut()
-        .find(|note| note.id == drag.address.note_id)
-    else {
-        state.status = String::from("That comment no longer exists.");
-        context.request_repaint();
-        return;
-    };
-    if time_millis != drag.original_time_millis {
-        note.time_millis = time_millis;
-    }
-    let final_time_millis = note.time_millis;
-    let changed = final_time_millis != drag.original_time_millis;
-    track.notes.sort_by_key(|note| note.time_millis);
     if let Some(draft) = state
         .draft_note
         .as_mut()
@@ -7082,26 +7277,37 @@ fn finish_reference_persisted_note_drag(
         return;
     };
     let time_millis = waveform::millis_for_ratio(ratio, duration_millis);
-    let Some(reference) = selected_reference_track_mut(state) else {
-        state.status = String::from("That reference track is no longer available.");
-        context.request_repaint();
+    let NoteOwner::ReferenceTrack(reference_path) = &drag.address.owner else {
         return;
     };
-    let Some(note) = reference
-        .notes
-        .iter_mut()
-        .find(|note| note.id == drag.address.note_id)
-    else {
-        state.status = String::from("That reference comment no longer exists.");
-        context.request_repaint();
-        return;
+    let result = state.library.mutate_with(
+        LibraryMutationScope::Markers,
+        |library| {
+            let reference = library
+                .reference_tracks
+                .find_mut(|reference| reference.path == *reference_path)
+                .ok_or_else(|| String::from("That reference track is no longer available."))?;
+            let note = reference
+                .notes
+                .iter_mut()
+                .find(|note| note.id == drag.address.note_id)
+                .ok_or_else(|| String::from("That reference comment no longer exists."))?;
+            note.time_millis = time_millis;
+            let final_time_millis = note.time_millis;
+            let changed = final_time_millis != drag.original_time_millis;
+            reference.notes.sort_by_key(|note| note.time_millis);
+            Ok((final_time_millis, changed))
+        },
+        |result: &Result<(u64, bool), String>| result.as_ref().is_ok_and(|(_, changed)| *changed),
+    );
+    let (final_time_millis, changed) = match result {
+        Ok(result) => result,
+        Err(error) => {
+            state.status = error;
+            context.request_repaint();
+            return;
+        }
     };
-    if time_millis != drag.original_time_millis {
-        note.time_millis = time_millis;
-    }
-    let final_time_millis = note.time_millis;
-    let changed = final_time_millis != drag.original_time_millis;
-    reference.notes.sort_by_key(|note| note.time_millis);
     if let Some(draft) = state
         .reference_draft_note
         .as_mut()
@@ -7359,7 +7565,9 @@ fn complete_main_import_batch(
     let error_summary = batch_error_summary(&report.errors);
     clear_planner_drag(state);
     if let Some(library) = report.library.take() {
-        state.library.replace(library);
+        state
+            .library
+            .replace(library, LibraryMutationScope::ProjectionAndMarkers);
         reset_comments_windows(state);
         refresh_selected_track_index(state);
         mark_library_snapshot_persisted(state);
@@ -7432,7 +7640,9 @@ fn complete_reference_import_batch(
     let imported_count = report.imported_paths.len();
     let error_summary = batch_error_summary(&report.errors);
     if let Some(library) = report.library.take() {
-        state.library.replace(library);
+        state
+            .library
+            .replace(library, LibraryMutationScope::ProjectionAndMarkers);
         reset_comments_windows(state);
         refresh_selected_track_index(state);
         mark_library_snapshot_persisted(state);
@@ -7491,7 +7701,9 @@ fn complete_reference_catalog_batch(
     state.reference_catalog_import_failed = report.errors.len();
     let error_summary = batch_error_summary(&report.errors);
     if let Some(library) = report.library.take() {
-        state.library.replace(library);
+        state
+            .library
+            .replace(library, LibraryMutationScope::ProjectionAndMarkers);
         reset_comments_windows(state);
         refresh_selected_track_index(state);
         mark_library_snapshot_persisted(state);
@@ -7836,7 +8048,9 @@ fn complete_reference_selection_commit(
 
     match result {
         Ok(library) => {
-            state.library.replace(library);
+            state
+                .library
+                .replace(library, LibraryMutationScope::ProjectionAndMarkers);
             reset_comments_windows(state);
             refresh_selected_track_index(state);
             mark_library_snapshot_persisted(state);
@@ -8130,15 +8344,18 @@ fn complete_historical_binding(
     }
 
     let bind_result = match &candidate.owner {
-        HistoricalBindingOwner::Main { track_id } => storage::bind_main_source_proof(
-            &mut state.library,
-            track_id,
-            &candidate.path,
-            fresh_proof,
+        HistoricalBindingOwner::Main { track_id } => state.library.mutate_with(
+            LibraryMutationScope::PersistedOnly,
+            |library| {
+                storage::bind_main_source_proof(library, track_id, &candidate.path, fresh_proof)
+            },
+            |result: &Result<(), String>| result.is_ok(),
         ),
-        HistoricalBindingOwner::Reference { .. } => {
-            storage::bind_reference_source_proof(&mut state.library, &candidate.path, fresh_proof)
-        }
+        HistoricalBindingOwner::Reference { .. } => state.library.mutate_with(
+            LibraryMutationScope::PersistedOnly,
+            |library| storage::bind_reference_source_proof(library, &candidate.path, fresh_proof),
+            |result: &Result<(), String>| result.is_ok(),
+        ),
     };
     match bind_result {
         Ok(()) => {
@@ -8440,6 +8657,36 @@ fn library_persistence_pending(state: &AppState) -> bool {
     library_dirty(state) || state.save_in_flight.is_some()
 }
 
+const SELECTION_SAVE_DEBOUNCE: Duration = Duration::from_millis(250);
+
+fn selection_save_debounce_active(state: &AppState) -> bool {
+    state.selection_save_latest.active().is_some()
+}
+
+fn cancel_selection_save_debounce(state: &mut AppState) {
+    state.selection_save_latest.cancel();
+    if state.selection_save_pending {
+        state.selection_save_pending = false;
+        state.save_admission_pending = false;
+    }
+}
+
+fn schedule_selection_library_save(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+) {
+    if !library_is_ready(state) {
+        return;
+    }
+    state.library_revision = state.library_revision.wrapping_add(1);
+    state.selection_save_pending = true;
+    context.after_latest(
+        &mut state.selection_save_latest,
+        SELECTION_SAVE_DEBOUNCE,
+        Message::AdmitSelectionSave,
+    );
+}
+
 /// Queue one save admission for the current UI turn's dirty revisions.
 ///
 /// The admission is intentionally deferred so several mutations can share one
@@ -8454,6 +8701,7 @@ fn request_library_save_admission(
 ) {
     if !library_is_ready(state)
         || !library_dirty(state)
+        || selection_save_debounce_active(state)
         || state.save_in_flight.is_some()
         || state.save_admission_pending
     {
@@ -8463,9 +8711,13 @@ fn request_library_save_admission(
     context.after(Duration::ZERO, Message::AdmitLibrarySave);
 }
 
-fn dispatch_library_save(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
-    if !library_is_ready(state) || !library_dirty(state) || state.save_in_flight.is_some() {
-        return;
+fn dispatch_library_save(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) -> bool {
+    if !library_is_ready(state)
+        || !library_dirty(state)
+        || selection_save_debounce_active(state)
+        || state.save_in_flight.is_some()
+    {
+        return false;
     }
     state.save_admission_pending = false;
     let revision = state.library_revision;
@@ -8477,16 +8729,19 @@ fn dispatch_library_save(state: &mut AppState, context: &mut ui::UiUpdateContext
     let attempt = LibrarySaveAttempt { id, revision };
     let library = state.library.snapshot();
     state.save_in_flight = Some(attempt);
+    state.selection_save_pending = false;
     context.business().blocking_io("cadence-save-library").run(
         move |_| storage::persist_library(&library),
         move |result| Message::LibrarySaved { attempt, result },
     );
+    true
 }
 
 fn schedule_library_save(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
     if !library_is_ready(state) {
         return;
     }
+    cancel_selection_save_debounce(state);
     state.library_revision = state.library_revision.wrapping_add(1);
     request_library_save_admission(state, context);
 }
@@ -8495,14 +8750,77 @@ fn retry_library_save(state: &mut AppState, context: &mut ui::UiUpdateContext<Me
     if !library_is_ready(state) || state.busy || state.save_in_flight.is_some() {
         return;
     }
+    cancel_selection_save_debounce(state);
     dispatch_library_save(state, context);
 }
 
 fn mark_library_snapshot_persisted(state: &mut AppState) {
+    cancel_selection_save_debounce(state);
     state.library_revision = state.library_revision.wrapping_add(1);
     state.persisted_library_revision = state.library_revision;
     state.save_in_flight = None;
     state.save_admission_pending = false;
+}
+
+fn persist_latest_snapshot_if_dirty(
+    state: &mut AppState,
+    persist: impl FnOnce(&storage::Library) -> Result<(), String>,
+) -> Result<bool, String> {
+    if !library_dirty(state) {
+        return Ok(false);
+    }
+
+    let revision = state.library_revision;
+    let snapshot = state.library.snapshot();
+    persist(&snapshot)?;
+    state.persisted_library_revision = revision;
+    state.save_admission_pending = false;
+    state.selection_save_pending = false;
+    Ok(true)
+}
+
+fn handle_close_requested(state: &mut AppState) -> bool {
+    handle_close_requested_with(state, storage::persist_library)
+}
+
+fn handle_close_requested_with(
+    state: &mut AppState,
+    persist: impl FnOnce(&storage::Library) -> Result<(), String>,
+) -> bool {
+    cancel_selection_save_debounce(state);
+    state.save_admission_pending = false;
+    if state.save_in_flight.is_some() {
+        state.status = String::from("Saving the library — try closing again when it finishes.");
+        return false;
+    }
+
+    match persist_latest_snapshot_if_dirty(state, persist) {
+        Ok(_) => true,
+        Err(error) => {
+            state.status = format!("Could not save the library before closing: {error}");
+            false
+        }
+    }
+}
+
+fn handle_shutdown(state: &mut AppState) -> Option<serde_json::Value> {
+    handle_shutdown_with(state, storage::persist_library)
+}
+
+fn handle_shutdown_with(
+    state: &mut AppState,
+    persist: impl FnOnce(&storage::Library) -> Result<(), String>,
+) -> Option<serde_json::Value> {
+    cancel_selection_save_debounce(state);
+    state.save_admission_pending = false;
+    if state.save_in_flight.is_some() {
+        return None;
+    }
+
+    if let Err(error) = persist_latest_snapshot_if_dirty(state, persist) {
+        state.status = format!("Could not save the library during shutdown: {error}");
+    }
+    None
 }
 
 fn reset_transport(state: &mut AppState) {
@@ -9256,7 +9574,11 @@ fn select_track_internal(
     if enter_review {
         state.workspace_mode = WorkspaceMode::Review;
     }
-    state.library.selected_track_id = Some(id.clone());
+    state
+        .library
+        .mutate(LibraryMutationScope::PersistedOnly, |library| {
+            library.selected_track_id = Some(id.clone());
+        });
     refresh_selected_track_index(state);
     reset_comments_windows(state);
     cancel_pending_comment_playback(state);
@@ -9297,7 +9619,7 @@ fn select_track_internal(
     reset_transport(state);
     reset_reference_transport(state);
     state.reference_match_enabled = false;
-    schedule_library_save(state, context);
+    schedule_selection_library_save(state, context);
     schedule_selected_waveform_decode(state, context);
     schedule_selected_reference_decode(state, context);
     if entering_review_from_planner {
@@ -9378,17 +9700,26 @@ fn rollback_persisted_note_drag(state: &mut AppState) {
         return;
     };
 
-    let mut note_restored = false;
-    if let Some(track) = state.library.tracks.find_mut(|track| track.id == *track_id)
-        && let Some(note) = track
-            .notes
-            .iter_mut()
-            .find(|note| note.id == drag.address.note_id)
-    {
-        note.time_millis = drag.original_time_millis;
-        track.notes.sort_by_key(|note| note.time_millis);
-        note_restored = true;
-    }
+    let note_restored = state.library.mutate_with(
+        LibraryMutationScope::Markers,
+        |library| {
+            let Some(track) = library.tracks.find_mut(|track| track.id == *track_id) else {
+                return false;
+            };
+            let Some(note) = track
+                .notes
+                .iter_mut()
+                .find(|note| note.id == drag.address.note_id)
+            else {
+                return false;
+            };
+            let changed = note.time_millis != drag.original_time_millis;
+            note.time_millis = drag.original_time_millis;
+            track.notes.sort_by_key(|note| note.time_millis);
+            changed
+        },
+        |changed| *changed,
+    );
     if note_restored && state.library.selected_track_id.as_deref() == Some(track_id.as_str()) {
         state.review_cursor_millis = drag.original_time_millis;
         state.transport_position_millis = drag.original_time_millis;
@@ -9410,20 +9741,29 @@ fn rollback_reference_persisted_note_drag(state: &mut AppState) {
         return;
     };
 
-    let mut note_restored = false;
-    if let Some(reference) = state
-        .library
-        .reference_tracks
-        .find_mut(|reference| reference.path == *reference_path)
-        && let Some(note) = reference
-            .notes
-            .iter_mut()
-            .find(|note| note.id == drag.address.note_id)
-    {
-        note.time_millis = drag.original_time_millis;
-        reference.notes.sort_by_key(|note| note.time_millis);
-        note_restored = true;
-    }
+    let note_restored = state.library.mutate_with(
+        LibraryMutationScope::Markers,
+        |library| {
+            let Some(reference) = library
+                .reference_tracks
+                .find_mut(|reference| reference.path == *reference_path)
+            else {
+                return false;
+            };
+            let Some(note) = reference
+                .notes
+                .iter_mut()
+                .find(|note| note.id == drag.address.note_id)
+            else {
+                return false;
+            };
+            let changed = note.time_millis != drag.original_time_millis;
+            note.time_millis = drag.original_time_millis;
+            reference.notes.sort_by_key(|note| note.time_millis);
+            changed
+        },
+        |changed| *changed,
+    );
     let selected_reference_matches = selected_track(state)
         .and_then(|track| track.reference_path.as_ref())
         .is_some_and(|path| path == reference_path);
@@ -9540,7 +9880,7 @@ fn planner_board_surface(content: ui::View<Message>) -> ui::View<Message> {
 fn project_surface(state: &AppState) -> ui::View<Message> {
     let workspace = {
         let mut projection_cache = state.library_projection_cache.borrow_mut();
-        projection_cache.ensure(state.library.generation(), &state.library);
+        projection_cache.ensure(state.library.projection_revision(), &state.library);
         match state.workspace_mode {
             WorkspaceMode::Review => ui::row([
                 library_panel(state, &projection_cache)
@@ -12390,20 +12730,6 @@ fn selected_reference_notes(state: &AppState) -> &[storage::Note] {
         .unwrap_or(&[])
 }
 
-fn selected_reference_track_mut(state: &mut AppState) -> Option<&mut storage::ReferenceTrack> {
-    let selected_id = state.library.selected_track_id.as_ref()?.clone();
-    let path = state
-        .library
-        .tracks
-        .iter()
-        .find(|track| track.id == selected_id)
-        .and_then(|track| track.reference_path.clone())?;
-    state
-        .library
-        .reference_tracks
-        .find_mut(|reference| reference.path == path)
-}
-
 fn is_current_main_owner(state: &AppState, owner: &NoteOwner) -> bool {
     matches!(
         (owner, state.library.selected_track_id.as_deref()),
@@ -12503,23 +12829,6 @@ fn reference_note_ratio_for_address(
     waveform::ratio_for_millis(note.time_millis, waveform.duration_millis)
 }
 
-fn selected_track_mut(state: &mut AppState) -> Option<&mut storage::Track> {
-    let selected_id = state.library.selected_track_id.as_deref()?.to_owned();
-    if let Some(index) = state.selected_track_index
-        && state
-            .library
-            .tracks
-            .get(index)
-            .is_some_and(|track| track.id == selected_id)
-    {
-        return state.library.tracks.get_mut(index);
-    }
-    state
-        .library
-        .tracks
-        .find_mut(|track| track.id == selected_id)
-}
-
 fn decode_result_is_current(state: &AppState, track_id: &str, generation: u64) -> bool {
     state.library.selected_track_id.as_deref() == Some(track_id)
         && state.waveform_generation == generation
@@ -12590,7 +12899,7 @@ mod tests {
     use super::{
         APP_VERSION_LABEL, AppState, AudioImportRequest, AudioImportTarget,
         DEFAULT_LIVE_SPECTROGRAM_DISPLAY_SAMPLE_RATE, FavoriteMarkerWidget, ImportBatchProgress,
-        LIBRARY_REVEAL_MARGIN, LIBRARY_SCROLL_VIEWPORT_ID, LibraryLoadState,
+        LIBRARY_REVEAL_MARGIN, LIBRARY_SCROLL_VIEWPORT_ID, LibraryLoadState, LibraryMutationScope,
         LibraryProjectionCache, LibrarySaveAttempt, LiveSpectrogramMode, LoopBounds, LoopSelection,
         LoopSelections, MAIN_SOURCE_MISMATCH_STATUS, Message, NoteAddress, NoteDraft, NoteOwner,
         PairedPlaybackGuard, PendingImportCommit, PlannerInsertionTarget, PlaybackSource,
@@ -12604,21 +12913,23 @@ mod tests {
         cleanup_reference_transport_failure, current_live_frame_for_source,
         current_loudness_match_gain_db, current_lufs_meter_value,
         current_reference_lufs_meter_value, decode_result_is_current, enforce_loop,
-        ensure_reference_transport_with, favorite_toggle, frame_surface_revisions, library_dirty,
+        ensure_library_projection_cache, ensure_reference_transport_with, favorite_toggle,
+        frame_surface_revisions, handle_close_requested_with, handle_shutdown_with, library_dirty,
         library_track_card_height, library_track_title_id, live_frame_matches_current_session,
         live_spectrogram_display_sample_rate, loop_bounds, main_output_gain, native_launch_options,
         note_editor, note_ratio_for_id, owned_tracks_in_stage, paint_live_playback_overlay,
         planner_insertion_target_is_valid, planner_stage_index, planner_tracks_with_favorites,
-        playback_shortcut, progress_paired_playback_cleanup, project_surface,
-        qualified_note_identity_key, reference_decode_result_is_current, reference_dropdown_paths,
-        reference_menu_available, reference_output_gain, reference_settings_auxiliary_windows,
-        reference_settings_window_view, refresh_live_spectrogram, refresh_live_spectrograms,
-        resume_transport_command, review_spectrogram_source, schedule_import,
-        schedule_library_save, schedule_reference_catalog_import, schedule_reference_import,
+        playback_shortcut, prepared_main_marker_projection, progress_paired_playback_cleanup,
+        project_surface, qualified_note_identity_key, reference_decode_result_is_current,
+        reference_dropdown_paths, reference_menu_available, reference_output_gain,
+        reference_settings_auxiliary_windows, reference_settings_window_view,
+        refresh_live_spectrogram, refresh_live_spectrograms, resume_transport_command,
+        review_spectrogram_source, schedule_import, schedule_library_save,
+        schedule_reference_catalog_import, schedule_reference_import,
         schedule_reference_waveform_decode, schedule_replace, schedule_waveform_decode,
-        seek_synchronized_positions, selected_reference_notes, selected_track, stage_dropdown,
-        stage_menu_anchor_from_pointer, stage_menu_popover, start_source_alongside_active,
-        transport_command_is_confirmed, update,
+        seek_synchronized_positions, selected_reference_notes, selected_track,
+        selection_save_debounce_active, stage_dropdown, stage_menu_anchor_from_pointer,
+        stage_menu_popover, start_source_alongside_active, transport_command_is_confirmed, update,
     };
     use crate::transport::{LiveFrameState, Snapshot};
     use crate::{
@@ -12982,7 +13293,30 @@ mod tests {
     }
 
     #[test]
-    fn library_projection_cache_reuses_key_and_rebuilds_on_generation_change() {
+    fn library_mutation_scopes_advance_only_their_dependency_revisions() {
+        let mut shared = SharedLibrary::default();
+        assert_eq!(shared.projection_revision(), 0);
+        assert_eq!(shared.marker_revision(), 0);
+
+        shared.mutate(LibraryMutationScope::PersistedOnly, |_| {});
+        assert_eq!(shared.projection_revision(), 0);
+        assert_eq!(shared.marker_revision(), 0);
+
+        shared.mutate(LibraryMutationScope::Projection, |_| {});
+        assert_eq!(shared.projection_revision(), 1);
+        assert_eq!(shared.marker_revision(), 0);
+
+        shared.mutate(LibraryMutationScope::Markers, |_| {});
+        assert_eq!(shared.projection_revision(), 1);
+        assert_eq!(shared.marker_revision(), 1);
+
+        shared.mutate(LibraryMutationScope::ProjectionAndMarkers, |_| {});
+        assert_eq!(shared.projection_revision(), 2);
+        assert_eq!(shared.marker_revision(), 2);
+    }
+
+    #[test]
+    fn library_projection_cache_reuses_key_and_rebuilds_on_projection_revision_change() {
         let mut favorite = audition_track("favorite");
         favorite.favorite = true;
         let regular = audition_track("regular");
@@ -13007,6 +13341,29 @@ mod tests {
     }
 
     #[test]
+    fn projection_cache_reuses_selection_only_revision_and_invalidates_projection_revision() {
+        let mut state = audition_state(&["projection-a", "projection-b"]);
+        ensure_library_projection_cache(&state);
+        assert_eq!(state.library_projection_cache.borrow().rebuild_count, 1);
+
+        state
+            .library
+            .mutate(LibraryMutationScope::PersistedOnly, |library| {
+                library.selected_track_id = Some(String::from("projection-b"));
+            });
+        ensure_library_projection_cache(&state);
+        assert_eq!(state.library_projection_cache.borrow().rebuild_count, 1);
+
+        state
+            .library
+            .mutate(LibraryMutationScope::Projection, |library| {
+                library.tracks[0].favorite = !library.tracks[0].favorite;
+            });
+        ensure_library_projection_cache(&state);
+        assert_eq!(state.library_projection_cache.borrow().rebuild_count, 2);
+    }
+
+    #[test]
     fn waveform_marker_projection_cache_reuses_and_invalidates_by_key() {
         let mut track = audition_track("marker-cache");
         track.notes = vec![
@@ -13028,7 +13385,7 @@ mod tests {
         let key = WaveformMarkerProjectionKey {
             owner_id: track.id.clone(),
             reference_path: None,
-            library_generation: 4,
+            marker_revision: 4,
             waveform_generation: 7,
             duration_millis: waveform.duration_millis,
             annotations_available: true,
@@ -13041,23 +13398,65 @@ mod tests {
         assert!(Arc::ptr_eq(&first.markers, &reused.markers));
         assert!(Arc::ptr_eq(&first.addresses, &reused.addresses));
 
-        let mut changed_generation = key.clone();
-        changed_generation.library_generation += 1;
-        let rebuilt_for_generation = cache.main(changed_generation.clone(), &track, &waveform);
+        let mut changed_revision = key.clone();
+        changed_revision.marker_revision += 1;
+        let rebuilt_for_revision = cache.main(changed_revision.clone(), &track, &waveform);
         assert_eq!(cache.rebuild_count, 2);
-        assert!(!Arc::ptr_eq(
-            &first.markers,
-            &rebuilt_for_generation.markers
-        ));
+        assert!(!Arc::ptr_eq(&first.markers, &rebuilt_for_revision.markers));
 
-        let mut changed_identity = changed_generation;
+        let mut changed_identity = changed_revision;
         changed_identity.owner_id = String::from("different-owner");
         let rebuilt_for_identity = cache.main(changed_identity, &track, &waveform);
         assert_eq!(cache.rebuild_count, 3);
         assert!(!Arc::ptr_eq(
-            &rebuilt_for_generation.markers,
+            &rebuilt_for_revision.markers,
             &rebuilt_for_identity.markers
         ));
+    }
+
+    #[test]
+    fn marker_cache_reuses_selection_only_revision_and_invalidates_marker_revision() {
+        let mut state = audition_state(&["marker-revision"]);
+        state.waveform = Some(audition_waveform());
+        state.waveform_track_id = Some(String::from("marker-revision"));
+        let track = state.library.tracks[0].clone();
+        let waveform = state.waveform.clone().expect("fixture waveform");
+
+        let first = prepared_main_marker_projection(&state, &track, &waveform);
+        state
+            .library
+            .mutate(LibraryMutationScope::PersistedOnly, |library| {
+                library.selected_track_id = Some(String::from("marker-revision"));
+            });
+        let reused = prepared_main_marker_projection(&state, &track, &waveform);
+        assert!(Arc::ptr_eq(&first.markers, &reused.markers));
+        assert_eq!(
+            state
+                .waveform_marker_projection_cache
+                .borrow()
+                .rebuild_count,
+            1
+        );
+
+        state
+            .library
+            .mutate(LibraryMutationScope::Markers, |library| {
+                library.tracks[0].notes.push(Note {
+                    id: String::from("marker-revision-note"),
+                    time_millis: 250,
+                    body: String::from("new marker"),
+                    done: false,
+                });
+            });
+        let rebuilt = prepared_main_marker_projection(&state, &state.library.tracks[0], &waveform);
+        assert_eq!(
+            state
+                .waveform_marker_projection_cache
+                .borrow()
+                .rebuild_count,
+            2
+        );
+        assert!(!Arc::ptr_eq(&reused.markers, &rebuilt.markers));
     }
 
     fn reference_removal_state() -> AppState {
@@ -15256,7 +15655,11 @@ mod tests {
             initial_rebuild_count
         );
 
-        state.library.make_mut().tracks[1].reference_path = Some(second_path);
+        state
+            .library
+            .mutate(LibraryMutationScope::Projection, |library| {
+                library.tracks[1].reference_path = Some(second_path);
+            });
         let updated_frame = reference_settings_window_view(&state)
             .view_frame_at_size_with_default_theme(Vector2::new(680.0, 520.0));
         let updated_labels = updated_frame.paint_plan.text_label_strings();
@@ -21046,6 +21449,10 @@ mod tests {
             &mut context,
         );
         assert_eq!(
+            context.into_command().repaint_scope(),
+            Some(RepaintScope::Projection)
+        );
+        assert_eq!(
             note_id_from_address(state.hovered_note_id.as_ref()),
             Some("hover-note")
         );
@@ -21065,12 +21472,78 @@ mod tests {
             Some(0.5)
         );
 
+        let mut context = ui::UiUpdateContext::default();
         update(
             &mut state,
             Message::CommentHoverEnded(NoteAddress::main("hover-track", "hover-note")),
             &mut context,
         );
         assert_eq!(state.hovered_note_id, None);
+        assert_eq!(
+            context.into_command().repaint_scope(),
+            Some(RepaintScope::Projection)
+        );
+    }
+
+    #[test]
+    fn reference_comment_hover_reducer_repaints_projection_and_preserves_marker_state() {
+        let track_id = String::from("reference-hover-reducer-track");
+        let reference_path = PathBuf::from("/external/reference-hover-reducer.wav");
+        let address = NoteAddress::reference(reference_path.clone(), "reference-hover-note");
+        let mut state = AppState {
+            busy: false,
+            reference_waveform: Some(audition_waveform()),
+            reference_waveform_track_id: Some(track_id.clone()),
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(track_id.clone());
+        state.library.tracks.push(Track {
+            id: track_id,
+            title: String::from("Reference hover reducer track"),
+            original_name: String::from("reference-hover-reducer.wav"),
+            path: PathBuf::from("/external/reference-hover-reducer-main.wav"),
+            source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
+            reference_path: Some(reference_path.clone()),
+            size: 0,
+            favorite: false,
+            stage: TrackStage::Backlog,
+            notes: crate::storage::SharedVec::default(),
+        });
+        state.library.reference_tracks.push(ReferenceTrack {
+            path: reference_path,
+            source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
+            notes: vec![Note {
+                id: String::from("reference-hover-note"),
+                time_millis: 500,
+                body: String::from("reference hover reducer"),
+                done: false,
+            }]
+            .into(),
+        });
+
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::ReferenceCommentHoverStarted(address.clone()),
+            &mut context,
+        );
+        assert_eq!(state.hovered_reference_note_id, Some(address.clone()));
+        assert_eq!(
+            context.into_command().repaint_scope(),
+            Some(RepaintScope::Projection)
+        );
+
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::ReferenceCommentHoverEnded(address),
+            &mut context,
+        );
+        assert_eq!(state.hovered_reference_note_id, None);
+        assert_eq!(
+            context.into_command().repaint_scope(),
+            Some(RepaintScope::Projection)
+        );
     }
 
     #[test]
@@ -27611,6 +28084,401 @@ mod tests {
         context: &mut ui::UiUpdateContext<Message>,
     ) {
         update(state, Message::AdmitLibrarySave, context);
+    }
+
+    #[test]
+    fn selection_debounce_admits_only_the_latest_ticket_and_revision() {
+        let mut state = audition_state(&["selection-first", "selection-second", "selection-third"]);
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::SelectTrack(String::from("selection-second")),
+            &mut context,
+        );
+        let first_ticket = state
+            .selection_save_latest
+            .active()
+            .expect("the first selection should start a debounce");
+        update(
+            &mut state,
+            Message::SelectTrack(String::from("selection-third")),
+            &mut context,
+        );
+        let latest_ticket = state
+            .selection_save_latest
+            .active()
+            .expect("the latest selection should replace the debounce");
+        assert_ne!(first_ticket, latest_ticket);
+        assert!(selection_save_debounce_active(&state));
+        assert!(state.selection_save_pending);
+
+        update(
+            &mut state,
+            Message::AdmitSelectionSave(first_ticket),
+            &mut context,
+        );
+        assert_eq!(state.selection_save_latest.active(), Some(latest_ticket));
+        assert!(state.selection_save_pending);
+        assert!(state.save_in_flight.is_none());
+
+        update(
+            &mut state,
+            Message::AdmitSelectionSave(latest_ticket),
+            &mut context,
+        );
+        let attempt = state
+            .save_in_flight
+            .expect("the latest selection should dispatch one save");
+        assert_eq!(attempt.revision, state.library_revision);
+        assert_eq!(
+            state.library.selected_track_id.as_deref(),
+            Some("selection-third")
+        );
+        assert!(!selection_save_debounce_active(&state));
+        assert!(!state.selection_save_pending);
+    }
+
+    #[test]
+    fn selection_debounce_waits_for_structural_save_completion() {
+        let mut state = audition_state(&["ordering-first", "ordering-second"]);
+        let mut context = ui::UiUpdateContext::default();
+        schedule_library_save(&mut state, &mut context);
+        admit_library_save_for_test(&mut state, &mut context);
+        let first_attempt = state
+            .save_in_flight
+            .expect("the structural mutation should dispatch first");
+        let _ = context.into_command();
+
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::SelectTrack(String::from("ordering-second")),
+            &mut context,
+        );
+        let selection_ticket = state
+            .selection_save_latest
+            .active()
+            .expect("the selection should start a debounce");
+        update(
+            &mut state,
+            Message::AdmitSelectionSave(selection_ticket),
+            &mut context,
+        );
+        assert_eq!(state.save_in_flight, Some(first_attempt));
+        assert!(
+            state.selection_save_pending,
+            "a timer that expires during a save must retain its admission obligation"
+        );
+
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::LibrarySaved {
+                attempt: first_attempt,
+                result: Ok(()),
+            },
+            &mut context,
+        );
+        assert!(state.save_admission_pending);
+        assert!(state.selection_save_pending);
+        admit_library_save_for_test(&mut state, &mut context);
+        let second_attempt = state
+            .save_in_flight
+            .expect("completion should admit the latest selection after the structural save");
+        assert_eq!(second_attempt.revision, state.library_revision);
+        assert_eq!(
+            state.library.selected_track_id.as_deref(),
+            Some("ordering-second")
+        );
+        assert!(!state.selection_save_pending);
+    }
+
+    #[test]
+    fn immediate_structural_mutation_cancels_selection_debounce() {
+        let mut state = audition_state(&["cancel-first", "cancel-second"]);
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::SelectTrack(String::from("cancel-second")),
+            &mut context,
+        );
+        let stale_ticket = state
+            .selection_save_latest
+            .active()
+            .expect("the selection should start a debounce");
+
+        update(
+            &mut state,
+            Message::ToggleFavorite(String::from("cancel-first")),
+            &mut context,
+        );
+        assert!(!selection_save_debounce_active(&state));
+        assert!(!state.selection_save_pending);
+        assert!(state.save_admission_pending);
+
+        update(
+            &mut state,
+            Message::AdmitSelectionSave(stale_ticket),
+            &mut context,
+        );
+        assert!(state.save_admission_pending);
+        admit_library_save_for_test(&mut state, &mut context);
+        let attempt = state
+            .save_in_flight
+            .expect("the structural mutation should own the save admission");
+        assert_eq!(attempt.revision, state.library_revision);
+        assert_eq!(
+            state.library.selected_track_id.as_deref(),
+            Some("cancel-second")
+        );
+        assert!(state.library.tracks[0].favorite);
+    }
+
+    #[test]
+    fn close_flush_success_persists_latest_selection_and_blocks_queued_admission() {
+        let mut state = audition_state(&["close-first", "close-second"]);
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::SelectTrack(String::from("close-second")),
+            &mut context,
+        );
+        let stale_ticket = state
+            .selection_save_latest
+            .active()
+            .expect("the selection should have a pending debounce");
+        state.save_admission_pending = true;
+        let revision = state.library_revision;
+        let mut saved = None;
+
+        let accepted = handle_close_requested_with(&mut state, |library| {
+            saved = Some(library.clone());
+            Ok(())
+        });
+
+        assert!(accepted);
+        assert_eq!(
+            saved
+                .as_ref()
+                .and_then(|library| library.selected_track_id.as_deref()),
+            Some("close-second")
+        );
+        assert_eq!(state.persisted_library_revision, revision);
+        assert!(!library_dirty(&state));
+        assert!(!selection_save_debounce_active(&state));
+        assert!(!state.selection_save_pending);
+        assert!(!state.save_admission_pending);
+        assert!(state.save_in_flight.is_none());
+
+        update(
+            &mut state,
+            Message::AdmitSelectionSave(stale_ticket),
+            &mut context,
+        );
+        update(&mut state, Message::AdmitLibrarySave, &mut context);
+        assert!(state.save_in_flight.is_none());
+    }
+
+    #[test]
+    fn close_flush_failure_keeps_dirty_latest_snapshot_and_cancels_admission() {
+        let mut state = audition_state(&["close-failure-first", "close-failure-second"]);
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::SelectTrack(String::from("close-failure-second")),
+            &mut context,
+        );
+        state.save_admission_pending = true;
+        let revision = state.library_revision;
+        let mut called = false;
+
+        let accepted = handle_close_requested_with(&mut state, |_| {
+            called = true;
+            Err(String::from("disk full"))
+        });
+
+        assert!(!accepted);
+        assert!(called);
+        assert_eq!(state.library_revision, revision);
+        assert_eq!(state.persisted_library_revision, 0);
+        assert!(library_dirty(&state));
+        assert_eq!(
+            state.status,
+            "Could not save the library before closing: disk full"
+        );
+        assert!(!selection_save_debounce_active(&state));
+        assert!(!state.selection_save_pending);
+        assert!(!state.save_admission_pending);
+        assert!(state.save_in_flight.is_none());
+    }
+
+    #[test]
+    fn close_request_vetoes_in_flight_save_without_sync_flush() {
+        let mut state = audition_state(&["close-in-flight-first", "close-in-flight-second"]);
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::SelectTrack(String::from("close-in-flight-second")),
+            &mut context,
+        );
+        let revision = state.library_revision;
+        let attempt = LibrarySaveAttempt { id: 7, revision: 0 };
+        state.save_in_flight = Some(attempt);
+        state.save_admission_pending = true;
+        let mut called = false;
+
+        let accepted = handle_close_requested_with(&mut state, |_| {
+            called = true;
+            Ok(())
+        });
+
+        assert!(!accepted);
+        assert!(
+            !called,
+            "close must not start a concurrent synchronous write"
+        );
+        assert_eq!(state.save_in_flight, Some(attempt));
+        assert_eq!(state.library_revision, revision);
+        assert!(library_dirty(&state));
+        assert_eq!(
+            state.status,
+            "Saving the library — try closing again when it finishes."
+        );
+        assert!(!selection_save_debounce_active(&state));
+        assert!(!state.selection_save_pending);
+        assert!(!state.save_admission_pending);
+    }
+
+    #[test]
+    fn shutdown_flushes_dirty_snapshot_and_does_not_claim_failed_persistence() {
+        let mut state = audition_state(&["shutdown-success-first", "shutdown-success-second"]);
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::SelectTrack(String::from("shutdown-success-second")),
+            &mut context,
+        );
+        state.save_admission_pending = true;
+        let revision = state.library_revision;
+        let mut saved = None;
+
+        assert!(
+            handle_shutdown_with(&mut state, |library| {
+                saved = Some(library.clone());
+                Ok(())
+            })
+            .is_none()
+        );
+        assert_eq!(
+            saved
+                .as_ref()
+                .and_then(|library| library.selected_track_id.as_deref()),
+            Some("shutdown-success-second")
+        );
+        assert_eq!(state.persisted_library_revision, revision);
+        assert!(!library_dirty(&state));
+        assert!(!state.save_admission_pending);
+
+        let mut state = audition_state(&["shutdown-failure-first", "shutdown-failure-second"]);
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::SelectTrack(String::from("shutdown-failure-second")),
+            &mut context,
+        );
+        state.save_admission_pending = true;
+        let revision = state.library_revision;
+
+        assert!(handle_shutdown_with(&mut state, |_| Err(String::from("disk full"))).is_none());
+        assert_eq!(state.library_revision, revision);
+        assert_eq!(state.persisted_library_revision, 0);
+        assert!(library_dirty(&state));
+        assert_eq!(
+            state.status,
+            "Could not save the library during shutdown: disk full"
+        );
+        assert!(!state.save_admission_pending);
+    }
+
+    #[test]
+    fn shutdown_fallback_skips_in_flight_save_without_sync_flush() {
+        let mut state = audition_state(&["shutdown-in-flight-first", "shutdown-in-flight-second"]);
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::SelectTrack(String::from("shutdown-in-flight-second")),
+            &mut context,
+        );
+        let revision = state.library_revision;
+        let attempt = LibrarySaveAttempt { id: 8, revision: 0 };
+        state.save_in_flight = Some(attempt);
+        state.save_admission_pending = true;
+        let mut called = false;
+
+        assert!(
+            handle_shutdown_with(&mut state, |_| {
+                called = true;
+                Ok(())
+            })
+            .is_none()
+        );
+        assert!(!called, "shutdown must not race an in-flight worker save");
+        assert_eq!(state.save_in_flight, Some(attempt));
+        assert_eq!(state.library_revision, revision);
+        assert!(library_dirty(&state));
+        assert!(!state.save_admission_pending);
+    }
+
+    #[test]
+    fn selection_debounce_survives_in_flight_failure_until_retry() {
+        let mut state = audition_state(&["selection-failure-first", "selection-failure-second"]);
+        let mut context = ui::UiUpdateContext::default();
+        schedule_library_save(&mut state, &mut context);
+        admit_library_save_for_test(&mut state, &mut context);
+        let first_attempt = state
+            .save_in_flight
+            .expect("the structural mutation should dispatch first");
+        let _ = context.into_command();
+
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::SelectTrack(String::from("selection-failure-second")),
+            &mut context,
+        );
+        let selection_ticket = state
+            .selection_save_latest
+            .active()
+            .expect("the selection should start a debounce");
+        update(
+            &mut state,
+            Message::AdmitSelectionSave(selection_ticket),
+            &mut context,
+        );
+        assert_eq!(state.save_in_flight, Some(first_attempt));
+        assert!(state.selection_save_pending);
+
+        update(
+            &mut state,
+            Message::LibrarySaved {
+                attempt: first_attempt,
+                result: Err(String::from("disk full")),
+            },
+            &mut context,
+        );
+        assert!(state.selection_save_pending);
+        assert!(library_dirty(&state));
+
+        update(&mut state, Message::RetryLibrarySave, &mut context);
+        let retry_attempt = state
+            .save_in_flight
+            .expect("retry should retain the latest selection snapshot");
+        assert_eq!(
+            retry_attempt.revision, state.library_revision,
+            "retry must preserve the latest revision after an in-flight failure"
+        );
+        assert!(!state.selection_save_pending);
     }
 
     #[test]
