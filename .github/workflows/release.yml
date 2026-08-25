@@ -499,29 +499,51 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Install stable Rust
-        run: rustup toolchain install stable --profile minimal --component clippy
-
-      - name: Install Apple Silicon Rust target
-        run: rustup target add --toolchain stable aarch64-apple-darwin
-
-      - name: Run Rust validation
-        run: |
-          cargo +stable test --locked
-          cargo +stable clippy --all-targets --all-features --locked -- -D warnings
-
-      - name: Reuse existing release artifact when available
-        id: reuse_artifact
+      - name: Download release reuse candidate
+        id: download_reuse_artifact
         continue-on-error: true
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: ${{ needs.prepare.outputs.artifact_upload_name }}
-          path: release-output
+          path: release-candidate
           github-token: ${{ github.token }}
           run-id: ${{ github.run_id }}
 
+      - name: Verify release reuse candidate
+        id: verify_reuse_artifact
+        if: steps.download_reuse_artifact.outcome == 'success'
+        env:
+          RELEASE_CHANNEL: ${{ needs.prepare.outputs.channel }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          RELEASE_BUILD_ID: ${{ needs.prepare.outputs.build_id }}
+          RELEASE_SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          node scripts/release/verify_release_reuse.mjs \
+            --root release-candidate \
+            --version "$RELEASE_VERSION" \
+            --channel "$RELEASE_CHANNEL" \
+            --build-id "$RELEASE_BUILD_ID" \
+            --source-sha "$RELEASE_SOURCE_SHA" \
+            --repository "$RELEASE_REPOSITORY"
+
+      - name: Install stable Rust
+        if: steps.verify_reuse_artifact.outcome != 'success'
+        run: rustup toolchain install stable --profile minimal --component clippy
+
+      - name: Install Apple Silicon Rust target
+        if: steps.verify_reuse_artifact.outcome != 'success'
+        run: rustup target add --toolchain stable aarch64-apple-darwin
+
+      - name: Run Rust validation
+        if: steps.verify_reuse_artifact.outcome != 'success'
+        run: |
+          cargo +stable test --locked
+          cargo +stable clippy --all-targets --all-features --locked -- -D warnings
+
       - name: Build, sign, notarize, and describe release
-        if: steps.reuse_artifact.outcome != 'success'
+        if: steps.verify_reuse_artifact.outcome != 'success'
         env:
           RELEASE_CHANNEL: ${{ needs.prepare.outputs.channel }}
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
@@ -541,7 +563,7 @@ jobs:
             --build-id "$RELEASE_BUILD_ID"
 
       - name: Upload immutable release artifact
-        if: steps.reuse_artifact.outcome != 'success'
+        if: steps.verify_reuse_artifact.outcome != 'success'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ needs.prepare.outputs.artifact_upload_name }}

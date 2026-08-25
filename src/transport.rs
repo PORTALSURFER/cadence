@@ -316,6 +316,8 @@ struct SharedSnapshot {
     playing: AtomicBool,
     ready: AtomicBool,
     requested_volume: AtomicU32,
+    output_gain_revision: AtomicU64,
+    applied_output_gain_revision: AtomicU64,
     error_available: AtomicBool,
     error: Mutex<Option<(u64, String)>>,
     analysis_warning_available: AtomicBool,
@@ -340,6 +342,8 @@ impl SharedSnapshot {
             playing: AtomicBool::new(false),
             ready: AtomicBool::new(false),
             requested_volume: AtomicU32::new(DEFAULT_VOLUME.to_bits()),
+            output_gain_revision: AtomicU64::new(0),
+            applied_output_gain_revision: AtomicU64::new(0),
             error_available: AtomicBool::new(false),
             error: Mutex::new(None),
             analysis_warning_available: AtomicBool::new(false),
@@ -452,6 +456,26 @@ impl SharedSnapshot {
         normalize_output_gain(f32::from_bits(
             self.requested_volume.load(Ordering::Acquire),
         ))
+    }
+
+    fn request_output_gain(&self, gain: f32) {
+        self.requested_volume
+            .store(normalize_output_gain(gain).to_bits(), Ordering::Release);
+        self.output_gain_revision.fetch_add(1, Ordering::AcqRel);
+        self.wake_control_thread();
+    }
+
+    fn requested_output_gain_revision(&self) -> Option<(u64, f32)> {
+        let revision = self.output_gain_revision.load(Ordering::Acquire);
+        if self.applied_output_gain_revision.load(Ordering::Acquire) == revision {
+            return None;
+        }
+        Some((revision, self.requested_volume()))
+    }
+
+    fn finish_output_gain_revision(&self, revision: u64) {
+        self.applied_output_gain_revision
+            .store(revision, Ordering::Release);
     }
 
     fn clear_live_frame(&self) {
@@ -1711,9 +1735,7 @@ impl AudioTransport {
     /// loudness-match offset can boost a quiet reference without changing the
     /// primary track's control value or raw LUFS analysis.
     pub fn set_output_gain(&self, gain: f32) {
-        self.shared
-            .requested_volume
-            .store(normalize_output_gain(gain).to_bits(), Ordering::Release);
+        self.shared.request_output_gain(gain);
     }
 
     pub(crate) fn has_command_capacity(&self, required: usize) -> bool {
@@ -1989,6 +2011,7 @@ fn run_transport(
                     &mut player,
                     &mut loaded,
                     &mut live_session,
+                    &mut applied_volume,
                 )
             }
             TransportWork::PendingLoad(command) => handle_command(
@@ -1998,7 +2021,11 @@ fn run_transport(
                 &mut player,
                 &mut loaded,
                 &mut live_session,
+                &mut applied_volume,
             ),
+            TransportWork::OutputGain => {
+                apply_requested_volume(&shared, player.as_ref(), &mut applied_volume);
+            }
             TransportWork::Tick => {}
             TransportWork::Disconnected => break,
         }
@@ -2014,6 +2041,7 @@ fn run_transport(
                         &mut player,
                         &mut loaded,
                         &mut live_session,
+                        &mut applied_volume,
                     )
                 }
                 Err(TryRecvError::Empty) => break,
@@ -2039,6 +2067,7 @@ fn run_transport(
 enum TransportWork {
     Command(Command),
     PendingLoad(Command),
+    OutputGain,
     Tick,
     Disconnected,
 }
@@ -2058,6 +2087,9 @@ fn wait_for_transport_work(
     loop {
         if let Some(command) = pending_load.take() {
             return TransportWork::PendingLoad(command);
+        }
+        if shared.requested_output_gain_revision().is_some() {
+            return TransportWork::OutputGain;
         }
         match receiver.try_recv() {
             Ok(command) => return TransportWork::Command(command),
@@ -2112,6 +2144,7 @@ fn handle_command(
     player: &mut Option<Player>,
     loaded: &mut Option<LoadedTrack>,
     live_session: &mut Option<Arc<LiveCaptureSession>>,
+    applied_volume: &mut Option<f32>,
 ) {
     let (token, acknowledged) = match command {
         Command::Load {
@@ -2177,6 +2210,7 @@ fn handle_command(
                         if let Some(session) = live_session.as_deref() {
                             shared.set_live_analysis_frozen(session, false);
                         }
+                        apply_requested_volume(shared, Some(player), applied_volume);
                         player.play();
                         shared.playing.store(true, Ordering::Release);
                     }
@@ -2231,6 +2265,9 @@ fn handle_command(
                         if !reloaded {
                             (token, false)
                         } else if let Some(player) = player.as_ref() {
+                            if resume {
+                                apply_requested_volume(shared, Some(player), applied_volume);
+                            }
                             let was_frozen = live_session.as_deref().is_none_or(|session| {
                                 session.analysis_frozen.load(Ordering::Acquire)
                             });
@@ -2450,15 +2487,23 @@ fn apply_requested_volume(
     player: Option<&Player>,
     applied_volume: &mut Option<f32>,
 ) {
+    let requested_revision = shared.requested_output_gain_revision();
     let Some(player) = player else {
         *applied_volume = None;
+        if let Some((revision, _)) = requested_revision {
+            shared.finish_output_gain_revision(revision);
+        }
         return;
     };
-    let requested = shared.requested_volume();
-    let changed = applied_volume.is_none_or(|applied| (applied - requested).abs() > f32::EPSILON);
+    let requested = requested_revision.map_or_else(|| shared.requested_volume(), |(_, gain)| gain);
+    let changed = requested_revision.is_some()
+        || applied_volume.is_none_or(|applied| (applied - requested).abs() > f32::EPSILON);
     if changed {
         player.set_volume(requested);
         *applied_volume = Some(requested);
+    }
+    if let Some((revision, _)) = requested_revision {
+        shared.finish_output_gain_revision(revision);
     }
 }
 
@@ -2523,18 +2568,18 @@ mod tests {
         LIVE_SPECTRUM_DISPLAY_TILT_DB_PER_OCTAVE, LIVE_SPECTRUM_DISPLAY_TILT_REFERENCE_FREQUENCY,
         LIVE_SPECTRUM_FFT_SIZE, LIVE_SPECTRUM_HOP_SIZE, LIVE_SPECTRUM_POINT_COUNT,
         LiveAnalysisSource, LiveAnalyzer, LiveCaptureSession, LiveSpectrogramFrame, LoadedTrack,
-        MAX_OUTPUT_GAIN, PendingLoad, SharedSnapshot, TransportWork, clamp_position,
-        display_tilt_db, finish_analyzer_fallback, handle_command, is_current, live_band_ranges,
-        live_display_frequency_bounds, live_spectrum_point_frequency, live_spectrum_point_mappings,
-        load_track, normalize_output_gain, normalize_volume, publish_live_frame_if_due,
-        publish_live_frame_if_due_at, run_live_analyzer, run_live_analyzer_iteration,
-        transport_cadence_active, wait_for_transport_work,
+        MAX_OUTPUT_GAIN, PendingLoad, SharedSnapshot, TransportWork, apply_requested_volume,
+        clamp_position, display_tilt_db, finish_analyzer_fallback, handle_command, is_current,
+        live_band_ranges, live_display_frequency_bounds, live_spectrum_point_frequency,
+        live_spectrum_point_mappings, load_track, normalize_output_gain, normalize_volume,
+        publish_live_frame_if_due, publish_live_frame_if_due_at, run_live_analyzer,
+        run_live_analyzer_iteration, transport_cadence_active, wait_for_transport_work,
     };
     use crate::source::{AudioSourceProof, SourceFileStamp, VerifiedSourceTicket};
     use rodio::{Player, Source, buffer::SamplesBuffer, source::SeekError};
     use std::sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     };
     use std::time::{Duration, Instant};
@@ -2616,6 +2661,163 @@ mod tests {
             .store(2.5_f32.to_bits(), Ordering::Release);
 
         assert_eq!(shared.requested_volume(), 2.5);
+    }
+
+    #[test]
+    fn output_gain_coalesces_to_the_latest_value_and_consumes_its_revision() {
+        let shared = SharedSnapshot::new();
+        shared.request_output_gain(0.5);
+        shared.request_output_gain(2.5);
+
+        assert_eq!(shared.requested_volume(), 2.5);
+        assert_eq!(shared.output_gain_revision.load(Ordering::Acquire), 2);
+        assert!(shared.requested_output_gain_revision().is_some());
+
+        let (player, _queue) = Player::new();
+        player.append(SamplesBuffer::new(
+            std::num::NonZeroU16::new(1).expect("non-zero channel count"),
+            std::num::NonZeroU32::new(48_000).expect("non-zero sample rate"),
+            vec![0.0; 4],
+        ));
+        player.set_volume(0.5);
+        player.pause();
+        let mut applied_volume = Some(0.5);
+
+        apply_requested_volume(&shared, Some(&player), &mut applied_volume);
+
+        assert_eq!(player.volume(), 2.5);
+        assert_eq!(applied_volume, Some(2.5));
+        assert!(shared.requested_output_gain_revision().is_none());
+    }
+
+    #[test]
+    fn newer_output_gain_revision_remains_pending_after_older_revision_finishes() {
+        let shared = SharedSnapshot::new();
+        shared.request_output_gain(0.5);
+        let (first_revision, _) = shared
+            .requested_output_gain_revision()
+            .expect("the first gain revision should be pending");
+
+        shared.request_output_gain(2.5);
+        shared.finish_output_gain_revision(first_revision);
+
+        let (pending_revision, pending_gain) = shared
+            .requested_output_gain_revision()
+            .expect("the newer gain revision must remain pending");
+        assert_ne!(pending_revision, first_revision);
+        assert_eq!(pending_gain, 2.5);
+    }
+
+    #[test]
+    fn play_applies_pending_output_gain_before_starting_a_loaded_player() {
+        let generation = 14;
+        let shared = Arc::new(SharedSnapshot::new());
+        shared
+            .requested_generation
+            .store(generation, Ordering::Release);
+        shared.request_output_gain(3.25);
+
+        let (player_handle, _queue) = Player::new();
+        player_handle.append(SamplesBuffer::new(
+            std::num::NonZeroU16::new(1).expect("non-zero channel count"),
+            std::num::NonZeroU32::new(48_000).expect("non-zero sample rate"),
+            vec![0.0; 4],
+        ));
+        player_handle.set_volume(0.25);
+        player_handle.pause();
+        let mut player = Some(player_handle);
+        let mut loaded = Some(LoadedTrack {
+            generation,
+            ticket: test_ticket("play-order.wav"),
+            duration_millis: 1_000,
+        });
+        let mut live_session = None;
+        let mut applied_volume = Some(0.25);
+
+        handle_command(
+            Command::Play {
+                token: 14,
+                generation,
+            },
+            &shared,
+            None,
+            &mut player,
+            &mut loaded,
+            &mut live_session,
+            &mut applied_volume,
+        );
+
+        let player = player
+            .as_ref()
+            .expect("the loaded player should remain active");
+        assert_eq!(player.volume(), 3.25);
+        assert!(!player.is_paused());
+        assert_eq!(shared.snapshot().acknowledged_token, 14);
+        assert!(shared.requested_output_gain_revision().is_none());
+    }
+
+    #[test]
+    fn resume_seek_applies_pending_output_gain_before_resuming_audio() {
+        let generation = 15;
+        let shared = Arc::new(SharedSnapshot::new());
+        shared
+            .requested_generation
+            .store(generation, Ordering::Release);
+        shared.request_output_gain(4.5);
+        let sought_to_millis = Arc::new(AtomicUsize::new(0));
+
+        let (player_handle, mut queue) = Player::new();
+        player_handle.append(SeekableSource {
+            samples: vec![0.0; 128],
+            position: 0,
+            sought_to_millis: Arc::clone(&sought_to_millis),
+            reject_seek: false,
+        });
+        player_handle.set_volume(0.25);
+        player_handle.pause();
+        let stop_queue_consumer = Arc::new(AtomicBool::new(false));
+        let queue_consumer_stop = Arc::clone(&stop_queue_consumer);
+        let queue_consumer = thread::spawn(move || {
+            while !queue_consumer_stop.load(Ordering::Acquire) {
+                let _ = queue.next();
+            }
+        });
+        let mut player = Some(player_handle);
+        let mut loaded = Some(LoadedTrack {
+            generation,
+            ticket: test_ticket("seek-order.wav"),
+            duration_millis: 1_000,
+        });
+        let mut live_session = None;
+        let mut applied_volume = Some(0.25);
+
+        handle_command(
+            Command::Seek {
+                token: 15,
+                generation,
+                position_millis: 37,
+                resume: true,
+            },
+            &shared,
+            None,
+            &mut player,
+            &mut loaded,
+            &mut live_session,
+            &mut applied_volume,
+        );
+
+        let player = player
+            .as_ref()
+            .expect("the loaded player should remain active");
+        assert_eq!(sought_to_millis.load(Ordering::Acquire), 37);
+        assert_eq!(player.volume(), 4.5);
+        assert!(!player.is_paused());
+        assert!(shared.snapshot().playing);
+        assert!(shared.requested_output_gain_revision().is_none());
+        stop_queue_consumer.store(true, Ordering::Release);
+        queue_consumer
+            .join()
+            .expect("the seek test queue consumer should stop");
     }
 
     #[test]
@@ -2792,6 +2994,45 @@ mod tests {
     }
 
     #[test]
+    fn wait_for_transport_work_wakes_for_a_pending_output_gain_without_an_idle_tick() {
+        let (_commands, receiver) = mpsc::sync_channel(1);
+        let shared = Arc::new(SharedSnapshot::new());
+        let pending_load = Arc::new(PendingLoad::new());
+        let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+        let (work_sender, work_receiver) = mpsc::sync_channel(1);
+        let waiter_shared = Arc::clone(&shared);
+        let waiter_pending_load = Arc::clone(&pending_load);
+        let waiter = thread::spawn(move || {
+            waiter_shared.register_control_thread();
+            ready_sender.send(()).expect("waiter should become ready");
+            let work = wait_for_transport_work(&receiver, &waiter_shared, &waiter_pending_load);
+            work_sender
+                .send(work)
+                .expect("waiter result should be delivered");
+        });
+
+        ready_receiver
+            .recv_timeout(Duration::from_millis(100))
+            .expect("waiter should register its control thread");
+        assert!(
+            work_receiver
+                .recv_timeout(CONTROL_INTERVAL.saturating_mul(2))
+                .is_err(),
+            "an idle transport must not emit control ticks"
+        );
+
+        shared.request_output_gain(1.75);
+
+        assert!(matches!(
+            work_receiver
+                .recv_timeout(Duration::from_millis(100))
+                .expect("an output gain should wake the idle waiter"),
+            TransportWork::OutputGain
+        ));
+        waiter.join().expect("waiter should exit cleanly");
+    }
+
+    #[test]
     fn acknowledged_tokens_never_move_backwards() {
         let shared = SharedSnapshot::new();
         shared.acknowledge(9);
@@ -2875,6 +3116,7 @@ mod tests {
             duration_millis: 1_000,
         });
         let mut live_session = Some(Arc::clone(&session));
+        let mut applied_volume = None;
 
         handle_command(
             Command::Play { token, generation },
@@ -2883,6 +3125,7 @@ mod tests {
             &mut player,
             &mut loaded,
             &mut live_session,
+            &mut applied_volume,
         );
 
         let error = shared
@@ -2917,6 +3160,7 @@ mod tests {
             duration_millis: 1_000,
         });
         let mut live_session = Some(Arc::clone(&session));
+        let mut applied_volume = None;
 
         handle_command(
             Command::Seek {
@@ -2930,6 +3174,7 @@ mod tests {
             &mut player,
             &mut loaded,
             &mut live_session,
+            &mut applied_volume,
         );
 
         let error = shared
@@ -4042,6 +4287,7 @@ mod tests {
         let mut player = None;
         let mut loaded = None;
         let mut live_session = Some(Arc::clone(&session));
+        let mut applied_volume = None;
         handle_command(
             Command::Pause {
                 token: 1,
@@ -4052,6 +4298,7 @@ mod tests {
             &mut player,
             &mut loaded,
             &mut live_session,
+            &mut applied_volume,
         );
         assert_eq!(shared.snapshot().acknowledged_token, 1);
         assert!(session.analysis_frozen.load(Ordering::Acquire));

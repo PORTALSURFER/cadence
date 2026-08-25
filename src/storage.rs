@@ -866,8 +866,16 @@ pub fn import_verified_batch(
     candidates: Vec<VerifiedImportCandidate>,
     library_path: &Path,
 ) -> BatchImportReport {
-    let prepared =
-        import_verified_batch_inner(library, candidates, |_| {}, apply_main_track_import);
+    let mut occupied_track_ids = occupied_track_ids(&library);
+    let mut apply_candidate =
+        |library: &mut Library, candidate: VerifiedImportCandidate, metadata: fs::Metadata| {
+            apply_main_track_import(library, candidate, metadata, &mut occupied_track_ids)
+        };
+    let mut prepared =
+        import_verified_batch_inner(library, candidates, |_| {}, &mut apply_candidate);
+    if !prepared.accepted_paths.is_empty() {
+        normalize_planner_order(&mut prepared.library);
+    }
     persist_batch_library(
         prepared.library,
         prepared.accepted_paths,
@@ -883,7 +891,15 @@ fn import_verified_batch_with_final_fence_hook(
     library_path: &Path,
     hook: impl FnMut(&VerifiedImportCandidate),
 ) -> BatchImportReport {
-    let prepared = import_verified_batch_inner(library, candidates, hook, apply_main_track_import);
+    let mut occupied_track_ids = occupied_track_ids(&library);
+    let mut apply_candidate =
+        |library: &mut Library, candidate: VerifiedImportCandidate, metadata: fs::Metadata| {
+            apply_main_track_import(library, candidate, metadata, &mut occupied_track_ids)
+        };
+    let mut prepared = import_verified_batch_inner(library, candidates, hook, &mut apply_candidate);
+    if !prepared.accepted_paths.is_empty() {
+        normalize_planner_order(&mut prepared.library);
+    }
     persist_batch_library(
         prepared.library,
         prepared.accepted_paths,
@@ -952,6 +968,7 @@ fn apply_main_track_import(
     library: &mut Library,
     candidate: VerifiedImportCandidate,
     metadata: fs::Metadata,
+    occupied_track_ids: &mut HashSet<String>,
 ) -> Result<(), String> {
     let path = candidate.path.clone();
     let original_name = path
@@ -964,7 +981,7 @@ fn apply_main_track_import(
         .and_then(|name| name.to_str())
         .unwrap_or("Untitled track")
         .replace(['_', '-'], " ");
-    let id = allocate_track_id(library);
+    let id = allocate_track_id_from_occupied(occupied_track_ids);
     library.tracks.push(Track {
         id: id.clone(),
         title: if title.trim().is_empty() {
@@ -981,9 +998,24 @@ fn apply_main_track_import(
         stage: TrackStage::Backlog,
         notes: SharedVec::default(),
     });
-    normalize_planner_order(library);
     library.selected_track_id = Some(id);
     Ok(())
+}
+
+fn occupied_track_ids(library: &Library) -> HashSet<String> {
+    library
+        .tracks
+        .iter()
+        .map(|track| track.id.clone())
+        .collect()
+}
+
+fn allocate_track_id_from_occupied(occupied_track_ids: &mut HashSet<String>) -> String {
+    let id = allocate_id("track", unique_id(), |candidate| {
+        occupied_track_ids.contains(candidate)
+    });
+    occupied_track_ids.insert(id.clone());
+    id
 }
 
 fn apply_reference_import(
@@ -2165,6 +2197,43 @@ mod tests {
                 .shares_entity_storage_with(&library.reference_tracks, 1)
         );
 
+        let late_snapshot = library.clone();
+        library
+            .tracks
+            .find_mut(|track| track.id == "track-2")
+            .expect("the late main target should exist")
+            .title = String::from("Late Track Mutation");
+        assert!(
+            late_snapshot
+                .tracks
+                .shares_entity_storage_with(&library.tracks, 0),
+            "mutating a late main target must leave preceding tracks shared"
+        );
+        assert!(
+            !late_snapshot
+                .tracks
+                .shares_entity_storage_with(&library.tracks, 1)
+        );
+
+        let late_reference_snapshot = library.clone();
+        library
+            .reference_tracks
+            .find_mut(|reference| reference.path == Path::new("/external/reference-2.wav"))
+            .expect("the late reference target should exist")
+            .notes[0]
+            .id = String::from("late-reference-note");
+        assert!(
+            late_reference_snapshot
+                .reference_tracks
+                .shares_entity_storage_with(&library.reference_tracks, 0),
+            "mutating a late reference target must leave preceding references shared"
+        );
+        assert!(
+            !late_reference_snapshot
+                .reference_tracks
+                .shares_entity_storage_with(&library.reference_tracks, 1)
+        );
+
         let encoded = serde_json::to_vec(&library).expect("mutated library should encode");
         let round_tripped: Library =
             serde_json::from_slice(&encoded).expect("mutated library should decode");
@@ -2200,6 +2269,26 @@ mod tests {
         assert_eq!(library.tracks.len(), original.tracks.len() + 2);
         assert!(library.tracks.iter().any(|track| track.path == first_path));
         assert!(library.tracks.iter().any(|track| track.path == second_path));
+        let imported_ids = [first_path.as_path(), second_path.as_path()]
+            .into_iter()
+            .map(|path| {
+                library
+                    .tracks
+                    .iter()
+                    .find(|track| track.path == path)
+                    .expect("each accepted path should have a track ID")
+                    .id
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            library.planner_order.iter().skip(1).collect::<Vec<_>>(),
+            imported_ids.iter().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            library.selected_track_id.as_deref(),
+            imported_ids.last().map(String::as_str)
+        );
         assert_eq!(
             load_library_at(&library_path).expect("batch should reload"),
             library

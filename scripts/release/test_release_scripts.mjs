@@ -2,6 +2,7 @@
 
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -16,6 +17,7 @@ const allocatorScript = path.join(releaseDirectory, "allocate_nightly_version.sh
 const buildScript = path.join(releaseDirectory, "build_macos_release.sh");
 const tagVerifierScript = path.join(releaseDirectory, "verify_tag_target.sh");
 const manifestScript = path.join(releaseDirectory, "create_manifest.mjs");
+const reuseVerifierScript = path.join(releaseDirectory, "verify_release_reuse.mjs");
 const workflowPath = path.join(releaseDirectory, "..", "..", ".github", "workflows", "release.yml");
 const gitSha = "a".repeat(40);
 const screenshotSourceGitSha = "b".repeat(40);
@@ -58,6 +60,44 @@ async function createManifest(directory, version, channel) {
   if (channel) args.push("--channel", channel);
   await execFileAsync(process.execPath, args);
   return JSON.parse(await fs.readFile(path.join(directory, "cadence-release-manifest.json"), "utf8"));
+}
+
+async function createReuseFixture() {
+  const version = "0.1.0";
+  const directory = await createInputDirectory(version);
+  const manifest = await createManifest(directory, version);
+  const descriptorNames = [
+    manifest.artifacts[0].name,
+    manifest.screenshot.name,
+    manifest.changelog.name,
+  ];
+  const sums = [];
+  for (const name of descriptorNames) {
+    const bytes = await fs.readFile(path.join(directory, name));
+    sums.push(`${crypto.createHash("sha256").update(bytes).digest("hex")}  ${name}`);
+  }
+  await fs.writeFile(path.join(directory, "SHA256SUMS.txt"), `${sums.join("\n")}\n`);
+  return { directory, manifest, version };
+}
+
+function verifyReuseFixture(directory, overrides = {}) {
+  const values = {
+    version: "0.1.0",
+    channel: "stable",
+    buildId: "cadence-test-build",
+    sourceSha: gitSha,
+    repository: "PORTALSURFER/cadence",
+    ...overrides,
+  };
+  return execFileAsync(process.execPath, [
+    reuseVerifierScript,
+    "--root", directory,
+    "--version", values.version,
+    "--channel", values.channel,
+    "--build-id", values.buildId,
+    "--source-sha", values.sourceSha,
+    "--repository", values.repository,
+  ]);
 }
 
 function parseTeamId(identity) {
@@ -562,6 +602,76 @@ test("manifest rejects unknown channels and mismatched channel versions", async 
   }
 });
 
+test("release reuse verifier accepts a complete production candidate", async () => {
+  const fixture = await createReuseFixture();
+  try {
+    const result = await verifyReuseFixture(fixture.directory);
+    assert.match(result.stdout, /"verified": true/);
+    assert.match(result.stdout, /"build_id": "cadence-test-build"/);
+  } finally {
+    await fs.rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("release reuse verifier rejects a missing required file", async () => {
+  const fixture = await createReuseFixture();
+  try {
+    await fs.rm(path.join(fixture.directory, fixture.manifest.artifacts[0].name));
+    await assert.rejects(
+      verifyReuseFixture(fixture.directory),
+      (error) => error.code === 1 && error.stderr.includes("required file is missing"),
+    );
+  } finally {
+    await fs.rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("release reuse verifier rejects malformed manifest JSON", async () => {
+  const fixture = await createReuseFixture();
+  try {
+    await fs.writeFile(path.join(fixture.directory, "cadence-release-manifest.json"), "{not-json\n");
+    await assert.rejects(
+      verifyReuseFixture(fixture.directory),
+      (error) => error.code === 1 && error.stderr.includes("manifest is not valid JSON"),
+    );
+  } finally {
+    await fs.rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("release reuse verifier rejects provenance mismatches", async () => {
+  const fixture = await createReuseFixture();
+  try {
+    fixture.manifest.source.repository = "example/other-cadence";
+    await fs.writeFile(
+      path.join(fixture.directory, "cadence-release-manifest.json"),
+      `${JSON.stringify(fixture.manifest, null, 2)}\n`,
+    );
+    await assert.rejects(
+      verifyReuseFixture(fixture.directory),
+      (error) => error.code === 1 && error.stderr.includes("source repository does not match"),
+    );
+  } finally {
+    await fs.rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("release reuse verifier rejects descriptor hash mismatches", async () => {
+  const fixture = await createReuseFixture();
+  try {
+    const artifactPath = path.join(fixture.directory, fixture.manifest.artifacts[0].name);
+    const artifact = await fs.readFile(artifactPath);
+    artifact[0] ^= 0xff;
+    await fs.writeFile(artifactPath, artifact);
+    await assert.rejects(
+      verifyReuseFixture(fixture.directory),
+      (error) => error.code === 1 && error.stderr.includes("SHA-256 does not match"),
+    );
+  } finally {
+    await fs.rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
 test("nightly allocator advances the initial, consecutive, and cross-channel patch stream", async (t) => {
   await t.test("initial release", async () => {
     assert.equal(await allocateNightlyVersion("0.1.0", ""), "0.1.1");
@@ -755,21 +865,28 @@ test("release workflow reserves nightly versions before immutable builds", async
   }
   assert.doesNotMatch(buildJob, /CADENCE_RELEASE_UPLOAD_TOKEN|PORTALSURFER_RELEASE_ENDPOINT|publish_release\.mjs|gh release/);
 
-  const reuseIndex = buildJob.indexOf("Reuse existing release artifact when available");
+  const reuseIndex = buildJob.indexOf("Download release reuse candidate");
+  const verifyReuseIndex = buildJob.indexOf("Verify release reuse candidate");
   const signingIndex = buildJob.indexOf("Build, sign, notarize, and describe release");
-  assert.ok(reuseIndex >= 0 && reuseIndex < signingIndex, "reuse must be attempted before signing");
+  const checkoutIndex = buildJob.indexOf("Check out source");
+  assert.ok(checkoutIndex >= 0 && checkoutIndex < reuseIndex && reuseIndex < verifyReuseIndex && verifyReuseIndex < signingIndex, "reuse must be downloaded after checkout and verified before signing");
   const reuseBlock = buildJob.slice(reuseIndex, signingIndex);
-  assert.match(reuseBlock, /id: reuse_artifact/);
+  assert.match(reuseBlock, /id: download_reuse_artifact/);
   assert.match(reuseBlock, /continue-on-error: true/);
   assert.match(reuseBlock, /actions\/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4\.3\.0/);
   assert.match(reuseBlock, /name: \$\{\{ needs\.prepare\.outputs\.artifact_upload_name \}\}/);
-  assert.match(reuseBlock, /path: release-output\n/);
+  assert.match(reuseBlock, /path: release-candidate\n/);
   assert.match(reuseBlock, /github-token: \$\{\{ github\.token \}\}/);
   assert.match(reuseBlock, /run-id: \$\{\{ github\.run_id \}\}/);
+  assert.match(reuseBlock, /id: verify_reuse_artifact/);
+  assert.match(reuseBlock, /if: steps\.download_reuse_artifact\.outcome == 'success'/);
+  assert.match(reuseBlock, /verify_release_reuse\.mjs/);
+  assert.match(reuseBlock, /--root release-candidate/);
+  assert.match(reuseBlock, /--repository "\$RELEASE_REPOSITORY"/);
   assert.equal(
-    buildJob.match(/if: steps\.reuse_artifact\.outcome != 'success'/g)?.length,
-    2,
-    "build and upload must both be conditional on artifact reuse",
+    buildJob.match(/if: steps\.verify_reuse_artifact\.outcome != 'success'/g)?.length,
+    5,
+    "Rust validation, build, and upload must all be conditional on verified artifact reuse",
   );
   const uploadIndex = buildJob.indexOf("Upload immutable release artifact");
   assert.ok(uploadIndex > signingIndex, "the artifact must upload after the conditional build");
