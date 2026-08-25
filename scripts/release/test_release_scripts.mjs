@@ -3,9 +3,11 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import crypto from "node:crypto";
+import { createServer } from "node:http";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { once } from "node:events";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import test from "node:test";
@@ -17,6 +19,7 @@ const allocatorScript = path.join(releaseDirectory, "allocate_nightly_version.sh
 const buildScript = path.join(releaseDirectory, "build_macos_release.sh");
 const tagVerifierScript = path.join(releaseDirectory, "verify_tag_target.sh");
 const manifestScript = path.join(releaseDirectory, "create_manifest.mjs");
+const publisherScript = path.join(releaseDirectory, "publish_release.mjs");
 const reuseVerifierScript = path.join(releaseDirectory, "verify_release_reuse.mjs");
 const workflowPath = path.join(releaseDirectory, "..", "..", ".github", "workflows", "release.yml");
 const gitSha = "a".repeat(40);
@@ -103,6 +106,65 @@ async function createManifest(directory, version, channel) {
   if (channel) args.push("--channel", channel);
   await execFileAsync(process.execPath, args);
   return JSON.parse(await fs.readFile(path.join(directory, "cadence-release-manifest.json"), "utf8"));
+}
+
+async function startReleaseServer({ failStageName } = {}) {
+  const requests = [];
+  const server = createServer((request, response) => {
+    const chunks = [];
+    request.on("data", (chunk) => chunks.push(chunk));
+    request.on("end", () => {
+      const body = Buffer.concat(chunks);
+      requests.push({
+        method: request.method,
+        url: request.url,
+        headers: request.headers,
+        body,
+      });
+      if (request.method === "GET" && request.url === "/plugins/api/v1/products/cadence/releases") {
+        response.writeHead(200, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ artifact_kind: "application", release_upload: { manifest_schema_versions: [2] } }));
+        return;
+      }
+      if (request.method === "PUT" && request.url?.includes("/staging/files/")) {
+        const name = decodeURIComponent(request.url.split("/").at(-1));
+        if (name === failStageName) {
+          response.writeHead(500, { "Content-Type": "text/plain" });
+          response.end("synthetic staging failure\n");
+          return;
+        }
+        response.writeHead(200);
+        response.end();
+        return;
+      }
+      if (request.method === "PUT" && request.url?.endsWith("/commit")) {
+        response.writeHead(200, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ committed: true }));
+        return;
+      }
+      response.writeHead(404);
+      response.end("not found\n");
+    });
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  assert.equal(typeof address, "object");
+  return {
+    endpoint: `http://127.0.0.1:${address.port}`,
+    requests,
+    close: () => new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve())),
+  };
+}
+
+function publishRelease(directory, endpoint) {
+  return execFileAsync(process.execPath, [
+    publisherScript,
+    "--manifest", path.join(directory, "cadence-release-manifest.json"),
+    "--root", directory,
+    "--endpoint", endpoint,
+    "--token", "fixture-release-token",
+  ]);
 }
 
 async function createReuseFixture() {
@@ -698,6 +760,112 @@ test("manifest rejects unknown channels and mismatched channel versions", async 
     } finally {
       await fs.rm(directory, { recursive: true, force: true });
     }
+  }
+});
+
+test("release publisher streams exact artifacts and commits only after ordered validation", async () => {
+  const directory = await createInputDirectory("0.1.0");
+  const manifest = await createManifest(directory, "0.1.0");
+  const server = await startReleaseServer();
+  try {
+    const result = await publishRelease(directory, server.endpoint);
+    assert.match(result.stdout, /"committed": true/);
+    const manifestBytes = await fs.readFile(path.join(directory, "cadence-release-manifest.json"));
+    const descriptors = [manifest.artifacts[0], manifest.screenshot, manifest.changelog];
+    assert.equal(server.requests.length, 5, "capability, three files, then commit");
+    assert.equal(server.requests[0].method, "GET");
+    for (const [index, descriptor] of descriptors.entries()) {
+      const request = server.requests[index + 1];
+      assert.equal(request.method, "PUT");
+      assert.match(request.url, new RegExp(`/staging/files/${encodeURIComponent(descriptor.name)}$`));
+      assert.equal(request.headers.authorization, "Bearer fixture-release-token");
+      assert.equal(request.headers["content-type"], "application/octet-stream");
+      assert.equal(Number(request.headers["content-length"]), descriptor.size_bytes);
+      assert.equal(request.body.length, descriptor.size_bytes);
+      assert.equal(
+        request.headers["x-portalsurfer-sha256"],
+        crypto.createHash("sha256").update(request.body).digest("hex"),
+      );
+      assert.equal(request.headers["x-portalsurfer-release-version"], manifest.version);
+      assert.equal(request.headers["x-portalsurfer-release-channel"], manifest.channel);
+      assert.equal(request.headers["x-portalsurfer-released-at"], manifest.released_at);
+    }
+    const commit = server.requests.at(-1);
+    assert.equal(commit.method, "PUT");
+    assert.match(commit.url, /\/commit$/);
+    assert.equal(commit.headers.authorization, "Bearer fixture-release-token");
+    assert.equal(commit.headers["content-type"], "application/vnd.portalsurfer.release-manifest+json;version=2");
+    assert.equal(Number(commit.headers["content-length"]), manifestBytes.length);
+    assert.deepEqual(commit.body, manifestBytes);
+    assert.equal(
+      commit.headers["x-portalsurfer-manifest-sha256"],
+      crypto.createHash("sha256").update(manifestBytes).digest("hex"),
+    );
+
+    const publisher = await fs.readFile(publisherScript, "utf8");
+    assert.doesNotMatch(publisher, /fs\.readFile\(filePath/);
+    assert.match(publisher, /createReadStream\(filePath\)/);
+    assert.match(publisher, /duplex: "half"/);
+  } finally {
+    await server.close();
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("release publisher stops before commit on staging failure or metadata mismatch", async (t) => {
+  await t.test("staging failure", async () => {
+    const directory = await createInputDirectory("0.1.0");
+    const manifest = await createManifest(directory, "0.1.0");
+    const server = await startReleaseServer({ failStageName: manifest.screenshot.name });
+    try {
+      await assert.rejects(
+        publishRelease(directory, server.endpoint),
+        (error) => error.code === 1 && error.stderr.includes(`staging ${manifest.screenshot.name} failed`),
+      );
+      assert.equal(server.requests.some((request) => request.url?.endsWith("/commit")), false);
+    } finally {
+      await server.close();
+      await fs.rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  await t.test("artifact hash mismatch", async () => {
+    const directory = await createInputDirectory("0.1.0");
+    await createManifest(directory, "0.1.0");
+    const manifestPath = path.join(directory, "cadence-release-manifest.json");
+    const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
+    const artifactPath = path.join(directory, manifest.artifacts[0].name);
+    const artifact = await fs.readFile(artifactPath);
+    artifact[0] ^= 0xff;
+    await fs.writeFile(artifactPath, artifact);
+    const server = await startReleaseServer();
+    try {
+      await assert.rejects(
+        publishRelease(directory, server.endpoint),
+        (error) => error.code === 1 && error.stderr.includes(`manifest metadata does not match ${manifest.artifacts[0].name}`),
+      );
+      assert.equal(server.requests.filter((request) => request.method === "PUT").length, 0);
+    } finally {
+      await server.close();
+      await fs.rm(directory, { recursive: true, force: true });
+    }
+  });
+});
+
+test("release publisher rejects a missing artifact before commit", async () => {
+  const directory = await createInputDirectory("0.1.0");
+  const manifest = await createManifest(directory, "0.1.0");
+  await fs.rm(path.join(directory, manifest.artifacts[0].name));
+  const server = await startReleaseServer();
+  try {
+    await assert.rejects(
+      publishRelease(directory, server.endpoint),
+      (error) => error.code === "ENOENT" || error.code === 1,
+    );
+    assert.equal(server.requests.some((request) => request.url?.endsWith("/commit")), false);
+  } finally {
+    await server.close();
+    await fs.rm(directory, { recursive: true, force: true });
   }
 });
 

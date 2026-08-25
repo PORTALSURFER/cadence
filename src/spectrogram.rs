@@ -95,13 +95,13 @@ struct OverlayGeometryKey {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct OverlayGeometryCache {
     key: Option<OverlayGeometryKey>,
-    primitives: Option<Arc<[PaintPrimitive]>>,
+    primitives: Vec<PaintPrimitive>,
 }
 
 impl OverlayGeometryCache {
-    fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.key = None;
-        self.primitives = None;
+        self.primitives.clear();
     }
 
     fn primitives_for(
@@ -111,7 +111,7 @@ impl OverlayGeometryCache {
         history_scale: f32,
         bounds: Rect,
         theme: &ThemeTokens,
-    ) -> Option<Arc<[PaintPrimitive]>> {
+    ) -> Option<&[PaintPrimitive]> {
         if !frame.is_valid() || !bounds.has_finite_positive_area() {
             self.clear();
             return None;
@@ -139,21 +139,28 @@ impl OverlayGeometryCache {
             ],
         };
         if self.key != Some(key) {
-            self.primitives = Some(Arc::from(
-                build_overlay_primitives(frame, mode, history_scale, bounds, theme)
-                    .into_boxed_slice(),
-            ));
+            self.primitives.clear();
+            append_overlay_primitives(
+                frame,
+                mode,
+                history_scale,
+                bounds,
+                &mut self.primitives,
+                theme,
+            );
             self.key = Some(key);
         }
-        self.primitives.as_ref().map(Arc::clone)
+        Some(self.primitives.as_slice())
     }
 
     #[cfg(test)]
     fn primitives_ptr(&self) -> Option<*const PaintPrimitive> {
-        self.primitives
-            .as_ref()
-            .and_then(|primitives| primitives.first())
-            .map(std::ptr::from_ref)
+        self.primitives.first().map(std::ptr::from_ref)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.key.is_none() && self.primitives.is_empty()
     }
 }
 
@@ -1122,7 +1129,7 @@ fn append_overlay_grid(
 /// backends, so its data path is deliberately bounded and shape-based. The
 /// regular projected widget retains the higher-resolution GPU path.
 fn append_overlay_primitives(
-    frame: Arc<LiveSpectrogramFrame>,
+    frame: &LiveSpectrogramFrame,
     mode: crate::LiveSpectrogramMode,
     history_scale: f32,
     bounds: Rect,
@@ -1155,7 +1162,7 @@ fn append_overlay_primitives(
         let spectrum_curve = match mode {
             crate::LiveSpectrogramMode::Waterfall => {
                 append_overlay_waterfall(
-                    &frame,
+                    frame,
                     plot,
                     history_scale,
                     primitives,
@@ -1164,7 +1171,7 @@ fn append_overlay_primitives(
                 None
             }
             crate::LiveSpectrogramMode::Spectrum => append_overlay_spectrum(
-                &frame,
+                frame,
                 plot,
                 primitives,
                 LIVE_SPECTROGRAM_OVERLAY_WIDGET_ID,
@@ -1172,7 +1179,7 @@ fn append_overlay_primitives(
             ),
         };
         append_overlay_grid(
-            &frame,
+            frame,
             plot,
             primitives,
             LIVE_SPECTROGRAM_OVERLAY_WIDGET_ID,
@@ -1199,25 +1206,6 @@ fn append_overlay_primitives(
     }));
 }
 
-fn build_overlay_primitives(
-    frame: &LiveSpectrogramFrame,
-    mode: crate::LiveSpectrogramMode,
-    history_scale: f32,
-    bounds: Rect,
-    theme: &ThemeTokens,
-) -> Vec<PaintPrimitive> {
-    let mut primitives = Vec::new();
-    append_overlay_primitives(
-        Arc::new(frame.clone()),
-        mode,
-        history_scale,
-        bounds,
-        &mut primitives,
-        theme,
-    );
-    primitives
-}
-
 /// Paint one validated live frame over the retained spectrogram body using a
 /// reusable bounded geometry cache.
 pub(crate) fn paint_overlay_cached(
@@ -1229,7 +1217,7 @@ pub(crate) fn paint_overlay_cached(
     theme: &ThemeTokens,
     cache: &mut OverlayGeometryCache,
 ) {
-    if let Some(cached) = cache.primitives_for(&frame, mode, history_scale, bounds, theme) {
+    if let Some(cached) = cache.primitives_for(frame.as_ref(), mode, history_scale, bounds, theme) {
         primitives.extend(cached.iter().cloned());
     }
 }
@@ -1859,6 +1847,7 @@ mod tests {
             &mut cache,
         );
         let first = cache.primitives_ptr().expect("cached overlay geometry");
+        let first_key = cache.key;
         primitives.clear();
         paint_overlay_cached(
             Arc::clone(&frame),
@@ -1882,7 +1871,11 @@ mod tests {
             &mut cache,
         );
         let mode_changed = cache.primitives_ptr().expect("mode cache entry");
-        assert_ne!(mode_changed, first);
+        assert_eq!(
+            mode_changed, first,
+            "key changes should reuse the top-level Vec"
+        );
+        assert_ne!(cache.key, first_key);
 
         primitives.clear();
         paint_overlay_cached(
@@ -1894,7 +1887,8 @@ mod tests {
             &theme,
             &mut cache,
         );
-        assert_ne!(cache.primitives_ptr(), Some(mode_changed));
+        assert_eq!(cache.primitives_ptr(), Some(mode_changed));
+        assert_ne!(cache.key, first_key);
     }
 
     #[test]
