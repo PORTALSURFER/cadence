@@ -1005,12 +1005,21 @@ fn resample_unknown_buckets(
     source_windows: usize,
     maximum_buckets: usize,
 ) -> Vec<PeakMeasurement> {
+    resample_unknown_buckets_impl(buckets, source_windows, maximum_buckets, None)
+}
+
+fn resample_unknown_buckets_impl(
+    buckets: &[PeakBucket],
+    source_windows: usize,
+    maximum_buckets: usize,
+    mut overlap_count: Option<&mut usize>,
+) -> Vec<PeakMeasurement> {
     if source_windows == 0 {
         return Vec::new();
     }
 
     let slot_count = source_windows.min(maximum_buckets.max(1));
-    let source_windows = source_windows as f64;
+    let source_windows_as_float = source_windows as f64;
     let slot_count_as_float = slot_count as f64;
     let mut slots = vec![ResampledPeak::empty(); slot_count];
 
@@ -1025,12 +1034,30 @@ fn resample_unknown_buckets(
             continue;
         }
 
-        for (slot_index, slot) in slots.iter_mut().enumerate() {
-            let slot_start = slot_index as f64 * source_windows / slot_count_as_float;
-            let slot_end = (slot_index + 1) as f64 * source_windows / slot_count_as_float;
+        // Bucket spans are source-ordered, so only the first and last slot
+        // that can overlap this bucket need to be visited. The integer
+        // arithmetic keeps exact boundary ownership even for large source
+        // windows; the overlap itself intentionally retains the existing f64
+        // calculation and accumulation semantics.
+        let source_windows_as_u128 = source_windows as u128;
+        let slot_count_as_u128 = slot_count as u128;
+        let first_slot = ((start_window as u128 * slot_count_as_u128) / source_windows_as_u128)
+            .min(slot_count_as_u128) as usize;
+        let last_slot = (end_window as u128 * slot_count_as_u128)
+            .div_ceil(source_windows_as_u128)
+            .min(slot_count_as_u128) as usize;
+
+        for (slot_index, slot) in slots[first_slot..last_slot].iter_mut().enumerate() {
+            let slot_index = first_slot + slot_index;
+            let slot_start = slot_index as f64 * source_windows_as_float / slot_count_as_float;
+            let slot_end = (slot_index + 1) as f64 * source_windows_as_float / slot_count_as_float;
             let overlap = (bucket_end.min(slot_end) - bucket_start.max(slot_start)).max(0.0);
             if overlap <= 0.0 {
                 continue;
+            }
+
+            if let Some(overlap_count) = overlap_count.as_deref_mut() {
+                *overlap_count = overlap_count.saturating_add(1);
             }
 
             let fraction = overlap / bucket_span;
@@ -1043,6 +1070,22 @@ fn resample_unknown_buckets(
     }
 
     slots.into_iter().map(ResampledPeak::finish).collect()
+}
+
+#[cfg(test)]
+fn resample_unknown_buckets_counted(
+    buckets: &[PeakBucket],
+    source_windows: usize,
+    maximum_buckets: usize,
+) -> (Vec<PeakMeasurement>, usize) {
+    let mut overlap_count = 0;
+    let result = resample_unknown_buckets_impl(
+        buckets,
+        source_windows,
+        maximum_buckets,
+        Some(&mut overlap_count),
+    );
+    (result, overlap_count)
 }
 
 /// Keep the decoded peak envelope bounded even when a source has millions of
@@ -1492,11 +1535,11 @@ fn summary_from_peaks(peaks: &[PeakMeasurement]) -> GpuSignalSummary {
 mod tests {
     use super::{
         LoudnessAccumulator, LoudnessPoint, MAX_LOUDNESS_MATCH_DB, MAX_LOUDNESS_PROFILE_POINTS,
-        PeakMeasurement, PeakReducer, PeakWindow, WaveformData, decode_audio_file,
-        decode_waveform_with_progress_and_cancellation, linear_gain_for_db, load_waveform_cache,
-        loudness_at_position, loudness_channel_map, loudness_match_gain_db, preview_progress,
-        preview_waveform, progressive_preview, summary_from_peaks,
-        write_waveform_cache_if_unchanged,
+        PeakBucket, PeakMeasurement, PeakReducer, PeakWindow, ResampledPeak, WaveformData,
+        decode_audio_file, decode_waveform_with_progress_and_cancellation, linear_gain_for_db,
+        load_waveform_cache, loudness_at_position, loudness_channel_map, loudness_match_gain_db,
+        preview_progress, preview_waveform, progressive_preview, resample_unknown_buckets,
+        resample_unknown_buckets_counted, summary_from_peaks, write_waveform_cache_if_unchanged,
     };
     use radiant::runtime::GpuSignalSummary;
     use std::{
@@ -1696,6 +1739,172 @@ mod tests {
         assert_eq!(finished.len(), 4);
         assert!(finished[2].rms() > 0.99);
         assert!(finished[3].rms() < 0.9);
+    }
+
+    fn test_bucket(
+        start_window: usize,
+        end_window: usize,
+        min: f32,
+        max: f32,
+        squared_energy: f64,
+        frames: usize,
+    ) -> PeakBucket {
+        PeakBucket {
+            min,
+            max,
+            windows: end_window.saturating_sub(start_window),
+            squared_energy,
+            frames,
+            start_window,
+            end_window,
+        }
+    }
+
+    fn slow_resample_unknown_buckets(
+        buckets: &[PeakBucket],
+        source_windows: usize,
+        maximum_buckets: usize,
+    ) -> Vec<PeakMeasurement> {
+        if source_windows == 0 {
+            return Vec::new();
+        }
+
+        let slot_count = source_windows.min(maximum_buckets.max(1));
+        let source_windows = source_windows as f64;
+        let slot_count_as_float = slot_count as f64;
+        let mut slots = vec![ResampledPeak::empty(); slot_count];
+
+        for bucket in buckets {
+            let Some((start_window, end_window)) = bucket.span() else {
+                continue;
+            };
+            let bucket_start = start_window as f64;
+            let bucket_end = end_window as f64;
+            let bucket_span = bucket_end - bucket_start;
+            if bucket_span <= 0.0 || bucket.frames == 0 {
+                continue;
+            }
+
+            for (slot_index, slot) in slots.iter_mut().enumerate() {
+                let slot_start = slot_index as f64 * source_windows / slot_count_as_float;
+                let slot_end = (slot_index + 1) as f64 * source_windows / slot_count_as_float;
+                let overlap = (bucket_end.min(slot_end) - bucket_start.max(slot_start)).max(0.0);
+                if overlap <= 0.0 {
+                    continue;
+                }
+
+                let fraction = overlap / bucket_span;
+                slot.min = slot.min.min(bucket.min);
+                slot.max = slot.max.max(bucket.max);
+                slot.squared_energy += bucket.squared_energy * fraction;
+                slot.frames += bucket.frames as f64 * fraction;
+                slot.covered_span += overlap;
+            }
+        }
+
+        slots.into_iter().map(ResampledPeak::finish).collect()
+    }
+
+    #[test]
+    fn unknown_duration_resampling_matches_oracle_at_exact_boundaries() {
+        let buckets = [
+            test_bucket(0, 2, -0.8, 0.4, 2.0, 2),
+            test_bucket(2, 4, -0.2, 0.9, 6.0, 2),
+        ];
+        let expected = slow_resample_unknown_buckets(&buckets, 4, 4);
+
+        assert_eq!(resample_unknown_buckets(&buckets, 4, 4), expected);
+    }
+
+    #[test]
+    fn unknown_duration_resampling_matches_oracle_for_uneven_multi_slot_buckets() {
+        let buckets = [
+            test_bucket(0, 3, -0.8, 0.4, 3.0, 3),
+            test_bucket(3, 7, -0.2, 0.9, 10.0, 4),
+            test_bucket(7, 10, -1.0, 0.7, 6.0, 3),
+        ];
+        let expected = slow_resample_unknown_buckets(&buckets, 10, 4);
+
+        assert_eq!(resample_unknown_buckets(&buckets, 10, 4), expected);
+        assert_eq!(expected.len(), 4);
+        assert_eq!(expected[0].min, -0.8);
+        assert_eq!(expected[1].max, 0.9);
+        assert_eq!(expected[3].max, 0.7);
+    }
+
+    #[test]
+    fn unknown_duration_resampling_preserves_weighted_extrema_energy_and_frames() {
+        let buckets = [
+            test_bucket(0, 3, -0.75, 0.5, 9.0, 6),
+            test_bucket(3, 8, -0.25, 0.9, 20.0, 10),
+        ];
+        let actual = resample_unknown_buckets(&buckets, 8, 3);
+        let expected = slow_resample_unknown_buckets(&buckets, 8, 3);
+
+        assert_eq!(actual, expected);
+        assert!(actual.iter().any(|peak| peak.min == -0.75));
+        assert!(actual.iter().any(|peak| peak.max == 0.9));
+        assert_eq!(actual.iter().map(|peak| peak.frames).sum::<usize>(), 15);
+        assert!((actual[0].squared_energy - 7.5).abs() < 1e-9);
+        assert!((actual[1].squared_energy - 9.6875).abs() < 1e-9);
+        assert!((actual[2].squared_energy - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn unknown_duration_partial_snapshot_matches_oracle() {
+        let mut reducer = PeakReducer::new(3, None);
+        for (index, level) in [0.2, 0.8, 0.4, 0.9, 0.1].into_iter().enumerate() {
+            reducer.add(PeakMeasurement {
+                min: -level,
+                max: level,
+                squared_energy: f64::from(level * level) * 2.0,
+                frames: 2,
+            });
+            assert_eq!(reducer.seen_windows, index + 1);
+        }
+
+        let partial = PeakMeasurement {
+            min: -0.6,
+            max: 0.6,
+            squared_energy: 1.8,
+            frames: 3,
+        };
+        let actual = reducer.snapshot_with_partial(Some(partial));
+        let mut buckets = reducer.buckets.clone();
+        let mut partial_bucket = PeakBucket::empty();
+        partial_bucket.add(partial, reducer.seen_windows);
+        buckets.push(partial_bucket);
+        let source_windows = reducer.seen_windows + 1;
+        if buckets.len() > reducer.maximum_buckets {
+            buckets = buckets
+                .chunks(2)
+                .map(|pair| {
+                    let first = pair[0];
+                    let second = pair.get(1).copied().unwrap_or_else(PeakBucket::empty);
+                    first.merge(second)
+                })
+                .collect();
+        }
+        let expected = slow_resample_unknown_buckets(&buckets, source_windows, 3);
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn unknown_duration_resampling_scales_to_maximum_bucket_count_with_bounded_overlap_work() {
+        let source_windows = 4_194_304;
+        let buckets = (0..4_096)
+            .map(|index| {
+                let start = index * 1_024;
+                test_bucket(start, start + 1_024, -0.5, 0.5, 1.0, 1)
+            })
+            .collect::<Vec<_>>();
+        let (peaks, overlap_count) =
+            resample_unknown_buckets_counted(&buckets, source_windows, 4_096);
+
+        assert_eq!(peaks.len(), 4_096);
+        assert_eq!(overlap_count, 4_096);
+        assert!(overlap_count < buckets.len() * 4_096);
     }
 
     #[test]
