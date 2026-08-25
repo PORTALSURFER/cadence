@@ -1495,10 +1495,10 @@ impl AppState {
     {
         let (transport, status) = match transport_factory() {
             Ok(transport) => (transport, String::from("Ready — import a track to begin.")),
-            Err(error) => (
-                transport::AudioTransport::unavailable(),
-                format!("Audio playback unavailable at startup: {error}"),
-            ),
+            Err(error) => {
+                let status = format!("Audio playback unavailable at startup: {error}");
+                (transport::AudioTransport::unavailable(Some(error)), status)
+            }
         };
         Self {
             library: SharedLibrary::default(),
@@ -2020,6 +2020,16 @@ fn library_unavailable_status(state: &AppState) -> &'static str {
     }
 }
 
+fn append_startup_transport_unavailable_status(
+    transport: &transport::AudioTransport,
+    status: &mut String,
+) {
+    if let Some(error) = transport.startup_error() {
+        status.push_str(" Audio playback unavailable at startup: ");
+        status.push_str(error);
+    }
+}
+
 fn activate_loaded_library(
     state: &mut AppState,
     context: &mut ui::UiUpdateContext<Message>,
@@ -2047,6 +2057,7 @@ fn activate_loaded_library(
             plural(state.library.tracks.len())
         )
     };
+    append_startup_transport_unavailable_status(&state.transport, &mut state.status);
     state.library_load_state = LibraryLoadState::Ready;
     state.review_cursor_millis = 0;
     state.draft_note = None;
@@ -3168,6 +3179,10 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     state.status = format!(
                         "Started a fresh library. The unreadable file was preserved at {}.",
                         backup_path.display()
+                    );
+                    append_startup_transport_unavailable_status(
+                        &state.transport,
+                        &mut state.status,
                     );
                 }
                 Err(error) => {
@@ -13371,9 +13386,38 @@ mod tests {
     }
 
     #[test]
+    fn loaded_library_activation_preserves_main_transport_startup_failure() {
+        let error = String::from("injected thread creation failure");
+        let mut state = AppState::loading_with_transport_factory(|| Err(error.clone()));
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::LibraryLoaded(Ok(Library::default())),
+            &mut context,
+        );
+
+        assert_eq!(state.library_load_state, LibraryLoadState::Ready);
+        assert!(
+            state
+                .status
+                .contains("Audio playback unavailable at startup")
+        );
+        assert!(state.status.contains(&error));
+        assert_eq!(
+            state.transport.play(0),
+            Err(String::from("The audio transport is no longer available."))
+        );
+        assert_eq!(
+            state.transport.pause(0),
+            Err(String::from("The audio transport is no longer available."))
+        );
+    }
+
+    #[test]
     fn successful_app_startup_preserves_ready_status() {
         let state =
-            AppState::with_transport_factory(|| Ok(transport::AudioTransport::unavailable()));
+            AppState::with_transport_factory(|| Ok(transport::AudioTransport::unavailable(None)));
 
         assert_eq!(state.library_load_state, LibraryLoadState::Ready);
         assert_eq!(state.status, "Ready — import a track to begin.");
@@ -13382,7 +13426,7 @@ mod tests {
     #[test]
     fn failed_reference_transport_creation_is_retryable_without_inserting_handle() {
         let mut state =
-            AppState::with_transport_factory(|| Ok(transport::AudioTransport::unavailable()));
+            AppState::with_transport_factory(|| Ok(transport::AudioTransport::unavailable(None)));
         let error = String::from("injected reference thread creation failure");
 
         let failure = ensure_reference_transport_with(&mut state, || Err(error.clone()));
@@ -13396,7 +13440,7 @@ mod tests {
         let mut retried = false;
         let success = ensure_reference_transport_with(&mut state, || {
             retried = true;
-            Ok(transport::AudioTransport::unavailable())
+            Ok(transport::AudioTransport::unavailable(None))
         });
 
         assert!(success.is_ok());

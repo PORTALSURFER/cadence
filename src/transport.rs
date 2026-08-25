@@ -1541,6 +1541,7 @@ pub struct AudioTransport {
     queued_commands: Arc<AtomicUsize>,
     shared: Arc<SharedSnapshot>,
     pending_load: Arc<PendingLoad>,
+    startup_error: Option<String>,
     next_token: Arc<AtomicU64>,
     #[cfg(test)]
     test_next_command_error: Arc<Mutex<Option<String>>>,
@@ -1589,10 +1590,11 @@ impl AudioTransport {
             queued_commands,
             shared,
             pending_load,
+            None,
         ))
     }
 
-    pub fn unavailable() -> Self {
+    pub fn unavailable(startup_error: Option<String>) -> Self {
         let (commands, receiver) = mpsc::sync_channel(COMMAND_CAPACITY);
         drop(receiver);
         Self::from_parts(
@@ -1600,6 +1602,7 @@ impl AudioTransport {
             Arc::new(AtomicUsize::new(0)),
             Arc::new(SharedSnapshot::new()),
             Arc::new(PendingLoad::new()),
+            startup_error,
         )
     }
 
@@ -1608,12 +1611,14 @@ impl AudioTransport {
         queued_commands: Arc<AtomicUsize>,
         shared: Arc<SharedSnapshot>,
         pending_load: Arc<PendingLoad>,
+        startup_error: Option<String>,
     ) -> Self {
         Self {
             commands,
             queued_commands,
             shared,
             pending_load,
+            startup_error,
             next_token: Arc::new(AtomicU64::new(1)),
             #[cfg(test)]
             test_next_command_error: Arc::new(Mutex::new(None)),
@@ -1627,6 +1632,10 @@ impl AudioTransport {
 
     pub fn snapshot(&self) -> Snapshot {
         self.shared.snapshot()
+    }
+
+    pub(crate) fn startup_error(&self) -> Option<&str> {
+        self.startup_error.as_deref()
     }
 
     pub(crate) fn live_frame_snapshot(
@@ -2626,6 +2635,7 @@ mod tests {
             queued_commands: Arc::new(AtomicUsize::new(super::COMMAND_CAPACITY)),
             shared: Arc::new(SharedSnapshot::new()),
             pending_load: Arc::new(PendingLoad::new()),
+            startup_error: None,
             next_token: Arc::new(AtomicU64::new(1)),
             test_next_command_error: Arc::new(Mutex::new(None)),
         };
