@@ -64,7 +64,7 @@ enum Message {
     ReferenceCatalogFilesPicked(Vec<PathBuf>),
     ReferenceCatalogImportCompleted {
         path: PathBuf,
-        result: Result<storage::Library, String>,
+        result: Result<storage::Persisted<storage::Library>, String>,
     },
     ReferenceCatalogImportBatchCompleted {
         report: storage::BatchImportReport,
@@ -73,20 +73,20 @@ enum Message {
     LibraryLoaded(Result<storage::Library, String>),
     RetryLibraryLoad,
     PreserveLibraryAndStartFresh,
-    LibraryRecoveryCompleted(Result<PathBuf, String>),
+    LibraryRecoveryCompleted(Result<storage::Persisted<PathBuf>, String>),
     AdmitLibrarySave,
     AdmitSelectionSave(ui::TaskTicket),
     RetryLibrarySave,
-    ImportCompleted(Result<storage::Library, String>),
+    ImportCompleted(Result<storage::Persisted<storage::Library>, String>),
     ImportBatchCompleted(storage::BatchImportReport),
     ReplaceCompleted {
         track_id: String,
-        result: Result<storage::Library, String>,
+        result: Result<storage::Persisted<storage::Library>, String>,
     },
     ReferenceImportCompleted {
         track_id: String,
         path: PathBuf,
-        result: Result<storage::Library, String>,
+        result: Result<storage::Persisted<storage::Library>, String>,
     },
     ReferenceImportBatchCompleted {
         track_id: String,
@@ -96,7 +96,7 @@ enum Message {
         request_id: u64,
         track_id: String,
         path: PathBuf,
-        result: Result<storage::Library, String>,
+        result: Result<storage::Persisted<storage::Library>, String>,
     },
     AudioImportPreflightCompleted {
         request: AudioImportRequest,
@@ -111,7 +111,7 @@ enum Message {
     },
     LibrarySaved {
         attempt: LibrarySaveAttempt,
-        result: Result<(), String>,
+        result: Result<storage::PersistenceOutcome, String>,
     },
     DecodeCompleted {
         track_id: String,
@@ -887,7 +887,7 @@ struct CloseSaveRequest {
 #[derive(Debug)]
 struct CloseSaveCompletion {
     attempt: LibrarySaveAttempt,
-    result: Result<(), String>,
+    result: Result<storage::PersistenceOutcome, String>,
 }
 
 type CloseSaveRequestReceiver = Rc<RefCell<Option<Receiver<CloseSaveRequest>>>>;
@@ -3411,8 +3411,13 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     .saturating_add(1)
                     .min(state.reference_catalog_import_completed);
             }
+            let persistence_outcome = match &result {
+                Ok(persisted) => Some(persisted.outcome.clone()),
+                Err(_) => None,
+            };
             match result {
-                Ok(library) => {
+                Ok(persisted) => {
+                    let library = persisted.value;
                     state
                         .library
                         .replace(library, LibraryMutationScope::ProjectionAndMarkers);
@@ -3443,6 +3448,9 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 schedule_next_pending_library_operation(state, context);
             } else {
                 schedule_next_reference_catalog_import(state, context);
+            }
+            if let Some(outcome) = persistence_outcome.as_ref() {
+                append_persistence_warning(&mut state.status, outcome);
             }
             context.request_repaint();
         }
@@ -3527,12 +3535,15 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
         Message::LibraryRecoveryCompleted(result) => {
             state.busy = false;
             match result {
-                Ok(backup_path) => {
+                Ok(persisted) => {
+                    let backup_path = persisted.value;
+                    let outcome = persisted.outcome;
                     activate_loaded_library(state, context, storage::Library::default());
                     state.status = format!(
                         "Started a fresh library. The unreadable file was preserved at {}.",
                         backup_path.display()
                     );
+                    append_persistence_warning(&mut state.status, &outcome);
                     append_startup_transport_unavailable_status(
                         &state.transport,
                         &mut state.status,
@@ -3563,7 +3574,9 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             record_import_attempt(state, failed);
             clear_planner_drag(state);
             match result {
-                Ok(library) => {
+                Ok(persisted) => {
+                    let library = persisted.value;
+                    let outcome = persisted.outcome;
                     state.status = format!(
                         "{} local track{} — all changes saved.",
                         library.tracks.len(),
@@ -3593,6 +3606,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     reset_transport(state);
                     reset_reference_transport(state);
                     state.reference_match_enabled = false;
+                    append_persistence_warning(&mut state.status, &outcome);
                     schedule_selected_waveform_decode(state, context);
                     schedule_selected_reference_decode(state, context);
                 }
@@ -3624,7 +3638,9 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
             clear_planner_drag(state);
             match result {
-                Ok(library) => {
+                Ok(persisted) => {
+                    let library = persisted.value;
+                    let outcome = persisted.outcome;
                     let title = library
                         .tracks
                         .iter()
@@ -3654,6 +3670,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     reset_reference_transport(state);
                     state.reference_match_enabled = false;
                     state.status = format!("Replaced {title}; existing comments were cleared.");
+                    append_persistence_warning(&mut state.status, &outcome);
                     schedule_selected_waveform_decode(state, context);
                     schedule_selected_reference_decode(state, context);
                 }
@@ -3685,7 +3702,9 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
             record_import_attempt(state, failed);
             match result {
-                Ok(library) => {
+                Ok(persisted) => {
+                    let library = persisted.value;
+                    let outcome = persisted.outcome;
                     state
                         .library
                         .replace(library, LibraryMutationScope::ProjectionAndMarkers);
@@ -3703,6 +3722,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                         .map(|track| track.title.clone())
                         .unwrap_or_else(|| String::from("track"));
                     state.status = format!("Reference track added for {title}.");
+                    append_persistence_warning(&mut state.status, &outcome);
                 }
                 Err(error) => state.status = error,
             }
@@ -4142,7 +4162,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
             state.save_in_flight = None;
             match result {
-                Ok(()) => {
+                Ok(outcome) => {
                     state.persisted_library_revision = attempt.revision;
                     if state.close_after_save {
                         if library_dirty(state) {
@@ -4164,16 +4184,23 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                                 }
                             }
                         } else {
+                            append_persistence_warning(&mut state.status, &outcome);
                             state.close_after_save = false;
                             context.exit();
                         }
                     } else {
                         if !main_source_is_mismatched(state)
                             && !reference_source_is_mismatched(state)
-                            && !library_dirty(state)
-                            && !selection_save_debounce_active(state)
                         {
-                            state.status = String::from("All changes saved locally.");
+                            if outcome.is_durability_uncertain() {
+                                state.status = outcome
+                                    .durability_warning()
+                                    .expect("uncertain persistence must have a warning");
+                            } else if !library_dirty(state)
+                                && !selection_save_debounce_active(state)
+                            {
+                                state.status = String::from("All changes saved locally.");
+                            }
                         }
                         if library_dirty(state) {
                             request_library_save_admission(state, context);
@@ -7873,6 +7900,7 @@ fn complete_main_import_batch(
         return;
     }
 
+    let persistence_outcome = report.persistence_outcome.clone();
     let preflight_error_count = state.pending_main_import_errors.len();
     merge_batch_errors(report, &mut state.pending_main_import_errors);
     record_batch_commit_errors(
@@ -7922,6 +7950,9 @@ fn complete_main_import_batch(
         state.status = error_summary;
     }
     finish_import_batch(state);
+    if let Some(outcome) = persistence_outcome.as_ref() {
+        append_persistence_warning(&mut state.status, outcome);
+    }
     clear_import_batch_buffers(state);
     schedule_next_pending_library_operation(state, context);
     context.request_repaint();
@@ -7949,6 +7980,7 @@ fn complete_reference_import_batch(
         return;
     }
 
+    let persistence_outcome = report.persistence_outcome.clone();
     let preflight_error_count = state.pending_reference_import_errors.len();
     merge_batch_errors(report, &mut state.pending_reference_import_errors);
     record_batch_commit_errors(
@@ -7990,6 +8022,9 @@ fn complete_reference_import_batch(
     }
     state.pending_reference_track_id = None;
     finish_import_batch(state);
+    if let Some(outcome) = persistence_outcome.as_ref() {
+        append_persistence_warning(&mut state.status, outcome);
+    }
     clear_import_batch_buffers(state);
     close_reference_menu(state);
     schedule_next_pending_library_operation(state, context);
@@ -8013,6 +8048,7 @@ fn complete_reference_catalog_batch(
         return;
     }
 
+    let persistence_outcome = report.persistence_outcome.clone();
     let preflight_error_count = state.pending_reference_catalog_errors.len();
     merge_batch_errors(report, &mut state.pending_reference_catalog_errors);
     state.reference_catalog_import_completed = report.imported_paths.len();
@@ -8059,6 +8095,9 @@ fn complete_reference_catalog_batch(
     } else {
         clear_import_batch_buffers(state);
         schedule_next_reference_catalog_import(state, context);
+    }
+    if let Some(outcome) = persistence_outcome.as_ref() {
+        append_persistence_warning(&mut state.status, outcome);
     }
     context.request_repaint();
 }
@@ -8142,6 +8181,7 @@ fn start_main_import_batch_commit(
             library: None,
             imported_paths: Vec::new(),
             errors: Vec::new(),
+            persistence_outcome: None,
         };
         update(state, Message::ImportBatchCompleted(report), context);
         return;
@@ -8335,7 +8375,7 @@ fn complete_reference_selection_commit(
     request_id: u64,
     track_id: String,
     path: PathBuf,
-    result: Result<storage::Library, String>,
+    result: Result<storage::Persisted<storage::Library>, String>,
 ) {
     if state.pending_import_commit.as_ref()
         != Some(&PendingImportCommit::ReferenceSelection { request_id })
@@ -8361,7 +8401,9 @@ fn complete_reference_selection_commit(
     let selected_path_changed = selected && previous_path.as_ref() != Some(&path);
 
     match result {
-        Ok(library) => {
+        Ok(persisted) => {
+            let library = persisted.value;
+            let outcome = persisted.outcome;
             state
                 .library
                 .replace(library, LibraryMutationScope::ProjectionAndMarkers);
@@ -8378,6 +8420,7 @@ fn complete_reference_selection_commit(
                 schedule_selected_reference_decode(state, context);
             }
             state.status = format!("Reference set to {}.", reference_track_name(&path));
+            append_persistence_warning(&mut state.status, &outcome);
         }
         Err(error) => {
             close_reference_menu(state);
@@ -8967,6 +9010,15 @@ fn library_dirty(state: &AppState) -> bool {
     state.library_revision != state.persisted_library_revision
 }
 
+fn append_persistence_warning(status: &mut String, outcome: &storage::PersistenceOutcome) {
+    if let Some(warning) = outcome.durability_warning() {
+        if !status.is_empty() {
+            status.push(' ');
+        }
+        status.push_str(&warning);
+    }
+}
+
 fn library_persistence_pending(state: &AppState) -> bool {
     library_dirty(state) || state.save_in_flight.is_some()
 }
@@ -9103,19 +9155,19 @@ fn mark_library_snapshot_persisted(state: &mut AppState) {
 
 fn persist_latest_snapshot_if_dirty(
     state: &mut AppState,
-    persist: impl FnOnce(&storage::Library) -> Result<(), String>,
-) -> Result<bool, String> {
+    persist: impl FnOnce(&storage::Library) -> Result<storage::PersistenceOutcome, String>,
+) -> Result<Option<storage::PersistenceOutcome>, String> {
     if !library_dirty(state) {
-        return Ok(false);
+        return Ok(None);
     }
 
     let revision = state.library_revision;
     let snapshot = state.library.snapshot();
-    persist(&snapshot)?;
+    let outcome = persist(&snapshot)?;
     state.persisted_library_revision = revision;
     state.save_admission_pending = false;
     state.selection_save_pending = false;
-    Ok(true)
+    Ok(Some(outcome))
 }
 
 fn handle_close_requested(state: &mut AppState) -> bool {
@@ -9154,7 +9206,7 @@ fn handle_shutdown(state: &mut AppState) -> Option<serde_json::Value> {
 
 fn handle_shutdown_with(
     state: &mut AppState,
-    persist: impl FnOnce(&storage::Library) -> Result<(), String>,
+    persist: impl FnOnce(&storage::Library) -> Result<storage::PersistenceOutcome, String>,
 ) -> Option<serde_json::Value> {
     cancel_selection_save_debounce(state);
     state.save_admission_pending = false;
@@ -9164,8 +9216,12 @@ fn handle_shutdown_with(
         return None;
     }
 
-    if let Err(error) = persist_latest_snapshot_if_dirty(state, persist) {
-        state.status = format!("Could not save the library during shutdown: {error}");
+    match persist_latest_snapshot_if_dirty(state, persist) {
+        Ok(Some(outcome)) => append_persistence_warning(&mut state.status, &outcome),
+        Ok(None) => {}
+        Err(error) => {
+            state.status = format!("Could not save the library during shutdown: {error}");
+        }
     }
     None
 }
@@ -13339,7 +13395,9 @@ mod tests {
     use crate::transport::{LiveFrameState, Snapshot};
     use crate::{
         audio::{LoudnessPoint, WaveformData},
-        storage::{Library, Note, ReferenceTrack, Track, TrackStage},
+        storage::{
+            Library, Note, Persisted, PersistenceOutcome, ReferenceTrack, Track, TrackStage,
+        },
         transport, waveform,
     };
     use radiant::{
@@ -14357,6 +14415,13 @@ mod tests {
         let decoded = crate::audio::decode_audio_file(&path)
             .expect("valid replacement audio should pass preflight");
         (path, decoded, root)
+    }
+
+    fn durable_persisted<T>(value: T) -> Persisted<T> {
+        Persisted {
+            value,
+            outcome: PersistenceOutcome::Durable,
+        }
     }
 
     fn reference_selection_state(
@@ -16827,7 +16892,7 @@ mod tests {
             &mut state,
             Message::ReferenceCatalogImportCompleted {
                 path,
-                result: Ok(library),
+                result: Ok(durable_persisted(library)),
             },
             &mut context,
         );
@@ -21693,7 +21758,7 @@ mod tests {
                 request_id,
                 track_id,
                 path: second_path.clone(),
-                result: Ok(committed),
+                result: Ok(durable_persisted(committed)),
             },
             &mut context,
         );
@@ -28865,7 +28930,7 @@ mod tests {
 
         update(
             &mut state,
-            Message::ImportCompleted(Ok(Library::default())),
+            Message::ImportCompleted(Ok(durable_persisted(Library::default()))),
             &mut context,
         );
         assert_eq!(
@@ -28902,7 +28967,7 @@ mod tests {
         state.pending_import_commit = Some(PendingImportCommit::Main);
         update(
             &mut state,
-            Message::ImportCompleted(Ok(Library::default())),
+            Message::ImportCompleted(Ok(durable_persisted(Library::default()))),
             &mut context,
         );
         assert!(state.import_batch.is_none());
@@ -29018,6 +29083,137 @@ mod tests {
         update(state, Message::AdmitLibrarySave, context);
     }
 
+    fn uncertain_persistence_outcome() -> PersistenceOutcome {
+        PersistenceOutcome::CommittedButDurabilityUncertain {
+            detail: String::from("injected post-rename parent-directory sync failure"),
+        }
+    }
+
+    #[test]
+    fn uncertain_save_completion_commits_without_retrying_the_same_revision() {
+        let mut state = AppState::default();
+        let mut context = ui::UiUpdateContext::default();
+        schedule_library_save(&mut state, &mut context);
+        admit_library_save_for_test(&mut state, &mut context);
+        let attempt = state
+            .save_in_flight
+            .expect("the mutation should dispatch a save");
+        let _ = context.into_command();
+
+        let mut completion_context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::LibrarySaved {
+                attempt,
+                result: Ok(uncertain_persistence_outcome()),
+            },
+            &mut completion_context,
+        );
+
+        assert_eq!(state.persisted_library_revision, attempt.revision);
+        assert!(!library_dirty(&state));
+        assert!(state.save_in_flight.is_none());
+        assert!(!state.save_admission_pending);
+        assert!(state.status.contains("Crash durability is unconfirmed"));
+        assert!(!state.status.contains("All changes saved locally."));
+        assert_eq!(
+            completion_context
+                .into_command()
+                .business_task_priority("cadence-save-library"),
+            None,
+            "a committed uncertain save must not retry the same revision"
+        );
+    }
+
+    #[test]
+    fn uncertain_save_completion_keeps_a_newer_revision_dirty_and_admissible() {
+        let mut state = AppState::default();
+        let mut context = ui::UiUpdateContext::default();
+        schedule_library_save(&mut state, &mut context);
+        admit_library_save_for_test(&mut state, &mut context);
+        let first_attempt = state
+            .save_in_flight
+            .expect("the first mutation should dispatch a save");
+        let _ = context.into_command();
+        let mut context = ui::UiUpdateContext::default();
+
+        state
+            .library
+            .mutate(LibraryMutationScope::PersistedOnly, |library| {
+                library.selected_track_id = Some(String::from("newer-selection"));
+            });
+        schedule_library_save(&mut state, &mut context);
+        assert!(state.library_revision > first_attempt.revision);
+
+        let mut completion_context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::LibrarySaved {
+                attempt: first_attempt,
+                result: Ok(uncertain_persistence_outcome()),
+            },
+            &mut completion_context,
+        );
+
+        assert_eq!(state.persisted_library_revision, first_attempt.revision);
+        assert!(library_dirty(&state));
+        assert!(state.save_admission_pending);
+        assert!(state.status.contains("Crash durability is unconfirmed"));
+        admit_library_save_for_test(&mut state, &mut completion_context);
+        let second_attempt = state
+            .save_in_flight
+            .expect("a newer revision should receive a fresh save");
+        assert!(second_attempt.revision > first_attempt.revision);
+        assert_ne!(second_attempt.id, first_attempt.id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn main_batch_adopts_snapshot_after_injected_uncertain_persistence() {
+        let (source, decoded, root) = decoded_replacement_fixture();
+        let library_path = root.join("library.json");
+        let mut state = AppState {
+            busy: true,
+            import_batch: Some(ImportBatchProgress {
+                total: 1,
+                completed: 1,
+                failed: 0,
+            }),
+            pending_import_commit: Some(PendingImportCommit::MainBatch),
+            ..AppState::default()
+        };
+        let mut context = ui::UiUpdateContext::default();
+        crate::storage::fail_next_persist_parent_directory_sync_for_test();
+        let report = crate::storage::import_verified_batch(
+            Arc::unwrap_or_clone(state.library.snapshot()),
+            vec![crate::storage::VerifiedImportCandidate::from_decoded(
+                &decoded,
+            )],
+            &library_path,
+        );
+
+        update(
+            &mut state,
+            Message::ImportBatchCompleted(report),
+            &mut context,
+        );
+
+        assert!(
+            state
+                .library
+                .tracks
+                .iter()
+                .any(|track| track.path == source)
+        );
+        assert!(state.import_batch.is_none());
+        assert!(!state.busy);
+        assert!(!library_dirty(&state));
+        assert_eq!(state.persisted_library_revision, state.library_revision);
+        assert!(state.status.contains("Crash durability is unconfirmed"));
+        assert!(!state.status.contains("failed"));
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn selection_debounce_admits_only_the_latest_ticket_and_revision() {
         let mut state = audition_state(&["selection-first", "selection-second", "selection-third"]);
@@ -29108,7 +29304,7 @@ mod tests {
             &mut state,
             Message::LibrarySaved {
                 attempt: first_attempt,
-                result: Ok(()),
+                result: Ok(PersistenceOutcome::Durable),
             },
             &mut context,
         );
@@ -29208,7 +29404,7 @@ mod tests {
             &mut state,
             Message::LibrarySaved {
                 attempt: request.attempt,
-                result: Ok(()),
+                result: Ok(PersistenceOutcome::Durable),
             },
             &mut context,
         );
@@ -29281,7 +29477,7 @@ mod tests {
             &mut state,
             Message::LibrarySaved {
                 attempt: active_attempt,
-                result: Ok(()),
+                result: Ok(PersistenceOutcome::Durable),
             },
             &mut context,
         );
@@ -29318,7 +29514,7 @@ mod tests {
             &mut state,
             Message::LibrarySaved {
                 attempt: first_request.attempt,
-                result: Ok(()),
+                result: Ok(PersistenceOutcome::Durable),
             },
             &mut context,
         );
@@ -29339,7 +29535,7 @@ mod tests {
             &mut state,
             Message::LibrarySaved {
                 attempt: second_request.attempt,
-                result: Ok(()),
+                result: Ok(PersistenceOutcome::Durable),
             },
             &mut completion_context,
         );
@@ -29368,7 +29564,7 @@ mod tests {
             &mut state,
             Message::LibrarySaved {
                 attempt: stale,
-                result: Ok(()),
+                result: Ok(PersistenceOutcome::Durable),
             },
             &mut context,
         );
@@ -29415,7 +29611,7 @@ mod tests {
         assert!(
             handle_shutdown_with(&mut state, |library| {
                 saved = Some(library.clone());
-                Ok(())
+                Ok(PersistenceOutcome::Durable)
             })
             .is_none()
         );
@@ -29448,6 +29644,33 @@ mod tests {
             "Could not save the library during shutdown: disk full"
         );
         assert!(!state.save_admission_pending);
+    }
+
+    #[test]
+    fn shutdown_treats_uncertain_persistence_as_a_committed_snapshot() {
+        let mut state = audition_state(&["shutdown-uncertain-first", "shutdown-uncertain-second"]);
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::SelectTrack(String::from("shutdown-uncertain-second")),
+            &mut context,
+        );
+        let revision = state.library_revision;
+        state.save_admission_pending = true;
+
+        assert!(
+            handle_shutdown_with(&mut state, |_| Ok(uncertain_persistence_outcome())).is_none()
+        );
+
+        assert_eq!(state.persisted_library_revision, revision);
+        assert!(!library_dirty(&state));
+        assert!(!state.save_admission_pending);
+        assert!(state.status.contains("Crash durability is unconfirmed"));
+        assert!(
+            !state
+                .status
+                .contains("Could not save the library during shutdown")
+        );
     }
 
     #[test]
@@ -29496,7 +29719,7 @@ mod tests {
                 assert!(main_token.is_cancelled());
                 assert!(reference_token.is_cancelled());
                 persistence_observed = true;
-                Ok(())
+                Ok(PersistenceOutcome::Durable)
             })
             .is_none()
         );
@@ -29532,7 +29755,7 @@ mod tests {
         assert!(
             handle_shutdown_with(&mut state, |_| {
                 called = true;
-                Ok(())
+                Ok(PersistenceOutcome::Durable)
             })
             .is_none()
         );
@@ -29715,7 +29938,7 @@ mod tests {
             &mut state,
             Message::LibrarySaved {
                 attempt: attempt_b,
-                result: Ok(()),
+                result: Ok(PersistenceOutcome::Durable),
             },
             &mut context,
         );
@@ -29784,7 +30007,7 @@ mod tests {
             &mut state,
             Message::LibrarySaved {
                 attempt: retry_attempt,
-                result: Ok(()),
+                result: Ok(PersistenceOutcome::Durable),
             },
             &mut context,
         );
@@ -29829,7 +30052,7 @@ mod tests {
             &mut state,
             Message::LibrarySaved {
                 attempt: first_attempt,
-                result: Ok(()),
+                result: Ok(PersistenceOutcome::Durable),
             },
             &mut context,
         );
@@ -29873,7 +30096,7 @@ mod tests {
             &mut state,
             Message::LibrarySaved {
                 attempt: second_attempt,
-                result: Ok(()),
+                result: Ok(PersistenceOutcome::Durable),
             },
             &mut context,
         );
@@ -30182,7 +30405,7 @@ mod tests {
                 request_id,
                 track_id: track_id.to_string(),
                 path: path.clone(),
-                result: Ok(committed),
+                result: Ok(durable_persisted(committed)),
             },
             &mut context,
         );
@@ -30339,7 +30562,7 @@ mod tests {
                 request_id,
                 track_id: track_id.to_string(),
                 path,
-                result: Ok(committed),
+                result: Ok(durable_persisted(committed)),
             },
             &mut context,
         );
@@ -30415,7 +30638,7 @@ mod tests {
                 request_id,
                 track_id: track_id.to_string(),
                 path,
-                result: Ok(committed),
+                result: Ok(durable_persisted(committed)),
             },
             &mut context,
         );
@@ -30490,7 +30713,9 @@ mod tests {
                 request_id,
                 track_id: track_id.to_string(),
                 path: path.clone(),
-                result: Ok(Arc::unwrap_or_clone(library_before.snapshot())),
+                result: Ok(durable_persisted(Arc::unwrap_or_clone(
+                    library_before.snapshot(),
+                ))),
             },
             &mut context,
         );
@@ -30610,7 +30835,7 @@ mod tests {
                 request_id,
                 track_id: track_id.to_string(),
                 path: path.clone(),
-                result: Ok(committed),
+                result: Ok(durable_persisted(committed)),
             },
             &mut context,
         );
@@ -30671,7 +30896,7 @@ mod tests {
                 request_id,
                 track_id: other_track_id.to_string(),
                 path: other_path,
-                result: Ok(committed),
+                result: Ok(durable_persisted(committed)),
             },
             &mut context,
         );
@@ -30766,7 +30991,7 @@ mod tests {
                 request_id,
                 track_id: track_id.to_string(),
                 path: PathBuf::from("/external/stale-reference.wav"),
-                result: Ok(Library::default()),
+                result: Ok(durable_persisted(Library::default())),
             },
             &mut context,
         );
@@ -31022,7 +31247,9 @@ mod tests {
             Message::ReferenceImportCompleted {
                 track_id: track_id.clone(),
                 path: first_reference.clone(),
-                result: Ok(Arc::unwrap_or_clone(reference_library.snapshot())),
+                result: Ok(durable_persisted(Arc::unwrap_or_clone(
+                    reference_library.snapshot(),
+                ))),
             },
             &mut context,
         );
@@ -31075,7 +31302,7 @@ mod tests {
             &mut state,
             Message::LibrarySaved {
                 attempt: save_attempt,
-                result: Ok(()),
+                result: Ok(PersistenceOutcome::Durable),
             },
             &mut context,
         );
@@ -31138,7 +31365,9 @@ mod tests {
             &mut state,
             Message::ReferenceCatalogImportCompleted {
                 path: first_catalog.clone(),
-                result: Ok(Arc::unwrap_or_clone(first_library.snapshot())),
+                result: Ok(durable_persisted(Arc::unwrap_or_clone(
+                    first_library.snapshot(),
+                ))),
             },
             &mut context,
         );
