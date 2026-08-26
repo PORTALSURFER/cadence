@@ -816,6 +816,32 @@ test("manifest rejects unknown channels and mismatched channel versions", async 
   }
 });
 
+test("manifest creation rejects a missing or empty output directory before artifact work", async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cadence-manifest-output-dir-test-"));
+  const commonArgs = [
+    "--version", "0.1.0",
+    "--build-id", "cadence-test-build",
+    "--git-sha", gitSha,
+    "--screenshot-source-git-sha", screenshotSourceGitSha,
+    "--released-at", "2026-08-09T00:00:00Z",
+    "--team-id", "TEAM123456",
+    "--notary-submission-id", notarySubmissionId,
+  ];
+  try {
+    for (const [label, outputArgs] of [["missing", []], ["empty", ["--output-dir", ""]]]) {
+      await t.test(label, async () => {
+        await assert.rejects(
+          execFileAsync(process.execPath, [manifestScript, ...outputArgs, ...commonArgs], { cwd: directory }),
+          (error) => error.code === 2 && error.stderr.includes("output-dir is required"),
+        );
+        await assert.rejects(fs.lstat(path.join(directory, "cadence-release-manifest.json")), { code: "ENOENT" });
+      });
+    }
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("release publisher streams exact artifacts and commits only after ordered validation", async () => {
   const directory = await createInputDirectory("0.1.0");
   const manifest = await createManifest(directory, "0.1.0");
@@ -857,8 +883,56 @@ test("release publisher streams exact artifacts and commits only after ordered v
 
     const publisher = await fs.readFile(publisherScript, "utf8");
     assert.doesNotMatch(publisher, /fs\.readFile\(filePath/);
-    assert.match(publisher, /createReadStream\(filePath\)/);
+    assert.match(publisher, /createReadStream\(\{ autoClose: true, start: 0 \}\)/);
     assert.match(publisher, /duplex: "half"/);
+  } finally {
+    await server.close();
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("release publisher rejects a symlink-backed manifest before network activity", async () => {
+  const directory = await createInputDirectory("0.1.0");
+  await createManifest(directory, "0.1.0");
+  const manifestPath = path.join(directory, "cadence-release-manifest.json");
+  const manifestTarget = path.join(directory, "manifest-target.json");
+  await fs.rename(manifestPath, manifestTarget);
+  await fs.symlink(manifestTarget, manifestPath);
+  const server = await startReleaseServer();
+  try {
+    await assert.rejects(
+      publishRelease(directory, server.endpoint),
+      (error) => (error.code === 1 || error.code === 2)
+        && error.stderr.includes("manifest")
+        && error.stderr.includes("regular file"),
+    );
+    assert.equal(server.requests.length, 0);
+  } finally {
+    await server.close();
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("release publisher rejects a symlink-backed descriptor before its upload or commit", async () => {
+  const directory = await createInputDirectory("0.1.0");
+  const manifest = await createManifest(directory, "0.1.0");
+  const descriptor = manifest.screenshot;
+  const descriptorPath = path.join(directory, descriptor.name);
+  const descriptorTarget = path.join(directory, "screenshot-target.png");
+  await fs.rename(descriptorPath, descriptorTarget);
+  await fs.symlink(descriptorTarget, descriptorPath);
+  const server = await startReleaseServer();
+  try {
+    await assert.rejects(
+      publishRelease(directory, server.endpoint),
+      (error) => error.code === 1
+        && error.stderr.includes(`artifact ${descriptor.name}`)
+        && error.stderr.includes("regular file"),
+    );
+    const uploads = server.requests.filter((request) => request.method === "PUT");
+    assert.equal(uploads.length, 1, "only the descriptor before the symlink may upload");
+    assert.match(uploads[0].url, new RegExp(`/staging/files/${encodeURIComponent(manifest.artifacts[0].name)}$`));
+    assert.equal(server.requests.some((request) => request.url?.endsWith("/commit")), false);
   } finally {
     await server.close();
     await fs.rm(directory, { recursive: true, force: true });
