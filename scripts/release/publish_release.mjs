@@ -8,6 +8,7 @@ import { finished } from "node:stream/promises";
 
 const MANIFEST_CONTENT_TYPE = "application/vnd.portalsurfer.release-manifest+json;version=2";
 const MAX_MANIFEST_BYTES = 4 * 1024 * 1024;
+const PRODUCTION_ORIGIN = "https://portalsurfer.org";
 const SHA_RE = /^[0-9a-f]{64}$/;
 const READ_ONLY_NOFOLLOW = fsStreams.constants.O_RDONLY | (fsStreams.constants.O_NOFOLLOW ?? 0);
 
@@ -69,11 +70,20 @@ function usage(message) {
 }
 
 function endpointOrigin(value) {
+  if (value.trim() !== value) throw new Error("endpoint must be https://portalsurfer.org or an explicit loopback URL");
+  if (value === PRODUCTION_ORIGIN) return PRODUCTION_ORIGIN;
   let parsed;
   try { parsed = new URL(value); } catch { throw new Error("endpoint must be https://portalsurfer.org or an explicit loopback URL"); }
   const loopback = parsed.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]", "::1"].includes(parsed.hostname);
-  if ((parsed.protocol !== "https:" || parsed.hostname !== "portalsurfer.org") && !loopback) throw new Error("endpoint must be https://portalsurfer.org or an explicit loopback URL");
-  if (parsed.pathname !== "/" || parsed.search || parsed.hash || parsed.username || parsed.password) throw new Error("endpoint must be an origin without a path");
+  if (!loopback) throw new Error("endpoint must be https://portalsurfer.org or an explicit loopback URL");
+  if (
+    parsed.pathname !== "/"
+    || value.includes("?")
+    || value.includes("#")
+    || value.includes("@")
+    || parsed.username
+    || parsed.password
+  ) throw new Error("endpoint must be an origin without a path");
   return parsed.origin;
 }
 

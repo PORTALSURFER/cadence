@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     env, fs,
-    io::{ErrorKind, Write},
+    io::{self, ErrorKind, Read, Write},
     ops::{Deref, DerefMut},
     path::{Path, PathBuf},
     sync::{
@@ -14,9 +14,13 @@ use std::{
 
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 const AUDIO_EXTENSIONS: &[&str] = &["aac", "aiff", "flac", "m4a", "mp3", "ogg", "opus", "wav"];
+const MAX_LIBRARY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TEMP_FILE_ALLOCATION_ATTEMPTS: usize = 128;
+const RECOVERY_COPY_BUFFER_BYTES: usize = 64 * 1024;
 
 static NEXT_TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
 
@@ -650,19 +654,59 @@ pub fn load_library() -> Result<Library, String> {
 }
 
 pub fn load_library_at(path: &Path) -> Result<Library, String> {
-    match fs::read_to_string(path) {
-        Ok(contents) => {
-            let mut library: Library = serde_json::from_str(&contents)
-                .map_err(|error| format!("Could not parse {}: {error}", path.display()))?;
-            validate_library_identity(&library)
-                .map_err(|error| format!("Could not validate {}: {error}", path.display()))?;
-            normalize_reference_tracks(&mut library);
-            normalize_planner_order(&mut library);
-            Ok(library)
-        }
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(Library::default()),
-        Err(error) => Err(format!("Could not read {}: {error}", path.display())),
+    let (mut file, metadata) = match open_admitted_regular_file(path) {
+        Ok(admitted) => admitted,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Library::default()),
+        Err(error) => return Err(format!("Could not read {}: {error}", path.display())),
+    };
+    if metadata.len() > MAX_LIBRARY_BYTES as u64 {
+        return Err(library_size_limit_error(path));
     }
+    let bytes = read_library_bytes(&mut file)
+        .map_err(|error| format!("Could not read {}: {error}", path.display()))?;
+    if bytes.len() > MAX_LIBRARY_BYTES {
+        return Err(library_size_limit_error(path));
+    }
+
+    let mut library: Library = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("Could not parse {}: {error}", path.display()))?;
+    validate_library_identity(&library)
+        .map_err(|error| format!("Could not validate {}: {error}", path.display()))?;
+    normalize_reference_tracks(&mut library);
+    normalize_planner_order(&mut library);
+    Ok(library)
+}
+
+fn open_admitted_regular_file(path: &Path) -> io::Result<(fs::File, fs::Metadata)> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NONBLOCK);
+
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    Ok((file, metadata))
+}
+
+fn read_library_bytes<R: Read>(reader: R) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader
+        .take((MAX_LIBRARY_BYTES as u64) + 1)
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn library_size_limit_error(path: &Path) -> String {
+    format!(
+        "Could not load {}: the library exceeds the maximum supported size of {MAX_LIBRARY_BYTES} bytes; reduce or move the file before retrying",
+        path.display()
+    )
 }
 
 /// Preserve an unreadable library before replacing it with a fresh snapshot.
@@ -677,8 +721,9 @@ pub fn preserve_unreadable_library_and_start_fresh() -> Result<PathBuf, String> 
 }
 
 pub fn preserve_unreadable_library_and_start_fresh_at(path: &Path) -> Result<PathBuf, String> {
-    let bytes = fs::read(path)
+    let (mut source_file, source_metadata) = open_admitted_regular_file(path)
         .map_err(|error| format!("Could not preserve {}: {error}", path.display()))?;
+    let source_length = source_metadata.len();
     let directory = path
         .parent()
         .ok_or_else(|| format!("No parent directory for {}", path.display()))?;
@@ -686,16 +731,33 @@ pub fn preserve_unreadable_library_and_start_fresh_at(path: &Path) -> Result<Pat
         .map_err(|error| format!("Could not create {}: {error}", directory.display()))?;
 
     let (backup_path, mut backup_file) = create_unique_recovery_backup(path)?;
-    backup_file
-        .write_all(&bytes)
-        .map_err(|error| format!("Could not write {}: {error}", backup_path.display()))?;
-    backup_file
-        .flush()
-        .map_err(|error| format!("Could not flush {}: {error}", backup_path.display()))?;
-    backup_file
-        .sync_all()
-        .map_err(|error| format!("Could not sync {}: {error}", backup_path.display()))?;
+    if let Err(error) = copy_exact_file_bytes(&mut source_file, &mut backup_file, source_length) {
+        drop(backup_file);
+        return Err(with_recovery_backup_cleanup(
+            format!(
+                "Could not copy {} to {}: {error}",
+                path.display(),
+                backup_path.display()
+            ),
+            &backup_path,
+        ));
+    }
+    if let Err(error) = backup_file.flush() {
+        drop(backup_file);
+        return Err(with_recovery_backup_cleanup(
+            format!("Could not flush {}: {error}", backup_path.display()),
+            &backup_path,
+        ));
+    }
+    if let Err(error) = backup_file.sync_all() {
+        drop(backup_file);
+        return Err(with_recovery_backup_cleanup(
+            format!("Could not sync {}: {error}", backup_path.display()),
+            &backup_path,
+        ));
+    }
     drop(backup_file);
+    drop(source_file);
 
     #[cfg(unix)]
     if let Err(error) = sync_parent_directory(directory) {
@@ -707,6 +769,21 @@ pub fn preserve_unreadable_library_and_start_fresh_at(path: &Path) -> Result<Pat
 
     persist_library_at(&Library::default(), path)?;
     Ok(backup_path)
+}
+
+fn copy_exact_file_bytes(
+    source: &mut fs::File,
+    destination: &mut fs::File,
+    mut length: u64,
+) -> io::Result<()> {
+    let mut buffer = [0_u8; RECOVERY_COPY_BUFFER_BYTES];
+    while length > 0 {
+        let chunk_length = length.min(buffer.len() as u64) as usize;
+        source.read_exact(&mut buffer[..chunk_length])?;
+        destination.write_all(&buffer[..chunk_length])?;
+        length -= chunk_length as u64;
+    }
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -1650,6 +1727,12 @@ fn persist_library_at(library: &Library, path: &Path) -> Result<(), String> {
         .map_err(|error| format!("Could not validate library before saving: {error}"))?;
     let encoded = serde_json::to_vec_pretty(library)
         .map_err(|error| format!("Could not encode library: {error}"))?;
+    if encoded.len() > MAX_LIBRARY_BYTES {
+        return Err(format!(
+            "Could not save {}: the encoded library exceeds the maximum supported size of {MAX_LIBRARY_BYTES} bytes; reduce the library before saving",
+            path.display()
+        ));
+    }
     let directory = path
         .parent()
         .ok_or_else(|| format!("No parent directory for {}", path.display()))?;
@@ -1767,6 +1850,17 @@ fn with_temp_cleanup(primary_error: String, temporary_path: &Path) -> String {
     }
 }
 
+fn with_recovery_backup_cleanup(primary_error: String, backup_path: &Path) -> String {
+    match fs::remove_file(backup_path) {
+        Ok(()) => primary_error,
+        Err(error) if error.kind() == ErrorKind::NotFound => primary_error,
+        Err(cleanup_error) => format!(
+            "{primary_error}; additionally, could not remove incomplete recovery backup {}: {cleanup_error}",
+            backup_path.display()
+        ),
+    }
+}
+
 #[cfg(unix)]
 fn sync_parent_directory(directory: &Path) -> std::io::Result<()> {
     let file = fs::File::open(directory)?;
@@ -1839,7 +1933,13 @@ fn unique_id() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::{
+        io::{self, Read},
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    #[cfg(unix)]
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
 
     static NEXT_TEST_DIRECTORY_NONCE: AtomicU64 = AtomicU64::new(0);
 
@@ -1960,6 +2060,102 @@ mod tests {
         let decoded = crate::audio::decode_audio_file(&source)
             .expect("valid audio fixture should pass preflight");
         (source, decoded)
+    }
+
+    #[test]
+    fn bounded_library_reader_reads_only_maximum_plus_one_bytes() {
+        struct CountingReader {
+            remaining: usize,
+            bytes_read: usize,
+        }
+
+        impl Read for CountingReader {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                let count = self.remaining.min(buffer.len());
+                buffer[..count].fill(b'x');
+                self.remaining -= count;
+                self.bytes_read += count;
+                Ok(count)
+            }
+        }
+
+        let mut reader = CountingReader {
+            remaining: MAX_LIBRARY_BYTES + 1_024,
+            bytes_read: 0,
+        };
+        let bytes = read_library_bytes(&mut reader).expect("bounded reader should succeed");
+
+        assert_eq!(bytes.len(), MAX_LIBRARY_BYTES + 1);
+        assert_eq!(reader.bytes_read, MAX_LIBRARY_BYTES + 1);
+
+        let mut normal_reader = CountingReader {
+            remaining: 128,
+            bytes_read: 0,
+        };
+        let normal_bytes =
+            read_library_bytes(&mut normal_reader).expect("normal reader should succeed");
+        assert_eq!(normal_bytes.len(), 128);
+        assert!(normal_bytes.capacity() < MAX_LIBRARY_BYTES);
+    }
+
+    #[test]
+    fn oversized_library_load_is_rejected_before_json_parse() {
+        let directory = TestDirectory::new();
+        let path = directory.path.join("library.json");
+        let oversized = vec![b'x'; MAX_LIBRARY_BYTES + 1];
+        fs::write(&path, &oversized).expect("oversized library should be writable");
+
+        let error = load_library_at(&path).expect_err("oversized library should fail to load");
+
+        assert!(error.contains("maximum supported size"));
+        assert!(error.contains(&MAX_LIBRARY_BYTES.to_string()));
+        assert_eq!(
+            fs::read(&path).expect("oversized library should remain readable"),
+            oversized
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_regular_library_sources_are_rejected_without_blocking() {
+        let directory = TestDirectory::new();
+        let directory_path = directory.path.join("library-directory");
+        fs::create_dir(&directory_path).expect("library directory should be creatable");
+
+        let fifo_path = directory.path.join("library-fifo");
+        let fifo_path_c = CString::new(fifo_path.as_os_str().as_bytes())
+            .expect("test FIFO path should not contain NUL");
+        let result = unsafe { libc::mkfifo(fifo_path_c.as_ptr(), 0o600) };
+        assert_eq!(result, 0, "test FIFO should be creatable");
+
+        for path in [directory_path.as_path(), fifo_path.as_path()] {
+            let load_error = load_library_at(path).expect_err("non-file load should fail");
+            assert!(load_error.contains("regular file"), "{load_error}");
+
+            let recovery_error = preserve_unreadable_library_and_start_fresh_at(path)
+                .expect_err("non-file recovery should fail");
+            assert!(recovery_error.contains("regular file"), "{recovery_error}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_to_regular_library_files_are_admitted() {
+        let directory = TestDirectory::new();
+        let target_path = directory.path.join("library-target.json");
+        fs::write(
+            &target_path,
+            serde_json::to_vec(&Library::default()).expect("default library should encode"),
+        )
+        .expect("library target should be writable");
+        let symlink_path = directory.path.join("library.json");
+        std::os::unix::fs::symlink(&target_path, &symlink_path)
+            .expect("library symlink should be creatable");
+
+        assert_eq!(
+            load_library_at(&symlink_path).expect("symlink target should load"),
+            Library::default()
+        );
     }
 
     #[test]
@@ -2690,6 +2886,61 @@ mod tests {
             fs::read(&path).expect("active library should remain readable"),
             malformed
         );
+    }
+
+    #[test]
+    fn oversized_recovery_streams_an_exact_backup_and_resets_the_library() {
+        let directory = TestDirectory::new();
+        let path = directory.path.join("library.json");
+        let mut oversized = Vec::with_capacity(MAX_LIBRARY_BYTES + 4_096);
+        oversized.extend_from_slice(b"not-json\n");
+        oversized.resize(MAX_LIBRARY_BYTES + 4_096, b'x');
+        fs::write(&path, &oversized).expect("oversized library should be writable");
+
+        let backup_path = preserve_unreadable_library_and_start_fresh_at(&path)
+            .expect("oversized recovery should preserve and reset the library");
+
+        assert_eq!(
+            fs::read(&backup_path).expect("backup should be readable"),
+            oversized
+        );
+        assert_eq!(
+            load_library_at(&path).expect("fresh library should load"),
+            Library::default()
+        );
+        assert!(temporary_paths(&directory.path).is_empty());
+    }
+
+    #[test]
+    fn oversized_persistence_preserves_old_snapshot_without_a_temp_file() {
+        let directory = TestDirectory::new();
+        let path = directory.path.join("library.json");
+        let original = persistence_fixture();
+        persist_library_at(&original, &path).expect("original library should persist");
+        let original_bytes = fs::read(&path).expect("original snapshot should be readable");
+
+        let mut oversized = original.clone();
+        oversized
+            .tracks
+            .get_mut(0)
+            .expect("fixture should contain a track")
+            .title = "x".repeat(MAX_LIBRARY_BYTES);
+        assert!(
+            serde_json::to_vec_pretty(&oversized)
+                .expect("oversized library should encode")
+                .len()
+                > MAX_LIBRARY_BYTES
+        );
+
+        let error = persist_library_at(&oversized, &path)
+            .expect_err("oversized library should fail before temp creation");
+
+        assert!(error.contains("maximum supported size"));
+        assert_eq!(
+            fs::read(&path).expect("old snapshot should remain readable"),
+            original_bytes
+        );
+        assert!(temporary_paths(&directory.path).is_empty());
     }
 
     #[test]

@@ -210,14 +210,29 @@ async function startReleaseServer({ failStageName } = {}) {
   };
 }
 
-function publishRelease(directory, endpoint) {
+function publishRelease(directory, endpoint, options = {}) {
   return execFileAsync(process.execPath, [
     publisherScript,
     "--manifest", path.join(directory, "cadence-release-manifest.json"),
     "--root", directory,
     "--endpoint", endpoint,
     "--token", "fixture-release-token",
-  ]);
+  ], options);
+}
+
+async function createFetchGuard() {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cadence-fetch-guard-"));
+  const guardPath = path.join(directory, "guard.cjs");
+  await fs.writeFile(guardPath, 'globalThis.fetch = async () => { throw new Error("network activity"); };\n');
+  return {
+    environment: {
+      ...process.env,
+      NODE_OPTIONS: [process.env.NODE_OPTIONS, `--require=${guardPath}`]
+        .filter((value) => value)
+        .join(" "),
+    },
+    cleanup: () => fs.rm(directory, { recursive: true, force: true }),
+  };
 }
 
 async function createReuseFixture() {
@@ -887,6 +902,37 @@ test("release publisher streams exact artifacts and commits only after ordered v
     assert.match(publisher, /duplex: "half"/);
   } finally {
     await server.close();
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("release publisher rejects noncanonical production origins before network activity", async () => {
+  const directory = await createInputDirectory("0.1.0");
+  await createManifest(directory, "0.1.0");
+  const guard = await createFetchGuard();
+  try {
+    for (const endpoint of [
+      "https://portalsurfer.org:444",
+      "https://portalsurfer.org:443",
+      "https://portalsurfer.org/releases",
+      "https://portalsurfer.org/",
+      "https://portalsurfer.org/..",
+      "https://portalsurfer.org/%2e%2e",
+      "https://release-user:release-password@portalsurfer.org",
+      "https://portalsurfer.org/?test=1",
+      "https://portalsurfer.org/#test",
+      " https://portalsurfer.org",
+      "https://portalsurfer.org ",
+    ]) {
+      await assert.rejects(
+        publishRelease(directory, endpoint, { env: guard.environment }),
+        (error) => (error.code === 1 || error.code === 2)
+          && error.stderr.includes("endpoint must be"),
+        `endpoint ${endpoint} must be rejected before fetch`,
+      );
+    }
+  } finally {
+    await guard.cleanup();
     await fs.rm(directory, { recursive: true, force: true });
   }
 });

@@ -9,6 +9,7 @@ use radiant::runtime::{GpuSignalSummary, GpuSignalSummaryBucket, GpuSignalSummar
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File},
+    io::Read,
     path::{Path, PathBuf},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -30,6 +31,7 @@ use crate::source::{
 const PEAK_WINDOW_FRAMES: usize = 1024;
 const MAX_DISPLAY_BUCKETS: usize = 4096;
 const SUMMARY_BAND_COUNT: usize = 2;
+const MAX_WAVEFORM_CACHE_BYTES: u64 = 4 * 1024 * 1024;
 // Publish the first completed (or currently filling) peak window as soon as
 // the decoder has data. The UI clips this prefix to its decoded extent.
 const PREVIEW_FIRST_MILLIS: u64 = 1;
@@ -160,19 +162,53 @@ pub struct WaveformCacheFingerprint {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CachedWaveform {
     version: u32,
-    ticket: VerifiedSourceTicket,
+    ticket: CachedSourceTicket,
     sample_rate: u32,
     channels: usize,
     duration_millis: u64,
     render_frames: usize,
     integrated_lufs: Option<f32>,
-    loudness_profile: Vec<LoudnessPoint>,
+    loudness_profile: Vec<CachedLoudnessPoint>,
     summary: CachedSummary,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CachedSourceTicket {
+    path: PathBuf,
+    proof: CachedSourceProof,
+    stamp: CachedSourceStamp,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CachedSourceProof {
+    sha256: String,
+    byte_len: u64,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CachedSourceStamp {
+    dev: u64,
+    inode: u64,
+    len: u64,
+    mtime_nanos: i128,
+    ctime_nanos: i128,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CachedLoudnessPoint {
+    end_frame: u64,
+    lufs: f32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CachedSummary {
     frames: usize,
     band_count: usize,
@@ -180,12 +216,14 @@ struct CachedSummary {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CachedSummaryLevel {
     bucket_frames: usize,
     buckets: Vec<CachedSummaryBucket>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CachedSummaryBucket {
     min: f32,
     max: f32,
@@ -211,9 +249,27 @@ impl CachedWaveformHit {
 /// source file. Cache failures are treated as misses so a corrupt or old
 /// entry never prevents the source from being decoded again.
 pub fn load_waveform_cache(path: &Path, cache_path: &Path) -> Option<CachedWaveformHit> {
-    let contents = fs::read(cache_path).ok()?;
+    let cache_file = File::open(cache_path).ok()?;
+    let metadata = cache_file.metadata().ok()?;
+    if metadata.len() > MAX_WAVEFORM_CACHE_BYTES {
+        return None;
+    }
+    let contents = read_bounded_waveform_cache(cache_file)?;
     let cached = serde_json::from_slice::<CachedWaveform>(&contents).ok()?;
     cached.into_waveform(path)
+}
+
+fn read_bounded_waveform_cache(mut reader: impl Read) -> Option<Vec<u8>> {
+    let mut contents = Vec::new();
+    reader
+        .by_ref()
+        .take(MAX_WAVEFORM_CACHE_BYTES + 1)
+        .read_to_end(&mut contents)
+        .ok()?;
+    if contents.len() as u64 > MAX_WAVEFORM_CACHE_BYTES {
+        return None;
+    }
+    Some(contents)
 }
 
 pub fn waveform_cache_fingerprint(path: &Path) -> Option<WaveformCacheFingerprint> {
@@ -376,22 +432,70 @@ fn unique_timestamp() -> u128 {
         .map_or(0, |duration| duration.as_nanos())
 }
 
+impl CachedSourceTicket {
+    fn from_ticket(ticket: &VerifiedSourceTicket) -> Self {
+        let stamp = ticket.stamp();
+        Self {
+            path: ticket.path().to_path_buf(),
+            proof: CachedSourceProof {
+                sha256: ticket.proof().sha256.clone(),
+                byte_len: ticket.proof().byte_len,
+            },
+            stamp: CachedSourceStamp {
+                dev: stamp.dev,
+                inode: stamp.inode,
+                len: stamp.len,
+                mtime_nanos: stamp.mtime_nanos,
+                ctime_nanos: stamp.ctime_nanos,
+            },
+        }
+    }
+
+    fn into_ticket(self) -> Option<VerifiedSourceTicket> {
+        let stamp = SourceFileStamp {
+            dev: self.stamp.dev,
+            inode: self.stamp.inode,
+            len: self.stamp.len,
+            mtime_nanos: self.stamp.mtime_nanos,
+            ctime_nanos: self.stamp.ctime_nanos,
+        };
+        VerifiedSourceTicket::new(
+            self.path,
+            AudioSourceProof {
+                sha256: self.proof.sha256,
+                byte_len: self.proof.byte_len,
+            },
+            stamp,
+        )
+        .ok()
+    }
+}
+
 impl CachedWaveform {
     fn from_waveform(path: &Path, ticket: VerifiedSourceTicket, waveform: &WaveformData) -> Self {
         Self {
             version: WAVEFORM_CACHE_VERSION,
-            ticket: VerifiedSourceTicket::new(
-                path.to_path_buf(),
-                ticket.proof().clone(),
-                ticket.stamp(),
-            )
-            .expect("cache writer receives a verified source ticket"),
+            ticket: CachedSourceTicket::from_ticket(
+                &VerifiedSourceTicket::new(
+                    path.to_path_buf(),
+                    ticket.proof().clone(),
+                    ticket.stamp(),
+                )
+                .expect("cache writer receives a verified source ticket"),
+            ),
             sample_rate: waveform.sample_rate,
             channels: waveform.channels,
             duration_millis: waveform.duration_millis,
             render_frames: waveform.render_frames,
             integrated_lufs: waveform.integrated_lufs,
-            loudness_profile: waveform.loudness_profile.to_vec(),
+            loudness_profile: waveform
+                .loudness_profile
+                .iter()
+                .map(|point| CachedLoudnessPoint {
+                    end_frame: point.end_frame,
+                    lufs: point.lufs,
+                })
+                .collect(),
             summary: CachedSummary {
                 frames: waveform.summary.frames,
                 band_count: waveform.summary.band_count,
@@ -416,78 +520,108 @@ impl CachedWaveform {
     }
 
     fn into_waveform(self, path: &Path) -> Option<CachedWaveformHit> {
-        if self.version != WAVEFORM_CACHE_VERSION
-            || self.ticket.path() != path
-            || self.ticket.proof().validate().is_err()
-            || self.ticket.proof().byte_len != self.ticket.stamp().len
-            || self.sample_rate == 0
-            || self.channels == 0
-            || self.render_frames == 0
-            || self.summary.frames != self.render_frames
-            || self.summary.band_count == 0
-            || self.summary.levels.is_empty()
-            || self.integrated_lufs.is_some_and(|value| !value.is_finite())
-            || self
-                .loudness_profile
-                .iter()
-                .any(|point| !point.lufs.is_finite())
-        {
-            return None;
-        }
-
+        let CachedWaveform {
+            version,
+            ticket,
+            sample_rate,
+            channels,
+            duration_millis,
+            render_frames,
+            integrated_lufs,
+            loudness_profile,
+            summary,
+        } = self;
+        let ticket = ticket.into_ticket()?;
         let CachedSummary {
             frames,
             band_count,
             levels: cached_levels,
-        } = self.summary;
-        let levels = cached_levels
-            .into_iter()
-            .map(|level| {
-                if level.bucket_frames == 0 {
-                    return None;
-                }
-                let expected_frames = frames.div_ceil(level.bucket_frames);
-                let expected_buckets = expected_frames.checked_mul(band_count)?;
-                if level.buckets.len() != expected_buckets
-                    || level.buckets.iter().any(|bucket| {
-                        !bucket.min.is_finite()
-                            || !bucket.max.is_finite()
-                            || bucket.min > bucket.max
-                            || bucket.min < -1.0
-                            || bucket.max > 1.0
-                    })
-                {
-                    return None;
-                }
-                Some(GpuSignalSummaryLevel {
-                    bucket_frames: level.bucket_frames,
-                    buckets: Arc::from(
-                        level
-                            .buckets
-                            .into_iter()
-                            .map(|bucket| GpuSignalSummaryBucket {
-                                min: bucket.min,
-                                max: bucket.max,
-                            })
-                            .collect::<Vec<_>>()
-                            .into_boxed_slice(),
-                    ),
+        } = summary;
+
+        if version != WAVEFORM_CACHE_VERSION
+            || ticket.path() != path
+            || ticket.proof().validate().is_err()
+            || ticket.proof().byte_len != ticket.stamp().len
+            || sample_rate == 0
+            || channels == 0
+            || render_frames == 0
+            || render_frames > MAX_DISPLAY_BUCKETS
+            || frames != render_frames
+            || band_count != SUMMARY_BAND_COUNT
+            || cached_levels.is_empty()
+            || integrated_lufs.is_some_and(|value| !value.is_finite())
+            || loudness_profile.len() > MAX_LOUDNESS_PROFILE_POINTS
+            || loudness_profile
+                .iter()
+                .any(|point| point.end_frame == 0 || !point.lufs.is_finite())
+            || loudness_profile
+                .windows(2)
+                .any(|points| points[0].end_frame >= points[1].end_frame)
+        {
+            return None;
+        }
+
+        let expected_level_count = (usize::BITS - frames.leading_zeros()) as usize;
+        if cached_levels.len() != expected_level_count {
+            return None;
+        }
+        let mut expected_bucket_frames = 1usize;
+        let mut levels = Vec::with_capacity(cached_levels.len());
+        for level in cached_levels {
+            if level.bucket_frames != expected_bucket_frames {
+                return None;
+            }
+            let expected_frames = frames.div_ceil(expected_bucket_frames);
+            let expected_buckets = expected_frames.checked_mul(SUMMARY_BAND_COUNT)?;
+            if level.buckets.len() != expected_buckets
+                || level.buckets.iter().any(|bucket| {
+                    !bucket.min.is_finite()
+                        || !bucket.max.is_finite()
+                        || bucket.min > bucket.max
+                        || bucket.min < -1.0
+                        || bucket.max > 1.0
                 })
-            })
-            .collect::<Option<Vec<_>>>()?;
+            {
+                return None;
+            }
+            levels.push(GpuSignalSummaryLevel {
+                bucket_frames: level.bucket_frames,
+                buckets: Arc::from(
+                    level
+                        .buckets
+                        .into_iter()
+                        .map(|bucket| GpuSignalSummaryBucket {
+                            min: bucket.min,
+                            max: bucket.max,
+                        })
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                ),
+            });
+            expected_bucket_frames = expected_bucket_frames.checked_mul(2)?;
+        }
 
         Some(CachedWaveformHit {
-            ticket: self.ticket,
+            ticket,
             waveform: WaveformData {
-                sample_rate: self.sample_rate,
-                channels: self.channels,
-                duration_millis: self.duration_millis,
-                render_frames: self.render_frames,
-                integrated_lufs: self.integrated_lufs,
-                loudness_profile: Arc::from(self.loudness_profile.into_boxed_slice()),
+                sample_rate,
+                channels,
+                duration_millis,
+                render_frames,
+                integrated_lufs,
+                loudness_profile: Arc::from(
+                    loudness_profile
+                        .into_iter()
+                        .map(|point| LoudnessPoint {
+                            end_frame: point.end_frame,
+                            lufs: point.lufs,
+                        })
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                ),
                 summary: Arc::new(GpuSignalSummary {
                     frames,
-                    band_count,
+                    band_count: SUMMARY_BAND_COUNT,
                     levels,
                 }),
             },
@@ -1534,12 +1668,14 @@ fn summary_from_peaks(peaks: &[PeakMeasurement]) -> GpuSignalSummary {
 #[cfg(test)]
 mod tests {
     use super::{
-        LoudnessAccumulator, LoudnessPoint, MAX_LOUDNESS_MATCH_DB, MAX_LOUDNESS_PROFILE_POINTS,
-        PeakBucket, PeakMeasurement, PeakReducer, PeakWindow, ResampledPeak, WaveformData,
-        decode_audio_file, decode_waveform_with_progress_and_cancellation, linear_gain_for_db,
-        load_waveform_cache, loudness_at_position, loudness_channel_map, loudness_match_gain_db,
-        preview_progress, preview_waveform, progressive_preview, resample_unknown_buckets,
-        resample_unknown_buckets_counted, summary_from_peaks, write_waveform_cache_if_unchanged,
+        LoudnessAccumulator, LoudnessPoint, MAX_DISPLAY_BUCKETS, MAX_LOUDNESS_MATCH_DB,
+        MAX_LOUDNESS_PROFILE_POINTS, MAX_WAVEFORM_CACHE_BYTES, PeakBucket, PeakMeasurement,
+        PeakReducer, PeakWindow, ResampledPeak, WaveformData, decode_audio_file,
+        decode_waveform_with_progress_and_cancellation, linear_gain_for_db, load_waveform_cache,
+        loudness_at_position, loudness_channel_map, loudness_match_gain_db, preview_progress,
+        preview_waveform, progressive_preview, read_bounded_waveform_cache,
+        resample_unknown_buckets, resample_unknown_buckets_counted, summary_from_peaks,
+        write_waveform_cache_if_unchanged,
     };
     use radiant::runtime::GpuSignalSummary;
     use std::{
@@ -1602,6 +1738,13 @@ mod tests {
             load_waveform_cache(&source, &cache).map(|hit| hit.waveform().clone()),
             Some(waveform.clone())
         );
+        assert_eq!(
+            load_waveform_cache(&source, &cache)
+                .expect("the valid cache should remain readable")
+                .ticket()
+                .stamp(),
+            ticket.stamp()
+        );
 
         fs::write(
             &cache,
@@ -1621,6 +1764,134 @@ mod tests {
         fs::write(&source, b"changed source").expect("change source fixture");
         assert!(write_waveform_cache_if_unchanged(&source, &cache, &ticket, &waveform).is_err());
         assert!(load_waveform_cache(&source, &cache).is_some());
+
+        fs::remove_dir_all(root).expect("remove cache test directory");
+    }
+
+    #[test]
+    fn waveform_cache_bounded_reader_caps_bytes_independent_of_metadata() {
+        struct EndlessReader {
+            bytes_read: usize,
+        }
+
+        impl std::io::Read for EndlessReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                buffer.fill(0);
+                self.bytes_read += buffer.len();
+                Ok(buffer.len())
+            }
+        }
+
+        let mut reader = EndlessReader { bytes_read: 0 };
+        assert!(read_bounded_waveform_cache(&mut reader).is_none());
+        assert_eq!(reader.bytes_read, (MAX_WAVEFORM_CACHE_BYTES + 1) as usize);
+    }
+
+    #[test]
+    fn waveform_cache_rejects_oversized_and_malformed_schema_two_entries() {
+        let root = std::env::temp_dir().join(format!(
+            "cadence-waveform-cache-schema-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock should be after the epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create cache test directory");
+        let source = root.join("source.wav");
+        let cache = root.join("waveform.json");
+        fs::write(&source, b"source").expect("write source fixture");
+        let waveform = WaveformData {
+            sample_rate: 48_000,
+            channels: 2,
+            duration_millis: 100,
+            render_frames: 2,
+            integrated_lufs: Some(-8.0),
+            loudness_profile: Arc::from([
+                LoudnessPoint {
+                    end_frame: 4_800,
+                    lufs: -8.5,
+                },
+                LoudnessPoint {
+                    end_frame: 9_600,
+                    lufs: -8.0,
+                },
+            ]),
+            summary: Arc::new(summary_from_peaks(&[rms_peak(0.5), rms_peak(0.25)])),
+        };
+        let ticket = crate::source::open_and_hash(&source, || false)
+            .expect("source should hash")
+            .ticket();
+        write_waveform_cache_if_unchanged(&source, &cache, &ticket, &waveform)
+            .expect("write waveform cache");
+
+        let oversized = fs::File::create(&cache).expect("create oversized cache");
+        oversized
+            .set_len(MAX_WAVEFORM_CACHE_BYTES + 1)
+            .expect("sparsely extend oversized cache");
+        drop(oversized);
+        assert_eq!(load_waveform_cache(&source, &cache), None);
+
+        write_waveform_cache_if_unchanged(&source, &cache, &ticket, &waveform)
+            .expect("restore valid waveform cache");
+        let valid: serde_json::Value =
+            serde_json::from_slice(&fs::read(&cache).expect("read valid waveform cache"))
+                .expect("valid cache should be JSON");
+        let assert_miss = |label: &str, malformed: serde_json::Value| {
+            fs::write(
+                &cache,
+                serde_json::to_vec(&malformed).expect("serialize malformed cache"),
+            )
+            .expect("write malformed cache");
+            assert_eq!(
+                load_waveform_cache(&source, &cache),
+                None,
+                "{label} schema mutation must remain a cache miss"
+            );
+        };
+
+        let mut malformed = valid.clone();
+        malformed["render_frames"] = serde_json::Value::from(MAX_DISPLAY_BUCKETS + 1);
+        assert_miss("render-frame bound", malformed);
+
+        let mut malformed = valid.clone();
+        malformed["loudness_profile"] = serde_json::json!([
+            { "end_frame": 9_600, "lufs": -8.0 },
+            { "end_frame": 4_800, "lufs": -8.5 }
+        ]);
+        assert_miss("profile ordering", malformed);
+
+        let mut malformed = valid.clone();
+        malformed["summary"]["band_count"] = serde_json::Value::from(1);
+        assert_miss("summary band count", malformed);
+
+        let mut malformed = valid.clone();
+        malformed["unexpected"] = serde_json::Value::from(true);
+        assert_miss("unknown top-level field", malformed);
+
+        let mut malformed = valid.clone();
+        malformed["ticket"]["unexpected"] = serde_json::Value::from(true);
+        assert_miss("unknown ticket field", malformed);
+
+        let mut malformed = valid.clone();
+        malformed["ticket"]["proof"]["unexpected"] = serde_json::Value::from(true);
+        assert_miss("unknown proof field", malformed);
+
+        let mut malformed = valid.clone();
+        malformed["ticket"]["stamp"]["unexpected"] = serde_json::Value::from(true);
+        assert_miss("unknown stamp field", malformed);
+
+        let mut malformed = valid.clone();
+        malformed["loudness_profile"][0]["unexpected"] = serde_json::Value::from(true);
+        assert_miss("unknown loudness field", malformed);
+
+        let mut malformed = valid.clone();
+        malformed["summary"]["levels"][0]["unexpected"] = serde_json::Value::from(true);
+        assert_miss("unknown summary level field", malformed);
+
+        let mut malformed = valid;
+        malformed["summary"]["levels"][0]["bucket_frames"] = serde_json::Value::from(2);
+        assert_miss("summary level ordering", malformed);
 
         fs::remove_dir_all(root).expect("remove cache test directory");
     }
