@@ -27,11 +27,14 @@ const args = process.argv.slice(2);
 const values = {};
 for (let index = 0; index < args.length; index += 1) {
   const argument = args[index];
-  if (!argument.startsWith("--") || index + 1 >= args.length) usage(`unknown argument ${argument}`);
+  if (!argument.startsWith("--")) usage(`unknown argument ${argument}`);
+  if (argument === "--output-dir" && (index + 1 >= args.length || args[index + 1].startsWith("--"))) usage("output-dir is required");
+  if (index + 1 >= args.length) usage(`unknown argument ${argument}`);
   values[argument.slice(2).replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())] = args[++index];
 }
 
-const outputDir = path.resolve(values.outputDir || "");
+if (!values.outputDir) usage("output-dir is required");
+const outputDir = path.resolve(values.outputDir);
 const version = String(values.version || "");
 const channel = String(values.channel || "stable");
 const buildId = String(values.buildId || "");

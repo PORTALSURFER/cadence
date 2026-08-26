@@ -9,14 +9,46 @@ import { finished } from "node:stream/promises";
 const MANIFEST_CONTENT_TYPE = "application/vnd.portalsurfer.release-manifest+json;version=2";
 const MAX_MANIFEST_BYTES = 4 * 1024 * 1024;
 const SHA_RE = /^[0-9a-f]{64}$/;
+const READ_ONLY_NOFOLLOW = fsStreams.constants.O_RDONLY | (fsStreams.constants.O_NOFOLLOW ?? 0);
 
 async function closeReadStream(stream) {
   if (!stream.destroyed) stream.destroy();
   if (!stream.closed) await finished(stream).catch(() => {});
 }
 
-async function hashArtifact(filePath) {
-  const stream = fsStreams.createReadStream(filePath);
+async function closeFileHandle(fileHandle) {
+  if (fileHandle) await fileHandle.close().catch(() => {});
+}
+
+function regularFileError(label) {
+  const error = new Error(`${label} must be a regular file`);
+  error.code = "ERR_RELEASE_NOT_REGULAR_FILE";
+  return error;
+}
+
+async function openRegularFile(filePath, label) {
+  const linkStat = await fs.lstat(filePath);
+  if (!linkStat.isFile()) throw regularFileError(label);
+
+  let fileHandle;
+  try {
+    fileHandle = await fs.open(filePath, READ_ONLY_NOFOLLOW);
+    const fileStat = await fileHandle.stat();
+    if (!fileStat.isFile()) throw regularFileError(label);
+    return { fileHandle, fileStat };
+  } catch (error) {
+    await closeFileHandle(fileHandle);
+    if (error.code === "ELOOP") throw regularFileError(label);
+    throw error;
+  }
+}
+
+function createReadStream(fileHandle) {
+  return fileHandle.createReadStream({ autoClose: true, start: 0 });
+}
+
+async function hashArtifact(fileHandle) {
+  const stream = createReadStream(fileHandle);
   const hash = crypto.createHash("sha256");
   let size = 0;
   try {
@@ -58,9 +90,24 @@ const token = String(values.token || process.env.CADENCE_RELEASE_UPLOAD_TOKEN ||
 if (!token) usage("an upload token is required");
 const manifestPath = path.resolve(values.manifest);
 const root = path.resolve(values.root || path.dirname(manifestPath));
-const manifestStat = await fs.stat(manifestPath);
-if (!manifestStat.isFile() || !Number.isSafeInteger(manifestStat.size) || manifestStat.size <= 0 || manifestStat.size > MAX_MANIFEST_BYTES) usage("manifest must be a regular file within the safe size limit");
-const manifestBytes = await fs.readFile(manifestPath);
+let manifestFile;
+try {
+  manifestFile = await openRegularFile(manifestPath, "manifest");
+} catch (error) {
+  if (error.code === "ERR_RELEASE_NOT_REGULAR_FILE") usage("manifest must be a regular file within the safe size limit");
+  throw error;
+}
+const { fileHandle: manifestHandle, fileStat: manifestStat } = manifestFile;
+let manifestBytes;
+const manifestMetadataIsSafe = Number.isSafeInteger(manifestStat.size)
+  && manifestStat.size > 0
+  && manifestStat.size <= MAX_MANIFEST_BYTES;
+try {
+  if (manifestMetadataIsSafe) manifestBytes = await manifestHandle.readFile();
+} finally {
+  await closeFileHandle(manifestHandle);
+}
+if (!manifestMetadataIsSafe) usage("manifest must be a regular file within the safe size limit");
 if (manifestBytes.length !== manifestStat.size) usage("manifest changed while it was being read");
 const manifest = JSON.parse(manifestBytes.toString("utf8"));
 if (!manifest || manifest.schema_version !== 2 || manifest.product !== "cadence" || !manifest.build_id) usage("manifest must be Cadence schema 2");
@@ -82,22 +129,49 @@ const metadata = {
 for (const descriptor of descriptors) {
   if (!descriptor?.name || path.basename(descriptor.name) !== descriptor.name || descriptor.name.startsWith(".") || !SHA_RE.test(descriptor.sha256) || !Number.isSafeInteger(descriptor.size_bytes) || descriptor.size_bytes <= 0) usage(`invalid descriptor for ${descriptor?.name || "unnamed file"}`);
   const filePath = path.join(root, descriptor.name);
-  const fileStat = await fs.stat(filePath);
-  if (!fileStat.isFile() || !Number.isSafeInteger(fileStat.size) || fileStat.size <= 0) throw new Error(`artifact ${descriptor.name} must be a regular file with a safe positive size`);
-  const { digest, size } = await hashArtifact(filePath);
-  if (digest !== descriptor.sha256 || size !== descriptor.size_bytes || fileStat.size !== size) throw new Error(`manifest metadata does not match ${descriptor.name}`);
-  const url = `${endpoint}/plugins/api/v1/products/cadence/release-uploads/${encodeURIComponent(manifest.build_id)}/staging/files/${encodeURIComponent(descriptor.name)}`;
-  const uploadStream = fsStreams.createReadStream(filePath);
+  let descriptorFile;
   try {
-    const response = await fetch(url, {
-      method: "PUT",
-      headers: { ...metadata, "Content-Type": "application/octet-stream", "Content-Length": String(size), "X-PortalSurfer-Sha256": digest },
-      body: uploadStream,
-      duplex: "half",
-    });
-    if (!response.ok) throw new Error(`staging ${descriptor.name} failed (${response.status}): ${await response.text()}`);
+    descriptorFile = await openRegularFile(filePath, `artifact ${descriptor.name}`);
+  } catch (error) {
+    if (error.code === "ERR_RELEASE_NOT_REGULAR_FILE") throw new Error(`artifact ${descriptor.name} must be a regular file with a safe positive size`);
+    throw error;
+  }
+  const { fileHandle, fileStat } = descriptorFile;
+  let digest;
+  let size;
+  try {
+    if (!Number.isSafeInteger(fileStat.size) || fileStat.size <= 0) throw new Error(`artifact ${descriptor.name} must be a regular file with a safe positive size`);
+    ({ digest, size } = await hashArtifact(fileHandle));
   } finally {
-    await closeReadStream(uploadStream);
+    await closeFileHandle(fileHandle);
+  }
+  if (digest !== descriptor.sha256 || size !== descriptor.size_bytes || fileStat.size !== size) throw new Error(`manifest metadata does not match ${descriptor.name}`);
+
+  let uploadFile;
+  try {
+    uploadFile = await openRegularFile(filePath, `artifact ${descriptor.name}`);
+  } catch (error) {
+    if (error.code === "ERR_RELEASE_NOT_REGULAR_FILE") throw new Error(`artifact ${descriptor.name} must be a regular file with a safe positive size`);
+    throw error;
+  }
+  const { fileHandle: uploadHandle, fileStat: uploadStat } = uploadFile;
+  try {
+    if (!Number.isSafeInteger(uploadStat.size) || uploadStat.size <= 0 || uploadStat.size !== size) throw new Error(`manifest metadata does not match ${descriptor.name}`);
+    const url = `${endpoint}/plugins/api/v1/products/cadence/release-uploads/${encodeURIComponent(manifest.build_id)}/staging/files/${encodeURIComponent(descriptor.name)}`;
+    const uploadStream = createReadStream(uploadHandle);
+    try {
+      const response = await fetch(url, {
+        method: "PUT",
+        headers: { ...metadata, "Content-Type": "application/octet-stream", "Content-Length": String(size), "X-PortalSurfer-Sha256": digest },
+        body: uploadStream,
+        duplex: "half",
+      });
+      if (!response.ok) throw new Error(`staging ${descriptor.name} failed (${response.status}): ${await response.text()}`);
+    } finally {
+      await closeReadStream(uploadStream);
+    }
+  } finally {
+    await closeFileHandle(uploadHandle);
   }
 }
 
