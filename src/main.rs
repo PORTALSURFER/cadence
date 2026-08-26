@@ -3053,6 +3053,17 @@ fn reset_waveform_decode(state: &mut AppState) {
     state.loop_selections.clear(PlaybackSource::Main);
 }
 
+fn retire_main_waveform_decode_for_shutdown(state: &mut AppState) {
+    state.waveform_generation = state.waveform_generation.wrapping_add(1);
+    state.waveform_pending = None;
+    state.waveform_in_flight = None;
+    state.waveform_busy = false;
+    state.waveform_progress = None;
+    if let Some(cancellation) = state.waveform_cancellation.take() {
+        cancellation.cancel();
+    }
+}
+
 fn schedule_selected_waveform_decode(
     state: &mut AppState,
     context: &mut ui::UiUpdateContext<Message>,
@@ -3174,6 +3185,17 @@ fn reset_reference_waveform_decode(state: &mut AppState) {
     state.reference_waveform_track_id = None;
     state.reference_waveform_progress = None;
     state.loop_selections.clear(PlaybackSource::Reference);
+}
+
+fn retire_reference_waveform_decode_for_shutdown(state: &mut AppState) {
+    state.reference_waveform_generation = state.reference_waveform_generation.wrapping_add(1);
+    state.reference_waveform_pending = None;
+    state.reference_waveform_in_flight = None;
+    state.reference_waveform_busy = false;
+    state.reference_waveform_progress = None;
+    if let Some(cancellation) = state.reference_waveform_cancellation.take() {
+        cancellation.cancel();
+    }
 }
 
 fn schedule_selected_reference_decode(
@@ -9136,6 +9158,8 @@ fn handle_shutdown_with(
 ) -> Option<serde_json::Value> {
     cancel_selection_save_debounce(state);
     state.save_admission_pending = false;
+    retire_main_waveform_decode_for_shutdown(state);
+    retire_reference_waveform_decode_for_shutdown(state);
     if state.save_in_flight.is_some() {
         return None;
     }
@@ -13337,7 +13361,7 @@ mod tests {
     use std::{
         fs,
         path::{Path, PathBuf},
-        sync::Arc,
+        sync::{Arc, Mutex},
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
@@ -24906,12 +24930,31 @@ mod tests {
             .into(),
             ..AppState::default()
         };
+        let reference_terminal_status = Arc::new(Mutex::new(None));
+        let status_observer = Arc::clone(&reference_terminal_status);
+        let reference_terminal_track_id = second_id.clone();
         let bridge = RuntimeTaskBridge(DeclarativeOwnedCommandRuntimeBridge::new(
             state,
             |state| project_surface(state).into_surface(),
-            |state, message| {
+            move |state, message| {
+                // Main and reference completions share state.status. Capture the
+                // reference terminal status before a main completion can replace it.
+                let is_reference_terminal_error = matches!(
+                    &message,
+                    Message::ReferenceDecodeCompleted {
+                        track_id,
+                        result: Err(error),
+                        ..
+                    } if track_id == &reference_terminal_track_id && error != "cancelled"
+                );
                 let mut context = ui::UiUpdateContext::default();
                 update(state, message, &mut context);
+                if is_reference_terminal_error {
+                    *status_observer
+                        .lock()
+                        .expect("reference terminal status observer should not be poisoned") =
+                        Some(state.status.clone());
+                }
                 context.into_command()
             },
         ));
@@ -24974,24 +25017,29 @@ mod tests {
             state.reference_waveform_in_flight.is_none()
                 && state.reference_waveform_pending.is_none()
                 && !state.reference_waveform_busy
+                && state.waveform_in_flight.is_none()
+                && state.waveform_pending.is_none()
+                && !state.waveform_busy
         });
         assert!(
             latest_messages > 0,
-            "the newest reference terminal completion should be delivered through SurfaceRuntime"
+            "the newest main and reference terminal completions should be delivered through SurfaceRuntime"
         );
+        let reference_terminal_status = reference_terminal_status
+            .lock()
+            .expect("reference terminal status observer should not be poisoned")
+            .clone()
+            .expect("the latest reference error should be observed at its terminal completion");
+        assert!(reference_terminal_status.contains("Reference waveform unavailable"));
+        assert!(reference_terminal_status.contains(second_path.to_string_lossy().as_ref()));
         let final_state = runtime.bridge().0.state();
         assert!(final_state.reference_waveform_cancellation.is_none());
         assert!(!final_state.reference_waveform_busy);
-        assert!(
-            final_state
-                .status
-                .contains("Reference waveform unavailable")
-        );
-        assert!(
-            final_state
-                .status
-                .contains(second_path.to_string_lossy().as_ref())
-        );
+        assert!(final_state.reference_waveform.is_none());
+        assert!(final_state.reference_waveform_source_ticket.is_none());
+        assert!(final_state.reference_waveform_track_id.is_none());
+        assert!(final_state.waveform_cancellation.is_none());
+        assert!(!final_state.waveform_busy);
     }
 
     #[test]
@@ -29400,6 +29448,70 @@ mod tests {
             "Could not save the library during shutdown: disk full"
         );
         assert!(!state.save_admission_pending);
+    }
+
+    #[test]
+    fn shutdown_cancels_and_retires_active_main_and_reference_decodes_before_persisting() {
+        let main_token = ui::CancellationToken::new();
+        let reference_token = ui::CancellationToken::new();
+        let mut state = AppState {
+            library_revision: 1,
+            persisted_library_revision: 0,
+            waveform_generation: 7,
+            waveform_busy: true,
+            waveform_in_flight: Some(WaveformDecodeRequest {
+                track_id: String::from("shutdown-main-active"),
+                path: PathBuf::from("/external/shutdown-main-active.wav"),
+                generation: 7,
+                expected_proof: None,
+            }),
+            waveform_pending: Some(WaveformDecodeRequest {
+                track_id: String::from("shutdown-main-pending"),
+                path: PathBuf::from("/external/shutdown-main-pending.wav"),
+                generation: 8,
+                expected_proof: None,
+            }),
+            waveform_cancellation: Some(main_token.clone()),
+            reference_waveform_generation: 11,
+            reference_waveform_busy: true,
+            reference_waveform_in_flight: Some(WaveformDecodeRequest {
+                track_id: String::from("shutdown-reference-active"),
+                path: PathBuf::from("/external/shutdown-reference-active.wav"),
+                generation: 11,
+                expected_proof: None,
+            }),
+            reference_waveform_pending: Some(WaveformDecodeRequest {
+                track_id: String::from("shutdown-reference-pending"),
+                path: PathBuf::from("/external/shutdown-reference-pending.wav"),
+                generation: 12,
+                expected_proof: None,
+            }),
+            reference_waveform_cancellation: Some(reference_token.clone()),
+            ..AppState::default()
+        };
+        let mut persistence_observed = false;
+
+        assert!(
+            handle_shutdown_with(&mut state, |_| {
+                assert!(main_token.is_cancelled());
+                assert!(reference_token.is_cancelled());
+                persistence_observed = true;
+                Ok(())
+            })
+            .is_none()
+        );
+
+        assert!(persistence_observed);
+        assert_eq!(state.waveform_generation, 8);
+        assert!(state.waveform_in_flight.is_none());
+        assert!(state.waveform_pending.is_none());
+        assert!(state.waveform_cancellation.is_none());
+        assert!(!state.waveform_busy);
+        assert_eq!(state.reference_waveform_generation, 12);
+        assert!(state.reference_waveform_in_flight.is_none());
+        assert!(state.reference_waveform_pending.is_none());
+        assert!(state.reference_waveform_cancellation.is_none());
+        assert!(!state.reference_waveform_busy);
     }
 
     #[test]
