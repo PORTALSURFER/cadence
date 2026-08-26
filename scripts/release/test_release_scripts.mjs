@@ -913,10 +913,16 @@ test("release publisher rejects noncanonical production origins before network a
   try {
     for (const endpoint of [
       "https://portalsurfer.org:444",
+      "https://portalsurfer.org:443",
       "https://portalsurfer.org/releases",
+      "https://portalsurfer.org/",
+      "https://portalsurfer.org/..",
+      "https://portalsurfer.org/%2e%2e",
       "https://release-user:release-password@portalsurfer.org",
       "https://portalsurfer.org/?test=1",
       "https://portalsurfer.org/#test",
+      " https://portalsurfer.org",
+      "https://portalsurfer.org ",
     ]) {
       await assert.rejects(
         publishRelease(directory, endpoint, { env: guard.environment }),

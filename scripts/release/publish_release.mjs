@@ -70,11 +70,12 @@ function usage(message) {
 }
 
 function endpointOrigin(value) {
+  if (value.trim() !== value) throw new Error("endpoint must be https://portalsurfer.org or an explicit loopback URL");
+  if (value === PRODUCTION_ORIGIN) return PRODUCTION_ORIGIN;
   let parsed;
   try { parsed = new URL(value); } catch { throw new Error("endpoint must be https://portalsurfer.org or an explicit loopback URL"); }
   const loopback = parsed.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]", "::1"].includes(parsed.hostname);
-  const production = parsed.protocol === "https:" && parsed.origin === PRODUCTION_ORIGIN;
-  if (!production && !loopback) throw new Error("endpoint must be https://portalsurfer.org or an explicit loopback URL");
+  if (!loopback) throw new Error("endpoint must be https://portalsurfer.org or an explicit loopback URL");
   if (
     parsed.pathname !== "/"
     || value.includes("?")
