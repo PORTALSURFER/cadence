@@ -14,6 +14,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 #[cfg(not(unix))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -246,7 +248,8 @@ impl VerifiedSourceTicket {
 /// by that playback session; a future reload opens a fresh handle and must
 /// match the ticket again.
 pub fn open_for_ticket(ticket: &VerifiedSourceTicket) -> Result<File, SourceProofError> {
-    let file = File::open(ticket.path()).map_err(|error| open_failure(ticket.path(), error))?;
+    let file =
+        open_source_file(ticket.path()).map_err(|error| open_failure(ticket.path(), error))?;
     let metadata = file
         .metadata()
         .map_err(|error| io_failure(ticket.path(), error))?;
@@ -407,7 +410,7 @@ fn open_and_hash_inner(
     mut on_hash: impl FnMut(),
 ) -> Result<VerifiedSourceFile, SourceProofError> {
     check_cancelled(path, &should_cancel)?;
-    let file = File::open(path).map_err(|error| open_failure(path, error))?;
+    let file = open_source_file(path).map_err(|error| open_failure(path, error))?;
     let metadata = file.metadata().map_err(|error| io_failure(path, error))?;
     if !metadata.is_file() {
         return Err(SourceProofError::Changed {
@@ -612,6 +615,26 @@ fn open_failure(path: &Path, error: io::Error) -> SourceProofError {
     }
 }
 
+fn open_source_file(path: &Path) -> io::Result<File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NONBLOCK);
+    options.open(path)
+}
+
+pub(crate) fn open_regular_file(path: &Path) -> io::Result<File> {
+    let file = open_source_file(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    Ok(file)
+}
+
 fn metadata_failure(path: &Path, error: io::Error) -> SourceProofError {
     if error.kind() == io::ErrorKind::NotFound {
         SourceProofError::Missing {
@@ -692,6 +715,8 @@ fn platform_stamp(metadata: &Metadata) -> SourceFileStamp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
     use std::{
         fs::{self, OpenOptions},
         io::{Read, Write},
@@ -838,5 +863,64 @@ mod tests {
         ));
         let _ = fs::remove_file(path);
         let _ = fs::remove_file(replacement);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_regular_sources_are_rejected_without_blocking() {
+        let directory = temp_path("non-regular");
+        fs::create_dir(&directory).expect("test directory should be creatable");
+        let fifo = directory.join("source.fifo");
+        let fifo_c = CString::new(fifo.as_os_str().as_bytes())
+            .expect("test FIFO path should not contain NUL");
+        let result = unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) };
+        assert_eq!(result, 0, "test FIFO should be creatable");
+
+        let hash_error =
+            open_and_hash(&fifo, || false).expect_err("a FIFO must be rejected before hashing");
+        assert!(matches!(hash_error, SourceProofError::Changed { .. }));
+
+        let metadata = fs::metadata(&fifo).expect("FIFO metadata should be readable");
+        let ticket = VerifiedSourceTicket::new(
+            fifo.clone(),
+            AudioSourceProof {
+                sha256: "0".repeat(SHA256_HEX_LENGTH),
+                byte_len: metadata.len(),
+            },
+            SourceFileStamp::from_metadata(&metadata),
+        )
+        .expect("FIFO ticket fixture should be structurally valid");
+        let ticket_error = open_for_ticket(&ticket)
+            .expect_err("a FIFO ticket must be rejected before transport load");
+        assert!(matches!(ticket_error, SourceProofError::Changed { .. }));
+
+        let directory_error = open_and_hash(&directory, || false)
+            .expect_err("a directory must be rejected before hashing");
+        assert!(matches!(directory_error, SourceProofError::Changed { .. }));
+
+        fs::remove_dir_all(directory).expect("test directory should be removable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_to_regular_sources_remain_admitted() {
+        let directory = temp_path("regular-symlink");
+        fs::create_dir(&directory).expect("test directory should be creatable");
+        let target = directory.join("target.wav");
+        let symlink = directory.join("source.wav");
+        fs::write(&target, b"encoded source").expect("target source should be writable");
+        std::os::unix::fs::symlink(&target, &symlink).expect("source symlink should be creatable");
+
+        let verified = open_and_hash(&symlink, || false)
+            .expect("a symlink to a regular source should remain admissible");
+        let mut opened =
+            open_for_ticket(&verified.ticket()).expect("the verified symlink ticket should open");
+        let mut bytes = Vec::new();
+        opened
+            .read_to_end(&mut bytes)
+            .expect("the regular target should remain readable");
+        assert_eq!(bytes, b"encoded source");
+
+        fs::remove_dir_all(directory).expect("test directory should be removable");
     }
 }

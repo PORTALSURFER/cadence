@@ -7,6 +7,8 @@
 use ebur128::{Channel as LoudnessChannel, EbuR128, Mode};
 use radiant::runtime::{GpuSignalSummary, GpuSignalSummaryBucket, GpuSignalSummaryLevel};
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::{
     fs::{self, File},
     io::Read,
@@ -249,9 +251,13 @@ impl CachedWaveformHit {
 /// source file. Cache failures are treated as misses so a corrupt or old
 /// entry never prevents the source from being decoded again.
 pub fn load_waveform_cache(path: &Path, cache_path: &Path) -> Option<CachedWaveformHit> {
-    let cache_file = File::open(cache_path).ok()?;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NONBLOCK);
+    let cache_file = options.open(cache_path).ok()?;
     let metadata = cache_file.metadata().ok()?;
-    if metadata.len() > MAX_WAVEFORM_CACHE_BYTES {
+    if !metadata.is_file() || metadata.len() > MAX_WAVEFORM_CACHE_BYTES {
         return None;
     }
     let contents = read_bounded_waveform_cache(cache_file)?;
@@ -561,7 +567,12 @@ impl CachedWaveform {
             return None;
         }
 
-        let expected_level_count = (usize::BITS - frames.leading_zeros()) as usize;
+        let mut expected_level_count = 1usize;
+        let mut level_count_bucket_frames = 1usize;
+        while level_count_bucket_frames < frames {
+            expected_level_count = expected_level_count.saturating_add(1);
+            level_count_bucket_frames = level_count_bucket_frames.checked_mul(2)?;
+        }
         if cached_levels.len() != expected_level_count {
             return None;
         }
@@ -1380,7 +1391,7 @@ pub fn decode_waveform_with_progress_and_cancellation(
     if should_cancel() {
         return Err(String::from("cancelled"));
     }
-    let file = File::open(path).map_err(|error| {
+    let file = source::open_regular_file(path).map_err(|error| {
         format!(
             "Could not open {} for waveform analysis: {error}",
             path.display()
@@ -1550,6 +1561,7 @@ fn decode_waveform_from_open_file(
     if let Some(peak) = window.finish() {
         reducer.add(peak);
     }
+    validate_declared_frame_count(path, expected_frames, decoded_frames)?;
     let peaks = reducer.finish();
     if decoded_frames == 0 || peaks.is_empty() {
         return Err(format!("No audio samples found in {}", path.display()));
@@ -1600,6 +1612,24 @@ fn preview_waveform(
         loudness_profile: Arc::from([]),
         summary: Arc::new(summary_from_peaks(&peaks)),
     }
+}
+
+fn validate_declared_frame_count(
+    path: &Path,
+    expected_frames: Option<u64>,
+    decoded_frames: usize,
+) -> Result<(), String> {
+    let Some(expected_frames) = expected_frames else {
+        return Ok(());
+    };
+    let decoded_frames = u64::try_from(decoded_frames).unwrap_or(u64::MAX);
+    if decoded_frames < expected_frames {
+        return Err(format!(
+            "Audio stream ended before its declared frame count in {}: decoded {decoded_frames} of {expected_frames} frames",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 fn summary_from_peaks(peaks: &[PeakMeasurement]) -> GpuSignalSummary {
@@ -1675,9 +1705,11 @@ mod tests {
         loudness_at_position, loudness_channel_map, loudness_match_gain_db, preview_progress,
         preview_waveform, progressive_preview, read_bounded_waveform_cache,
         resample_unknown_buckets, resample_unknown_buckets_counted, summary_from_peaks,
-        write_waveform_cache_if_unchanged,
+        validate_declared_frame_count, write_waveform_cache_if_unchanged,
     };
     use radiant::runtime::GpuSignalSummary;
+    #[cfg(unix)]
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
     use std::{
         fs,
         path::Path,
@@ -1894,6 +1926,124 @@ mod tests {
         assert_miss("summary level ordering", malformed);
 
         fs::remove_dir_all(root).expect("remove cache test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn waveform_cache_rejects_non_regular_entries_without_blocking() {
+        let root = std::env::temp_dir().join(format!(
+            "cadence-waveform-cache-non-regular-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock should be after the epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create cache test directory");
+        let source = root.join("source.wav");
+        let directory_cache = root.join("cache-directory");
+        let fifo_cache = root.join("cache-fifo");
+        fs::write(&source, b"source").expect("write source fixture");
+        fs::create_dir(&directory_cache).expect("cache directory should be creatable");
+        let fifo_c = CString::new(fifo_cache.as_os_str().as_bytes())
+            .expect("test FIFO path should not contain NUL");
+        let result = unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) };
+        assert_eq!(result, 0, "test FIFO should be creatable");
+
+        assert_eq!(load_waveform_cache(&source, &directory_cache), None);
+        assert_eq!(load_waveform_cache(&source, &fifo_cache), None);
+
+        fs::remove_dir_all(root).expect("remove cache test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn waveform_decoder_rejects_non_regular_entries_without_blocking() {
+        let root = std::env::temp_dir().join(format!(
+            "cadence-waveform-decoder-non-regular-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock should be after the epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create decoder test directory");
+        let fifo = root.join("source.fifo");
+        let fifo_c = CString::new(fifo.as_os_str().as_bytes())
+            .expect("test FIFO path should not contain NUL");
+        let result = unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) };
+        assert_eq!(result, 0, "test FIFO should be creatable");
+
+        let error = decode_waveform_with_progress_and_cancellation(&fifo, || false, |_| {})
+            .expect_err("the waveform decoder must reject a FIFO before reading it");
+        assert!(
+            error.contains("regular file"),
+            "unexpected decoder error: {error}"
+        );
+
+        fs::remove_dir_all(root).expect("remove decoder test directory");
+    }
+
+    #[test]
+    fn waveform_cache_round_trips_non_power_of_two_summary_levels() {
+        let root = std::env::temp_dir().join(format!(
+            "cadence-waveform-cache-non-power-two-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock should be after the epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create cache test directory");
+        let source = root.join("source.wav");
+        let cache = root.join("waveform.json");
+        fs::write(&source, b"source").expect("write source fixture");
+        let ticket = crate::source::open_and_hash(&source, || false)
+            .expect("source should hash")
+            .ticket();
+
+        for frame_count in [3usize, 5] {
+            let peaks = (0..frame_count)
+                .map(|index| rms_peak((index + 1) as f32 / 10.0))
+                .collect::<Vec<_>>();
+            let waveform = WaveformData {
+                sample_rate: 48_000,
+                channels: 1,
+                duration_millis: 100,
+                render_frames: frame_count,
+                integrated_lufs: None,
+                loudness_profile: Arc::from([]),
+                summary: Arc::new(summary_from_peaks(&peaks)),
+            };
+
+            write_waveform_cache_if_unchanged(&source, &cache, &ticket, &waveform)
+                .expect("write waveform cache");
+            let loaded = load_waveform_cache(&source, &cache)
+                .expect("non-power-of-two cache should remain readable");
+            assert_eq!(loaded.waveform(), &waveform);
+            assert_eq!(
+                loaded
+                    .waveform()
+                    .summary
+                    .levels
+                    .iter()
+                    .map(|level| level.bucket_frames)
+                    .collect::<Vec<_>>(),
+                match frame_count {
+                    3 => vec![1, 2, 4],
+                    5 => vec![1, 2, 4, 8],
+                    _ => unreachable!(),
+                }
+            );
+        }
+
+        fs::remove_dir_all(root).expect("remove cache test directory");
+    }
+
+    #[test]
+    fn declared_frame_count_validation_keeps_unknown_and_longer_streams_compatible() {
+        assert!(validate_declared_frame_count(Path::new("unknown.wav"), None, 3).is_ok());
+        assert!(validate_declared_frame_count(Path::new("longer.wav"), Some(3), 4).is_ok());
     }
 
     #[test]
@@ -2317,6 +2467,42 @@ mod tests {
             "unexpected corrupt-audio error: {error}"
         );
         fs::remove_dir_all(root).expect("remove decode test directory");
+    }
+
+    #[test]
+    fn structurally_valid_truncated_wav_rejects_short_decoded_output() {
+        let root = std::env::temp_dir().join(format!(
+            "cadence-truncated-wav-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock should be after the epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create truncated WAV test directory");
+        let path = root.join("truncated.wav");
+        let mut bytes = Vec::from(*b"RIFF");
+        bytes.extend_from_slice(&44_u32.to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&8_000_u32.to_le_bytes());
+        bytes.extend_from_slice(&16_000_u32.to_le_bytes());
+        bytes.extend_from_slice(&2_u16.to_le_bytes());
+        bytes.extend_from_slice(&16_u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&8_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_i16.to_le_bytes());
+        fs::write(&path, bytes).expect("truncated WAV fixture should be writable");
+
+        let error = decode_audio_file(&path).expect_err("truncated WAV must fail preflight");
+        assert!(
+            error.contains("declared frame count"),
+            "unexpected truncated WAV error: {error}"
+        );
+
+        fs::remove_dir_all(root).expect("remove truncated WAV test directory");
     }
 
     #[test]

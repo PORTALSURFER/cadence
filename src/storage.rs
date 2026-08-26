@@ -12,6 +12,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(all(test, unix))]
+use std::cell::Cell;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
@@ -23,6 +25,11 @@ const MAX_TEMP_FILE_ALLOCATION_ATTEMPTS: usize = 128;
 const RECOVERY_COPY_BUFFER_BYTES: usize = 64 * 1024;
 
 static NEXT_TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static FAIL_NEXT_PERSIST_PARENT_DIRECTORY_SYNC: Cell<bool> = const { Cell::new(false) };
+}
 
 /// A persistable vector whose backing allocation is shared until a mutation.
 ///
@@ -483,11 +490,58 @@ pub struct BatchImportError {
     pub error: String,
 }
 
+/// The result of the ordered persistence protocol after the temporary file has
+/// been replaced. A directory-sync failure is reported as a committed result
+/// because the new snapshot is already authoritative at the rename point.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PersistenceOutcome {
+    Durable,
+    CommittedButDurabilityUncertain { detail: String },
+}
+
+impl PersistenceOutcome {
+    pub fn is_durability_uncertain(&self) -> bool {
+        matches!(self, Self::CommittedButDurabilityUncertain { .. })
+    }
+
+    pub fn durability_warning(&self) -> Option<String> {
+        match self {
+            Self::Durable => None,
+            Self::CommittedButDurabilityUncertain { detail } => {
+                Some(format!("Crash durability is unconfirmed: {detail}"))
+            }
+        }
+    }
+}
+
+/// A value whose snapshot was committed, together with the durability outcome
+/// of the final parent-directory sync.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Persisted<T> {
+    pub value: T,
+    pub outcome: PersistenceOutcome,
+}
+
+impl<T> Persisted<T> {
+    fn new(value: T, outcome: PersistenceOutcome) -> Self {
+        Self { value, outcome }
+    }
+}
+
+impl<T> Deref for Persisted<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BatchImportReport {
     pub library: Option<Library>,
     pub imported_paths: Vec<PathBuf>,
     pub errors: Vec<BatchImportError>,
+    pub persistence_outcome: Option<PersistenceOutcome>,
 }
 
 impl BatchImportReport {
@@ -496,6 +550,7 @@ impl BatchImportReport {
             library: None,
             imported_paths: Vec::new(),
             errors: vec![BatchImportError { path, error }],
+            persistence_outcome: None,
         }
     }
 }
@@ -716,11 +771,13 @@ fn library_size_limit_error(path: &Path) -> String {
 /// synced so the backup contents and directory entry are durable before the
 /// active library is replaced. Backups are intentionally never removed by
 /// this helper.
-pub fn preserve_unreadable_library_and_start_fresh() -> Result<PathBuf, String> {
+pub fn preserve_unreadable_library_and_start_fresh() -> Result<Persisted<PathBuf>, String> {
     preserve_unreadable_library_and_start_fresh_at(&library_path())
 }
 
-pub fn preserve_unreadable_library_and_start_fresh_at(path: &Path) -> Result<PathBuf, String> {
+pub fn preserve_unreadable_library_and_start_fresh_at(
+    path: &Path,
+) -> Result<Persisted<PathBuf>, String> {
     let (mut source_file, source_metadata) = open_admitted_regular_file(path)
         .map_err(|error| format!("Could not preserve {}: {error}", path.display()))?;
     let source_length = source_metadata.len();
@@ -767,8 +824,8 @@ pub fn preserve_unreadable_library_and_start_fresh_at(path: &Path) -> Result<Pat
         ));
     }
 
-    persist_library_at(&Library::default(), path)?;
-    Ok(backup_path)
+    let outcome = persist_library_at(&Library::default(), path)?;
+    Ok(Persisted::new(backup_path, outcome))
 }
 
 fn copy_exact_file_bytes(
@@ -790,7 +847,7 @@ fn copy_exact_file_bytes(
 pub fn import_into_library(
     library: Library,
     decoded: crate::audio::DecodedAudioFile,
-) -> Result<Library, String> {
+) -> Result<Persisted<Library>, String> {
     import_into_library_at(library, decoded, &library_path())
 }
 
@@ -799,7 +856,7 @@ fn import_into_library_at(
     mut library: Library,
     decoded: crate::audio::DecodedAudioFile,
     library_path: &Path,
-) -> Result<Library, String> {
+) -> Result<Persisted<Library>, String> {
     let path = decoded.path().to_path_buf();
     validate_audio_path(&path)?;
     ensure_decoded_audio_unchanged(&decoded)?;
@@ -840,8 +897,8 @@ fn import_into_library_at(
     normalize_planner_order(&mut library);
     library.selected_track_id = Some(id);
     ensure_decoded_audio_unchanged(&decoded)?;
-    persist_library_at(&library, library_path)?;
-    Ok(library)
+    let outcome = persist_library_at(&library, library_path)?;
+    Ok(Persisted::new(library, outcome))
 }
 
 /// Replace the source file for one existing track while preserving its stable
@@ -851,7 +908,7 @@ pub fn replace_track(
     library: Library,
     track_id: &str,
     decoded: crate::audio::DecodedAudioFile,
-) -> Result<Library, String> {
+) -> Result<Persisted<Library>, String> {
     replace_track_at(library, track_id, decoded, &library_path())
 }
 
@@ -860,7 +917,7 @@ fn replace_track_at(
     track_id: &str,
     decoded: crate::audio::DecodedAudioFile,
     library_path: &Path,
-) -> Result<Library, String> {
+) -> Result<Persisted<Library>, String> {
     let path = decoded.path().to_path_buf();
     validate_audio_path(&path)?;
     ensure_decoded_audio_unchanged(&decoded)?;
@@ -880,8 +937,8 @@ fn replace_track_at(
     )?;
     library.selected_track_id = Some(track_id.to_owned());
     ensure_decoded_audio_unchanged(&decoded)?;
-    persist_library_at(&library, library_path)?;
-    Ok(library)
+    let outcome = persist_library_at(&library, library_path)?;
+    Ok(Persisted::new(library, outcome))
 }
 
 /// Associate a second audio file with one track. The reference is kept as an
@@ -891,7 +948,7 @@ pub fn set_reference_track(
     library: Library,
     track_id: &str,
     decoded: crate::audio::DecodedAudioFile,
-) -> Result<Library, String> {
+) -> Result<Persisted<Library>, String> {
     set_reference_track_at(library, track_id, decoded, &library_path())
 }
 
@@ -900,7 +957,7 @@ fn set_reference_track_at(
     track_id: &str,
     decoded: crate::audio::DecodedAudioFile,
     library_path: &Path,
-) -> Result<Library, String> {
+) -> Result<Persisted<Library>, String> {
     let path = decoded.path().to_path_buf();
     validate_audio_path(&path)?;
     ensure_decoded_audio_unchanged(&decoded)?;
@@ -918,8 +975,8 @@ fn set_reference_track_at(
         Some(decoded.source_proof().clone()),
     )?;
     ensure_decoded_audio_unchanged(&decoded)?;
-    persist_library_at(&library, library_path)?;
-    Ok(library)
+    let outcome = persist_library_at(&library, library_path)?;
+    Ok(Persisted::new(library, outcome))
 }
 
 /// Add an audio file to the global reference catalog without assigning it to
@@ -929,7 +986,7 @@ fn set_reference_track_at(
 pub fn add_reference_track(
     library: Library,
     decoded: crate::audio::DecodedAudioFile,
-) -> Result<Library, String> {
+) -> Result<Persisted<Library>, String> {
     add_reference_track_at(library, decoded, &library_path())
 }
 
@@ -1198,24 +1255,30 @@ fn persist_batch_library(
             library: None,
             imported_paths: Vec::new(),
             errors,
+            persistence_outcome: None,
         };
     }
-    if let Err(error) = persist_library_at(&library, library_path) {
-        let mut errors = errors;
-        errors.push(BatchImportError {
-            path: library_path.to_path_buf(),
-            error: format!("Atomic import batch was not saved: {error}"),
-        });
-        return BatchImportReport {
-            library: None,
-            imported_paths: Vec::new(),
-            errors,
-        };
-    }
+    let persistence_outcome = match persist_library_at(&library, library_path) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let mut errors = errors;
+            errors.push(BatchImportError {
+                path: library_path.to_path_buf(),
+                error: format!("Atomic import batch was not saved: {error}"),
+            });
+            return BatchImportReport {
+                library: None,
+                imported_paths: Vec::new(),
+                errors,
+                persistence_outcome: None,
+            };
+        }
+    };
     BatchImportReport {
         library: Some(library),
         imported_paths: accepted_paths,
         errors,
+        persistence_outcome: Some(persistence_outcome),
     }
 }
 
@@ -1224,7 +1287,7 @@ fn add_reference_track_at(
     mut library: Library,
     decoded: crate::audio::DecodedAudioFile,
     library_path: &Path,
-) -> Result<Library, String> {
+) -> Result<Persisted<Library>, String> {
     let path = decoded.path().to_path_buf();
     validate_audio_path(&path)?;
     ensure_decoded_audio_unchanged(&decoded)?;
@@ -1237,8 +1300,8 @@ fn add_reference_track_at(
 
     ensure_reference_track_with_proof(&mut library, path, decoded.source_proof().clone())?;
     ensure_decoded_audio_unchanged(&decoded)?;
-    persist_library_at(&library, library_path)?;
-    Ok(library)
+    let outcome = persist_library_at(&library, library_path)?;
+    Ok(Persisted::new(library, outcome))
 }
 
 fn ensure_decoded_audio_unchanged(decoded: &crate::audio::DecodedAudioFile) -> Result<(), String> {
@@ -1717,12 +1780,12 @@ pub fn selection_after_removal(library: &Library, removed_index: usize) -> Optio
         .map(|track| track.id.clone())
 }
 
-pub fn persist_library(library: &Library) -> Result<(), String> {
+pub fn persist_library(library: &Library) -> Result<PersistenceOutcome, String> {
     let path = library_path();
     persist_library_at(library, &path)
 }
 
-fn persist_library_at(library: &Library, path: &Path) -> Result<(), String> {
+fn persist_library_at(library: &Library, path: &Path) -> Result<PersistenceOutcome, String> {
     validate_library_identity(library)
         .map_err(|error| format!("Could not validate library before saving: {error}"))?;
     let encoded = serde_json::to_vec_pretty(library)
@@ -1764,15 +1827,17 @@ fn persist_library_at(library: &Library, path: &Path) -> Result<(), String> {
     }
 
     #[cfg(unix)]
-    if let Err(error) = sync_parent_directory(directory) {
-        return Err(format!(
-            "Could not sync containing directory {} after replacing {}; durability is uncertain: {error}",
-            directory.display(),
-            path.display()
-        ));
+    if let Err(error) = sync_persist_parent_directory(directory) {
+        return Ok(PersistenceOutcome::CommittedButDurabilityUncertain {
+            detail: format!(
+                "could not sync containing directory {} after replacing {}: {error}",
+                directory.display(),
+                path.display()
+            ),
+        });
     }
 
-    Ok(())
+    Ok(PersistenceOutcome::Durable)
 }
 
 fn create_unique_temp_file(path: &Path) -> Result<(PathBuf, fs::File), String> {
@@ -1865,6 +1930,24 @@ fn with_recovery_backup_cleanup(primary_error: String, backup_path: &Path) -> St
 fn sync_parent_directory(directory: &Path) -> std::io::Result<()> {
     let file = fs::File::open(directory)?;
     file.sync_all()
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn fail_next_persist_parent_directory_sync_for_test() {
+    FAIL_NEXT_PERSIST_PARENT_DIRECTORY_SYNC.with(|should_fail| should_fail.set(true));
+}
+
+#[cfg(unix)]
+fn sync_persist_parent_directory(directory: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_NEXT_PERSIST_PARENT_DIRECTORY_SYNC.with(Cell::get) {
+        FAIL_NEXT_PERSIST_PARENT_DIRECTORY_SYNC.with(|should_fail| should_fail.set(false));
+        return Err(std::io::Error::other(
+            "injected post-rename parent-directory sync failure",
+        ));
+    }
+
+    sync_parent_directory(directory)
 }
 
 pub fn library_path() -> PathBuf {
@@ -2331,6 +2414,33 @@ mod tests {
         assert!(temporary_paths(&directory.path).is_empty());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn post_rename_parent_sync_failure_reports_a_committed_uncertain_outcome() {
+        let directory = TestDirectory::new();
+        let path = directory.path.join("library.json");
+        let original = persistence_fixture();
+        persist_library_at(&original, &path).expect("original library should persist");
+
+        let mut replacement = original.clone();
+        replacement.tracks[0].title = String::from("Committed replacement");
+        fail_next_persist_parent_directory_sync_for_test();
+
+        let outcome = persist_library_at(&replacement, &path)
+            .expect("a post-rename directory-sync failure must not report an ordinary error");
+
+        assert!(matches!(
+            &outcome,
+            PersistenceOutcome::CommittedButDurabilityUncertain { detail }
+                if detail.contains("injected post-rename parent-directory sync failure")
+        ));
+        assert_eq!(
+            load_library_at(&path).expect("the committed replacement should reload"),
+            replacement
+        );
+        assert!(temporary_paths(&directory.path).is_empty());
+    }
+
     #[test]
     fn shared_entity_snapshot_cow_clones_only_the_changed_entity_and_round_trips_json() {
         let second_reference_path = PathBuf::from("/external/reference-2.wav");
@@ -2493,6 +2603,40 @@ mod tests {
         assert_eq!(
             load_library_at(&library_path).expect("batch should reload"),
             library
+        );
+        assert!(temporary_paths(&directory.path).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn import_batch_keeps_accepted_paths_when_post_rename_sync_is_uncertain() {
+        let directory = TestDirectory::new();
+        let library_path = directory.path.join("library.json");
+        let (source, decoded) = decoded_audio_fixture(&directory.path);
+        let original = persistence_fixture();
+        persist_library_at(&original, &library_path).expect("original library should persist");
+        fail_next_persist_parent_directory_sync_for_test();
+
+        let report = import_verified_batch(
+            original,
+            vec![VerifiedImportCandidate::from_decoded(&decoded)],
+            &library_path,
+        );
+
+        let library = report
+            .library
+            .as_ref()
+            .expect("the renamed batch snapshot should remain accepted");
+        assert_eq!(report.imported_paths, vec![source]);
+        assert!(report.errors.is_empty());
+        assert!(matches!(
+            report.persistence_outcome.as_ref(),
+            Some(PersistenceOutcome::CommittedButDurabilityUncertain { detail })
+                if detail.contains("injected post-rename parent-directory sync failure")
+        ));
+        assert_eq!(
+            load_library_at(&library_path).expect("the committed batch should reload"),
+            *library
         );
         assert!(temporary_paths(&directory.path).is_empty());
     }
@@ -2901,7 +3045,7 @@ mod tests {
             .expect("oversized recovery should preserve and reset the library");
 
         assert_eq!(
-            fs::read(&backup_path).expect("backup should be readable"),
+            fs::read(&backup_path.value).expect("backup should be readable"),
             oversized
         );
         assert_eq!(
@@ -2953,10 +3097,10 @@ mod tests {
         let backup_path = preserve_unreadable_library_and_start_fresh_at(&path)
             .expect("recovery should preserve and reset the library");
 
-        assert_ne!(backup_path, path);
+        assert_ne!(backup_path.value, path);
         assert_eq!(backup_path.parent(), path.parent());
         assert_eq!(
-            fs::read(&backup_path).expect("backup should be readable"),
+            fs::read(&backup_path.value).expect("backup should be readable"),
             malformed
         );
         assert_eq!(
@@ -3565,7 +3709,7 @@ mod tests {
         assert_eq!(replaced.selected_track_id.as_deref(), Some("track-1"));
         let reloaded = load_library_at(&library_path).expect("replaced library should reload");
         assert_eq!(reloaded.selected_track_id.as_deref(), Some("track-1"));
-        assert_eq!(reloaded, replaced);
+        assert_eq!(reloaded, replaced.value);
     }
 
     #[test]
@@ -3585,7 +3729,7 @@ mod tests {
         assert_eq!(imported.tracks[0].path, source);
         assert_eq!(
             load_library_at(&library_path).expect("persisted import should reload"),
-            imported
+            imported.value
         );
         let json = fs::read_to_string(&library_path).expect("persisted JSON should be readable");
         assert!(json.contains("\"source_proof\""));
@@ -3656,10 +3800,10 @@ mod tests {
                 .is_unknown()
         );
 
-        library = selected.clone();
+        library = selected.value.clone();
         let persisted = add_reference_track_at(library.clone(), decoded, &library_path)
             .expect("same path and proof should remain idempotent");
-        assert_eq!(persisted, library);
+        assert_eq!(persisted.value, library);
         assert_eq!(persisted.reference_tracks[0].notes, notes);
         assert!(
             persisted.reference_tracks[0]
