@@ -11570,9 +11570,29 @@ const SETTINGS_REFERENCE_ROW_TEXT_SPACING: f32 = 4.0;
 const SETTINGS_REFERENCE_ROW_TEXT_HEIGHT: f32 = SETTINGS_REFERENCE_ROW_TITLE_HEIGHT
     + SETTINGS_REFERENCE_ROW_TEXT_SPACING
     + SETTINGS_REFERENCE_ROW_METADATA_HEIGHT;
-const SETTINGS_REFERENCE_REIMPORT_BUTTON_WIDTH: f32 = 92.0;
-const SETTINGS_REFERENCE_REMOVE_BUTTON_WIDTH: f32 = 72.0;
 const SETTINGS_REFERENCE_ACTION_HEIGHT: f32 = 32.0;
+const SETTINGS_REFERENCE_REIMPORT_LABEL: &str = "Re-import / replace reference track";
+const SETTINGS_REFERENCE_REMOVE_LABEL: &str = "Remove reference track";
+
+static SETTINGS_REFERENCE_REIMPORT_ICON: ui::SvgIconTintCache = ui::SvgIconTintCache::new(
+    r#"<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" fill="currentColor">
+  <path d="M12 4V1L8 5l4 4V6c2.8 0 5 2.2 5 5 0 .8-.2 1.6-.5 2.2l1.5 1.5c.6-1.1 1-2.4 1-3.7 0-3.9-3.1-7-7-7Zm0 14c-2.8 0-5-2.2-5-5 0-.8.2-1.6.5-2.2L6 9.3c-.6 1.1-1 2.4-1 3.7 0 3.9 3.1 7 7 7v3l4-4-4-4v3Z"/>
+</svg>"#,
+);
+
+static SETTINGS_REFERENCE_REMOVE_ICON: ui::SvgIconTintCache = ui::SvgIconTintCache::new(
+    r#"<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" fill="currentColor">
+  <path d="M6 7h12l-1 13H7L6 7Zm3-4h6l1 2h4v2H4V5h4l1-2Zm0 7h2v7H9v-7Zm4 0h2v7h-2v-7Z"/>
+</svg>"#,
+);
+
+fn settings_reference_reimport_icon() -> ui::SvgIcon {
+    SETTINGS_REFERENCE_REIMPORT_ICON.icon_for_state(REVIEW_TRANSPORT_ICON_TINTS, true, false)
+}
+
+fn settings_reference_remove_icon() -> ui::SvgIcon {
+    SETTINGS_REFERENCE_REMOVE_ICON.icon_for_state(REVIEW_TRANSPORT_ICON_TINTS, true, false)
+}
 
 fn keyboard_stage_menu_anchor(state: &AppState) -> Point {
     match state.workspace_mode {
@@ -11718,23 +11738,34 @@ fn settings_reference_row(
             .spacing(SETTINGS_REFERENCE_ROW_TEXT_SPACING)
             .fill_width()
             .height(SETTINGS_REFERENCE_ROW_TEXT_HEIGHT),
-            ui::button("Re-import")
+            ui::icon_button(settings_reference_reimport_icon())
+                .label(SETTINGS_REFERENCE_REIMPORT_LABEL)
                 .subtle()
                 .message(Message::ReferenceReplacementPressed(replacement_path))
                 .key(format!("settings-reimport-reference-{}", path.display()))
-                .tooltip("Re-import / replace reference track")
-                .width(SETTINGS_REFERENCE_REIMPORT_BUTTON_WIDTH)
+                .tooltip(SETTINGS_REFERENCE_REIMPORT_LABEL)
+                .size(
+                    SETTINGS_REFERENCE_ACTION_HEIGHT,
+                    SETTINGS_REFERENCE_ACTION_HEIGHT,
+                )
+                .width(SETTINGS_REFERENCE_ACTION_HEIGHT)
                 .height(SETTINGS_REFERENCE_ACTION_HEIGHT),
-            ui::button("Remove")
+            ui::icon_button(settings_reference_remove_icon())
+                .label(SETTINGS_REFERENCE_REMOVE_LABEL)
                 .subtle()
                 .message(Message::RemoveReferenceTrack(remove_path))
                 .key(format!("settings-remove-reference-{}", path.display()))
-                .tooltip("Remove reference track")
-                .width(SETTINGS_REFERENCE_REMOVE_BUTTON_WIDTH)
+                .tooltip(SETTINGS_REFERENCE_REMOVE_LABEL)
+                .size(
+                    SETTINGS_REFERENCE_ACTION_HEIGHT,
+                    SETTINGS_REFERENCE_ACTION_HEIGHT,
+                )
+                .width(SETTINGS_REFERENCE_ACTION_HEIGHT)
                 .height(SETTINGS_REFERENCE_ACTION_HEIGHT),
         ],
     )
     .fill_width()
+    .align_cross(radiant::layout::CrossAlign::Center)
     .height(SETTINGS_REFERENCE_ROW_HEIGHT)
 }
 
@@ -13884,14 +13915,14 @@ mod tests {
         LoopSelections, MAIN_SOURCE_MISMATCH_STATUS, Message, NoteAddress, NoteDraft, NoteOwner,
         PairedPlaybackGuard, PendingImportCommit, PersistedNoteDrag, PlannerInsertionTarget,
         PlaybackSource, REFERENCE_MENU_WIDTH, REFERENCE_SOURCE_MISMATCH_STATUS,
-        ReferenceUnloadState, ResumeTransportCommand, SETTINGS_REFERENCE_ROW_METADATA_HEIGHT,
-        SETTINGS_REFERENCE_ROW_TEXT_HEIGHT, SETTINGS_REFERENCE_ROW_TEXT_SPACING,
-        SETTINGS_REFERENCE_ROW_TITLE_HEIGHT, STATUS_BAR_VERSION_WIDTH, SharedLibrary,
-        TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER, TRACK_CARD_LIST_SPACING, TRACK_CARD_SELECTED_CORAL,
-        WAVEFORM_HEIGHT, WaveformDecodeRequest, WaveformMarkerProjectionCache,
-        WaveformMarkerProjectionKey, WorkspaceMode, animation_requested, apply_transport_snapshot,
-        cleanup_reference_transport_failure, current_live_frame_for_source,
-        current_loudness_match_gain_db, current_lufs_meter_value,
+        ReferenceUnloadState, ResumeTransportCommand, SETTINGS_REFERENCE_ACTION_HEIGHT,
+        SETTINGS_REFERENCE_ROW_METADATA_HEIGHT, SETTINGS_REFERENCE_ROW_TEXT_HEIGHT,
+        SETTINGS_REFERENCE_ROW_TEXT_SPACING, SETTINGS_REFERENCE_ROW_TITLE_HEIGHT,
+        STATUS_BAR_VERSION_WIDTH, SharedLibrary, TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER,
+        TRACK_CARD_LIST_SPACING, TRACK_CARD_SELECTED_CORAL, WAVEFORM_HEIGHT, WaveformDecodeRequest,
+        WaveformMarkerProjectionCache, WaveformMarkerProjectionKey, WorkspaceMode,
+        animation_requested, apply_transport_snapshot, cleanup_reference_transport_failure,
+        current_live_frame_for_source, current_loudness_match_gain_db, current_lufs_meter_value,
         current_reference_lufs_meter_value, decode_result_is_current, enforce_loop,
         ensure_library_projection_cache, ensure_reference_transport_with, favorite_toggle,
         frame_surface_revisions, handle_close_requested, handle_shutdown_with, library_dirty,
@@ -13922,6 +13953,7 @@ mod tests {
     };
     use radiant::{
         application::IntoView,
+        gui::automation::AutomationRole,
         gui::types::{Point, Rect, Vector2},
         prelude as ui,
         runtime::{
@@ -17417,6 +17449,44 @@ mod tests {
             source_proof: crate::source::SourceProvenance::Unknown,
             notes: crate::storage::SharedVec::default(),
         };
+        let frame = settings_reference_row(&reference, 2, true)
+            .view_frame_at_size_with_default_theme(Vector2::new(680.0, 64.0));
+        let labels = frame.paint_plan.text_label_strings();
+        assert!(!labels.iter().any(|label| {
+            label == "Re-import"
+                || label == "Remove"
+                || label == "Re-import / replace reference track"
+                || label == "Remove reference track"
+        }));
+        assert!(paint_plan_contains_icon(
+            &frame.paint_plan.primitives,
+            &super::settings_reference_reimport_icon()
+        ));
+        assert!(paint_plan_contains_icon(
+            &frame.paint_plan.primitives,
+            &super::settings_reference_remove_icon()
+        ));
+
+        let mut reimport_primitives = Vec::new();
+        super::settings_reference_reimport_icon().append_paint(
+            &mut reimport_primitives,
+            0,
+            Rect::from_min_size(Point::new(0.0, 0.0), Vector2::new(16.0, 16.0)),
+        );
+        let mut remove_primitives = Vec::new();
+        super::settings_reference_remove_icon().append_paint(
+            &mut remove_primitives,
+            0,
+            Rect::from_min_size(Point::new(0.0, 0.0), Vector2::new(16.0, 16.0)),
+        );
+        let PaintPrimitive::Svg(reimport_svg) = &reimport_primitives[0] else {
+            panic!("reference re-import should paint a retained SVG");
+        };
+        let PaintPrimitive::Svg(remove_svg) = &remove_primitives[0] else {
+            panic!("reference remove should paint a retained SVG");
+        };
+        assert_ne!(reimport_svg.document, remove_svg.document);
+
         let bridge = DeclarativeOwnedRuntimeBridge::new(
             Harness {
                 reference: reference.clone(),
@@ -17434,18 +17504,56 @@ mod tests {
         let targets = runtime.automation_target_snapshot().targets;
         let reimport_target = targets
             .iter()
-            .find(|target| target.label.as_deref() == Some("Re-import"))
+            .find(|target| target.label.as_deref() == Some("Re-import / replace reference track"))
             .expect("reference re-import should be an automation target");
         let remove_target = targets
             .iter()
-            .find(|target| target.label.as_deref() == Some("Remove"))
+            .find(|target| target.label.as_deref() == Some("Remove reference track"))
             .expect("reference remove should be an automation target");
-        for target in [reimport_target, remove_target] {
+        assert_eq!(reimport_target.role, AutomationRole::Button);
+        assert_eq!(remove_target.role, AutomationRole::Button);
+        assert_eq!(
+            reimport_target.label.as_deref(),
+            Some("Re-import / replace reference track")
+        );
+        assert_eq!(
+            remove_target.label.as_deref(),
+            Some("Remove reference track")
+        );
+        assert_eq!(
+            reimport_target.bounds.width,
+            SETTINGS_REFERENCE_ACTION_HEIGHT
+        );
+        assert_eq!(
+            reimport_target.bounds.height,
+            SETTINGS_REFERENCE_ACTION_HEIGHT
+        );
+        assert_eq!(remove_target.bounds.width, SETTINGS_REFERENCE_ACTION_HEIGHT);
+        assert_eq!(
+            remove_target.bounds.height,
+            SETTINGS_REFERENCE_ACTION_HEIGHT
+        );
+        assert_ne!(reimport_target.id, remove_target.id);
+        assert!(reimport_target.tree_index < remove_target.tree_index);
+        for (target, expected_tooltip) in [
+            (reimport_target, "Re-import / replace reference track"),
+            (remove_target, "Remove reference track"),
+        ] {
             assert!(target.interaction_target);
             assert!(target.enabled);
             assert!(target.focusable);
             let point = Point::new(target.center.x, target.center.y);
-            assert!(runtime.widget_at(point).is_some());
+            let widget_id = runtime
+                .widget_at(point)
+                .expect("reference action should have a pointer target");
+            let widget = runtime
+                .surface()
+                .find_widget(widget_id)
+                .expect("reference action widget should be addressable");
+            assert_eq!(
+                widget.widget().common().tooltip.as_deref(),
+                Some(expected_tooltip)
+            );
             runtime.dispatch_primary_click(point);
         }
         assert_eq!(runtime.bridge().state().reimported_path, Some(path.clone()));
@@ -17465,9 +17573,50 @@ mod tests {
             },
         );
         let mut keyboard_runtime = SurfaceRuntime::new(keyboard_bridge, Vector2::new(680.0, 64.0));
+        let keyboard_targets = keyboard_runtime.automation_target_snapshot().targets;
+        let keyboard_action_targets = keyboard_targets
+            .iter()
+            .filter(|target| {
+                target.label.as_deref() == Some("Re-import / replace reference track")
+                    || target.label.as_deref() == Some("Remove reference track")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(keyboard_action_targets.len(), 2);
+        assert_eq!(
+            keyboard_action_targets
+                .iter()
+                .map(|target| target.id.clone())
+                .collect::<Vec<_>>(),
+            vec![reimport_target.id.clone(), remove_target.id.clone()]
+        );
+        assert_eq!(
+            keyboard_action_targets
+                .iter()
+                .map(|target| target.label.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("Re-import / replace reference track"),
+                Some("Remove reference track")
+            ]
+        );
+        let keyboard_reimport = keyboard_action_targets[0];
+        let keyboard_remove = keyboard_action_targets[1];
+        let keyboard_reimport_widget = keyboard_runtime
+            .widget_at(Point::new(
+                keyboard_reimport.center.x,
+                keyboard_reimport.center.y,
+            ))
+            .expect("keyboard re-import should have a widget target");
+        let keyboard_remove_widget = keyboard_runtime
+            .widget_at(Point::new(
+                keyboard_remove.center.x,
+                keyboard_remove.center.y,
+            ))
+            .expect("keyboard remove should have a widget target");
         let reimport_focus = keyboard_runtime
             .traverse_focus(FocusTraversal::Forward)
             .expect("reference re-import should be keyboard focusable");
+        assert_eq!(reimport_focus, keyboard_reimport_widget);
         assert_eq!(
             keyboard_runtime.dispatch_event(Event::key_press(ui::WidgetKey::Enter)),
             Some(reimport_focus)
@@ -17480,6 +17629,7 @@ mod tests {
             .traverse_focus(FocusTraversal::Forward)
             .expect("reference remove should be keyboard focusable");
         assert_ne!(reimport_focus, remove_focus);
+        assert_eq!(remove_focus, keyboard_remove_widget);
         assert_eq!(
             keyboard_runtime.dispatch_event(Event::key_press(ui::WidgetKey::Enter)),
             Some(remove_focus)
