@@ -5060,6 +5060,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
         }
         Message::CommentDragEnded { ratio } => {
             if !library_is_ready(state) || state.busy || state.waveform_busy {
+                rollback_persisted_note_drag(state);
                 return;
             }
             if reject_main_source_mismatch(state, context) {
@@ -5114,6 +5115,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 || state.waveform_busy
                 || state.reference_waveform_busy
             {
+                rollback_reference_persisted_note_drag(state);
                 return;
             }
             if reject_main_source_mismatch(state, context)
@@ -8459,6 +8461,8 @@ fn start_reference_replacement_commit(
         replacement_path: replacement_path.clone(),
         expected_proof: expected_proof.clone(),
     });
+    rollback_persisted_note_drag(state);
+    rollback_reference_persisted_note_drag(state);
     let library = state.library.snapshot();
     let commit_reference_path = reference_path.clone();
     let commit_expected_proof = expected_proof;
@@ -13782,9 +13786,9 @@ mod tests {
         LIBRARY_REVEAL_MARGIN, LIBRARY_SCROLL_VIEWPORT_ID, LibraryLoadState, LibraryMutationScope,
         LibraryProjectionCache, LibrarySaveAttempt, LiveSpectrogramMode, LoopBounds, LoopSelection,
         LoopSelections, MAIN_SOURCE_MISMATCH_STATUS, Message, NoteAddress, NoteDraft, NoteOwner,
-        PairedPlaybackGuard, PendingImportCommit, PlannerInsertionTarget, PlaybackSource,
-        REFERENCE_MENU_WIDTH, REFERENCE_SOURCE_MISMATCH_STATUS, ReferenceUnloadState,
-        ResumeTransportCommand, SETTINGS_REFERENCE_ROW_METADATA_HEIGHT,
+        PairedPlaybackGuard, PendingImportCommit, PersistedNoteDrag, PlannerInsertionTarget,
+        PlaybackSource, REFERENCE_MENU_WIDTH, REFERENCE_SOURCE_MISMATCH_STATUS,
+        ReferenceUnloadState, ResumeTransportCommand, SETTINGS_REFERENCE_ROW_METADATA_HEIGHT,
         SETTINGS_REFERENCE_ROW_TEXT_HEIGHT, SETTINGS_REFERENCE_ROW_TEXT_SPACING,
         SETTINGS_REFERENCE_ROW_TITLE_HEIGHT, STATUS_BAR_VERSION_WIDTH, SharedLibrary,
         TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER, TRACK_CARD_LIST_SPACING, TRACK_CARD_SELECTED_CORAL,
@@ -31044,6 +31048,72 @@ mod tests {
                 && pending_replacement == &replacement_path
                 && pending_proof == &proof
         ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reference_replacement_fences_late_persisted_comment_drag() {
+        let reference_path = PathBuf::from("/external/fenced-reference.wav");
+        let (replacement_path, decoded, root) = decoded_replacement_fixture();
+        let track_id = String::from("reference-replacement-fence");
+        let note_id = String::from("late-note");
+        let mut state = reference_selection_state(
+            &track_id,
+            None,
+            None,
+            reference_path.clone(),
+            Some(decoded.source_proof().clone()),
+        );
+        state.library.tracks[0].notes.push(Note {
+            id: note_id.clone(),
+            time_millis: 500,
+            body: String::from("must remain unchanged"),
+            done: false,
+        });
+        state.persisted_note_drag = Some(PersistedNoteDrag {
+            address: NoteAddress::main(track_id, note_id.clone()),
+            original_time_millis: 500,
+        });
+        assert!(state.persisted_note_drag.is_some());
+        let library_before = state.library.clone();
+
+        let request_id = begin_reference_replacement_commit(
+            &mut state,
+            &reference_path,
+            &replacement_path,
+            decoded,
+        );
+        let pending_before = state.pending_import_commit.clone();
+        assert!(state.busy);
+        assert!(state.persisted_note_drag.is_none());
+
+        update(
+            &mut state,
+            Message::CommentDragEnded { ratio: 0.75 },
+            &mut ui::UiUpdateContext::default(),
+        );
+
+        assert_eq!(state.library, library_before);
+        assert_eq!(
+            state.library.tracks[0]
+                .notes
+                .iter()
+                .find(|note| note.id == note_id)
+                .map(|note| note.time_millis),
+            Some(500)
+        );
+        assert!(state.persisted_note_drag.is_none());
+        assert!(state.save_in_flight.is_none());
+        assert!(!state.save_admission_pending);
+        assert_eq!(state.pending_import_commit, pending_before);
+        assert!(matches!(
+            state.pending_import_commit.as_ref(),
+            Some(PendingImportCommit::ReferenceReplacement {
+                request_id: pending_request_id,
+                ..
+            }) if *pending_request_id == request_id
+        ));
+        assert!(state.busy);
         let _ = fs::remove_dir_all(root);
     }
 
