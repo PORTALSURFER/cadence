@@ -474,6 +474,7 @@ const LIVE_SPECTROGRAM_HEADER_HEIGHT: f32 = 22.0;
 const LIVE_SPECTROGRAM_SECTION_SPACING: f32 = 4.0;
 const MAIN_WAVEFORM_HEADER_HEIGHT: f32 = 22.0;
 const LUFS_METER_WIDTH: f32 = 76.0;
+const METER_TO_WAVEFORM_GUTTER: f32 = 8.0;
 const REFERENCE_HEADER_HEIGHT: f32 = 26.0;
 const REFERENCE_SECTION_SPACING: f32 = 4.0;
 const WAVEFORM_SECTION_SPACING: f32 = 8.0;
@@ -12460,7 +12461,7 @@ fn review_panel(state: &AppState) -> ui::View<Message> {
             .height(WAVEFORM_HEIGHT),
         waveform_view,
     ])
-    .spacing(8.0)
+    .spacing(METER_TO_WAVEFORM_GUTTER)
     .fill_width()
     .height(WAVEFORM_HEIGHT);
     let main_waveform_header = ui::row([
@@ -12868,7 +12869,7 @@ fn reference_waveform_section(state: &AppState, track: &storage::Track) -> ui::V
             .height(REFERENCE_WAVEFORM_HEIGHT)
     };
     let body = ui::row([reference_meter, reference_body])
-        .spacing(0.0)
+        .spacing(METER_TO_WAVEFORM_GUTTER)
         .fill_width()
         .height(REFERENCE_WAVEFORM_HEIGHT);
     let header = ui::row([
@@ -12882,7 +12883,7 @@ fn reference_waveform_section(state: &AppState, track: &storage::Track) -> ui::V
             .align_text(ui::TextAlign::Right)
             .subtle(),
     ])
-    .spacing(8.0)
+    .spacing(METER_TO_WAVEFORM_GUTTER)
     .fill_width()
     .height(REFERENCE_HEADER_HEIGHT);
     ui::column([body, header])
@@ -13962,7 +13963,7 @@ mod tests {
             RepaintScope, RuntimeBridge, RuntimeHostCapabilities, RuntimeTaskHost, SurfaceRuntime,
             TaskPriority, TransientOverlayContext, UiSurface,
         },
-        theme::ThemeTokens,
+        theme::{DpiScale, ThemeTokens},
         widgets::{
             EditEvent, EditPhase, InteractionProvenance, KeyboardModifiers, PointerModifiers,
             SliderEditBatch, Widget, WidgetInput,
@@ -16515,6 +16516,35 @@ mod tests {
             .collect::<Vec<_>>();
         rects.sort_by(|left, right| left.min.y.total_cmp(&right.min.y));
         rects
+    }
+
+    fn waveform_drawable_span(primitives: &[PaintPrimitive], widget_id: u64) -> Option<Rect> {
+        let theme = ThemeTokens::default();
+        let bar_colors = [
+            theme.text_primary,
+            theme.text_muted.with_alpha(160),
+            theme.highlight_orange,
+            theme.highlight_orange.with_alpha(160),
+        ];
+        primitives
+            .iter()
+            .filter_map(|primitive| match primitive {
+                PaintPrimitive::FillRect(fill)
+                    if fill.widget_id == widget_id && bar_colors.contains(&fill.color) =>
+                {
+                    Some(fill.rect)
+                }
+                _ => None,
+            })
+            .fold(None, |span, rect| {
+                Some(match span {
+                    Some(span) => Rect::from_min_max(
+                        Point::new(span.min.x.min(rect.min.x), span.min.y.min(rect.min.y)),
+                        Point::new(span.max.x.max(rect.max.x), span.max.y.max(rect.max.y)),
+                    ),
+                    None => rect,
+                })
+            })
     }
 
     fn command_has_begin_drag(command: &Command<Message>) -> bool {
@@ -22018,6 +22048,44 @@ mod tests {
             stage: TrackStage::Backlog,
             notes: crate::storage::SharedVec::default(),
         });
+
+        for width in [900.0, 1_180.0, 1_800.0] {
+            let frame = project_surface(&state)
+                .view_frame_at_size_with_default_theme(Vector2::new(width, 1_000.0));
+            let main_waveform_span = waveform_drawable_span(
+                &frame.paint_plan.primitives,
+                waveform::MAIN_WAVEFORM_WIDGET_ID,
+            )
+            .expect("the main waveform should paint drawable bars");
+            let reference_waveform_span = waveform_drawable_span(
+                &frame.paint_plan.primitives,
+                waveform::REFERENCE_WAVEFORM_WIDGET_ID,
+            )
+            .expect("the reference waveform should paint drawable bars");
+
+            assert_eq!(
+                main_waveform_span.min.x, reference_waveform_span.min.x,
+                "waveform drawable starts should align at {width} logical points"
+            );
+            assert_eq!(
+                main_waveform_span.max.x, reference_waveform_span.max.x,
+                "waveform drawable ends should align at {width} logical points"
+            );
+
+            for dpi_factor in [1.0, 1.25, 1.5, 2.0] {
+                let dpi_scale = DpiScale::new(dpi_factor);
+                assert_eq!(
+                    dpi_scale.logical_to_physical(main_waveform_span.min.x),
+                    dpi_scale.logical_to_physical(reference_waveform_span.min.x),
+                    "waveform drawable starts should align at {width} logical points and {dpi_factor}x DPI"
+                );
+                assert_eq!(
+                    dpi_scale.logical_to_physical(main_waveform_span.max.x),
+                    dpi_scale.logical_to_physical(reference_waveform_span.max.x),
+                    "waveform drawable ends should align at {width} logical points and {dpi_factor}x DPI"
+                );
+            }
+        }
 
         let frame = project_surface(&state)
             .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1_000.0));
