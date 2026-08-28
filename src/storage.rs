@@ -990,6 +990,54 @@ pub fn add_reference_track(
     add_reference_track_at(library, decoded, &library_path())
 }
 
+/// Replace one existing reference-catalog entry in place through one durable
+/// library replacement. The entry's notes and any future fields remain on the
+/// existing record; only its source path and proof change. Main-track
+/// assignments that pointed at the old path follow the replacement.
+pub fn replace_reference_track(
+    library: Library,
+    original_path: &Path,
+    expected_proof: Option<&crate::source::AudioSourceProof>,
+    decoded: crate::audio::DecodedAudioFile,
+) -> Result<Persisted<Library>, String> {
+    replace_reference_track_at(
+        library,
+        original_path,
+        expected_proof,
+        decoded,
+        &library_path(),
+    )
+}
+
+fn replace_reference_track_at(
+    mut library: Library,
+    original_path: &Path,
+    expected_proof: Option<&crate::source::AudioSourceProof>,
+    decoded: crate::audio::DecodedAudioFile,
+    library_path: &Path,
+) -> Result<Persisted<Library>, String> {
+    ensure_reference_track_matches_proof(&library, original_path, expected_proof)?;
+    let path = decoded.path().to_path_buf();
+    validate_audio_path(&path)?;
+    ensure_decoded_audio_unchanged(&decoded)?;
+    let metadata = fs::metadata(&path)
+        .map_err(|error| format!("Could not inspect {}: {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("{} is not a file", path.display()));
+    }
+    ensure_decoded_audio_unchanged(&decoded)?;
+
+    replace_reference_track_metadata_with_proof(
+        &mut library,
+        original_path,
+        path,
+        decoded.source_proof().clone(),
+    )?;
+    ensure_decoded_audio_unchanged(&decoded)?;
+    let outcome = persist_library_at(&library, library_path)?;
+    Ok(Persisted::new(library, outcome))
+}
+
 /// Commit one logical main-track import batch through one durable library
 /// replacement. Candidates are provisionally validated without changing the
 /// staged library, then revalidated in original order immediately before they
@@ -1331,6 +1379,66 @@ fn set_reference_track_metadata_with_proof(
         ensure_reference_track(library, path.clone());
     }
     set_reference_track_selection(library, track_id, path).map(|_| ())
+}
+
+fn replace_reference_track_metadata_with_proof(
+    library: &mut Library,
+    original_path: &Path,
+    replacement_path: PathBuf,
+    source_proof: crate::source::AudioSourceProof,
+) -> Result<(), String> {
+    let reference_index = library
+        .reference_tracks
+        .iter()
+        .position(|reference| reference.path == original_path)
+        .ok_or_else(|| String::from("That reference track is no longer in the catalog."))?;
+    if replacement_path != original_path
+        && library
+            .reference_tracks
+            .iter()
+            .enumerate()
+            .any(|(index, reference)| {
+                index != reference_index && reference.path == replacement_path
+            })
+    {
+        return Err(format!(
+            "Reference path {} is already owned by another catalog entry; choose a different file.",
+            replacement_path.display()
+        ));
+    }
+
+    let reference = library
+        .reference_tracks
+        .get_mut(reference_index)
+        .expect("the reference index was found before mutation");
+    reference.path = replacement_path.clone();
+    reference.source_proof = crate::source::SourceProvenance::Verified(source_proof);
+
+    for track in &mut library.tracks {
+        if track.reference_path.as_deref() == Some(original_path) {
+            track.reference_path = Some(replacement_path.clone());
+        }
+    }
+    Ok(())
+}
+
+fn ensure_reference_track_matches_proof(
+    library: &Library,
+    original_path: &Path,
+    expected_proof: Option<&crate::source::AudioSourceProof>,
+) -> Result<(), String> {
+    let reference = library
+        .reference_tracks
+        .iter()
+        .find(|reference| reference.path == original_path)
+        .ok_or_else(|| String::from("That reference track is no longer in the catalog."))?;
+    if reference.source_provenance().verified_proof() != expected_proof {
+        return Err(format!(
+            "Reference catalog changed for {}; replacement was not applied.",
+            original_path.display()
+        ));
+    }
+    Ok(())
 }
 
 pub fn set_reference_track_selection(
@@ -3710,6 +3818,314 @@ mod tests {
         let reloaded = load_library_at(&library_path).expect("replaced library should reload");
         assert_eq!(reloaded.selected_track_id.as_deref(), Some("track-1"));
         assert_eq!(reloaded, replaced.value);
+    }
+
+    #[test]
+    fn replacing_reference_catalog_entry_preserves_order_notes_assignments_and_reloads() {
+        let directory = TestDirectory::new();
+        let library_path = directory.path.join("library.json");
+        let replacement_path = directory.path.join("replacement.wav");
+        fs::write(&replacement_path, tiny_pcm_wav()).expect("replacement fixture should write");
+        let decoded = crate::audio::decode_audio_file(&replacement_path)
+            .expect("replacement fixture should decode");
+        let original_path = PathBuf::from("/external/original-reference.wav");
+        let other_path = PathBuf::from("/external/other-reference.wav");
+        let original_note = Note {
+            id: String::from("reference-note"),
+            time_millis: 250,
+            body: String::from("Keep this note on the catalog entry."),
+            done: false,
+        };
+        let track = |id: &str, reference_path: Option<PathBuf>| Track {
+            id: id.to_owned(),
+            title: id.to_owned(),
+            original_name: format!("{id}.wav"),
+            path: PathBuf::from(format!("/external/{id}.wav")),
+            source_proof: crate::source::SourceProvenance::Unknown,
+            reference_path,
+            size: 0,
+            favorite: false,
+            stage: TrackStage::Production,
+            notes: SharedVec::default(),
+        };
+        let library = Library {
+            tracks: vec![
+                track("first", Some(original_path.clone())),
+                track("second", Some(original_path.clone())),
+                track("other", Some(other_path.clone())),
+            ]
+            .into(),
+            selected_track_id: Some(String::from("second")),
+            reference_tracks: vec![
+                ReferenceTrack {
+                    path: original_path.clone(),
+                    source_proof: crate::source::SourceProvenance::Unknown,
+                    notes: vec![original_note.clone()].into(),
+                },
+                ReferenceTrack {
+                    path: other_path.clone(),
+                    source_proof: crate::source::SourceProvenance::Unknown,
+                    notes: SharedVec::default(),
+                },
+            ]
+            .into(),
+            planner_order: vec![
+                String::from("other"),
+                String::from("first"),
+                String::from("second"),
+            ]
+            .into(),
+        };
+        persist_library_at(&library, &library_path).expect("original library should persist");
+
+        let replaced = replace_reference_track_at(
+            library.clone(),
+            &original_path,
+            None,
+            decoded,
+            &library_path,
+        )
+        .expect("reference replacement should persist");
+
+        assert_eq!(
+            replaced
+                .reference_tracks
+                .iter()
+                .map(|reference| reference.path.clone())
+                .collect::<Vec<_>>(),
+            vec![replacement_path.clone(), other_path]
+        );
+        assert_eq!(
+            replaced.reference_tracks[0].notes,
+            vec![original_note].into()
+        );
+        assert_eq!(
+            replaced
+                .tracks
+                .iter()
+                .map(|track| track.reference_path.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Some(replacement_path.clone()),
+                Some(replacement_path.clone()),
+                Some(PathBuf::from("/external/other-reference.wav")),
+            ]
+        );
+        assert_eq!(
+            replaced.planner_order.as_slice(),
+            ["other", "first", "second"]
+        );
+        assert!(
+            replaced.reference_tracks[0]
+                .source_provenance()
+                .verified_proof()
+                .is_some()
+        );
+        assert_eq!(
+            load_library_at(&library_path).expect("replaced library should reload"),
+            replaced.value
+        );
+    }
+
+    #[test]
+    fn stale_reference_catalog_proof_rejects_before_persistence() {
+        let directory = TestDirectory::new();
+        let library_path = directory.path.join("library.json");
+        let replacement_path = directory.path.join("replacement.wav");
+        fs::write(&replacement_path, tiny_pcm_wav()).expect("replacement fixture should write");
+        let decoded = crate::audio::decode_audio_file(&replacement_path)
+            .expect("replacement fixture should decode");
+        let original_path = PathBuf::from("/external/original-reference.wav");
+        let library = Library {
+            tracks: vec![Track {
+                id: String::from("owner"),
+                title: String::from("Owner"),
+                original_name: String::from("owner.wav"),
+                path: PathBuf::from("/external/owner.wav"),
+                source_proof: crate::source::SourceProvenance::Unknown,
+                reference_path: Some(original_path.clone()),
+                size: 0,
+                favorite: false,
+                stage: TrackStage::Backlog,
+                notes: SharedVec::default(),
+            }]
+            .into(),
+            selected_track_id: Some(String::from("owner")),
+            reference_tracks: vec![ReferenceTrack {
+                path: original_path.clone(),
+                source_proof: crate::source::SourceProvenance::Verified(
+                    decoded.source_proof().clone(),
+                ),
+                notes: vec![Note {
+                    id: String::from("keep-note"),
+                    time_millis: 100,
+                    body: String::from("Keep this note."),
+                    done: false,
+                }]
+                .into(),
+            }]
+            .into(),
+            planner_order: vec![String::from("owner")].into(),
+        };
+        persist_library_at(&library, &library_path).expect("original library should persist");
+        let original_bytes = fs::read(&library_path).expect("original snapshot should read");
+        let stale_proof = crate::source::AudioSourceProof {
+            sha256: "a".repeat(64),
+            byte_len: decoded.source_proof().byte_len,
+        };
+
+        let error = replace_reference_track_at(
+            library.clone(),
+            &original_path,
+            Some(&stale_proof),
+            decoded,
+            &library_path,
+        )
+        .expect_err("a stale catalog proof must reject the worker commit");
+
+        assert!(error.contains("Reference catalog changed"));
+        assert_eq!(
+            library,
+            load_library_at(&library_path).expect("library should reload")
+        );
+        assert_eq!(
+            fs::read(&library_path).expect("stale replacement must not rewrite the snapshot"),
+            original_bytes
+        );
+    }
+
+    #[test]
+    fn replacing_reference_catalog_entry_refreshes_same_path_proof_and_preserves_notes() {
+        let directory = TestDirectory::new();
+        let library_path = directory.path.join("library.json");
+        let source = directory.path.join("same-reference.wav");
+        fs::write(&source, tiny_pcm_wav()).expect("reference fixture should write");
+        let first = crate::audio::decode_audio_file(&source).expect("first proof should decode");
+        let note = Note {
+            id: String::from("same-path-note"),
+            time_millis: 100,
+            body: String::from("Preserve across a same-path re-import."),
+            done: true,
+        };
+        let library = Library {
+            tracks: vec![Track {
+                id: String::from("owner"),
+                title: String::from("Owner"),
+                original_name: String::from("owner.wav"),
+                path: PathBuf::from("/external/owner.wav"),
+                source_proof: crate::source::SourceProvenance::Unknown,
+                reference_path: Some(source.clone()),
+                size: 0,
+                favorite: false,
+                stage: TrackStage::Backlog,
+                notes: SharedVec::default(),
+            }]
+            .into(),
+            selected_track_id: Some(String::from("owner")),
+            reference_tracks: vec![ReferenceTrack {
+                path: source.clone(),
+                source_proof: crate::source::SourceProvenance::Verified(
+                    first.source_proof().clone(),
+                ),
+                notes: vec![note.clone()].into(),
+            }]
+            .into(),
+            planner_order: vec![String::from("owner")].into(),
+        };
+        persist_library_at(&library, &library_path).expect("original library should persist");
+
+        let mut changed = tiny_pcm_wav();
+        let last = changed.len() - 1;
+        changed[last] = 1;
+        fs::write(&source, changed).expect("changed reference should write");
+        let second = crate::audio::decode_audio_file(&source).expect("second proof should decode");
+        assert_ne!(first.source_proof(), second.source_proof());
+        let second_proof = second.source_proof().clone();
+
+        let replaced = replace_reference_track_at(
+            library,
+            &source,
+            Some(first.source_proof()),
+            second,
+            &library_path,
+        )
+        .expect("same-path reference replacement should persist");
+
+        assert_eq!(replaced.reference_tracks[0].path, source);
+        assert_eq!(
+            replaced.reference_tracks[0]
+                .source_provenance()
+                .verified_proof(),
+            Some(&second_proof)
+        );
+        assert_eq!(replaced.reference_tracks[0].notes, vec![note].into());
+        assert_eq!(replaced.tracks[0].reference_path, Some(source.clone()));
+        assert_eq!(
+            load_library_at(&library_path).expect("same-path replacement should reload"),
+            replaced.value
+        );
+    }
+
+    #[test]
+    fn replacing_reference_catalog_entry_rejects_another_entry_path_atomically() {
+        let directory = TestDirectory::new();
+        let library_path = directory.path.join("library.json");
+        let occupied_path = directory.path.join("occupied.wav");
+        fs::write(&occupied_path, tiny_pcm_wav()).expect("occupied fixture should write");
+        let decoded = crate::audio::decode_audio_file(&occupied_path)
+            .expect("occupied fixture should decode");
+        let original_path = PathBuf::from("/external/original-reference.wav");
+        let library = Library {
+            tracks: vec![Track {
+                id: String::from("owner"),
+                title: String::from("Owner"),
+                original_name: String::from("owner.wav"),
+                path: PathBuf::from("/external/owner.wav"),
+                source_proof: crate::source::SourceProvenance::Unknown,
+                reference_path: Some(original_path.clone()),
+                size: 0,
+                favorite: false,
+                stage: TrackStage::Backlog,
+                notes: SharedVec::default(),
+            }]
+            .into(),
+            selected_track_id: Some(String::from("owner")),
+            reference_tracks: vec![
+                ReferenceTrack {
+                    path: original_path.clone(),
+                    source_proof: crate::source::SourceProvenance::Unknown,
+                    notes: SharedVec::default(),
+                },
+                ReferenceTrack {
+                    path: occupied_path.clone(),
+                    source_proof: crate::source::SourceProvenance::Unknown,
+                    notes: SharedVec::default(),
+                },
+            ]
+            .into(),
+            planner_order: vec![String::from("owner")].into(),
+        };
+        persist_library_at(&library, &library_path).expect("original library should persist");
+        let original_bytes = fs::read(&library_path).expect("original snapshot should read");
+
+        let error = replace_reference_track_at(
+            library.clone(),
+            &original_path,
+            None,
+            decoded,
+            &library_path,
+        )
+        .expect_err("replacement must reject another catalog owner's path");
+
+        assert!(error.contains("already owned"));
+        assert_eq!(
+            library,
+            load_library_at(&library_path).expect("library should remain intact")
+        );
+        assert_eq!(
+            fs::read(&library_path).expect("snapshot should remain intact"),
+            original_bytes
+        );
     }
 
     #[test]
