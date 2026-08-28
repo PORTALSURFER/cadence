@@ -627,50 +627,83 @@ impl Widget for TrackCardChromeWidget {
         _layout: &LayoutOutput,
         theme: &ThemeTokens,
     ) {
-        if !bounds.has_finite_positive_area() {
-            return;
-        }
-
-        let points = track_card_points(bounds);
-        primitives.push(PaintPrimitive::FillPolygon(PaintFillPolygon {
-            widget_id: self.common.id,
-            points: Arc::clone(&points),
-            color: track_card_fill(self.favorite, theme),
-        }));
-        primitives.push(PaintPrimitive::StrokePolygon(PaintStrokePolygon {
-            widget_id: self.common.id,
-            points,
-            color: if self.selected {
-                TRACK_CARD_SELECTED_CORAL
-            } else {
-                theme.grid_strong
-            },
-            width: TRACK_CARD_OUTLINE_WIDTH,
-        }));
-        let rail_vertical_inset = TRACK_CARD_RAIL_VERTICAL_INSET.min(bounds.height() * 0.5);
-        let rail_edge_inset = TRACK_CARD_RAIL_EDGE_INSET.min(bounds.width());
-        let rail_width = TRACK_CARD_RAIL_WIDTH.min((bounds.width() - rail_edge_inset).max(0.0));
-        let rail = Rect::from_min_max(
-            Point::new(
-                bounds.min.x + rail_edge_inset,
-                bounds.min.y + rail_vertical_inset,
-            ),
-            Point::new(
-                bounds.min.x + rail_edge_inset + rail_width,
-                bounds.max.y - rail_vertical_inset,
-            ),
+        append_track_card_chrome(
+            primitives,
+            bounds,
+            self.common.id,
+            theme,
+            self.selected,
+            self.favorite,
+            false,
         );
-        if rail.has_finite_positive_area() {
-            primitives.push(PaintPrimitive::FillRect(PaintFillRect {
-                widget_id: self.common.id,
-                rect: rail,
-                color: if self.selected {
-                    TRACK_CARD_SELECTED_CORAL
-                } else {
-                    theme.grid_strong
-                },
-            }));
+    }
+}
+
+/// Review-only card chrome that retains the existing row input contract while
+/// exposing the row's local hover state to the card outline.
+#[derive(Clone, Debug)]
+struct ReviewLibraryCardChromeWidget {
+    inner: InteractiveRowWidget,
+    track_id: String,
+    selected: bool,
+    favorite: bool,
+}
+
+impl ReviewLibraryCardChromeWidget {
+    fn new(track_id: String, selected: bool, favorite: bool) -> Self {
+        Self {
+            inner: InteractiveRowWidget::new(0, ui::WidgetSizing::fixed(Vector2::new(1.0, 1.0)))
+                .with_hover_messages(true),
+            track_id,
+            selected,
+            favorite,
         }
+    }
+}
+
+impl Widget for ReviewLibraryCardChromeWidget {
+    fn common(&self) -> &WidgetCommon {
+        self.inner.common()
+    }
+
+    fn common_mut(&mut self) -> &mut WidgetCommon {
+        self.inner.common_mut()
+    }
+
+    fn handle_input(&mut self, bounds: Rect, input: WidgetInput) -> Option<WidgetOutput> {
+        self.inner.handle_input_mapped(bounds, input, |message| {
+            matches!(message, ui::InteractiveRowMessage::Activate { .. })
+                .then(|| Message::SelectTrack(self.track_id.clone()))
+        })
+    }
+
+    fn synchronize_from_previous(&mut self, previous: &dyn Widget) {
+        let Some(previous) = previous.as_any().downcast_ref::<Self>() else {
+            return;
+        };
+        Widget::synchronize_from_previous(&mut self.inner, &previous.inner);
+    }
+
+    fn accepts_pointer_move(&self) -> bool {
+        self.inner.accepts_pointer_move()
+    }
+
+    fn append_paint(
+        &self,
+        primitives: &mut Vec<PaintPrimitive>,
+        bounds: Rect,
+        _layout: &LayoutOutput,
+        theme: &ThemeTokens,
+    ) {
+        append_track_card_chrome(
+            primitives,
+            bounds,
+            self.inner.common().id,
+            theme,
+            self.selected,
+            self.favorite,
+            self.inner.common().state.hovered,
+        );
     }
 }
 
@@ -690,6 +723,63 @@ fn track_card_fill(favorite: bool, theme: &ThemeTokens) -> ui::Rgba8 {
     favorite_fill(theme.bg_primary, favorite, theme)
 }
 
+fn append_track_card_chrome(
+    primitives: &mut Vec<PaintPrimitive>,
+    bounds: Rect,
+    widget_id: u64,
+    theme: &ThemeTokens,
+    selected: bool,
+    favorite: bool,
+    hovered: bool,
+) {
+    if !bounds.has_finite_positive_area() {
+        return;
+    }
+
+    let points = track_card_points(bounds);
+    primitives.push(PaintPrimitive::FillPolygon(PaintFillPolygon {
+        widget_id,
+        points: Arc::clone(&points),
+        color: track_card_fill(favorite, theme),
+    }));
+    primitives.push(PaintPrimitive::StrokePolygon(PaintStrokePolygon {
+        widget_id,
+        points,
+        color: if selected {
+            TRACK_CARD_SELECTED_CORAL
+        } else if hovered {
+            theme.border_emphasis
+        } else {
+            theme.grid_strong
+        },
+        width: TRACK_CARD_OUTLINE_WIDTH,
+    }));
+    let rail_vertical_inset = TRACK_CARD_RAIL_VERTICAL_INSET.min(bounds.height() * 0.5);
+    let rail_edge_inset = TRACK_CARD_RAIL_EDGE_INSET.min(bounds.width());
+    let rail_width = TRACK_CARD_RAIL_WIDTH.min((bounds.width() - rail_edge_inset).max(0.0));
+    let rail = Rect::from_min_max(
+        Point::new(
+            bounds.min.x + rail_edge_inset,
+            bounds.min.y + rail_vertical_inset,
+        ),
+        Point::new(
+            bounds.min.x + rail_edge_inset + rail_width,
+            bounds.max.y - rail_vertical_inset,
+        ),
+    );
+    if rail.has_finite_positive_area() {
+        primitives.push(PaintPrimitive::FillRect(PaintFillRect {
+            widget_id,
+            rect: rail,
+            color: if selected {
+                TRACK_CARD_SELECTED_CORAL
+            } else {
+                theme.grid_strong
+            },
+        }));
+    }
+}
+
 fn favorite_fill(base: ui::Rgba8, favorite: bool, theme: &ThemeTokens) -> ui::Rgba8 {
     if favorite {
         base.blend_toward(theme.surface_overlay, TRACK_CARD_FAVORITE_FILL_BLEND)
@@ -700,6 +790,17 @@ fn favorite_fill(base: ui::Rgba8, favorite: bool, theme: &ThemeTokens) -> ui::Rg
 
 fn track_card_chrome(selected: bool, favorite: bool) -> ui::View<Message> {
     ui::custom_widget(TrackCardChromeWidget::new(selected, favorite), |_| None).fill()
+}
+
+fn review_library_card_chrome(
+    track_id: String,
+    selected: bool,
+    favorite: bool,
+) -> ui::View<Message> {
+    ui::custom_widget_direct(ReviewLibraryCardChromeWidget::new(
+        track_id, selected, favorite,
+    ))
+    .fill()
 }
 
 #[derive(Clone, Debug)]
@@ -11888,16 +11989,11 @@ fn track_row(
             .height(REMOVAL_CONFIRMATION_ROW_HEIGHT)
     };
     let row_select_id = track.id.clone();
-    let row_background = ui::interactive_row_underlay(ui::spacer().fill())
-        .selected(selected)
-        .style(ui::WidgetStyle::normal(ui::WidgetTone::Neutral))
-        .dense_chrome_palette(ui::DenseRowPalette::new())
-        .actions(ui::row_actions().primary(move || Message::SelectTrack(row_select_id.clone())))
+    let row_background = review_library_card_chrome(row_select_id, selected, track.favorite)
         .key(format!("library-track-input-{}", track.id))
         .fill();
     ui::stack([
         row_background,
-        track_card_chrome(selected, track.favorite),
         ui::column([
             ui::row([
                 card_control(
@@ -13836,8 +13932,8 @@ mod tests {
         },
         theme::ThemeTokens,
         widgets::{
-            EditEvent, EditPhase, InteractionProvenance, PointerModifiers, SliderEditBatch, Widget,
-            WidgetInput,
+            EditEvent, EditPhase, InteractionProvenance, KeyboardModifiers, PointerModifiers,
+            SliderEditBatch, Widget, WidgetInput,
         },
     };
     use std::{
@@ -28844,6 +28940,366 @@ mod tests {
         assert_eq!(snapshot.rail, super::TRACK_CARD_SELECTED_CORAL);
         assert_eq!(snapshot.rail_width, super::TRACK_CARD_RAIL_WIDTH);
         assert_eq!(snapshot.points, super::track_card_points(bounds));
+    }
+
+    #[test]
+    fn review_card_hover_border_preserves_card_geometry_and_state_precedence() {
+        let bounds = Rect::from_min_size(Point::new(10.0, 20.0), Vector2::new(200.0, 100.0));
+
+        for (name, theme) in [
+            ("dark", ThemeTokens::default()),
+            ("light", ThemeTokens::light()),
+        ] {
+            let mut normal =
+                super::ReviewLibraryCardChromeWidget::new(String::from("hover-card"), false, true);
+            let normal_snapshot = &track_card_paint_snapshots(&normal.paint_primitives(
+                bounds,
+                &radiant::layout::LayoutOutput::default(),
+                &theme,
+            ))[0];
+            assert_eq!(
+                normal_snapshot.outline, theme.grid_strong,
+                "{name} baseline"
+            );
+            assert_eq!(
+                normal_snapshot.rail, theme.grid_strong,
+                "{name} baseline rail"
+            );
+
+            normal.common_mut().state.hovered = true;
+            let hovered_snapshot = &track_card_paint_snapshots(&normal.paint_primitives(
+                bounds,
+                &radiant::layout::LayoutOutput::default(),
+                &theme,
+            ))[0];
+            assert_eq!(
+                hovered_snapshot.outline, theme.border_emphasis,
+                "{name} hover"
+            );
+            assert_eq!(
+                hovered_snapshot.rail, theme.grid_strong,
+                "{name} hover rail"
+            );
+            assert_eq!(
+                hovered_snapshot.outline_width,
+                normal_snapshot.outline_width
+            );
+            assert_eq!(hovered_snapshot.points, normal_snapshot.points);
+            assert_eq!(hovered_snapshot.fill, normal_snapshot.fill);
+
+            let mut selected = super::ReviewLibraryCardChromeWidget::new(
+                String::from("selected-hover-card"),
+                true,
+                false,
+            );
+            selected.common_mut().state.hovered = true;
+            let selected_snapshot = &track_card_paint_snapshots(&selected.paint_primitives(
+                bounds,
+                &radiant::layout::LayoutOutput::default(),
+                &theme,
+            ))[0];
+            assert_eq!(
+                selected_snapshot.outline,
+                super::TRACK_CARD_SELECTED_CORAL,
+                "selection should outrank hover in {name}"
+            );
+            assert_eq!(selected_snapshot.rail, super::TRACK_CARD_SELECTED_CORAL);
+
+            let mut focused = super::ReviewLibraryCardChromeWidget::new(
+                String::from("focused-card"),
+                false,
+                false,
+            );
+            focused.common_mut().state.focused = true;
+            let focused_snapshot = &track_card_paint_snapshots(&focused.paint_primitives(
+                bounds,
+                &radiant::layout::LayoutOutput::default(),
+                &theme,
+            ))[0];
+            assert_eq!(focused_snapshot.outline, theme.grid_strong, "{name} focus");
+            assert_eq!(focused_snapshot.points, normal_snapshot.points);
+            assert_eq!(focused.common().focus, ui::FocusBehavior::Keyboard);
+            assert!(!focused.common().paint.paints_focus);
+        }
+    }
+
+    #[test]
+    fn review_card_background_hover_routes_activation_without_emitting_drag() {
+        let bounds = Rect::from_size(240.0, 120.0);
+        let track_id = String::from("review-card-input");
+        let mut card = super::ReviewLibraryCardChromeWidget::new(track_id.clone(), false, false);
+
+        assert!(card.accepts_pointer_move());
+        assert!(
+            card.handle_input(bounds, WidgetInput::pointer_move(Point::new(40.0, 50.0)))
+                .is_none()
+        );
+        assert!(card.common().state.hovered);
+
+        assert!(
+            card.handle_input(bounds, WidgetInput::primary_press(Point::new(40.0, 50.0)))
+                .is_none()
+        );
+        assert!(card.common().state.pressed);
+        assert!(card.common().state.focused);
+        assert!(
+            card.handle_input(bounds, WidgetInput::pointer_move(Point::new(44.0, 54.0)),)
+                .is_none()
+        );
+        let output = card
+            .handle_input(bounds, WidgetInput::primary_release(Point::new(44.0, 54.0)))
+            .and_then(|output| output.typed_cloned::<Message>());
+        assert!(matches!(
+            output,
+            Some(Message::SelectTrack(id)) if id == track_id
+        ));
+        assert!(!card.common().state.pressed);
+        assert!(card.common().state.hovered);
+
+        let mut keyboard_card =
+            super::ReviewLibraryCardChromeWidget::new(track_id.clone(), false, false);
+        assert!(
+            keyboard_card
+                .handle_input(bounds, WidgetInput::FocusChanged(true))
+                .is_none()
+        );
+        let keyboard_output = keyboard_card
+            .handle_input(
+                bounds,
+                WidgetInput::KeyPress {
+                    key: ui::WidgetKey::Enter,
+                    modifiers: KeyboardModifiers::default(),
+                    repeat: false,
+                    timestamp: None,
+                },
+            )
+            .and_then(|output| output.typed_cloned::<Message>());
+        assert!(matches!(
+            keyboard_output,
+            Some(Message::SelectTrack(id)) if id == track_id
+        ));
+    }
+
+    #[test]
+    fn review_library_card_hover_isolated_from_controls_and_other_cards() {
+        let first_id = String::from("review-hover-first");
+        let second_id = String::from("review-hover-second");
+        let mut state = AppState {
+            busy: false,
+            ..AppState::default()
+        };
+        state.library.tracks = vec![audition_track(&first_id), audition_track(&second_id)].into();
+        let viewport = Vector2::new(800.0, 900.0);
+        let card_rects = |frame: &radiant::runtime::SurfaceFrame| {
+            let mut rects = frame
+                .paint_plan
+                .fill_polygons()
+                .filter_map(|fill| {
+                    if fill.points.len() != 5 {
+                        return None;
+                    }
+                    let min_x = fill
+                        .points
+                        .iter()
+                        .map(|point| point.x)
+                        .fold(f32::INFINITY, f32::min);
+                    let min_y = fill
+                        .points
+                        .iter()
+                        .map(|point| point.y)
+                        .fold(f32::INFINITY, f32::min);
+                    let max_x = fill
+                        .points
+                        .iter()
+                        .map(|point| point.x)
+                        .fold(f32::NEG_INFINITY, f32::max);
+                    let max_y = fill
+                        .points
+                        .iter()
+                        .map(|point| point.y)
+                        .fold(f32::NEG_INFINITY, f32::max);
+                    let rect =
+                        Rect::from_min_max(Point::new(min_x, min_y), Point::new(max_x, max_y));
+                    (rect.width() > 200.0 && rect.height() > 60.0).then_some(rect)
+                })
+                .collect::<Vec<_>>();
+            rects.sort_by(|left, right| left.min.y.total_cmp(&right.min.y));
+            rects
+        };
+        let outline_for = |frame: &radiant::runtime::SurfaceFrame, rect: Rect| {
+            frame
+                .paint_plan
+                .primitives
+                .iter()
+                .find_map(|primitive| match primitive {
+                    PaintPrimitive::StrokePolygon(stroke)
+                        if stroke.points.len() == 5
+                            && (stroke.points[0].x - rect.min.x).abs() < 0.01
+                            && (stroke.points[0].y - rect.min.y).abs() < 0.01 =>
+                    {
+                        Some(stroke.color)
+                    }
+                    _ => None,
+                })
+                .expect("the requested card should paint one outline")
+        };
+
+        let bridge = DeclarativeOwnedCommandRuntimeBridge::new(
+            state,
+            |state| project_surface(state).into_surface(),
+            |state, message| {
+                let mut context = ui::UiUpdateContext::default();
+                update(state, message, &mut context);
+                context.into_command()
+            },
+        );
+        let mut runtime = SurfaceRuntime::new(bridge, viewport);
+        let idle = runtime.frame_with_default_theme();
+        let idle_rects = card_rects(&idle);
+        assert_eq!(idle_rects.len(), 2);
+        assert_eq!(
+            outline_for(&idle, idle_rects[0]),
+            ThemeTokens::default().grid_strong
+        );
+        assert_eq!(
+            outline_for(&idle, idle_rects[1]),
+            ThemeTokens::default().grid_strong
+        );
+
+        let background_point =
+            |rect: Rect| Point::new(rect.min.x + 8.0, rect.min.y + rect.height() * 0.5);
+        let first_background = background_point(idle_rects[0]);
+        let second_background = background_point(idle_rects[1]);
+        assert!(runtime.widget_at(first_background).is_some());
+        assert!(runtime.widget_at(second_background).is_some());
+
+        runtime.dispatch_pointer_move_deferred_refresh_with_outcome(first_background);
+        runtime.refresh();
+        let first_hover = runtime.frame_with_default_theme();
+        assert_eq!(
+            outline_for(&first_hover, idle_rects[0]),
+            ThemeTokens::default().border_emphasis
+        );
+        assert_eq!(
+            outline_for(&first_hover, idle_rects[1]),
+            ThemeTokens::default().grid_strong
+        );
+        assert_eq!(card_rects(&first_hover), idle_rects);
+
+        runtime.dispatch_pointer_move_deferred_refresh_with_outcome(second_background);
+        runtime.refresh();
+        let second_hover = runtime.frame_with_default_theme();
+        assert_eq!(
+            outline_for(&second_hover, idle_rects[0]),
+            ThemeTokens::default().grid_strong
+        );
+        assert_eq!(
+            outline_for(&second_hover, idle_rects[1]),
+            ThemeTokens::default().border_emphasis
+        );
+        assert_eq!(card_rects(&second_hover), idle_rects);
+
+        runtime.dispatch_pointer_move_deferred_refresh_with_outcome(Point::new(4.0, 4.0));
+        runtime.refresh();
+        let outside = runtime.frame_with_default_theme();
+        assert_eq!(
+            outline_for(&outside, idle_rects[0]),
+            ThemeTokens::default().grid_strong
+        );
+        assert_eq!(
+            outline_for(&outside, idle_rects[1]),
+            ThemeTokens::default().grid_strong
+        );
+
+        let hover_again = background_point(idle_rects[0]);
+        runtime.dispatch_pointer_move_deferred_refresh_with_outcome(hover_again);
+        runtime.refresh();
+        let control_frame = runtime.frame_with_default_theme();
+        let favorite_run = control_frame
+            .paint_plan
+            .text_runs()
+            .find(|run| run.text.as_str() == "☆" && idle_rects[0].contains(run.rect.center()))
+            .expect("the first card should expose its favorite control");
+        let favorite_point = favorite_run.rect.center();
+        assert_eq!(
+            runtime.widget_at(favorite_point),
+            Some(favorite_run.widget_id)
+        );
+        runtime.dispatch_pointer_move_deferred_refresh_with_outcome(favorite_point);
+        runtime.refresh();
+        let over_control = runtime.frame_with_default_theme();
+        assert_eq!(
+            outline_for(&over_control, idle_rects[0]),
+            ThemeTokens::default().grid_strong,
+            "hovering an embedded control must not keep the card-background border active"
+        );
+        assert_eq!(
+            runtime.widget_at(favorite_point),
+            Some(favorite_run.widget_id)
+        );
+        runtime.dispatch_primary_click(favorite_point);
+        assert!(
+            runtime
+                .bridge()
+                .state()
+                .library
+                .tracks
+                .iter()
+                .find(|track| track.id == first_id)
+                .is_some_and(|track| track.favorite)
+        );
+        assert_eq!(
+            runtime.bridge().state().library.selected_track_id,
+            None,
+            "an embedded control must not select its card"
+        );
+
+        runtime.dispatch_pointer_move_deferred_refresh_with_outcome(second_background);
+        runtime.refresh();
+        runtime.dispatch_primary_click(second_background);
+        assert_eq!(
+            runtime
+                .bridge()
+                .state()
+                .library
+                .selected_track_id
+                .as_deref(),
+            Some(second_id.as_str())
+        );
+        let selected = runtime.frame_with_default_theme();
+        assert_eq!(
+            outline_for(&selected, idle_rects[1]),
+            super::TRACK_CARD_SELECTED_CORAL,
+            "selection should retain precedence after a background click"
+        );
+        assert_eq!(card_rects(&selected), idle_rects);
+
+        runtime.dispatch_pointer_move_deferred_refresh_with_outcome(first_background);
+        runtime.refresh();
+        runtime.dispatch_event(Event::primary_press(first_background));
+        let moved_inside = Point::new(first_background.x + 2.0, first_background.y + 2.0);
+        runtime.dispatch_pointer_move_deferred_refresh_with_outcome(moved_inside);
+        runtime.refresh();
+        runtime.dispatch_event(Event::primary_release(moved_inside));
+        assert_eq!(
+            runtime
+                .bridge()
+                .state()
+                .library
+                .selected_track_id
+                .as_deref(),
+            Some(first_id.as_str()),
+            "a short press-drag within a Review card should retain row activation"
+        );
+        assert_eq!(card_rects(&runtime.frame_with_default_theme()), idle_rects);
+
+        let light_frame = project_surface(&AppState {
+            busy: false,
+            library: runtime.bridge().state().library.clone(),
+            ..AppState::default()
+        })
+        .view_frame_at_size(viewport, &ThemeTokens::light());
+        assert_eq!(card_rects(&light_frame), idle_rects);
     }
 
     #[test]
