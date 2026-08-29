@@ -203,6 +203,7 @@ enum Message {
     ActivatePlaybackSource(PlaybackSource),
     SelectCommentSource(CommentSource),
     ToggleReferenceMatch,
+    TogglePlaybackMute,
     PlaybackVolumeChanged(SliderEditBatch),
     Frame,
     WaveformLoopDragStarted {
@@ -1808,6 +1809,7 @@ struct AppState {
     transport_polling: bool,
     transport_waiting_token: Option<u64>,
     playback_volume: f32,
+    playback_muted: bool,
     playback_source: PlaybackSource,
     reference_transport: Option<transport::AudioTransport>,
     reference_transport_generation: u64,
@@ -1989,6 +1991,7 @@ impl AppState {
             transport_polling: false,
             transport_waiting_token: None,
             playback_volume: transport::DEFAULT_VOLUME,
+            playback_muted: false,
             playback_source: PlaybackSource::Main,
             reference_transport: None,
             reference_transport_generation: 0,
@@ -3428,6 +3431,9 @@ fn reference_output_gain_without_cleanup_for_source(
     state: &AppState,
     source: PlaybackSource,
 ) -> f32 {
+    if state.playback_muted {
+        return 0.0;
+    }
     let match_gain = state
         .reference_match_enabled
         .then(|| current_loudness_match_gain_db(state))
@@ -3437,6 +3443,14 @@ fn reference_output_gain_without_cleanup_for_source(
         transport::normalize_output_gain(state.playback_volume * match_gain)
     } else {
         0.0
+    }
+}
+
+fn playback_volume_gain(state: &AppState) -> f32 {
+    if state.playback_muted {
+        0.0
+    } else {
+        state.playback_volume
     }
 }
 
@@ -3455,14 +3469,25 @@ fn main_output_gain(state: &AppState) -> f32 {
         ))
         && state.playback_source == PlaybackSource::Main
     {
-        state.playback_volume
+        playback_volume_gain(state)
     } else {
         0.0
     }
 }
 
 fn sync_playback_output_gains(state: &AppState) {
-    if !cleanup_any_active(state) || cleanup_owns_main(state) {
+    sync_playback_output_gains_with_main_cleanup_override(state, false);
+}
+
+fn sync_playback_output_gains_with_main_cleanup_override(
+    state: &AppState,
+    override_main_cleanup: bool,
+) {
+    if override_main_cleanup
+        || !cleanup_any_active(state)
+        || cleanup_owns_main(state)
+        || state.playback_muted
+    {
         state.transport.set_output_gain(main_output_gain(state));
     }
     if let Some(reference_transport) = state.reference_transport.as_ref() {
@@ -4944,15 +4969,24 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
             context.request_repaint();
         }
+        Message::TogglePlaybackMute => {
+            state.playback_muted = !state.playback_muted;
+            sync_playback_output_gains_with_main_cleanup_override(state, !state.playback_muted);
+            context.repaint(ui::RepaintScope::Projection);
+        }
         Message::PlaybackVolumeChanged(edit) => {
+            let mut unmuted_by_edit = false;
             if let Some(volume) = edit.value_change() {
+                let was_muted = state.playback_muted;
                 let volume = transport::normalize_volume(volume);
                 state.playback_volume = volume;
+                state.playback_muted = false;
+                unmuted_by_edit = was_muted;
                 // This gain is applied only by Rodio's output player. The
                 // decoder's integrated LUFS value is computed from raw samples.
-                sync_playback_output_gains(state);
+                sync_playback_output_gains_with_main_cleanup_override(state, was_muted);
             }
-            if edit.events().iter().any(|event| event.phase.is_terminal()) {
+            if unmuted_by_edit || edit.events().iter().any(|event| event.phase.is_terminal()) {
                 context.repaint(ui::RepaintScope::Projection);
             } else {
                 context.request_paint_only();
@@ -6095,6 +6129,7 @@ fn seek_synchronized_positions(
             clear_live_spectrogram(state, PlaybackSource::Reference);
         }
     }
+    state.transport.set_output_gain(main_output_gain(state));
     let main_token = match state.transport.seek(
         state.transport_generation,
         main_position_millis,
@@ -6349,6 +6384,7 @@ fn seek_loop_owner(
             {
                 return Err(String::from(transport::CONTROLS_BUSY_ERROR));
             }
+            state.transport.set_output_gain(main_output_gain(state));
             let token = match state.transport.seek(
                 state.transport_generation,
                 position_millis,
@@ -6378,6 +6414,10 @@ fn seek_loop_owner(
             {
                 return Err(String::from(transport::CONTROLS_BUSY_ERROR));
             }
+            reference_transport.set_output_gain(reference_output_gain_for_source(
+                state,
+                PlaybackSource::Reference,
+            ));
             let seek_result = reference_transport.seek(
                 state.reference_transport_generation,
                 position_millis,
@@ -6605,7 +6645,7 @@ fn start_source_alongside_active(
                 resume_transport_command(state, PlaybackSource::Main, position_millis, loop_bounds,),
                 ResumeTransportCommand::Seek
             );
-            state.transport.set_output_gain(state.playback_volume);
+            state.transport.set_output_gain(playback_volume_gain(state));
             let result = if starts_new_segment {
                 state.transport.seek(
                     state.transport_generation,
@@ -7101,6 +7141,7 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
                 ),
                 ResumeTransportCommand::Seek
             );
+        state.transport.set_output_gain(main_output_gain(state));
         let main_result = if main_starts_new_segment {
             state.transport.seek(
                 state.transport_generation,
@@ -12119,6 +12160,13 @@ static REVIEW_VOLUME_ICON: ui::SvgIconTintCache = ui::SvgIconTintCache::new(
 </svg>"#,
 );
 
+static REVIEW_MUTED_VOLUME_ICON: ui::SvgIconTintCache = ui::SvgIconTintCache::new(
+    r#"<svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg" fill="currentColor">
+  <path d="M2 6h3l4-3v10l-4-3H2z"/>
+  <path d="m11 5 4 6M15 5l-4 6" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+</svg>"#,
+);
+
 fn playback_source_icon(transporting: bool) -> ui::SvgIcon {
     let icon = if transporting {
         &REVIEW_SOURCE_STOP_ICON
@@ -12130,6 +12178,15 @@ fn playback_source_icon(transporting: bool) -> ui::SvgIcon {
 
 fn review_transport_icon(icon: &'static ui::SvgIconTintCache, active: bool) -> ui::SvgIcon {
     icon.icon_for_state(REVIEW_TRANSPORT_ICON_TINTS, true, active)
+}
+
+fn review_volume_icon(muted: bool) -> ui::SvgIcon {
+    let icon = if muted {
+        &REVIEW_MUTED_VOLUME_ICON
+    } else {
+        &REVIEW_VOLUME_ICON
+    };
+    review_transport_icon(icon, muted)
 }
 
 fn current_live_frame_for_source(
@@ -12645,20 +12702,27 @@ fn review_reference_controls(state: &AppState, track: &storage::Track) -> ui::Vi
 }
 
 fn review_global_controls(state: &AppState, track: &storage::Track) -> ui::View<Message> {
+    let mute_label = if state.playback_muted {
+        "Unmute playback"
+    } else {
+        "Mute playback"
+    };
     ui::row([
         review_reference_controls(state, track),
-        ui::icon_button(review_transport_icon(&REVIEW_VOLUME_ICON, false))
+        ui::icon_button(review_volume_icon(state.playback_muted))
             .bare()
-            .focus(ui::FocusBehavior::None)
-            .passive::<Message>()
+            .active(state.playback_muted)
+            .label(mute_label)
+            .message(Message::TogglePlaybackMute)
             .key("review-transport-volume")
-            .tooltip(format!(
-                "Volume {:02}",
-                (state.playback_volume * 100.0).round() as u32
-            ))
+            .tooltip(mute_label)
             .size(20.0, 26.0),
         ui::slider(state.playback_volume)
-            .primary()
+            .style(if state.playback_muted {
+                ui::WidgetStyle::subtle(ui::WidgetTone::Neutral)
+            } else {
+                ui::WidgetStyle::strong(ui::WidgetTone::Accent)
+            })
             .compact()
             .track_height(5.0)
             .track_border()
@@ -13936,11 +14000,11 @@ mod tests {
         qualified_note_identity_key, reference_decode_result_is_current, reference_dropdown_paths,
         reference_menu_available, reference_output_gain, reference_settings_auxiliary_windows,
         reference_settings_window_view, refresh_live_spectrogram, refresh_live_spectrograms,
-        resume_transport_command, review_spectrogram_source, schedule_import,
-        schedule_library_save, schedule_reference_catalog_import, schedule_reference_import,
-        schedule_reference_waveform_decode, schedule_replace, schedule_waveform_decode,
-        seek_synchronized_positions, selected_reference_notes, selected_track,
-        selection_save_debounce_active, settings_reference_row, stage_dropdown,
+        resume_transport_command, review_global_controls, review_spectrogram_source,
+        schedule_import, schedule_library_save, schedule_reference_catalog_import,
+        schedule_reference_import, schedule_reference_waveform_decode, schedule_replace,
+        schedule_waveform_decode, seek_synchronized_positions, selected_reference_notes,
+        selected_track, selection_save_debounce_active, settings_reference_row, stage_dropdown,
         stage_menu_anchor_from_pointer, stage_menu_popover, start_source_alongside_active,
         transport_command_is_confirmed, update,
     };
@@ -17212,6 +17276,271 @@ mod tests {
     }
 
     #[test]
+    fn review_volume_toggle_is_pointer_and_keyboard_actionable_with_state_semantics() {
+        let state = audition_state(&["mute-control"]);
+        let bridge = DeclarativeOwnedRuntimeBridge::new(
+            state,
+            |state| project_surface(state).into_surface(),
+            |state, message| {
+                let mut context = ui::UiUpdateContext::default();
+                update(state, message, &mut context);
+            },
+        );
+        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1180.0, 720.0));
+        let initial_frame = runtime.frame_with_default_theme();
+        assert!(paint_plan_contains_icon(
+            &initial_frame.paint_plan.primitives,
+            &super::review_volume_icon(false),
+        ));
+        assert!(!paint_plan_contains_icon(
+            &initial_frame.paint_plan.primitives,
+            &super::review_volume_icon(true),
+        ));
+
+        let initial_target = runtime
+            .automation_target_snapshot()
+            .targets
+            .into_iter()
+            .find(|target| target.label.as_deref() == Some("Mute playback"))
+            .expect("the unmuted playback control should be labeled");
+        assert_eq!(initial_target.role, AutomationRole::Button);
+        assert!(initial_target.enabled);
+        assert!(initial_target.focusable);
+        assert!(initial_target.interaction_target);
+        let initial_point = Point::new(initial_target.center.x, initial_target.center.y);
+        let initial_widget_id = runtime
+            .widget_at(initial_point)
+            .expect("the unmuted playback control should have a pointer target");
+        let initial_widget = runtime
+            .surface()
+            .find_widget(initial_widget_id)
+            .expect("the unmuted playback control should be addressable");
+        assert_eq!(
+            initial_widget.widget().common().focus,
+            ui::FocusBehavior::Keyboard
+        );
+        assert!(!initial_widget.widget().common().state.active);
+        assert_eq!(
+            initial_widget.widget().common().tooltip.as_deref(),
+            Some("Mute playback")
+        );
+
+        runtime.dispatch_primary_click(initial_point);
+        assert!(runtime.bridge().state().playback_muted);
+
+        let muted_frame = runtime.frame_with_default_theme();
+        assert!(paint_plan_contains_icon(
+            &muted_frame.paint_plan.primitives,
+            &super::review_volume_icon(true),
+        ));
+        assert!(!paint_plan_contains_icon(
+            &muted_frame.paint_plan.primitives,
+            &super::review_volume_icon(false),
+        ));
+        let muted_target = runtime
+            .automation_target_snapshot()
+            .targets
+            .into_iter()
+            .find(|target| target.label.as_deref() == Some("Unmute playback"))
+            .expect("the muted playback control should be labeled");
+        assert!(muted_target.focusable);
+        let muted_point = Point::new(muted_target.center.x, muted_target.center.y);
+        let muted_widget_id = runtime
+            .widget_at(muted_point)
+            .expect("the muted playback control should have a pointer target");
+        let muted_widget = runtime
+            .surface()
+            .find_widget(muted_widget_id)
+            .expect("the muted playback control should be addressable");
+        assert!(muted_widget.widget().common().state.active);
+        assert_eq!(
+            muted_widget.widget().common().tooltip.as_deref(),
+            Some("Unmute playback")
+        );
+
+        runtime.execute_command(Command::focus(muted_widget_id));
+        assert_eq!(runtime.focused_widget(), Some(muted_widget_id));
+        assert_eq!(
+            runtime.dispatch_event(Event::key_press(ui::WidgetKey::Enter)),
+            Some(muted_widget_id)
+        );
+        assert!(!runtime.bridge().state().playback_muted);
+    }
+
+    #[test]
+    fn muted_volume_slider_keeps_its_contract_and_unmutes_on_pointer_and_keyboard_edits() {
+        let mut state = audition_state(&["volume-control"]);
+        state.playback_volume = 0.4;
+        let bridge = DeclarativeOwnedRuntimeBridge::new(
+            state,
+            |state| {
+                let track = selected_track(state).expect("the volume test needs a selected track");
+                review_global_controls(state, track).into_surface()
+            },
+            |state, message| {
+                let mut context = ui::UiUpdateContext::default();
+                update(state, message, &mut context);
+            },
+        );
+        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(600.0, 40.0));
+
+        let initial_slider_target = runtime
+            .automation_target_snapshot()
+            .targets
+            .into_iter()
+            .find(|target| target.role == AutomationRole::Slider)
+            .expect("the review volume slider should be an automation target");
+        assert!(initial_slider_target.enabled);
+        assert!(initial_slider_target.focusable);
+        assert!(initial_slider_target.interaction_target);
+        assert_eq!(initial_slider_target.value.as_deref(), Some("0.400"));
+        let initial_slider_point = Point::new(
+            initial_slider_target.center.x,
+            initial_slider_target.center.y,
+        );
+        let initial_slider_widget_id = runtime
+            .widget_at(initial_slider_point)
+            .expect("the review volume slider should have a pointer target");
+        let initial_slider_widget = runtime
+            .surface()
+            .find_widget(initial_slider_widget_id)
+            .expect("the review volume slider should be addressable");
+        assert_eq!(
+            initial_slider_widget.widget().common().style,
+            ui::WidgetStyle::strong(ui::WidgetTone::Accent)
+        );
+        assert_eq!(
+            initial_slider_widget.widget().common().focus,
+            ui::FocusBehavior::Keyboard
+        );
+        assert!(!initial_slider_widget.widget().common().state.disabled);
+        assert!(!initial_slider_widget.widget().common().state.read_only);
+        let initial_slider_style = initial_slider_widget.widget().common().style;
+
+        let mute_target = runtime
+            .automation_target_snapshot()
+            .targets
+            .into_iter()
+            .find(|target| target.label.as_deref() == Some("Mute playback"))
+            .expect("the mute control should be present");
+        runtime.dispatch_primary_click(Point::new(mute_target.center.x, mute_target.center.y));
+        assert!(runtime.bridge().state().playback_muted);
+
+        let muted_slider_target = runtime
+            .automation_target_snapshot()
+            .targets
+            .into_iter()
+            .find(|target| target.role == AutomationRole::Slider)
+            .expect("the muted review volume slider should remain an automation target");
+        assert_eq!(muted_slider_target.id, initial_slider_target.id);
+        assert_eq!(muted_slider_target.role, initial_slider_target.role);
+        assert_eq!(muted_slider_target.enabled, initial_slider_target.enabled);
+        assert_eq!(
+            muted_slider_target.focusable,
+            initial_slider_target.focusable
+        );
+        assert_eq!(
+            muted_slider_target.interaction_target,
+            initial_slider_target.interaction_target
+        );
+        assert_eq!(muted_slider_target.value, initial_slider_target.value);
+        assert_eq!(
+            muted_slider_target.available_actions,
+            initial_slider_target.available_actions
+        );
+        let muted_slider_point =
+            Point::new(muted_slider_target.center.x, muted_slider_target.center.y);
+        let muted_slider_widget_id = runtime
+            .widget_at(muted_slider_point)
+            .expect("the muted review volume slider should keep a pointer target");
+        assert_eq!(muted_slider_widget_id, initial_slider_widget_id);
+        let muted_slider_widget = runtime
+            .surface()
+            .find_widget(muted_slider_widget_id)
+            .expect("the muted review volume slider should remain addressable");
+        assert_eq!(
+            muted_slider_widget.widget().common().style,
+            ui::WidgetStyle::subtle(ui::WidgetTone::Neutral)
+        );
+        assert_ne!(
+            muted_slider_widget.widget().common().style,
+            initial_slider_style
+        );
+        assert_eq!(
+            muted_slider_widget.widget().common().focus,
+            ui::FocusBehavior::Keyboard
+        );
+        assert!(!muted_slider_widget.widget().common().state.disabled);
+        assert!(!muted_slider_widget.widget().common().state.read_only);
+
+        runtime.dispatch_primary_click(muted_slider_point);
+        assert!(!runtime.bridge().state().playback_muted);
+        assert!(
+            (runtime.bridge().state().playback_volume
+                - initial_slider_target
+                    .value
+                    .as_deref()
+                    .expect("the slider should expose its value")
+                    .parse::<f32>()
+                    .expect("the slider value should be numeric"))
+            .abs()
+                > f32::EPSILON
+        );
+        let unmuted_mute_target = runtime
+            .automation_target_snapshot()
+            .targets
+            .into_iter()
+            .find(|target| target.label.as_deref() == Some("Mute playback"))
+            .expect("the pointer slider edit should restore the mute label");
+        let unmuted_mute_widget = runtime
+            .surface()
+            .find_widget(
+                runtime
+                    .widget_at(Point::new(
+                        unmuted_mute_target.center.x,
+                        unmuted_mute_target.center.y,
+                    ))
+                    .expect("the mute control should remain addressable"),
+            )
+            .expect("the mute control should remain a widget");
+        assert_eq!(
+            unmuted_mute_widget.widget().common().tooltip.as_deref(),
+            Some("Mute playback")
+        );
+
+        runtime.dispatch_primary_click(Point::new(
+            unmuted_mute_target.center.x,
+            unmuted_mute_target.center.y,
+        ));
+        assert!(runtime.bridge().state().playback_muted);
+
+        let keyboard_slider_target = runtime
+            .automation_target_snapshot()
+            .targets
+            .into_iter()
+            .find(|target| target.role == AutomationRole::Slider)
+            .expect("the muted slider should remain keyboard addressable");
+        let keyboard_slider_widget_id = runtime
+            .widget_at(Point::new(
+                keyboard_slider_target.center.x,
+                keyboard_slider_target.center.y,
+            ))
+            .expect("the muted slider should keep its keyboard widget");
+        runtime.execute_command(Command::focus(keyboard_slider_widget_id));
+        assert_eq!(runtime.focused_widget(), Some(keyboard_slider_widget_id));
+        let keyboard_start = runtime.bridge().state().playback_volume;
+        assert_eq!(
+            runtime.dispatch_event(Event::key_press(ui::WidgetKey::ArrowRight)),
+            Some(keyboard_slider_widget_id)
+        );
+        assert!(!runtime.bridge().state().playback_muted);
+        assert!(
+            (runtime.bridge().state().playback_volume - (keyboard_start + 0.05)).abs()
+                <= f32::EPSILON
+        );
+    }
+
+    #[test]
     fn reference_settings_auxiliary_projection_is_closed_or_one_cached_window() {
         let mut state = AppState::default();
         assert!(reference_settings_auxiliary_windows(&mut state).is_empty());
@@ -18369,6 +18698,167 @@ mod tests {
         assert_eq!(
             context.into_command().repaint_scope(),
             Some(RepaintScope::Projection)
+        );
+    }
+
+    #[test]
+    fn muted_playback_volume_edit_unmutes_and_restores_reference_gain() {
+        let mut state = shared_reference_playback_state();
+        state.playback_source = PlaybackSource::Reference;
+        state.playback_volume = 0.8;
+        state
+            .reference_waveform
+            .as_mut()
+            .expect("reference waveform")
+            .integrated_lufs = Some(-14.0);
+        state.reference_match_enabled = true;
+
+        update(
+            &mut state,
+            Message::TogglePlaybackMute,
+            &mut ui::UiUpdateContext::default(),
+        );
+        assert!(state.playback_muted);
+        assert_eq!(
+            state
+                .reference_transport
+                .as_ref()
+                .expect("reference transport")
+                .requested_output_gain_for_test(),
+            0.0
+        );
+
+        let selected_volume = 0.37;
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::PlaybackVolumeChanged(playback_volume_edit(
+                0.8,
+                selected_volume,
+                Some(EditPhase::Commit),
+            )),
+            &mut context,
+        );
+
+        let expected_reference_gain = reference_output_gain(&state);
+        assert!(!state.playback_muted);
+        assert_eq!(state.playback_volume, selected_volume);
+        assert_eq!(main_output_gain(&state), 0.0);
+        assert!(expected_reference_gain > selected_volume);
+        assert_eq!(
+            state
+                .reference_transport
+                .as_ref()
+                .expect("reference transport")
+                .requested_output_gain_for_test(),
+            expected_reference_gain
+        );
+        assert_eq!(
+            context.into_command().repaint_scope(),
+            Some(RepaintScope::Projection)
+        );
+    }
+
+    #[test]
+    fn playback_mute_toggle_preserves_volume_and_reference_match() {
+        let mut state = shared_reference_playback_state();
+        state.playback_source = PlaybackSource::Reference;
+        state.playback_volume = 0.37;
+        state
+            .reference_waveform
+            .as_mut()
+            .expect("reference waveform")
+            .integrated_lufs = Some(-14.0);
+        state.reference_match_enabled = true;
+        let reference_gain = reference_output_gain(&state);
+        assert!(reference_gain > state.playback_volume);
+
+        let mut context = ui::UiUpdateContext::default();
+        update(&mut state, Message::TogglePlaybackMute, &mut context);
+
+        assert!(state.playback_muted);
+        assert_eq!(state.playback_volume, 0.37);
+        assert!(state.reference_match_enabled);
+        assert_eq!(reference_output_gain(&state), 0.0);
+        assert_eq!(
+            state
+                .reference_transport
+                .as_ref()
+                .expect("reference transport")
+                .requested_output_gain_for_test(),
+            0.0
+        );
+        assert_eq!(
+            context.into_command().repaint_scope(),
+            Some(RepaintScope::Projection)
+        );
+
+        let mut context = ui::UiUpdateContext::default();
+        update(&mut state, Message::TogglePlaybackMute, &mut context);
+
+        assert!(!state.playback_muted);
+        assert_eq!(state.playback_volume, 0.37);
+        assert!(state.reference_match_enabled);
+        assert!((reference_output_gain(&state) - reference_gain).abs() < f32::EPSILON);
+        assert_eq!(
+            state
+                .reference_transport
+                .as_ref()
+                .expect("reference transport")
+                .requested_output_gain_for_test(),
+            reference_gain
+        );
+    }
+
+    #[test]
+    fn muted_global_and_promotion_starts_request_zero_main_and_reference_gain() {
+        let mut main_only = main_only_loop_state();
+        main_only.playback_muted = true;
+        main_only.playback_volume = 0.37;
+        update(
+            &mut main_only,
+            Message::TogglePlayback,
+            &mut ui::UiUpdateContext::default(),
+        );
+        assert_eq!(main_output_gain(&main_only), 0.0);
+        assert_eq!(main_only.transport.requested_output_gain_for_test(), 0.0);
+
+        let mut paired = shared_reference_playback_state();
+        paired.playback_source = PlaybackSource::Reference;
+        paired.playback_muted = true;
+        update(
+            &mut paired,
+            Message::TogglePlayback,
+            &mut ui::UiUpdateContext::default(),
+        );
+        assert_eq!(paired.transport.requested_output_gain_for_test(), 0.0);
+        assert_eq!(
+            paired
+                .reference_transport
+                .as_ref()
+                .expect("reference transport")
+                .requested_output_gain_for_test(),
+            0.0
+        );
+
+        let mut promoted = shared_reference_playback_state();
+        promoted.playback_source = PlaybackSource::Reference;
+        promoted.playback_muted = true;
+        promoted.reference_only_playback = true;
+        promoted.reference_transport_playing = true;
+        update(
+            &mut promoted,
+            Message::ActivatePlaybackSource(PlaybackSource::Main),
+            &mut ui::UiUpdateContext::default(),
+        );
+        assert_eq!(promoted.transport.requested_output_gain_for_test(), 0.0);
+        assert_eq!(
+            promoted
+                .reference_transport
+                .as_ref()
+                .expect("reference transport")
+                .requested_output_gain_for_test(),
+            0.0
         );
     }
 
@@ -21505,6 +21995,188 @@ mod tests {
         assert_eq!(state.review_cursor_millis, 510);
         assert_eq!(state.transport_generation, main_generation);
         assert_eq!(state.transport.requested_output_gain_for_test(), 0.37);
+    }
+
+    #[test]
+    fn playback_mute_toggle_overrides_delayed_reference_cleanup() {
+        let mut state = shared_reference_playback_state();
+        let preserved_gain = 0.37;
+        let main_generation = state.transport_generation;
+        let main_position = 510;
+        let error = String::from("reference unload busy");
+        state.playback_volume = preserved_gain;
+        state.reference_only_playback = true;
+        state.transport_playing = true;
+        state.transport_position_millis = main_position;
+        state.review_cursor_millis = main_position;
+        state.transport.set_output_gain(preserved_gain);
+        let reference_transport = state
+            .reference_transport
+            .as_ref()
+            .expect("reference-only playback should have a reference transport")
+            .clone();
+        reference_transport.set_output_gain(0.42);
+        reference_transport.force_command_queue_full_for_test();
+
+        cleanup_reference_transport_failure(&mut state, error.clone());
+
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::StoppingReference {
+                reference_unload: ReferenceUnloadState::PendingAdmission,
+                ..
+            }
+        ));
+        assert!(!super::cleanup_owns_main(&state));
+        assert_eq!(
+            state.transport.requested_output_gain_for_test(),
+            preserved_gain
+        );
+        assert_eq!(reference_transport.requested_output_gain_for_test(), 0.0);
+
+        reference_transport.set_command_queue_size_for_test(31);
+        progress_paired_playback_cleanup(&mut state);
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::StoppingReference {
+                reference_unload: ReferenceUnloadState::AwaitingAcknowledgement(_),
+                ..
+            }
+        ));
+
+        update(
+            &mut state,
+            Message::TogglePlaybackMute,
+            &mut ui::UiUpdateContext::default(),
+        );
+
+        assert!(state.playback_muted);
+        assert_eq!(state.playback_volume, preserved_gain);
+        assert_eq!(state.transport.requested_output_gain_for_test(), 0.0);
+        assert_eq!(reference_transport.requested_output_gain_for_test(), 0.0);
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::StoppingReference {
+                reference_unload: ReferenceUnloadState::AwaitingAcknowledgement(_),
+                ..
+            }
+        ));
+        assert_eq!(state.status, error);
+        assert!(state.transport_playing);
+        assert_eq!(state.transport_position_millis, main_position);
+
+        update(
+            &mut state,
+            Message::TogglePlaybackMute,
+            &mut ui::UiUpdateContext::default(),
+        );
+
+        assert!(!state.playback_muted);
+        assert_eq!(state.playback_volume, preserved_gain);
+        assert_eq!(
+            state.transport.requested_output_gain_for_test(),
+            preserved_gain
+        );
+        assert_eq!(reference_transport.requested_output_gain_for_test(), 0.0);
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::StoppingReference {
+                reference_unload: ReferenceUnloadState::AwaitingAcknowledgement(_),
+                ..
+            }
+        ));
+
+        acknowledge_reference_unload(&state);
+        progress_paired_playback_cleanup(&mut state);
+
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::Idle
+        ));
+        assert!(state.reference_transport.is_none());
+        assert_eq!(state.transport_generation, main_generation);
+        assert!(state.transport_playing);
+        assert_eq!(state.transport_position_millis, main_position);
+        assert_eq!(
+            state.transport.requested_output_gain_for_test(),
+            preserved_gain
+        );
+        assert_eq!(reference_transport.requested_output_gain_for_test(), 0.0);
+    }
+
+    #[test]
+    fn muted_playback_volume_edit_restores_main_gain_during_reference_cleanup() {
+        let mut state = shared_reference_playback_state();
+        let initial_volume = 0.37;
+        let selected_volume = 0.53;
+        let error = String::from("reference unload busy");
+        state.playback_volume = initial_volume;
+        state.reference_only_playback = true;
+        state.transport_playing = true;
+        state.transport.set_output_gain(initial_volume);
+        let reference_transport = state
+            .reference_transport
+            .as_ref()
+            .expect("reference-only playback should have a reference transport")
+            .clone();
+        reference_transport.force_command_queue_full_for_test();
+
+        cleanup_reference_transport_failure(&mut state, error);
+        reference_transport.set_command_queue_size_for_test(31);
+        progress_paired_playback_cleanup(&mut state);
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::StoppingReference {
+                reference_unload: ReferenceUnloadState::AwaitingAcknowledgement(_),
+                ..
+            }
+        ));
+
+        update(
+            &mut state,
+            Message::TogglePlaybackMute,
+            &mut ui::UiUpdateContext::default(),
+        );
+        assert!(state.playback_muted);
+        assert_eq!(state.transport.requested_output_gain_for_test(), 0.0);
+
+        update(
+            &mut state,
+            Message::PlaybackVolumeChanged(playback_volume_edit(
+                initial_volume,
+                selected_volume,
+                Some(EditPhase::Commit),
+            )),
+            &mut ui::UiUpdateContext::default(),
+        );
+
+        assert!(!state.playback_muted);
+        assert_eq!(state.playback_volume, selected_volume);
+        assert_eq!(
+            state.transport.requested_output_gain_for_test(),
+            selected_volume
+        );
+        assert_eq!(reference_transport.requested_output_gain_for_test(), 0.0);
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::StoppingReference {
+                reference_unload: ReferenceUnloadState::AwaitingAcknowledgement(_),
+                ..
+            }
+        ));
+
+        acknowledge_reference_unload(&state);
+        progress_paired_playback_cleanup(&mut state);
+
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::Idle
+        ));
+        assert!(state.reference_transport.is_none());
+        assert_eq!(
+            state.transport.requested_output_gain_for_test(),
+            selected_volume
+        );
     }
 
     #[test]
