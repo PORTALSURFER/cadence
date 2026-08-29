@@ -12921,7 +12921,7 @@ fn comments_panel(state: &AppState, track: &storage::Track) -> ui::View<Message>
                 track.notes.as_slice()
             },
             state.selected_note_id.as_ref(),
-            "Click the lower main waveform rail to add a comment for this file.",
+            "No comments found.",
         ),
         CommentSource::Reference => (
             if reference_unknown {
@@ -22904,6 +22904,38 @@ mod tests {
                 .iter()
                 .any(|label| label == "REFERENCE COMMENT AT 00:00")
         );
+    }
+
+    #[test]
+    fn rendered_main_comments_empty_state_uses_neutral_copy() {
+        let track_id = String::from("empty-comments-track");
+        let mut state = AppState {
+            busy: false,
+            ..AppState::default()
+        };
+        state.library.selected_track_id = Some(track_id.clone());
+        state.library.tracks.push(Track {
+            id: track_id,
+            title: String::from("Empty comments track"),
+            original_name: String::from("empty-comments.wav"),
+            path: PathBuf::from("/external/empty-comments.wav"),
+            source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
+            reference_path: None,
+            size: 0,
+            favorite: false,
+            stage: TrackStage::Backlog,
+            notes: crate::storage::SharedVec::default(),
+        });
+
+        let labels = project_surface(&state)
+            .view_frame_at_size_with_default_theme(Vector2::new(1_180.0, 1_000.0))
+            .paint_plan
+            .text_label_strings();
+
+        assert!(labels.iter().any(|label| label == "No comments found."));
+        assert!(!labels.iter().any(|label| {
+            label == "Click the lower main waveform rail to add a comment for this file."
+        }));
     }
 
     #[test]
