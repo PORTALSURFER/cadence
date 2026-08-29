@@ -9483,7 +9483,7 @@ fn start_reference_catalog_import(
     state.busy = true;
     state.status = format!(
         "Adding {} to the reference catalog…",
-        reference_track_name(&path)
+        reference_track_label(state, &path)
     );
     let request = AudioImportRequest {
         target: AudioImportTarget::Catalog,
@@ -32943,9 +32943,23 @@ mod tests {
     fn corrupt_catalog_preflight_uses_background_and_terminal_failure_once() {
         let path = PathBuf::from("/external/corrupt-catalog.wav");
         let mut state = AppState::default();
+        state.library.reference_tracks.push(ReferenceTrack {
+            path: path.clone(),
+            display_name: Some(String::from("Custom catalog name")),
+            source_proof: crate::source::SourceProvenance::Unknown,
+            notes: crate::storage::SharedVec::default(),
+        });
+        assert_eq!(
+            super::reference_track_label(&state, Path::new("/external/unmatched-catalog.wav")),
+            "unmatched-catalog.wav"
+        );
         let mut context = ui::UiUpdateContext::default();
         schedule_reference_catalog_import(&mut state, &mut context, vec![path.clone()]);
         assert!(state.busy);
+        assert_eq!(
+            state.status,
+            "Adding Custom catalog name to the reference catalog…"
+        );
         assert_eq!(state.reference_catalog_import_total, 1);
         assert_eq!(
             context
