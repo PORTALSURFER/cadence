@@ -3476,7 +3476,18 @@ fn main_output_gain(state: &AppState) -> f32 {
 }
 
 fn sync_playback_output_gains(state: &AppState) {
-    if !cleanup_any_active(state) || cleanup_owns_main(state) {
+    sync_playback_output_gains_with_main_cleanup_override(state, false);
+}
+
+fn sync_playback_output_gains_with_main_cleanup_override(
+    state: &AppState,
+    override_main_cleanup: bool,
+) {
+    if override_main_cleanup
+        || !cleanup_any_active(state)
+        || cleanup_owns_main(state)
+        || state.playback_muted
+    {
         state.transport.set_output_gain(main_output_gain(state));
     }
     if let Some(reference_transport) = state.reference_transport.as_ref() {
@@ -4960,7 +4971,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
         }
         Message::TogglePlaybackMute => {
             state.playback_muted = !state.playback_muted;
-            sync_playback_output_gains(state);
+            sync_playback_output_gains_with_main_cleanup_override(state, !state.playback_muted);
             context.repaint(ui::RepaintScope::Projection);
         }
         Message::PlaybackVolumeChanged(edit) => {
@@ -21745,6 +21756,113 @@ mod tests {
         assert_eq!(state.review_cursor_millis, 510);
         assert_eq!(state.transport_generation, main_generation);
         assert_eq!(state.transport.requested_output_gain_for_test(), 0.37);
+    }
+
+    #[test]
+    fn playback_mute_toggle_overrides_delayed_reference_cleanup() {
+        let mut state = shared_reference_playback_state();
+        let preserved_gain = 0.37;
+        let main_generation = state.transport_generation;
+        let main_position = 510;
+        let error = String::from("reference unload busy");
+        state.playback_volume = preserved_gain;
+        state.reference_only_playback = true;
+        state.transport_playing = true;
+        state.transport_position_millis = main_position;
+        state.review_cursor_millis = main_position;
+        state.transport.set_output_gain(preserved_gain);
+        let reference_transport = state
+            .reference_transport
+            .as_ref()
+            .expect("reference-only playback should have a reference transport")
+            .clone();
+        reference_transport.set_output_gain(0.42);
+        reference_transport.force_command_queue_full_for_test();
+
+        cleanup_reference_transport_failure(&mut state, error.clone());
+
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::StoppingReference {
+                reference_unload: ReferenceUnloadState::PendingAdmission,
+                ..
+            }
+        ));
+        assert!(!super::cleanup_owns_main(&state));
+        assert_eq!(
+            state.transport.requested_output_gain_for_test(),
+            preserved_gain
+        );
+        assert_eq!(reference_transport.requested_output_gain_for_test(), 0.0);
+
+        reference_transport.set_command_queue_size_for_test(31);
+        progress_paired_playback_cleanup(&mut state);
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::StoppingReference {
+                reference_unload: ReferenceUnloadState::AwaitingAcknowledgement(_),
+                ..
+            }
+        ));
+
+        update(
+            &mut state,
+            Message::TogglePlaybackMute,
+            &mut ui::UiUpdateContext::default(),
+        );
+
+        assert!(state.playback_muted);
+        assert_eq!(state.playback_volume, preserved_gain);
+        assert_eq!(state.transport.requested_output_gain_for_test(), 0.0);
+        assert_eq!(reference_transport.requested_output_gain_for_test(), 0.0);
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::StoppingReference {
+                reference_unload: ReferenceUnloadState::AwaitingAcknowledgement(_),
+                ..
+            }
+        ));
+        assert_eq!(state.status, error);
+        assert!(state.transport_playing);
+        assert_eq!(state.transport_position_millis, main_position);
+
+        update(
+            &mut state,
+            Message::TogglePlaybackMute,
+            &mut ui::UiUpdateContext::default(),
+        );
+
+        assert!(!state.playback_muted);
+        assert_eq!(state.playback_volume, preserved_gain);
+        assert_eq!(
+            state.transport.requested_output_gain_for_test(),
+            preserved_gain
+        );
+        assert_eq!(reference_transport.requested_output_gain_for_test(), 0.0);
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::StoppingReference {
+                reference_unload: ReferenceUnloadState::AwaitingAcknowledgement(_),
+                ..
+            }
+        ));
+
+        acknowledge_reference_unload(&state);
+        progress_paired_playback_cleanup(&mut state);
+
+        assert!(matches!(
+            state.paired_playback_guard,
+            PairedPlaybackGuard::Idle
+        ));
+        assert!(state.reference_transport.is_none());
+        assert_eq!(state.transport_generation, main_generation);
+        assert!(state.transport_playing);
+        assert_eq!(state.transport_position_millis, main_position);
+        assert_eq!(
+            state.transport.requested_output_gain_for_test(),
+            preserved_gain
+        );
+        assert_eq!(reference_transport.requested_output_gain_for_test(), 0.0);
     }
 
     #[test]
