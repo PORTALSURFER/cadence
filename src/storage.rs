@@ -400,6 +400,8 @@ pub struct Library {
 pub struct ReferenceTrack {
     pub path: PathBuf,
     #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
     pub source_proof: crate::source::SourceProvenance,
     #[serde(default)]
     pub notes: SharedVec<Note>,
@@ -1459,6 +1461,29 @@ pub fn set_reference_track_selection(
     Ok(changed)
 }
 
+/// Update a catalog entry's optional presentation name without changing its
+/// path-based identity or any of its source/annotation metadata.
+pub fn rename_reference_track(
+    library: &mut Library,
+    path: &Path,
+    display_name: &str,
+) -> Result<bool, String> {
+    let display_name = display_name.trim();
+    if display_name.is_empty() {
+        return Err(String::from("Reference track name cannot be empty."));
+    }
+
+    let reference = library
+        .reference_tracks
+        .find_mut(|reference| reference.path == path)
+        .ok_or_else(|| String::from("That reference track is no longer in the catalog."))?;
+    if reference.display_name.as_deref() == Some(display_name) {
+        return Ok(false);
+    }
+    reference.display_name = Some(display_name.to_owned());
+    Ok(true)
+}
+
 fn ensure_reference_track(library: &mut Library, path: PathBuf) {
     if !library
         .reference_tracks
@@ -1467,6 +1492,7 @@ fn ensure_reference_track(library: &mut Library, path: PathBuf) {
     {
         library.reference_tracks.push(ReferenceTrack {
             path,
+            display_name: None,
             source_proof: crate::source::SourceProvenance::Unknown,
             notes: SharedVec::default(),
         });
@@ -1498,6 +1524,7 @@ fn ensure_reference_track_with_proof(
     } else {
         library.reference_tracks.push(ReferenceTrack {
             path,
+            display_name: None,
             source_proof: crate::source::SourceProvenance::Verified(source_proof),
             notes: SharedVec::default(),
         });
@@ -2207,6 +2234,7 @@ mod tests {
             selected_track_id: Some(String::from("track-1")),
             reference_tracks: vec![ReferenceTrack {
                 path: reference_path,
+                display_name: Some(String::from("Reference vocal")),
                 source_proof: crate::source::SourceProvenance::Unknown,
                 notes: vec![Note {
                     id: String::from("reference-note-1"),
@@ -2520,6 +2548,77 @@ mod tests {
                 .expect("persisted snapshot should parse");
         assert_eq!(read_back, library);
         assert!(temporary_paths(&directory.path).is_empty());
+    }
+
+    #[test]
+    fn reference_display_name_round_trips_and_legacy_records_default_to_none() {
+        let library = persistence_fixture();
+        let encoded = serde_json::to_string(&library).expect("named library should encode");
+        assert!(encoded.contains(r#""display_name":"Reference vocal""#));
+        let round_trip: Library =
+            serde_json::from_str(&encoded).expect("named library should decode");
+        assert_eq!(
+            round_trip.reference_tracks[0].display_name.as_deref(),
+            Some("Reference vocal")
+        );
+
+        let legacy: Library = serde_json::from_str(
+            r#"{"tracks":[],"selected_track_id":null,"reference_tracks":[{"path":"/tmp/legacy-reference.wav"}]}"#,
+        )
+        .expect("legacy reference catalog should decode without display_name");
+        assert_eq!(legacy.reference_tracks[0].display_name, None);
+    }
+
+    #[test]
+    fn rename_reference_track_trims_rejects_blank_and_allows_duplicate_names() {
+        let mut library = persistence_fixture();
+        let original_path = library.reference_tracks[0].path.clone();
+        let original_notes = library.reference_tracks[0].notes.clone();
+        let original_assignment = library.tracks[0].reference_path.clone();
+        library.reference_tracks[0].source_proof =
+            crate::source::SourceProvenance::Verified(crate::source::AudioSourceProof {
+                sha256: "a".repeat(64),
+                byte_len: 42,
+            });
+        let original_proof = library.reference_tracks[0].source_proof.clone();
+
+        assert!(
+            rename_reference_track(&mut library, &original_path, "  Shared name  ")
+                .expect("a non-blank name should be accepted")
+        );
+        assert_eq!(
+            library.reference_tracks[0].display_name.as_deref(),
+            Some("Shared name")
+        );
+        assert_eq!(library.reference_tracks[0].path, original_path);
+        assert_eq!(library.reference_tracks[0].notes, original_notes);
+        assert_eq!(library.reference_tracks[0].source_proof, original_proof);
+        assert_eq!(library.tracks[0].reference_path, original_assignment);
+
+        let duplicate_path = PathBuf::from("/external/duplicate-reference.wav");
+        let mut duplicate = library.reference_tracks[0].clone();
+        duplicate.path = duplicate_path.clone();
+        duplicate.display_name = None;
+        library.reference_tracks.push(duplicate);
+        assert!(
+            rename_reference_track(&mut library, &duplicate_path, " Shared name ")
+                .expect("duplicate display names should be accepted")
+        );
+        assert_eq!(
+            library.reference_tracks[0].display_name,
+            library.reference_tracks[1].display_name
+        );
+        assert_eq!(library.reference_tracks[0].path, original_path);
+        assert_eq!(library.reference_tracks[1].path, duplicate_path);
+        assert_eq!(library.reference_tracks[1].notes, original_notes);
+        assert_eq!(library.reference_tracks[1].source_proof, original_proof);
+        assert_eq!(library.tracks[0].reference_path, original_assignment);
+
+        let before_blank = library.clone();
+        let error = rename_reference_track(&mut library, &original_path, " \t\n")
+            .expect_err("whitespace-only names should be rejected");
+        assert!(error.contains("cannot be empty"));
+        assert_eq!(library, before_blank);
     }
 
     #[cfg(unix)]
@@ -3365,6 +3464,7 @@ mod tests {
             selected_track_id: Some(String::from("track-1")),
             reference_tracks: vec![ReferenceTrack {
                 path: PathBuf::from("/tmp/reference.wav"),
+                display_name: None,
                 source_proof: crate::source::SourceProvenance::Unknown,
                 notes: vec![Note {
                     id: String::from("reference-note-1"),
@@ -3859,11 +3959,13 @@ mod tests {
             reference_tracks: vec![
                 ReferenceTrack {
                     path: original_path.clone(),
+                    display_name: Some(String::from("Original reference")),
                     source_proof: crate::source::SourceProvenance::Unknown,
                     notes: vec![original_note.clone()].into(),
                 },
                 ReferenceTrack {
                     path: other_path.clone(),
+                    display_name: None,
                     source_proof: crate::source::SourceProvenance::Unknown,
                     notes: SharedVec::default(),
                 },
@@ -3898,6 +4000,10 @@ mod tests {
         assert_eq!(
             replaced.reference_tracks[0].notes,
             vec![original_note].into()
+        );
+        assert_eq!(
+            replaced.reference_tracks[0].display_name.as_deref(),
+            Some("Original reference")
         );
         assert_eq!(
             replaced
@@ -3953,6 +4059,7 @@ mod tests {
             selected_track_id: Some(String::from("owner")),
             reference_tracks: vec![ReferenceTrack {
                 path: original_path.clone(),
+                display_name: None,
                 source_proof: crate::source::SourceProvenance::Verified(
                     decoded.source_proof().clone(),
                 ),
@@ -4024,6 +4131,7 @@ mod tests {
             selected_track_id: Some(String::from("owner")),
             reference_tracks: vec![ReferenceTrack {
                 path: source.clone(),
+                display_name: None,
                 source_proof: crate::source::SourceProvenance::Verified(
                     first.source_proof().clone(),
                 ),
@@ -4093,11 +4201,13 @@ mod tests {
             reference_tracks: vec![
                 ReferenceTrack {
                     path: original_path.clone(),
+                    display_name: None,
                     source_proof: crate::source::SourceProvenance::Unknown,
                     notes: SharedVec::default(),
                 },
                 ReferenceTrack {
                     path: occupied_path.clone(),
+                    display_name: None,
                     source_proof: crate::source::SourceProvenance::Unknown,
                     notes: SharedVec::default(),
                 },
@@ -4194,6 +4304,7 @@ mod tests {
             selected_track_id: Some(String::from("owner")),
             reference_tracks: vec![ReferenceTrack {
                 path: source.clone(),
+                display_name: None,
                 source_proof: crate::source::SourceProvenance::Unknown,
                 notes: notes.clone(),
             }]
@@ -4305,6 +4416,7 @@ mod tests {
             selected_track_id: Some(String::from("owner")),
             reference_tracks: vec![ReferenceTrack {
                 path: reference_path.clone(),
+                display_name: None,
                 source_proof: crate::source::SourceProvenance::Unknown,
                 notes: vec![reference_note.clone()].into(),
             }]
@@ -4362,6 +4474,7 @@ mod tests {
             selected_track_id: Some(String::from("owner")),
             reference_tracks: vec![ReferenceTrack {
                 path: source.clone(),
+                display_name: None,
                 source_proof: crate::source::SourceProvenance::Verified(
                     first.source_proof().clone(),
                 ),
@@ -4656,6 +4769,7 @@ mod tests {
             reference_tracks: vec![
                 ReferenceTrack {
                     path: removed_path.clone(),
+                    display_name: None,
                     source_proof: crate::source::SourceProvenance::Unknown,
                     notes: vec![Note {
                         id: String::from("removed-note"),
@@ -4667,6 +4781,7 @@ mod tests {
                 },
                 ReferenceTrack {
                     path: retained_path.clone(),
+                    display_name: None,
                     source_proof: crate::source::SourceProvenance::Unknown,
                     notes: SharedVec::default(),
                 },
@@ -4714,6 +4829,7 @@ mod tests {
             reference_tracks: vec![
                 ReferenceTrack {
                     path: first_path.clone(),
+                    display_name: None,
                     source_proof: crate::source::SourceProvenance::Unknown,
                     notes: vec![Note {
                         id: String::from("first-note"),
@@ -4725,6 +4841,7 @@ mod tests {
                 },
                 ReferenceTrack {
                     path: second_path.clone(),
+                    display_name: None,
                     source_proof: crate::source::SourceProvenance::Unknown,
                     notes: vec![Note {
                         id: String::from("second-note"),
