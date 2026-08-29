@@ -203,6 +203,7 @@ enum Message {
     ActivatePlaybackSource(PlaybackSource),
     SelectCommentSource(CommentSource),
     ToggleReferenceMatch,
+    TogglePlaybackMute,
     PlaybackVolumeChanged(SliderEditBatch),
     Frame,
     WaveformLoopDragStarted {
@@ -1808,6 +1809,7 @@ struct AppState {
     transport_polling: bool,
     transport_waiting_token: Option<u64>,
     playback_volume: f32,
+    playback_muted: bool,
     playback_source: PlaybackSource,
     reference_transport: Option<transport::AudioTransport>,
     reference_transport_generation: u64,
@@ -1989,6 +1991,7 @@ impl AppState {
             transport_polling: false,
             transport_waiting_token: None,
             playback_volume: transport::DEFAULT_VOLUME,
+            playback_muted: false,
             playback_source: PlaybackSource::Main,
             reference_transport: None,
             reference_transport_generation: 0,
@@ -3428,6 +3431,9 @@ fn reference_output_gain_without_cleanup_for_source(
     state: &AppState,
     source: PlaybackSource,
 ) -> f32 {
+    if state.playback_muted {
+        return 0.0;
+    }
     let match_gain = state
         .reference_match_enabled
         .then(|| current_loudness_match_gain_db(state))
@@ -3437,6 +3443,14 @@ fn reference_output_gain_without_cleanup_for_source(
         transport::normalize_output_gain(state.playback_volume * match_gain)
     } else {
         0.0
+    }
+}
+
+fn playback_volume_gain(state: &AppState) -> f32 {
+    if state.playback_muted {
+        0.0
+    } else {
+        state.playback_volume
     }
 }
 
@@ -3455,7 +3469,7 @@ fn main_output_gain(state: &AppState) -> f32 {
         ))
         && state.playback_source == PlaybackSource::Main
     {
-        state.playback_volume
+        playback_volume_gain(state)
     } else {
         0.0
     }
@@ -4944,6 +4958,11 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             }
             context.request_repaint();
         }
+        Message::TogglePlaybackMute => {
+            state.playback_muted = !state.playback_muted;
+            sync_playback_output_gains(state);
+            context.repaint(ui::RepaintScope::Projection);
+        }
         Message::PlaybackVolumeChanged(edit) => {
             if let Some(volume) = edit.value_change() {
                 let volume = transport::normalize_volume(volume);
@@ -6095,6 +6114,7 @@ fn seek_synchronized_positions(
             clear_live_spectrogram(state, PlaybackSource::Reference);
         }
     }
+    state.transport.set_output_gain(main_output_gain(state));
     let main_token = match state.transport.seek(
         state.transport_generation,
         main_position_millis,
@@ -6349,6 +6369,7 @@ fn seek_loop_owner(
             {
                 return Err(String::from(transport::CONTROLS_BUSY_ERROR));
             }
+            state.transport.set_output_gain(main_output_gain(state));
             let token = match state.transport.seek(
                 state.transport_generation,
                 position_millis,
@@ -6378,6 +6399,10 @@ fn seek_loop_owner(
             {
                 return Err(String::from(transport::CONTROLS_BUSY_ERROR));
             }
+            reference_transport.set_output_gain(reference_output_gain_for_source(
+                state,
+                PlaybackSource::Reference,
+            ));
             let seek_result = reference_transport.seek(
                 state.reference_transport_generation,
                 position_millis,
@@ -6605,7 +6630,7 @@ fn start_source_alongside_active(
                 resume_transport_command(state, PlaybackSource::Main, position_millis, loop_bounds,),
                 ResumeTransportCommand::Seek
             );
-            state.transport.set_output_gain(state.playback_volume);
+            state.transport.set_output_gain(playback_volume_gain(state));
             let result = if starts_new_segment {
                 state.transport.seek(
                     state.transport_generation,
@@ -7101,6 +7126,7 @@ fn toggle_playback(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
                 ),
                 ResumeTransportCommand::Seek
             );
+        state.transport.set_output_gain(main_output_gain(state));
         let main_result = if main_starts_new_segment {
             state.transport.seek(
                 state.transport_generation,
@@ -12119,6 +12145,13 @@ static REVIEW_VOLUME_ICON: ui::SvgIconTintCache = ui::SvgIconTintCache::new(
 </svg>"#,
 );
 
+static REVIEW_MUTED_VOLUME_ICON: ui::SvgIconTintCache = ui::SvgIconTintCache::new(
+    r#"<svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg" fill="currentColor">
+  <path d="M2 6h3l4-3v10l-4-3H2z"/>
+  <path d="m11 5 4 6M15 5l-4 6" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+</svg>"#,
+);
+
 fn playback_source_icon(transporting: bool) -> ui::SvgIcon {
     let icon = if transporting {
         &REVIEW_SOURCE_STOP_ICON
@@ -12130,6 +12163,15 @@ fn playback_source_icon(transporting: bool) -> ui::SvgIcon {
 
 fn review_transport_icon(icon: &'static ui::SvgIconTintCache, active: bool) -> ui::SvgIcon {
     icon.icon_for_state(REVIEW_TRANSPORT_ICON_TINTS, true, active)
+}
+
+fn review_volume_icon(muted: bool) -> ui::SvgIcon {
+    let icon = if muted {
+        &REVIEW_MUTED_VOLUME_ICON
+    } else {
+        &REVIEW_VOLUME_ICON
+    };
+    review_transport_icon(icon, muted)
 }
 
 fn current_live_frame_for_source(
@@ -12645,17 +12687,20 @@ fn review_reference_controls(state: &AppState, track: &storage::Track) -> ui::Vi
 }
 
 fn review_global_controls(state: &AppState, track: &storage::Track) -> ui::View<Message> {
+    let mute_label = if state.playback_muted {
+        "Unmute playback"
+    } else {
+        "Mute playback"
+    };
     ui::row([
         review_reference_controls(state, track),
-        ui::icon_button(review_transport_icon(&REVIEW_VOLUME_ICON, false))
+        ui::icon_button(review_volume_icon(state.playback_muted))
             .bare()
-            .focus(ui::FocusBehavior::None)
-            .passive::<Message>()
+            .active(state.playback_muted)
+            .label(mute_label)
+            .message(Message::TogglePlaybackMute)
             .key("review-transport-volume")
-            .tooltip(format!(
-                "Volume {:02}",
-                (state.playback_volume * 100.0).round() as u32
-            ))
+            .tooltip(mute_label)
             .size(20.0, 26.0),
         ui::slider(state.playback_volume)
             .primary()
@@ -17212,6 +17257,98 @@ mod tests {
     }
 
     #[test]
+    fn review_volume_toggle_is_pointer_and_keyboard_actionable_with_state_semantics() {
+        let state = audition_state(&["mute-control"]);
+        let bridge = DeclarativeOwnedRuntimeBridge::new(
+            state,
+            |state| project_surface(state).into_surface(),
+            |state, message| {
+                let mut context = ui::UiUpdateContext::default();
+                update(state, message, &mut context);
+            },
+        );
+        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1180.0, 720.0));
+        let initial_frame = runtime.frame_with_default_theme();
+        assert!(paint_plan_contains_icon(
+            &initial_frame.paint_plan.primitives,
+            &super::review_volume_icon(false),
+        ));
+        assert!(!paint_plan_contains_icon(
+            &initial_frame.paint_plan.primitives,
+            &super::review_volume_icon(true),
+        ));
+
+        let initial_target = runtime
+            .automation_target_snapshot()
+            .targets
+            .into_iter()
+            .find(|target| target.label.as_deref() == Some("Mute playback"))
+            .expect("the unmuted playback control should be labeled");
+        assert_eq!(initial_target.role, AutomationRole::Button);
+        assert!(initial_target.enabled);
+        assert!(initial_target.focusable);
+        assert!(initial_target.interaction_target);
+        let initial_point = Point::new(initial_target.center.x, initial_target.center.y);
+        let initial_widget_id = runtime
+            .widget_at(initial_point)
+            .expect("the unmuted playback control should have a pointer target");
+        let initial_widget = runtime
+            .surface()
+            .find_widget(initial_widget_id)
+            .expect("the unmuted playback control should be addressable");
+        assert_eq!(
+            initial_widget.widget().common().focus,
+            ui::FocusBehavior::Keyboard
+        );
+        assert!(!initial_widget.widget().common().state.active);
+        assert_eq!(
+            initial_widget.widget().common().tooltip.as_deref(),
+            Some("Mute playback")
+        );
+
+        runtime.dispatch_primary_click(initial_point);
+        assert!(runtime.bridge().state().playback_muted);
+
+        let muted_frame = runtime.frame_with_default_theme();
+        assert!(paint_plan_contains_icon(
+            &muted_frame.paint_plan.primitives,
+            &super::review_volume_icon(true),
+        ));
+        assert!(!paint_plan_contains_icon(
+            &muted_frame.paint_plan.primitives,
+            &super::review_volume_icon(false),
+        ));
+        let muted_target = runtime
+            .automation_target_snapshot()
+            .targets
+            .into_iter()
+            .find(|target| target.label.as_deref() == Some("Unmute playback"))
+            .expect("the muted playback control should be labeled");
+        assert!(muted_target.focusable);
+        let muted_point = Point::new(muted_target.center.x, muted_target.center.y);
+        let muted_widget_id = runtime
+            .widget_at(muted_point)
+            .expect("the muted playback control should have a pointer target");
+        let muted_widget = runtime
+            .surface()
+            .find_widget(muted_widget_id)
+            .expect("the muted playback control should be addressable");
+        assert!(muted_widget.widget().common().state.active);
+        assert_eq!(
+            muted_widget.widget().common().tooltip.as_deref(),
+            Some("Unmute playback")
+        );
+
+        runtime.execute_command(Command::focus(muted_widget_id));
+        assert_eq!(runtime.focused_widget(), Some(muted_widget_id));
+        assert_eq!(
+            runtime.dispatch_event(Event::key_press(ui::WidgetKey::Enter)),
+            Some(muted_widget_id)
+        );
+        assert!(!runtime.bridge().state().playback_muted);
+    }
+
+    #[test]
     fn reference_settings_auxiliary_projection_is_closed_or_one_cached_window() {
         let mut state = AppState::default();
         assert!(reference_settings_auxiliary_windows(&mut state).is_empty());
@@ -18369,6 +18506,109 @@ mod tests {
         assert_eq!(
             context.into_command().repaint_scope(),
             Some(RepaintScope::Projection)
+        );
+    }
+
+    #[test]
+    fn playback_mute_toggle_preserves_volume_and_reference_match() {
+        let mut state = shared_reference_playback_state();
+        state.playback_source = PlaybackSource::Reference;
+        state.playback_volume = 0.37;
+        state
+            .reference_waveform
+            .as_mut()
+            .expect("reference waveform")
+            .integrated_lufs = Some(-14.0);
+        state.reference_match_enabled = true;
+        let reference_gain = reference_output_gain(&state);
+        assert!(reference_gain > state.playback_volume);
+
+        let mut context = ui::UiUpdateContext::default();
+        update(&mut state, Message::TogglePlaybackMute, &mut context);
+
+        assert!(state.playback_muted);
+        assert_eq!(state.playback_volume, 0.37);
+        assert!(state.reference_match_enabled);
+        assert_eq!(reference_output_gain(&state), 0.0);
+        assert_eq!(
+            state
+                .reference_transport
+                .as_ref()
+                .expect("reference transport")
+                .requested_output_gain_for_test(),
+            0.0
+        );
+        assert_eq!(
+            context.into_command().repaint_scope(),
+            Some(RepaintScope::Projection)
+        );
+
+        let mut context = ui::UiUpdateContext::default();
+        update(&mut state, Message::TogglePlaybackMute, &mut context);
+
+        assert!(!state.playback_muted);
+        assert_eq!(state.playback_volume, 0.37);
+        assert!(state.reference_match_enabled);
+        assert!((reference_output_gain(&state) - reference_gain).abs() < f32::EPSILON);
+        assert_eq!(
+            state
+                .reference_transport
+                .as_ref()
+                .expect("reference transport")
+                .requested_output_gain_for_test(),
+            reference_gain
+        );
+    }
+
+    #[test]
+    fn muted_global_and_promotion_starts_request_zero_main_and_reference_gain() {
+        let mut main_only = main_only_loop_state();
+        main_only.playback_muted = true;
+        main_only.playback_volume = 0.37;
+        update(
+            &mut main_only,
+            Message::TogglePlayback,
+            &mut ui::UiUpdateContext::default(),
+        );
+        assert_eq!(main_output_gain(&main_only), 0.0);
+        assert_eq!(main_only.transport.requested_output_gain_for_test(), 0.0);
+
+        let mut paired = shared_reference_playback_state();
+        paired.playback_source = PlaybackSource::Reference;
+        paired.playback_muted = true;
+        update(
+            &mut paired,
+            Message::TogglePlayback,
+            &mut ui::UiUpdateContext::default(),
+        );
+        assert_eq!(paired.transport.requested_output_gain_for_test(), 0.0);
+        assert_eq!(
+            paired
+                .reference_transport
+                .as_ref()
+                .expect("reference transport")
+                .requested_output_gain_for_test(),
+            0.0
+        );
+
+        let mut promoted = shared_reference_playback_state();
+        promoted.playback_source = PlaybackSource::Reference;
+        promoted.playback_muted = true;
+        promoted.reference_only_playback = true;
+        promoted.reference_transport_playing = true;
+        update(
+            &mut promoted,
+            Message::ActivatePlaybackSource(PlaybackSource::Main),
+            &mut ui::UiUpdateContext::default(),
+        );
+        assert_eq!(promoted.transport.requested_output_gain_for_test(), 0.0);
+        assert_eq!(
+            promoted
+                .reference_transport
+                .as_ref()
+                .expect("reference transport")
+                .requested_output_gain_for_test(),
+            0.0
         );
     }
 
