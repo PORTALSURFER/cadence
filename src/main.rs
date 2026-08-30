@@ -21,8 +21,8 @@ use radiant::{
     },
     theme::ThemeTokens,
     widgets::{
-        DragHandleWidget, InteractiveRowWidget, SliderEditBatch, Widget, WidgetCommon, WidgetInput,
-        WidgetOutput,
+        DragHandleWidget, InteractiveRowWidget, SliderEditBatch, TextInputRevision, Widget,
+        WidgetCommon, WidgetInput, WidgetOutput,
     },
 };
 use std::{
@@ -171,6 +171,13 @@ enum Message {
     },
     ToggleSettings,
     CloseSettings,
+    RenameReferenceTrack(PathBuf),
+    ReferenceTrackNameChanged {
+        path: PathBuf,
+        name: String,
+    },
+    SaveReferenceTrackName(PathBuf),
+    CancelReferenceTrackName(PathBuf),
     RemoveReferenceTrack(PathBuf),
     SetReferenceTrack {
         track_id: String,
@@ -488,6 +495,7 @@ const MAIN_COMMENT_EDITOR_ID: u64 = 0xCAD3_1001;
 const REFERENCE_COMMENT_EDITOR_ID: u64 = 0xCAD3_1002;
 const MAIN_INLINE_COMMENT_EDITOR_SCOPE: u64 = 0xCAD3_1003;
 const REFERENCE_INLINE_COMMENT_EDITOR_SCOPE: u64 = 0xCAD3_1004;
+const REFERENCE_SETTINGS_NAME_EDITOR_SCOPE: u64 = 0xCAD3_1007;
 const MAIN_COMMENTS_SCROLL_VIEWPORT_ID: u64 = 0xCAD3_1005;
 const REFERENCE_COMMENTS_SCROLL_VIEWPORT_ID: u64 = 0xCAD3_1006;
 const COMMENT_ROW_HEIGHT: f32 = 44.0;
@@ -991,6 +999,21 @@ struct ImportBatchProgress {
 struct LibrarySaveAttempt {
     id: u64,
     revision: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReferenceNameDraft {
+    path: PathBuf,
+    value: String,
+    revision: TextInputRevision,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingReferenceNameSave {
+    attempt: Option<LibrarySaveAttempt>,
+    path: PathBuf,
+    previous_display_name: Option<String>,
+    saved_display_name: String,
 }
 
 #[derive(Debug)]
@@ -1762,6 +1785,7 @@ struct AppState {
     library_revision: u64,
     persisted_library_revision: u64,
     save_in_flight: Option<LibrarySaveAttempt>,
+    pending_reference_name_save: Option<PendingReferenceNameSave>,
     close_after_save: bool,
     close_save_request_sender: Sender<CloseSaveRequest>,
     close_save_request_receiver: Rc<RefCell<Option<Receiver<CloseSaveRequest>>>>,
@@ -1769,6 +1793,7 @@ struct AppState {
     selection_save_latest: ui::LatestTask,
     selection_save_pending: bool,
     last_save_attempt_id: u64,
+    next_reference_name_revision: u64,
     waveform: Option<audio::WaveformData>,
     waveform_source_ticket: Option<crate::source::VerifiedSourceTicket>,
     main_source_mismatch: Option<PathBuf>,
@@ -1829,6 +1854,7 @@ struct AppState {
     pending_comment_playback: Option<PendingCommentPlayback>,
     draft_note: Option<NoteDraft>,
     reference_draft_note: Option<NoteDraft>,
+    reference_name_draft: Option<ReferenceNameDraft>,
     persisted_note_drag: Option<PersistedNoteDrag>,
     reference_persisted_note_drag: Option<PersistedNoteDrag>,
     selected_note_id: Option<NoteAddress>,
@@ -1944,6 +1970,7 @@ impl AppState {
             library_revision: 0,
             persisted_library_revision: 0,
             save_in_flight: None,
+            pending_reference_name_save: None,
             close_after_save: false,
             close_save_request_sender,
             close_save_request_receiver,
@@ -1951,6 +1978,7 @@ impl AppState {
             selection_save_latest: ui::LatestTask::new(),
             selection_save_pending: false,
             last_save_attempt_id: 0,
+            next_reference_name_revision: 0,
             waveform: None,
             waveform_source_ticket: None,
             main_source_mismatch: None,
@@ -2011,6 +2039,7 @@ impl AppState {
             pending_comment_playback: None,
             draft_note: None,
             reference_draft_note: None,
+            reference_name_draft: None,
             persisted_note_drag: None,
             reference_persisted_note_drag: None,
             selected_note_id: None,
@@ -2118,6 +2147,14 @@ fn allocate_note_draft_nonce(state: &mut AppState) -> u64 {
     state.next_note_draft_nonce
 }
 
+fn allocate_reference_name_revision(state: &mut AppState) -> TextInputRevision {
+    state.next_reference_name_revision = state
+        .next_reference_name_revision
+        .checked_add(1)
+        .expect("reference name revision overflow");
+    TextInputRevision::new(state.next_reference_name_revision)
+}
+
 fn active_draft_matches(draft: Option<&NoteDraft>, identity: &NoteDraftIdentity) -> bool {
     draft.is_some_and(|draft| draft.identity().eq(identity))
 }
@@ -2126,7 +2163,11 @@ fn playback_shortcut(state: &AppState, press: ui::KeyPress) -> ui::ShortcutResol
     let comment_draft_active = state.draft_note.is_some() || state.reference_draft_note.is_some();
 
     if press == ui::KeyPress::new(ui::KeyCode::Escape) {
-        ui::ShortcutResolution::action(Message::StopPlayback)
+        if let Some(draft) = state.reference_name_draft.as_ref() {
+            ui::ShortcutResolution::action(Message::CancelReferenceTrackName(draft.path.clone()))
+        } else {
+            ui::ShortcutResolution::action(Message::StopPlayback)
+        }
     } else if !comment_draft_active && press == ui::KeyPress::new(ui::KeyCode::N) {
         ui::ShortcutResolution::action(Message::NewNoteAtCurrentTime)
     } else if !comment_draft_active && press == ui::KeyPress::new(ui::KeyCode::Space) {
@@ -2195,6 +2236,7 @@ fn frame_surface_revisions(state: &mut AppState) -> SurfaceRevisions {
     let structure = frame_revision_mix(&[
         workspace_mode_key(state.workspace_mode),
         state.library.tracks.len() as u64,
+        state.library.projection_revision(),
         frame_revision_text(state.library.selected_track_id.as_deref()),
         frame_revision_text(state.waveform_track_id.as_deref()),
         frame_revision_text(state.reference_waveform_track_id.as_deref()),
@@ -2205,6 +2247,12 @@ fn frame_surface_revisions(state: &mut AppState) -> SurfaceRevisions {
         selected_track.is_some_and(|track| track.reference_path.is_some()) as u64,
         state.draft_note.is_some() as u64,
         state.reference_draft_note.is_some() as u64,
+        frame_revision_text(
+            state
+                .reference_name_draft
+                .as_ref()
+                .map(|draft| draft.value.as_str()),
+        ),
     ]);
     let layout = frame_revision_mix(&[
         state.live_spectrogram_height.to_bits() as u64,
@@ -2531,6 +2579,7 @@ fn activate_loaded_library(
     state.library_revision = 0;
     state.persisted_library_revision = 0;
     state.save_in_flight = None;
+    state.pending_reference_name_save = None;
     state.save_admission_pending = false;
     state.selection_save_latest.cancel();
     state.selection_save_pending = false;
@@ -2557,6 +2606,7 @@ fn activate_loaded_library(
     state.review_cursor_millis = 0;
     state.draft_note = None;
     state.reference_draft_note = None;
+    state.reference_name_draft = None;
     rollback_persisted_note_drag(state);
     rollback_reference_persisted_note_drag(state);
     state.reference_playhead_drag_active = false;
@@ -3641,7 +3691,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     mark_library_snapshot_persisted(state);
                     state.status = format!(
                         "Added {} to the reference catalog.",
-                        reference_track_name(&path)
+                        reference_track_label(state, &path)
                     );
                 }
                 Err(error) => state.status = error,
@@ -4047,6 +4097,18 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             close_settings(state);
             context.request_repaint();
         }
+        Message::RenameReferenceTrack(path) => {
+            begin_reference_track_rename(state, context, path);
+        }
+        Message::ReferenceTrackNameChanged { path, name } => {
+            update_reference_track_name_draft(state, context, path, name);
+        }
+        Message::SaveReferenceTrackName(path) => {
+            save_reference_track_name(state, context, path);
+        }
+        Message::CancelReferenceTrackName(path) => {
+            cancel_reference_track_name(state, context, path);
+        }
         Message::DecodeProgress {
             track_id,
             generation,
@@ -4393,6 +4455,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             match result {
                 Ok(outcome) => {
                     state.persisted_library_revision = attempt.revision;
+                    complete_reference_name_save_success(state, attempt);
                     if state.close_after_save {
                         if library_dirty(state) {
                             match dispatch_close_library_save(state) {
@@ -4439,6 +4502,7 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                     }
                 }
                 Err(error) => {
+                    rollback_reference_name_save(state, attempt);
                     if state.close_after_save {
                         state.close_after_save = false;
                         state.status =
@@ -4571,6 +4635,14 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             if !library_is_ready(state) || state.busy {
                 return;
             }
+            let reference_name = reference_track_label(state, &path);
+            if state
+                .reference_name_draft
+                .as_ref()
+                .is_some_and(|draft| draft.path == path)
+            {
+                state.reference_name_draft = None;
+            }
             let selected_affected = selected_track(state)
                 .and_then(|track| track.reference_path.as_ref())
                 .is_some_and(|selected_path| selected_path == &path);
@@ -4598,14 +4670,11 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 schedule_selected_reference_decode(state, context);
             }
             state.status = if cleared_assignments == 0 {
-                format!(
-                    "Removed {} from the reference catalog.",
-                    reference_track_name(&path)
-                )
+                format!("Removed {} from the reference catalog.", reference_name)
             } else {
                 format!(
                     "Removed {} and cleared {} track assignment{}.",
-                    reference_track_name(&path),
+                    reference_name,
                     cleared_assignments,
                     plural(cleared_assignments)
                 )
@@ -4665,7 +4734,10 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
                 path: path.clone(),
             };
             state.busy = true;
-            state.status = format!("Checking reference {}…", reference_track_name(&path));
+            state.status = format!(
+                "Checking reference {}…",
+                reference_track_label(state, &path)
+            );
             close_reference_menu(state);
             state.audio_import_in_flight = Some(request.clone());
             start_audio_import_preflight(context, request);
@@ -8828,7 +8900,7 @@ fn complete_reference_selection_commit(
                 state.reference_match_enabled = false;
                 schedule_selected_reference_decode(state, context);
             }
-            state.status = format!("Reference set to {}.", reference_track_name(&path));
+            state.status = format!("Reference set to {}.", reference_track_label(state, &path));
             append_persistence_warning(&mut state.status, &outcome);
         }
         Err(error) => {
@@ -8887,9 +8959,18 @@ fn complete_reference_replacement_commit(
             } else {
                 let library = persisted.value;
                 let outcome = persisted.outcome;
+                let previous_reference_name = reference_track_label(state, &reference_path);
                 let selected_reference_affected = selected_track(state)
                     .and_then(|track| track.reference_path.as_deref())
                     .is_some_and(|path| path == reference_path.as_path());
+                if reference_path != replacement_path
+                    && state
+                        .reference_name_draft
+                        .as_ref()
+                        .is_some_and(|draft| draft.path == reference_path)
+                {
+                    state.reference_name_draft = None;
+                }
                 state
                     .library
                     .replace(library, LibraryMutationScope::ProjectionAndMarkers);
@@ -8908,13 +8989,13 @@ fn complete_reference_replacement_commit(
                 state.status = if reference_path == replacement_path {
                     format!(
                         "Re-imported reference {}; notes were preserved.",
-                        reference_track_name(&replacement_path)
+                        reference_track_label(state, &replacement_path)
                     )
                 } else {
                     format!(
                         "Replaced reference {} with {}; notes were preserved.",
-                        reference_track_name(&reference_path),
-                        reference_track_name(&replacement_path)
+                        previous_reference_name,
+                        reference_track_label(state, &replacement_path)
                     )
                 };
                 append_persistence_warning(&mut state.status, &outcome);
@@ -9420,7 +9501,7 @@ fn start_reference_catalog_import(
     state.busy = true;
     state.status = format!(
         "Adding {} to the reference catalog…",
-        reference_track_name(&path)
+        reference_track_label(state, &path)
     );
     let request = AudioImportRequest {
         target: AudioImportTarget::Catalog,
@@ -9635,6 +9716,59 @@ fn request_library_save_admission(
     context.after(Duration::ZERO, Message::AdmitLibrarySave);
 }
 
+fn record_reference_name_save_attempt(state: &mut AppState, attempt: LibrarySaveAttempt) {
+    if let Some(pending) = state.pending_reference_name_save.as_mut()
+        && pending.attempt.is_none()
+    {
+        pending.attempt = Some(attempt);
+    }
+}
+
+fn complete_reference_name_save_success(state: &mut AppState, attempt: LibrarySaveAttempt) {
+    if state
+        .pending_reference_name_save
+        .as_ref()
+        .is_some_and(|pending| pending.attempt == Some(attempt))
+    {
+        state.pending_reference_name_save = None;
+    }
+}
+
+fn rollback_reference_name_save(state: &mut AppState, attempt: LibrarySaveAttempt) -> bool {
+    let Some(pending) = state
+        .pending_reference_name_save
+        .as_ref()
+        .filter(|pending| pending.attempt == Some(attempt))
+        .cloned()
+    else {
+        return false;
+    };
+    let restored = state.library.mutate_with(
+        LibraryMutationScope::Projection,
+        |library| {
+            let Some(reference) = library
+                .reference_tracks
+                .find_mut(|reference| reference.path == pending.path)
+            else {
+                return false;
+            };
+            if reference.display_name.as_deref() != Some(pending.saved_display_name.as_str()) {
+                return false;
+            }
+            reference.display_name = pending.previous_display_name;
+            true
+        },
+        |changed| *changed,
+    );
+    state.pending_reference_name_save = None;
+    if restored && state.library_revision == attempt.revision {
+        cancel_selection_save_debounce(state);
+        state.library_revision = state.persisted_library_revision;
+        state.save_admission_pending = false;
+    }
+    restored
+}
+
 fn dispatch_library_save(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) -> bool {
     if !library_is_ready(state)
         || !library_dirty(state)
@@ -9653,6 +9787,7 @@ fn dispatch_library_save(state: &mut AppState, context: &mut ui::UiUpdateContext
     let attempt = LibrarySaveAttempt { id, revision };
     let library = state.library.snapshot();
     state.save_in_flight = Some(attempt);
+    record_reference_name_save_attempt(state, attempt);
     state.selection_save_pending = false;
     context.business().blocking_io("cadence-save-library").run(
         move |_| storage::persist_library(&library),
@@ -9681,6 +9816,7 @@ fn dispatch_close_library_save(state: &mut AppState) -> Result<bool, String> {
         .map_err(|_| String::from("background close-save worker disconnected"))?;
     state.last_save_attempt_id = id;
     state.save_in_flight = Some(attempt);
+    record_reference_name_save_attempt(state, attempt);
     state.save_admission_pending = false;
     state.selection_save_pending = false;
     Ok(true)
@@ -10389,6 +10525,7 @@ fn close_reference_menu(state: &mut AppState) {
 
 fn close_settings(state: &mut AppState) {
     state.settings_open = false;
+    state.reference_name_draft = None;
 }
 
 fn toggle_settings(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
@@ -10400,6 +10537,136 @@ fn toggle_settings(state: &mut AppState, context: &mut ui::UiUpdateContext<Messa
         state.settings_open = true;
     }
     context.request_repaint();
+}
+
+fn begin_reference_track_rename(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    path: PathBuf,
+) {
+    if !library_is_ready(state) || state.busy {
+        return;
+    }
+    if library_persistence_pending(state) {
+        state.status =
+            String::from("Saving the library — try renaming a reference again in a moment.");
+        context.request_repaint();
+        return;
+    }
+    let Some(reference) = state
+        .library
+        .reference_tracks
+        .iter()
+        .find(|reference| reference.path == path)
+    else {
+        state.status = String::from("That reference track is no longer in the catalog.");
+        context.request_repaint();
+        return;
+    };
+    let value = reference_track_display_name(reference);
+    let revision = allocate_reference_name_revision(state);
+    let editor_id = reference_track_name_editor_id(&path);
+    state.reference_name_draft = Some(ReferenceNameDraft {
+        path,
+        value,
+        revision,
+    });
+    state.status = String::from("Editing reference track name.");
+    context.request_repaint();
+    context.focus(editor_id);
+}
+
+fn update_reference_track_name_draft(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    path: PathBuf,
+    name: String,
+) {
+    if let Some(draft) = state
+        .reference_name_draft
+        .as_mut()
+        .filter(|draft| draft.path == path)
+    {
+        draft.value = name;
+        context.request_repaint();
+    }
+}
+
+fn save_reference_track_name(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    path: PathBuf,
+) {
+    if !library_is_ready(state) || state.busy {
+        return;
+    }
+    if library_persistence_pending(state) {
+        state.status =
+            String::from("Saving the library — try saving the reference name again in a moment.");
+        context.request_repaint();
+        return;
+    }
+    let Some(draft) = state
+        .reference_name_draft
+        .as_ref()
+        .filter(|draft| draft.path == path)
+        .cloned()
+    else {
+        return;
+    };
+    let previous_display_name = state
+        .library
+        .reference_tracks
+        .iter()
+        .find(|reference| reference.path == path)
+        .and_then(|reference| reference.display_name.clone());
+    let result = state.library.mutate_with(
+        LibraryMutationScope::Projection,
+        |library| storage::rename_reference_track(library, &path, &draft.value),
+        |result| matches!(result, Ok(true)),
+    );
+    let changed = match result {
+        Ok(changed) => changed,
+        Err(error) => {
+            state.status = error;
+            context.request_repaint();
+            return;
+        }
+    };
+    state.reference_name_draft = None;
+    if changed {
+        let saved_display_name = draft.value.trim().to_owned();
+        state.pending_reference_name_save = Some(PendingReferenceNameSave {
+            attempt: None,
+            path: path.clone(),
+            previous_display_name,
+            saved_display_name,
+        });
+        state.status = format!(
+            "Renamed reference track to {}.",
+            reference_track_label(state, &path)
+        );
+        schedule_library_save(state, context);
+    } else {
+        state.status = String::from("Reference track name unchanged.");
+    }
+    context.request_repaint();
+}
+
+fn cancel_reference_track_name(
+    state: &mut AppState,
+    context: &mut ui::UiUpdateContext<Message>,
+    path: PathBuf,
+) {
+    if state
+        .reference_name_draft
+        .as_ref()
+        .is_some_and(|draft| draft.path == path)
+    {
+        state.reference_name_draft = None;
+        state.status = String::from("Reference track rename canceled.");
+        context.request_repaint();
+    }
 }
 
 fn library_track_card_height() -> f32 {
@@ -11615,6 +11882,8 @@ const SETTINGS_REFERENCE_ROW_TEXT_HEIGHT: f32 = SETTINGS_REFERENCE_ROW_TITLE_HEI
 const SETTINGS_REFERENCE_ACTION_HEIGHT: f32 = 32.0;
 const SETTINGS_REFERENCE_REIMPORT_LABEL: &str = "Re-import / replace reference track";
 const SETTINGS_REFERENCE_REMOVE_LABEL: &str = "Remove reference track";
+const SETTINGS_REFERENCE_RENAME_LABEL: &str = "Rename reference track";
+const SETTINGS_REFERENCE_NAME_INPUT_LABEL: &str = "Reference track display name";
 
 static SETTINGS_REFERENCE_REIMPORT_ICON: ui::SvgIconTintCache = ui::SvgIconTintCache::new(
     r#"<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" fill="currentColor">
@@ -11628,12 +11897,22 @@ static SETTINGS_REFERENCE_REMOVE_ICON: ui::SvgIconTintCache = ui::SvgIconTintCac
 </svg>"#,
 );
 
+static SETTINGS_REFERENCE_RENAME_ICON: ui::SvgIconTintCache = ui::SvgIconTintCache::new(
+    r#"<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" fill="currentColor">
+  <path d="m17.7 2.3 4 4-12.4 12.4-5 1 1-5L17.7 2.3Zm-10.1 13.2-.4 2 2-.4L18.9 7.4l-1.9-1.9L7.6 15.5ZM4 22h16v-2H4v2Z"/>
+</svg>"#,
+);
+
 fn settings_reference_reimport_icon() -> ui::SvgIcon {
     SETTINGS_REFERENCE_REIMPORT_ICON.icon_for_state(REVIEW_TRANSPORT_ICON_TINTS, true, false)
 }
 
 fn settings_reference_remove_icon() -> ui::SvgIcon {
     SETTINGS_REFERENCE_REMOVE_ICON.icon_for_state(REVIEW_TRANSPORT_ICON_TINTS, true, false)
+}
+
+fn settings_reference_rename_icon() -> ui::SvgIcon {
+    SETTINGS_REFERENCE_RENAME_ICON.icon_for_state(REVIEW_TRANSPORT_ICON_TINTS, true, false)
 }
 
 fn keyboard_stage_menu_anchor(state: &AppState) -> Point {
@@ -11748,13 +12027,24 @@ fn stage_menu_popover(track: &storage::Track, anchor: Point) -> ui::View<Message
     ))
 }
 
+#[cfg(test)]
 fn settings_reference_row(
     reference: &storage::ReferenceTrack,
     assignment_count: usize,
     active: bool,
 ) -> ui::View<Message> {
+    settings_reference_row_with_editing(reference, assignment_count, active, None)
+}
+
+fn settings_reference_row_with_editing(
+    reference: &storage::ReferenceTrack,
+    assignment_count: usize,
+    active: bool,
+    editing: Option<&ReferenceNameDraft>,
+) -> ui::View<Message> {
     let path = reference.path.as_path();
-    let name = reference_track_name(path);
+    let path_key = reference_path_identity_key(path);
+    let name = reference_track_display_name(reference);
     let assignment_label = if active {
         format!("{} assigned · ACTIVE", assignment_count,)
     } else {
@@ -11762,29 +12052,85 @@ fn settings_reference_row(
     };
     let replacement_path = path.to_path_buf();
     let remove_path = path.to_path_buf();
-    let row_key = format!("settings-reference-{}", path.display());
+    let rename_path = path.to_path_buf();
+    let editing = editing.filter(|draft| draft.path == path);
+    let name_column = if let Some(draft) = editing {
+        let input_path = path.to_path_buf();
+        let input_id = reference_track_name_editor_id(path);
+        ui::column([
+            ui::text_input(draft.value.clone())
+                .placeholder(SETTINGS_REFERENCE_NAME_INPUT_LABEL)
+                .select_all()
+                .revision(draft.revision)
+                .message_event(move |input| {
+                    let submitted = input.is_submitted();
+                    let value = input.into_value();
+                    if submitted {
+                        Message::SaveReferenceTrackName(input_path.clone())
+                    } else {
+                        Message::ReferenceTrackNameChanged {
+                            path: input_path.clone(),
+                            name: value,
+                        }
+                    }
+                })
+                .id(input_id)
+                .fill_width()
+                .height(SETTINGS_REFERENCE_ROW_TITLE_HEIGHT),
+            ui::text(assignment_label)
+                .truncate()
+                .height(SETTINGS_REFERENCE_ROW_METADATA_HEIGHT)
+                .fill_width()
+                .subtle(),
+        ])
+        .spacing(SETTINGS_REFERENCE_ROW_TEXT_SPACING)
+        .fill_width()
+        .height(SETTINGS_REFERENCE_ROW_TEXT_HEIGHT)
+    } else {
+        ui::column([
+            ui::text(name)
+                .truncate()
+                .height(SETTINGS_REFERENCE_ROW_TITLE_HEIGHT)
+                .fill_width()
+                .tooltip(path.display().to_string()),
+            ui::text(assignment_label)
+                .truncate()
+                .height(SETTINGS_REFERENCE_ROW_METADATA_HEIGHT)
+                .fill_width()
+                .subtle(),
+        ])
+        .spacing(SETTINGS_REFERENCE_ROW_TEXT_SPACING)
+        .fill_width()
+        .height(SETTINGS_REFERENCE_ROW_TEXT_HEIGHT)
+    };
+    let name_action = if editing.is_some() {
+        ui::spacer()
+            .width(SETTINGS_REFERENCE_ACTION_HEIGHT)
+            .height(SETTINGS_REFERENCE_ACTION_HEIGHT)
+    } else {
+        ui::icon_button(settings_reference_rename_icon())
+            .label(SETTINGS_REFERENCE_RENAME_LABEL)
+            .subtle()
+            .message(Message::RenameReferenceTrack(rename_path))
+            .key(format!("settings-rename-reference-{path_key}"))
+            .tooltip(SETTINGS_REFERENCE_RENAME_LABEL)
+            .size(
+                SETTINGS_REFERENCE_ACTION_HEIGHT,
+                SETTINGS_REFERENCE_ACTION_HEIGHT,
+            )
+            .width(SETTINGS_REFERENCE_ACTION_HEIGHT)
+            .height(SETTINGS_REFERENCE_ACTION_HEIGHT)
+    };
+    let row_key = format!("settings-reference-{path_key}");
     ui::list_row(
         row_key,
         [
-            ui::column([
-                ui::text(name)
-                    .truncate()
-                    .height(SETTINGS_REFERENCE_ROW_TITLE_HEIGHT)
-                    .fill_width(),
-                ui::text(assignment_label)
-                    .truncate()
-                    .height(SETTINGS_REFERENCE_ROW_METADATA_HEIGHT)
-                    .fill_width()
-                    .subtle(),
-            ])
-            .spacing(SETTINGS_REFERENCE_ROW_TEXT_SPACING)
-            .fill_width()
-            .height(SETTINGS_REFERENCE_ROW_TEXT_HEIGHT),
+            name_column,
             ui::icon_button(settings_reference_reimport_icon())
                 .label(SETTINGS_REFERENCE_REIMPORT_LABEL)
                 .subtle()
                 .message(Message::ReferenceReplacementPressed(replacement_path))
-                .key(format!("settings-reimport-reference-{}", path.display()))
+                .key(format!("settings-reimport-reference-{path_key}"))
                 .tooltip(SETTINGS_REFERENCE_REIMPORT_LABEL)
                 .size(
                     SETTINGS_REFERENCE_ACTION_HEIGHT,
@@ -11796,7 +12142,7 @@ fn settings_reference_row(
                 .label(SETTINGS_REFERENCE_REMOVE_LABEL)
                 .subtle()
                 .message(Message::RemoveReferenceTrack(remove_path))
-                .key(format!("settings-remove-reference-{}", path.display()))
+                .key(format!("settings-remove-reference-{path_key}"))
                 .tooltip(SETTINGS_REFERENCE_REMOVE_LABEL)
                 .size(
                     SETTINGS_REFERENCE_ACTION_HEIGHT,
@@ -11804,6 +12150,7 @@ fn settings_reference_row(
                 )
                 .width(SETTINGS_REFERENCE_ACTION_HEIGHT)
                 .height(SETTINGS_REFERENCE_ACTION_HEIGHT),
+            name_action,
         ],
     )
     .fill_width()
@@ -11833,6 +12180,7 @@ fn reference_settings_window_view(state: &AppState) -> ui::View<Message> {
             None,
             false,
         );
+        let editing = state.reference_name_draft.as_ref();
         ui::virtual_list_windowed(|index| {
             let reference: &storage::ReferenceTrack = &state.library.reference_tracks[index];
             let assignment_count = projection
@@ -11840,7 +12188,7 @@ fn reference_settings_window_view(state: &AppState) -> ui::View<Message> {
                 .copied()
                 .unwrap_or_default();
             let active = selected_reference_path == Some(reference.path.as_path());
-            settings_reference_row(reference, assignment_count, active)
+            settings_reference_row_with_editing(reference, assignment_count, active, editing)
         })
         .window(window)
         .row_height(SETTINGS_REFERENCE_ROW_HEIGHT)
@@ -12632,7 +12980,7 @@ fn review_reference_controls(state: &AppState, track: &storage::Track) -> ui::Vi
         .reference_path
         .as_ref()
         .map_or("Choose reference".to_owned(), |path| {
-            reference_track_name(path)
+            reference_track_label(state, path)
         });
     let selector = if menu_available {
         let reference_id = track.id.clone();
@@ -12746,7 +13094,7 @@ fn reference_dropdown_options(
         .map(|path| {
             let selected = selected_path == Some(&path);
             ui::DropdownOption::new(
-                reference_track_name(&path),
+                reference_track_label(state, &path),
                 selected,
                 Message::SetReferenceTrack {
                     track_id: track_id.clone(),
@@ -12792,7 +13140,7 @@ fn reference_waveform_section(state: &AppState, track: &storage::Track) -> ui::V
     let reference_meter_lufs = current_reference_lufs_meter_value(state, &track.id);
     let reference_name = track.reference_path.as_ref().map_or_else(
         || String::from("No reference track"),
-        |path| reference_track_name(path),
+        |path| reference_track_label(state, path),
     );
     let reference_label = if let Some(reference_lufs) = reference_integrated_lufs {
         format!("REFERENCE · {reference_name} · {reference_lufs:.1} LUFS")
@@ -13854,6 +14202,34 @@ fn reference_track_name(path: &Path) -> String {
         .map_or_else(|| path.to_string_lossy().into_owned(), ToOwned::to_owned)
 }
 
+fn reference_track_display_name(reference: &storage::ReferenceTrack) -> String {
+    reference
+        .display_name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .map_or_else(|| reference_track_name(&reference.path), ToOwned::to_owned)
+}
+
+fn reference_track_label(state: &AppState, path: &Path) -> String {
+    state
+        .library
+        .reference_tracks
+        .iter()
+        .find(|reference| reference.path == path)
+        .map(reference_track_display_name)
+        .unwrap_or_else(|| reference_track_name(path))
+}
+
+fn reference_path_identity_key(path: &Path) -> String {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    format!("{}:{}", bytes.len(), hex_bytes(bytes))
+}
+
+fn reference_track_name_editor_id(path: &Path) -> u64 {
+    let key = reference_path_identity_key(path);
+    ui::stable_widget_id(REFERENCE_SETTINGS_NAME_EDITOR_SCOPE, &key)
+}
+
 fn note_ratio_for_address(
     state: &AppState,
     track: &storage::Track,
@@ -13979,15 +14355,16 @@ mod tests {
         LibraryProjectionCache, LibrarySaveAttempt, LiveSpectrogramMode, LoopBounds, LoopSelection,
         LoopSelections, MAIN_SOURCE_MISMATCH_STATUS, Message, NoteAddress, NoteDraft, NoteOwner,
         PairedPlaybackGuard, PendingImportCommit, PersistedNoteDrag, PlannerInsertionTarget,
-        PlaybackSource, REFERENCE_MENU_WIDTH, REFERENCE_SOURCE_MISMATCH_STATUS,
+        PlaybackSource, REFERENCE_MENU_WIDTH, REFERENCE_SOURCE_MISMATCH_STATUS, ReferenceNameDraft,
         ReferenceUnloadState, ResumeTransportCommand, SETTINGS_REFERENCE_ACTION_HEIGHT,
-        SETTINGS_REFERENCE_ROW_METADATA_HEIGHT, SETTINGS_REFERENCE_ROW_TEXT_HEIGHT,
-        SETTINGS_REFERENCE_ROW_TEXT_SPACING, SETTINGS_REFERENCE_ROW_TITLE_HEIGHT,
-        STATUS_BAR_VERSION_WIDTH, SharedLibrary, TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER,
-        TRACK_CARD_LIST_SPACING, TRACK_CARD_SELECTED_CORAL, WAVEFORM_HEIGHT, WaveformDecodeRequest,
-        WaveformMarkerProjectionCache, WaveformMarkerProjectionKey, WorkspaceMode,
-        animation_requested, apply_transport_snapshot, cleanup_reference_transport_failure,
-        current_live_frame_for_source, current_loudness_match_gain_db, current_lufs_meter_value,
+        SETTINGS_REFERENCE_ROW_HEIGHT, SETTINGS_REFERENCE_ROW_METADATA_HEIGHT,
+        SETTINGS_REFERENCE_ROW_TEXT_HEIGHT, SETTINGS_REFERENCE_ROW_TEXT_SPACING,
+        SETTINGS_REFERENCE_ROW_TITLE_HEIGHT, STATUS_BAR_VERSION_WIDTH, SharedLibrary,
+        TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER, TRACK_CARD_LIST_SPACING, TRACK_CARD_SELECTED_CORAL,
+        TextInputRevision, WAVEFORM_HEIGHT, WaveformDecodeRequest, WaveformMarkerProjectionCache,
+        WaveformMarkerProjectionKey, WorkspaceMode, animation_requested, apply_transport_snapshot,
+        cleanup_reference_transport_failure, current_live_frame_for_source,
+        current_loudness_match_gain_db, current_lufs_meter_value,
         current_reference_lufs_meter_value, decode_result_is_current, enforce_loop,
         ensure_library_projection_cache, ensure_reference_transport_with, favorite_toggle,
         frame_surface_revisions, handle_close_requested, handle_shutdown_with, library_dirty,
@@ -13999,12 +14376,13 @@ mod tests {
         prepared_main_marker_projection, progress_paired_playback_cleanup, project_surface,
         qualified_note_identity_key, reference_decode_result_is_current, reference_dropdown_paths,
         reference_menu_available, reference_output_gain, reference_settings_auxiliary_windows,
-        reference_settings_window_view, refresh_live_spectrogram, refresh_live_spectrograms,
-        resume_transport_command, review_global_controls, review_spectrogram_source,
-        schedule_import, schedule_library_save, schedule_reference_catalog_import,
-        schedule_reference_import, schedule_reference_waveform_decode, schedule_replace,
-        schedule_waveform_decode, seek_synchronized_positions, selected_reference_notes,
-        selected_track, selection_save_debounce_active, settings_reference_row, stage_dropdown,
+        reference_settings_window_view, reference_track_name_editor_id, refresh_live_spectrogram,
+        refresh_live_spectrograms, resume_transport_command, review_global_controls,
+        review_spectrogram_source, schedule_import, schedule_library_save,
+        schedule_reference_catalog_import, schedule_reference_import,
+        schedule_reference_waveform_decode, schedule_replace, schedule_waveform_decode,
+        seek_synchronized_positions, selected_reference_notes, selected_track,
+        selection_save_debounce_active, settings_reference_row, stage_dropdown,
         stage_menu_anchor_from_pointer, stage_menu_popover, start_source_alongside_active,
         transport_command_is_confirmed, update,
     };
@@ -14975,6 +15353,7 @@ mod tests {
         state.library.reference_tracks = vec![
             ReferenceTrack {
                 path: first_path,
+                display_name: None,
                 source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
                 notes: vec![Note {
                     id: String::from("shared-reference-note"),
@@ -14986,6 +15365,7 @@ mod tests {
             },
             ReferenceTrack {
                 path: second_path,
+                display_name: None,
                 source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
                 notes: vec![Note {
                     id: String::from("shared-reference-note"),
@@ -15055,6 +15435,7 @@ mod tests {
         state.library.selected_track_id = selected_track_id.map(String::from);
         state.library.reference_tracks.push(ReferenceTrack {
             path: catalog_path,
+            display_name: None,
             source_proof: crate::source::SourceProvenance::from_optional(catalog_proof),
             notes: crate::storage::SharedVec::default(),
         });
@@ -16308,6 +16689,24 @@ mod tests {
         }
     }
 
+    fn focus_request_ids(command: &radiant::runtime::Command<Message>) -> Vec<u64> {
+        match command {
+            radiant::runtime::Command::Focus(id) => vec![*id],
+            radiant::runtime::Command::Batch(commands) => {
+                commands.iter().flat_map(focus_request_ids).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn command_has_timer(command: &radiant::runtime::Command<Message>) -> bool {
+        match command {
+            radiant::runtime::Command::Timer(_) => true,
+            radiant::runtime::Command::Batch(commands) => commands.iter().any(command_has_timer),
+            _ => false,
+        }
+    }
+
     fn scroll_into_view_request(
         command: &radiant::runtime::Command<Message>,
     ) -> Option<(u64, f32, f32, f32, f32)> {
@@ -16720,6 +17119,7 @@ mod tests {
             .expect("the test track should have a reference path");
         state.library.reference_tracks.push(ReferenceTrack {
             path: reference_path.clone(),
+            display_name: None,
             source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             notes: vec![Note {
                 id: String::from("existing-reference-note"),
@@ -16849,6 +17249,7 @@ mod tests {
             .expect("the test track should have a reference path");
         state.library.reference_tracks.push(ReferenceTrack {
             path: reference_path.clone(),
+            display_name: None,
             source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             notes: crate::storage::SharedVec::default(),
         });
@@ -16980,6 +17381,7 @@ mod tests {
             .reference_tracks
             .push(ReferenceTrack {
                 path: reference_path.clone(),
+                display_name: None,
                 source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
                 notes: crate::storage::SharedVec::default(),
             });
@@ -17110,6 +17512,7 @@ mod tests {
         });
         state.library.reference_tracks.push(ReferenceTrack {
             path: reference_path.clone(),
+            display_name: None,
             source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             notes: vec![Note {
                 id: note_id.clone(),
@@ -17584,11 +17987,13 @@ mod tests {
         state.library.reference_tracks = vec![
             ReferenceTrack {
                 path: first_path.clone(),
+                display_name: None,
                 source_proof: crate::source::SourceProvenance::Unknown,
                 notes: crate::storage::SharedVec::default(),
             },
             ReferenceTrack {
                 path: second_path.clone(),
+                display_name: None,
                 source_proof: crate::source::SourceProvenance::Unknown,
                 notes: crate::storage::SharedVec::default(),
             },
@@ -17678,11 +18083,13 @@ mod tests {
         state.library.reference_tracks = vec![
             ReferenceTrack {
                 path: first_path,
+                display_name: None,
                 source_proof: crate::source::SourceProvenance::Unknown,
                 notes: crate::storage::SharedVec::default(),
             },
             ReferenceTrack {
                 path: second_path,
+                display_name: None,
                 source_proof: crate::source::SourceProvenance::Unknown,
                 notes: crate::storage::SharedVec::default(),
             },
@@ -17729,6 +18136,7 @@ mod tests {
         state.library.reference_tracks = (0..64)
             .map(|index| ReferenceTrack {
                 path: PathBuf::from(format!("/external/reference-window-{index}.wav")),
+                display_name: None,
                 source_proof: crate::source::SourceProvenance::Unknown,
                 notes: crate::storage::SharedVec::default(),
             })
@@ -17758,6 +18166,7 @@ mod tests {
         let mut state = AppState::default();
         state.library.reference_tracks.push(ReferenceTrack {
             path,
+            display_name: None,
             source_proof: crate::source::SourceProvenance::Unknown,
             notes: crate::storage::SharedVec::default(),
         });
@@ -17805,6 +18214,7 @@ mod tests {
         let path = PathBuf::from("/external/row-target-reference.wav");
         let reference = ReferenceTrack {
             path: path.clone(),
+            display_name: None,
             source_proof: crate::source::SourceProvenance::Unknown,
             notes: crate::storage::SharedVec::default(),
         };
@@ -17997,6 +18407,567 @@ mod tests {
     }
 
     #[test]
+    fn begin_reference_track_rename_emits_one_immediate_focus_without_retry() {
+        let path = PathBuf::from("/external/immediate-focus-reference.wav");
+        let mut state = AppState::default();
+        state.library.reference_tracks.push(ReferenceTrack {
+            path: path.clone(),
+            display_name: Some(String::from("Immediate focus reference")),
+            source_proof: crate::source::SourceProvenance::Unknown,
+            notes: crate::storage::SharedVec::default(),
+        });
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::RenameReferenceTrack(path.clone()),
+            &mut context,
+        );
+
+        let command = context.into_command();
+        assert_eq!(
+            focus_request_ids(&command),
+            vec![reference_track_name_editor_id(path.as_path())]
+        );
+        assert!(!command_has_timer(&command));
+    }
+
+    #[test]
+    fn reference_name_sessions_use_strictly_increasing_revisions() {
+        let path = PathBuf::from("/external/session-revision-reference.wav");
+        let mut state = AppState::default();
+        state.library.reference_tracks.push(ReferenceTrack {
+            path: path.clone(),
+            display_name: Some(String::from("Session reference")),
+            source_proof: crate::source::SourceProvenance::Unknown,
+            notes: crate::storage::SharedVec::default(),
+        });
+
+        let missing_path = PathBuf::from("/external/missing-reference.wav");
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::RenameReferenceTrack(missing_path),
+            &mut context,
+        );
+        assert_eq!(state.next_reference_name_revision, 0);
+        assert!(state.reference_name_draft.is_none());
+        let _ = context.into_command();
+
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::RenameReferenceTrack(path.clone()),
+            &mut context,
+        );
+        let first_revision = state
+            .reference_name_draft
+            .as_ref()
+            .expect("accepted rename should create a draft")
+            .revision;
+        assert_eq!(first_revision, TextInputRevision::new(1));
+        assert_eq!(state.next_reference_name_revision, 1);
+        let _ = context.into_command();
+
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::ReferenceTrackNameChanged {
+                path: path.clone(),
+                name: String::from("Changed during first session"),
+            },
+            &mut context,
+        );
+        assert_eq!(
+            state
+                .reference_name_draft
+                .as_ref()
+                .expect("the first draft should remain active")
+                .revision,
+            first_revision
+        );
+        assert_eq!(state.next_reference_name_revision, 1);
+
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::CancelReferenceTrackName(path.clone()),
+            &mut context,
+        );
+        assert!(state.reference_name_draft.is_none());
+        let _ = context.into_command();
+
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::RenameReferenceTrack(path.clone()),
+            &mut context,
+        );
+        let second_revision = state
+            .reference_name_draft
+            .as_ref()
+            .expect("reopened rename should create a draft")
+            .revision;
+        assert!(second_revision > first_revision);
+        let _ = context.into_command();
+
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::ReferenceTrackNameChanged {
+                path: path.clone(),
+                name: String::from("Saved session reference"),
+            },
+            &mut context,
+        );
+        update(
+            &mut state,
+            Message::SaveReferenceTrackName(path.clone()),
+            &mut context,
+        );
+        assert!(state.reference_name_draft.is_none());
+        assert_eq!(state.next_reference_name_revision, 2);
+        admit_library_save_for_test(&mut state, &mut context);
+        let attempt = state
+            .save_in_flight
+            .expect("the saved rename should dispatch a save");
+        let _ = context.into_command();
+
+        let mut completion_context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::LibrarySaved {
+                attempt,
+                result: Ok(PersistenceOutcome::Durable),
+            },
+            &mut completion_context,
+        );
+
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::RenameReferenceTrack(path),
+            &mut context,
+        );
+        let third_revision = state
+            .reference_name_draft
+            .as_ref()
+            .expect("reopened rename after save should create a draft")
+            .revision;
+        assert!(third_revision > second_revision);
+        assert_eq!(state.next_reference_name_revision, 3);
+    }
+
+    #[test]
+    fn reference_name_reducer_uses_effective_name_and_preserves_cancel_and_validation_state() {
+        let path = PathBuf::from("/external/effective-reference.wav");
+        let make_state = || {
+            let mut state = AppState::default();
+            state.library.reference_tracks.push(ReferenceTrack {
+                path: path.clone(),
+                display_name: Some(String::from("Effective reference")),
+                source_proof: crate::source::SourceProvenance::Unknown,
+                notes: crate::storage::SharedVec::default(),
+            });
+            state
+        };
+
+        let mut canceled = make_state();
+        let original_library = canceled.library.clone();
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut canceled,
+            Message::RenameReferenceTrack(path.clone()),
+            &mut context,
+        );
+        assert_eq!(
+            canceled
+                .reference_name_draft
+                .as_ref()
+                .map(|draft| draft.value.as_str()),
+            Some("Effective reference")
+        );
+        let focus_command = context.into_command();
+        assert_eq!(
+            focus_request_id(&focus_command),
+            Some(reference_track_name_editor_id(path.as_path()))
+        );
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut canceled,
+            Message::ReferenceTrackNameChanged {
+                path: path.clone(),
+                name: String::from("Changed but canceled"),
+            },
+            &mut context,
+        );
+        update(
+            &mut canceled,
+            Message::CancelReferenceTrackName(path.clone()),
+            &mut context,
+        );
+        assert_eq!(canceled.library, original_library);
+        assert!(canceled.reference_name_draft.is_none());
+
+        let mut saved = make_state();
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut saved,
+            Message::RenameReferenceTrack(path.clone()),
+            &mut context,
+        );
+        update(
+            &mut saved,
+            Message::ReferenceTrackNameChanged {
+                path: path.clone(),
+                name: String::from("  Trimmed reference  "),
+            },
+            &mut context,
+        );
+        update(
+            &mut saved,
+            Message::SaveReferenceTrackName(path.clone()),
+            &mut context,
+        );
+        assert_eq!(
+            saved.library.reference_tracks[0].display_name.as_deref(),
+            Some("Trimmed reference")
+        );
+        assert!(saved.reference_name_draft.is_none());
+        assert!(saved.save_admission_pending);
+        assert!(library_dirty(&saved));
+        admit_library_save_for_test(&mut saved, &mut context);
+        assert!(saved.save_in_flight.is_some());
+        let _ = context.into_command();
+
+        let mut blank = make_state();
+        let original_library = blank.library.clone();
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut blank,
+            Message::RenameReferenceTrack(path.clone()),
+            &mut context,
+        );
+        update(
+            &mut blank,
+            Message::ReferenceTrackNameChanged {
+                path: path.clone(),
+                name: String::from(" \t\n"),
+            },
+            &mut context,
+        );
+        update(
+            &mut blank,
+            Message::SaveReferenceTrackName(path),
+            &mut context,
+        );
+        assert_eq!(blank.library, original_library);
+        assert_eq!(
+            blank
+                .reference_name_draft
+                .as_ref()
+                .map(|draft| draft.value.as_str()),
+            Some(" \t\n")
+        );
+        assert!(blank.status.contains("cannot be empty"));
+        assert!(!blank.save_admission_pending);
+    }
+
+    #[test]
+    fn reference_name_save_failure_restores_the_previous_name_and_clears_dirty_state() {
+        let path = PathBuf::from("/external/rollback-reference.wav");
+        let mut state = AppState::default();
+        state.library.reference_tracks.push(ReferenceTrack {
+            path: path.clone(),
+            display_name: Some(String::from("Previous reference")),
+            source_proof: crate::source::SourceProvenance::Unknown,
+            notes: crate::storage::SharedVec::default(),
+        });
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::RenameReferenceTrack(path.clone()),
+            &mut context,
+        );
+        update(
+            &mut state,
+            Message::ReferenceTrackNameChanged {
+                path: path.clone(),
+                name: String::from("  Renamed reference  "),
+            },
+            &mut context,
+        );
+        update(
+            &mut state,
+            Message::SaveReferenceTrackName(path.clone()),
+            &mut context,
+        );
+        assert_eq!(
+            state.library.reference_tracks[0].display_name.as_deref(),
+            Some("Renamed reference")
+        );
+        admit_library_save_for_test(&mut state, &mut context);
+        let attempt = state
+            .save_in_flight
+            .expect("a valid rename should dispatch a library save");
+        let _ = context.into_command();
+
+        let mut completion_context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::LibrarySaved {
+                attempt,
+                result: Err(String::from("save failed")),
+            },
+            &mut completion_context,
+        );
+
+        assert_eq!(
+            state.library.reference_tracks[0].display_name.as_deref(),
+            Some("Previous reference")
+        );
+        assert!(state.pending_reference_name_save.is_none());
+        assert!(!library_dirty(&state));
+        assert_eq!(state.status, "save failed");
+    }
+
+    #[test]
+    fn reference_name_settings_controls_are_accessible_and_path_stable() {
+        #[derive(Clone)]
+        struct RenameHarness {
+            reference: ReferenceTrack,
+            renamed_path: Option<PathBuf>,
+        }
+
+        let path = PathBuf::from("/external/stable-reference.wav");
+        let reference = ReferenceTrack {
+            path: path.clone(),
+            display_name: Some(String::from("Studio reference")),
+            source_proof: crate::source::SourceProvenance::Unknown,
+            notes: crate::storage::SharedVec::default(),
+        };
+        let first_bridge = DeclarativeOwnedRuntimeBridge::new(
+            RenameHarness {
+                reference: reference.clone(),
+                renamed_path: None,
+            },
+            |state| settings_reference_row(&state.reference, 2, true).into_surface(),
+            |state, message| {
+                if let Message::RenameReferenceTrack(path) = message {
+                    state.renamed_path = Some(path);
+                }
+            },
+        );
+        let mut first_runtime = SurfaceRuntime::new(first_bridge, Vector2::new(680.0, 64.0));
+        let first_targets = first_runtime.automation_target_snapshot().targets;
+        let rename_target = first_targets
+            .iter()
+            .find(|target| target.label.as_deref() == Some("Rename reference track"))
+            .expect("reference rename should be an automation target");
+        assert_eq!(rename_target.role, AutomationRole::Button);
+        assert!(rename_target.interaction_target);
+        assert!(rename_target.enabled);
+        assert!(rename_target.focusable);
+        first_runtime
+            .dispatch_primary_click(Point::new(rename_target.center.x, rename_target.center.y));
+        assert_eq!(
+            first_runtime.bridge().state().renamed_path,
+            Some(path.clone())
+        );
+
+        let second_bridge = DeclarativeOwnedRuntimeBridge::new(
+            RenameHarness {
+                reference: ReferenceTrack {
+                    display_name: None,
+                    ..reference.clone()
+                },
+                renamed_path: None,
+            },
+            |state| settings_reference_row(&state.reference, 2, true).into_surface(),
+            |state, message| {
+                if let Message::RenameReferenceTrack(path) = message {
+                    state.renamed_path = Some(path);
+                }
+            },
+        );
+        let second_runtime = SurfaceRuntime::new(second_bridge, Vector2::new(680.0, 64.0));
+        let second_rename_target = second_runtime
+            .automation_target_snapshot()
+            .targets
+            .into_iter()
+            .find(|target| target.label.as_deref() == Some("Rename reference track"))
+            .expect("legacy reference rename should be an automation target");
+        assert_eq!(rename_target.id, second_rename_target.id);
+
+        #[derive(Clone)]
+        struct EditorHarness {
+            reference: ReferenceTrack,
+            draft: super::ReferenceNameDraft,
+            changed_path: Option<PathBuf>,
+            saved_path: Option<PathBuf>,
+            saved_value: Option<String>,
+        }
+
+        let editor_bridge = DeclarativeOwnedRuntimeBridge::new(
+            EditorHarness {
+                reference,
+                draft: super::ReferenceNameDraft {
+                    path: path.clone(),
+                    value: String::from("Studio reference"),
+                    revision: TextInputRevision::new(1),
+                },
+                changed_path: None,
+                saved_path: None,
+                saved_value: None,
+            },
+            |state| {
+                super::settings_reference_row_with_editing(
+                    &state.reference,
+                    2,
+                    true,
+                    Some(&state.draft),
+                )
+                .into_surface()
+            },
+            |state, message| match message {
+                Message::ReferenceTrackNameChanged { path, name } => {
+                    state.changed_path = Some(path.clone());
+                    if path == state.draft.path {
+                        state.draft.value = name;
+                    }
+                }
+                Message::SaveReferenceTrackName(path) => {
+                    state.saved_path = Some(path);
+                    state.saved_value = Some(state.draft.value.clone());
+                }
+                _ => {}
+            },
+        );
+        let mut editor_runtime = SurfaceRuntime::new(editor_bridge, Vector2::new(680.0, 64.0));
+        let editor_frame = editor_runtime.frame_with_default_theme();
+        let editor_labels = editor_frame.paint_plan.text_label_strings();
+        assert!(!editor_labels.iter().any(|label| {
+            label == "Save reference track name" || label == "Cancel renaming reference track"
+        }));
+        let editor_targets = editor_runtime.automation_target_snapshot().targets;
+        let input_target = editor_targets
+            .iter()
+            .find(|target| target.label.as_deref() == Some("Reference track display name"))
+            .expect("reference name input should have an accessible label");
+        let reimport_target = editor_targets
+            .iter()
+            .find(|target| target.label.as_deref() == Some("Re-import / replace reference track"))
+            .expect("reference re-import should remain an automation target while renaming");
+        let remove_target = editor_targets
+            .iter()
+            .find(|target| target.label.as_deref() == Some("Remove reference track"))
+            .expect("reference remove should remain an automation target while renaming");
+        assert_eq!(input_target.role, AutomationRole::TextInput);
+        assert_eq!(
+            input_target.id.0,
+            reference_track_name_editor_id(path.as_path()).to_string()
+        );
+        assert_eq!(input_target.value.as_deref(), Some("Studio reference"));
+        assert!(input_target.interaction_target);
+        assert!(input_target.enabled);
+        assert!(input_target.focusable);
+        assert_eq!(
+            input_target.bounds.height,
+            SETTINGS_REFERENCE_ROW_TITLE_HEIGHT
+        );
+        assert!(input_target.bounds.y >= 0.0);
+        assert!(
+            input_target.bounds.y + input_target.bounds.height
+                <= SETTINGS_REFERENCE_ROW_HEIGHT + 0.01
+        );
+        assert_eq!(reimport_target.role, AutomationRole::Button);
+        assert_eq!(remove_target.role, AutomationRole::Button);
+        assert_eq!(
+            reimport_target.bounds.width,
+            SETTINGS_REFERENCE_ACTION_HEIGHT
+        );
+        assert_eq!(remove_target.bounds.width, SETTINGS_REFERENCE_ACTION_HEIGHT);
+        assert_eq!(
+            reimport_target.bounds.height,
+            SETTINGS_REFERENCE_ACTION_HEIGHT
+        );
+        assert_eq!(
+            remove_target.bounds.height,
+            SETTINGS_REFERENCE_ACTION_HEIGHT
+        );
+        assert!(input_target.tree_index < reimport_target.tree_index);
+        assert!(reimport_target.tree_index < remove_target.tree_index);
+        let input_widget = editor_runtime
+            .widget_at(Point::new(input_target.center.x, input_target.center.y))
+            .expect("reference name input should have a pointer target");
+        editor_runtime.execute_command(Command::focus(input_widget));
+        assert_eq!(editor_runtime.focused_widget(), Some(input_widget));
+        assert_eq!(
+            editor_runtime.focused_text_selection(),
+            Some(String::from("Studio reference"))
+        );
+
+        editor_runtime.bridge_mut().state_mut().draft.value = String::from("stale host projection");
+        editor_runtime.refresh();
+        let same_revision_target = editor_runtime
+            .automation_target_snapshot()
+            .targets
+            .into_iter()
+            .find(|target| target.label.as_deref() == Some("Reference track display name"))
+            .expect("same-revision input should remain an automation target");
+        assert_eq!(
+            same_revision_target.value.as_deref(),
+            Some("Studio reference")
+        );
+        assert_eq!(
+            editor_runtime.focused_text_selection(),
+            Some(String::from("Studio reference"))
+        );
+
+        {
+            let state = editor_runtime.bridge_mut().state_mut();
+            state.draft.value = String::from("new session reference");
+            state.draft.revision = TextInputRevision::new(2);
+        }
+        editor_runtime.refresh();
+        let newer_revision_target = editor_runtime
+            .automation_target_snapshot()
+            .targets
+            .into_iter()
+            .find(|target| target.label.as_deref() == Some("Reference track display name"))
+            .expect("new-session input should remain an automation target");
+        assert_eq!(
+            newer_revision_target.value.as_deref(),
+            Some("new session reference")
+        );
+        assert_eq!(
+            editor_runtime.focused_text_selection(),
+            Some(String::from("new session reference"))
+        );
+        assert_eq!(
+            editor_runtime.dispatch_event(Event::character('x')),
+            Some(input_widget)
+        );
+        assert_eq!(
+            editor_runtime.bridge().state().changed_path,
+            Some(path.clone())
+        );
+        assert_eq!(editor_runtime.bridge().state().draft.value, "x");
+        assert_eq!(
+            editor_runtime.dispatch_event(Event::key_press(ui::WidgetKey::Enter)),
+            Some(input_widget)
+        );
+        assert_eq!(
+            editor_runtime.bridge().state().saved_path,
+            Some(path.clone())
+        );
+        assert_eq!(
+            editor_runtime.bridge().state().saved_value.as_deref(),
+            Some("x")
+        );
+    }
+
+    #[test]
     fn empty_reference_settings_window_has_growing_empty_region_and_opaque_root() {
         let frame = reference_settings_window_view(&AppState::default())
             .view_frame_at_size_with_default_theme(Vector2::new(680.0, 520.0));
@@ -18073,6 +19044,7 @@ mod tests {
             selected_track_id: Some(String::from("main-track")),
             reference_tracks: vec![ReferenceTrack {
                 path: path.clone(),
+                display_name: None,
                 source_proof: crate::source::SourceProvenance::Unknown,
                 notes: crate::storage::SharedVec::default(),
             }]
@@ -18138,6 +19110,7 @@ mod tests {
         });
         state.library.reference_tracks.push(ReferenceTrack {
             path: reference_path.clone(),
+            display_name: None,
             source_proof: crate::source::SourceProvenance::Unknown,
             notes: crate::storage::SharedVec::default(),
         });
@@ -18171,6 +19144,24 @@ mod tests {
         assert_eq!(
             playback_shortcut(&state, ui::KeyPress::new(ui::KeyCode::Escape)),
             ui::ShortcutResolution::action(Message::StopPlayback)
+        );
+    }
+
+    #[test]
+    fn playback_shortcut_cancels_reference_name_rename_before_stop_playback() {
+        let path = PathBuf::from("/external/escape-reference.wav");
+        let state = AppState {
+            reference_name_draft: Some(ReferenceNameDraft {
+                path: path.clone(),
+                value: String::from("Draft reference"),
+                revision: TextInputRevision::new(1),
+            }),
+            ..AppState::default()
+        };
+
+        assert_eq!(
+            playback_shortcut(&state, ui::KeyPress::new(ui::KeyCode::Escape)),
+            ui::ShortcutResolution::action(Message::CancelReferenceTrackName(path))
         );
     }
 
@@ -20067,6 +21058,7 @@ mod tests {
             .expect("the paired state should have a reference path");
         state.library.reference_tracks.push(ReferenceTrack {
             path: reference_path.clone(),
+            display_name: None,
             source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             notes: vec![
                 Note {
@@ -20141,6 +21133,7 @@ mod tests {
             .expect("the paired state should have a reference path");
         state.library.reference_tracks.push(ReferenceTrack {
             path: reference_path,
+            display_name: None,
             source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             notes: crate::storage::SharedVec::default(),
         });
@@ -22898,6 +23891,7 @@ mod tests {
         });
         state.library.reference_tracks.push(ReferenceTrack {
             path: reference_path,
+            display_name: None,
             source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             notes: vec![Note {
                 id: String::from("reference-persisted-note"),
@@ -23220,6 +24214,7 @@ mod tests {
         state.library.reference_tracks = vec![
             ReferenceTrack {
                 path: first_path.clone(),
+                display_name: None,
                 source_proof: crate::source::SourceProvenance::Verified(
                     first_decoded.source_proof().clone(),
                 ),
@@ -23227,6 +24222,7 @@ mod tests {
             },
             ReferenceTrack {
                 path: second_path.clone(),
+                display_name: None,
                 source_proof: crate::source::SourceProvenance::Verified(
                     second_decoded.source_proof().clone(),
                 ),
@@ -23606,6 +24602,7 @@ mod tests {
         });
         state.library.reference_tracks.push(ReferenceTrack {
             path: reference_path,
+            display_name: None,
             source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             notes: vec![Note {
                 id: String::from("reference-note"),
@@ -23854,6 +24851,7 @@ mod tests {
         });
         state.library.reference_tracks.push(ReferenceTrack {
             path: reference_path.clone(),
+            display_name: None,
             source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             notes: vec![Note {
                 id: String::from("selected-reference-note"),
@@ -24097,6 +25095,7 @@ mod tests {
         });
         state.library.reference_tracks.push(ReferenceTrack {
             path: reference_path,
+            display_name: None,
             source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             notes: vec![Note {
                 id: String::from("reference-hover-note"),
@@ -24158,6 +25157,7 @@ mod tests {
         });
         state.library.reference_tracks.push(ReferenceTrack {
             path: reference_path,
+            display_name: None,
             source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             notes: vec![Note {
                 id: note_id.clone(),
@@ -24257,6 +25257,7 @@ mod tests {
         });
         state.library.reference_tracks.push(ReferenceTrack {
             path: reference_path,
+            display_name: None,
             source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             notes: crate::storage::SharedVec::default(),
         });
@@ -24799,6 +25800,7 @@ mod tests {
             .expect("the shared state should have a reference path");
         state.library.reference_tracks.push(ReferenceTrack {
             path: reference_path.clone(),
+            display_name: None,
             source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             notes: vec![Note {
                 id: String::from("play-from-reference-comment"),
@@ -25359,6 +26361,7 @@ mod tests {
             .expect("paired playback state should have a reference path");
         state.library.reference_tracks.push(ReferenceTrack {
             path: reference_path.clone(),
+            display_name: None,
             source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             notes: vec![Note {
                 id: String::from("play-reference-comment"),
@@ -25420,6 +26423,7 @@ mod tests {
                     .expect("the paired state should have a reference path");
                 state.library.reference_tracks.push(ReferenceTrack {
                     path: reference_path.clone(),
+                    display_name: None,
                     source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
                     notes: vec![Note {
                         id: note_id.clone(),
@@ -25653,6 +26657,7 @@ mod tests {
         state.library.tracks.push(track);
         state.library.reference_tracks.push(ReferenceTrack {
             path: path.clone(),
+            display_name: None,
             source_proof: crate::source::SourceProvenance::Unknown,
             notes: vec![Note {
                 id: String::from("legacy-reference-note"),
@@ -25767,6 +26772,7 @@ mod tests {
         state.library.tracks[0].reference_path = Some(reference_path.clone());
         state.library.reference_tracks.push(ReferenceTrack {
             path: reference_path.clone(),
+            display_name: None,
             source_proof: crate::source::SourceProvenance::Unknown,
             notes: crate::storage::SharedVec::default(),
         });
@@ -25835,6 +26841,7 @@ mod tests {
         state.library.tracks[0].reference_path = Some(reference_path.clone());
         state.library.reference_tracks.push(ReferenceTrack {
             path: reference_path.clone(),
+            display_name: None,
             source_proof: crate::source::SourceProvenance::Unknown,
             notes: crate::storage::SharedVec::default(),
         });
@@ -25934,6 +26941,7 @@ mod tests {
         state.library.tracks.push(track);
         state.library.reference_tracks.push(ReferenceTrack {
             path: path.clone(),
+            display_name: None,
             source_proof: crate::source::SourceProvenance::Unknown,
             notes: notes.clone(),
         });
@@ -27349,6 +28357,7 @@ mod tests {
         state.library.tracks = vec![track].into();
         state.library.reference_tracks = vec![ReferenceTrack {
             path: reference_path.clone(),
+            display_name: None,
             source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             notes: (0..64)
                 .map(|index| Note {
@@ -27480,6 +28489,7 @@ mod tests {
         state.library.tracks = vec![track].into();
         state.library.reference_tracks = vec![ReferenceTrack {
             path: reference_path.clone(),
+            display_name: None,
             source_proof: crate::source::SourceProvenance::Verified(fixture_source_proof()),
             notes: (0..64)
                 .map(|index| Note {
@@ -28701,11 +29711,13 @@ mod tests {
         state.library.reference_tracks = vec![
             ReferenceTrack {
                 path: first_path,
+                display_name: None,
                 source_proof: crate::source::SourceProvenance::Unknown,
                 notes: crate::storage::SharedVec::default(),
             },
             ReferenceTrack {
                 path: second_path.clone(),
+                display_name: None,
                 source_proof: crate::source::SourceProvenance::Unknown,
                 notes: crate::storage::SharedVec::default(),
             },
@@ -28797,6 +29809,7 @@ mod tests {
         state.library.tracks[0].reference_path = Some(assigned_path.clone());
         state.library.reference_tracks.push(ReferenceTrack {
             path: catalog_path.clone(),
+            display_name: None,
             source_proof: crate::source::SourceProvenance::Unknown,
             notes: crate::storage::SharedVec::default(),
         });
@@ -29098,6 +30111,7 @@ mod tests {
         };
         state.library.reference_tracks.push(ReferenceTrack {
             path: reference_path.clone(),
+            display_name: None,
             source_proof: crate::source::SourceProvenance::Unknown,
             notes: crate::storage::SharedVec::default(),
         });
@@ -32233,9 +33247,23 @@ mod tests {
     fn corrupt_catalog_preflight_uses_background_and_terminal_failure_once() {
         let path = PathBuf::from("/external/corrupt-catalog.wav");
         let mut state = AppState::default();
+        state.library.reference_tracks.push(ReferenceTrack {
+            path: path.clone(),
+            display_name: Some(String::from("Custom catalog name")),
+            source_proof: crate::source::SourceProvenance::Unknown,
+            notes: crate::storage::SharedVec::default(),
+        });
+        assert_eq!(
+            super::reference_track_label(&state, Path::new("/external/unmatched-catalog.wav")),
+            "unmatched-catalog.wav"
+        );
         let mut context = ui::UiUpdateContext::default();
         schedule_reference_catalog_import(&mut state, &mut context, vec![path.clone()]);
         assert!(state.busy);
+        assert_eq!(
+            state.status,
+            "Adding Custom catalog name to the reference catalog…"
+        );
         assert_eq!(state.reference_catalog_import_total, 1);
         assert_eq!(
             context
@@ -32747,6 +33775,7 @@ mod tests {
         );
         inactive.library.reference_tracks.push(ReferenceTrack {
             path: inactive_active_path.clone(),
+            display_name: None,
             source_proof: crate::source::SourceProvenance::Verified(inactive_proof.clone()),
             notes: crate::storage::SharedVec::default(),
         });
@@ -32825,6 +33854,53 @@ mod tests {
         assert!(inactive.reference_waveform_in_flight.is_none());
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(inactive_root);
+    }
+
+    #[test]
+    fn different_path_reference_replacement_clears_active_name_draft_for_escape() {
+        let original_path = PathBuf::from("/external/rename-before-replacement.wav");
+        let (replacement_path, decoded, root) = decoded_replacement_fixture();
+        let proof = decoded.source_proof().clone();
+        let mut state = reference_selection_state(
+            "reference-replacement-name-draft",
+            None,
+            None,
+            original_path.clone(),
+            Some(proof.clone()),
+        );
+
+        update(
+            &mut state,
+            Message::RenameReferenceTrack(original_path.clone()),
+            &mut ui::UiUpdateContext::default(),
+        );
+        assert!(state.reference_name_draft.is_some());
+
+        let request_id = begin_reference_replacement_commit(
+            &mut state,
+            &original_path,
+            &replacement_path,
+            decoded,
+        );
+        let replaced_library =
+            reference_replacement_library(&state, &original_path, &replacement_path, &proof);
+        update(
+            &mut state,
+            Message::ReferenceReplacementCompleted {
+                request_id,
+                reference_path: original_path,
+                replacement_path,
+                result: Ok(durable_persisted(replaced_library)),
+            },
+            &mut ui::UiUpdateContext::default(),
+        );
+
+        assert!(state.reference_name_draft.is_none());
+        assert_eq!(
+            playback_shortcut(&state, ui::KeyPress::new(ui::KeyCode::Escape)),
+            ui::ShortcutResolution::action(Message::StopPlayback)
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
