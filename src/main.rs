@@ -10671,8 +10671,7 @@ fn cancel_reference_track_name(
 
 fn library_track_card_height() -> f32 {
     26.0 + ui::dropdown_trigger_height()
-        + (TRACK_CARD_CONTENT_SPACING * 3.0)
-        + 18.0
+        + (TRACK_CARD_CONTENT_SPACING * 2.0)
         + REMOVAL_CONFIRMATION_ROW_HEIGHT
         + (TRACK_CARD_CONTENT_INSET * 2.0)
 }
@@ -10681,11 +10680,10 @@ const VIRTUAL_LIST_VIEWPORT_ROWS: usize = 8;
 const VIRTUAL_LIST_OVERSCAN_ROWS: usize = 4;
 
 fn planner_card_height() -> f32 {
-    28.0 + 20.0
-        + REMOVAL_CONFIRMATION_ROW_HEIGHT
+    28.0 + REMOVAL_CONFIRMATION_ROW_HEIGHT
         + 22.0
         + ui::dropdown_trigger_height()
-        + (TRACK_CARD_CONTENT_SPACING * 4.0)
+        + (TRACK_CARD_CONTENT_SPACING * 3.0)
         + (TRACK_CARD_CONTENT_INSET * 2.0)
 }
 
@@ -11756,11 +11754,6 @@ fn planner_card_with_key(
         ])
         .fill_width()
         .spacing(TRACK_CARD_CONTENT_SPACING),
-        card_muted_text(selected, track.original_name.clone())
-            .truncate()
-            .height(20.0)
-            .fill_width()
-            .subtle(),
         removal_controls,
         card_muted_text(
             selected,
@@ -12437,11 +12430,6 @@ fn track_row(
             .spacing(3.0)
             .fill_width()
             .height(26.0),
-            ui::text(track.original_name.clone())
-                .truncate()
-                .height(18.0)
-                .fill_width()
-                .subtle(),
             removal_controls,
             stage_control,
         ])
@@ -29000,11 +28988,27 @@ mod tests {
             labels.iter().any(|label| label == "Preview me"),
             "the active Planner board must retain the source card"
         );
-        assert!(labels.iter().any(|label| label == "preview.wav"));
+        assert!(!labels.iter().any(|label| label == "preview.wav"));
+        let cards = track_card_paint_snapshots(&frame.paint_plan.primitives);
         assert_eq!(
-            track_card_paint_snapshots(&frame.paint_plan.primitives).len(),
+            cards.len(),
             1,
             "the runtime-owned preview must not duplicate the full Planner board card"
+        );
+        let card = &cards[0];
+        let min_y = card
+            .points
+            .iter()
+            .map(|point| point.y)
+            .fold(f32::INFINITY, f32::min);
+        let max_y = card
+            .points
+            .iter()
+            .map(|point| point.y)
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            (max_y - min_y - super::planner_card_height()).abs() < 0.01,
+            "the Planner card should use the filename-free height"
         );
     }
 
@@ -30208,6 +30212,14 @@ mod tests {
             .paint_plan
             .first_text_run("planner-review-card")
             .expect("the Planner card should paint its title");
+        assert!(
+            !frame
+                .paint_plan
+                .text_label_strings()
+                .iter()
+                .any(|label| label == "planner-review-card.wav"),
+            "the Planner card should not paint the redundant filename"
+        );
         assert!(paint_plan_contains_icon(
             &frame.paint_plan.primitives,
             &super::planner_review_icon()
@@ -31757,10 +31769,16 @@ mod tests {
                     .fold(f32::NEG_INFINITY, f32::max),
             ),
         );
+        assert!(
+            !frame.paint_plan.text_runs().any(|run| {
+                run.text.as_str() == "card-inset-track.wav"
+                    && card_bounds.contains(run.rect.center())
+            }),
+            "the Review card should not paint the redundant filename"
+        );
         let expected_height = 26.0
             + ui::dropdown_trigger_height()
-            + (super::TRACK_CARD_CONTENT_SPACING * 3.0)
-            + 18.0
+            + (super::TRACK_CARD_CONTENT_SPACING * 2.0)
             + super::REMOVAL_CONFIRMATION_ROW_HEIGHT
             + (super::TRACK_CARD_CONTENT_INSET * 2.0);
         assert!(
