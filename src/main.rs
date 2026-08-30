@@ -8957,6 +8957,14 @@ fn complete_reference_replacement_commit(
                 let selected_reference_affected = selected_track(state)
                     .and_then(|track| track.reference_path.as_deref())
                     .is_some_and(|path| path == reference_path.as_path());
+                if reference_path != replacement_path
+                    && state
+                        .reference_name_draft
+                        .as_ref()
+                        .is_some_and(|draft| draft.path == reference_path)
+                {
+                    state.reference_name_draft = None;
+                }
                 state
                     .library
                     .replace(library, LibraryMutationScope::ProjectionAndMarkers);
@@ -33623,6 +33631,53 @@ mod tests {
         assert!(inactive.reference_waveform_in_flight.is_none());
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(inactive_root);
+    }
+
+    #[test]
+    fn different_path_reference_replacement_clears_active_name_draft_for_escape() {
+        let original_path = PathBuf::from("/external/rename-before-replacement.wav");
+        let (replacement_path, decoded, root) = decoded_replacement_fixture();
+        let proof = decoded.source_proof().clone();
+        let mut state = reference_selection_state(
+            "reference-replacement-name-draft",
+            None,
+            None,
+            original_path.clone(),
+            Some(proof.clone()),
+        );
+
+        update(
+            &mut state,
+            Message::RenameReferenceTrack(original_path.clone()),
+            &mut ui::UiUpdateContext::default(),
+        );
+        assert!(state.reference_name_draft.is_some());
+
+        let request_id = begin_reference_replacement_commit(
+            &mut state,
+            &original_path,
+            &replacement_path,
+            decoded,
+        );
+        let replaced_library =
+            reference_replacement_library(&state, &original_path, &replacement_path, &proof);
+        update(
+            &mut state,
+            Message::ReferenceReplacementCompleted {
+                request_id,
+                reference_path: original_path,
+                replacement_path,
+                result: Ok(durable_persisted(replaced_library)),
+            },
+            &mut ui::UiUpdateContext::default(),
+        );
+
+        assert!(state.reference_name_draft.is_none());
+        assert_eq!(
+            playback_shortcut(&state, ui::KeyPress::new(ui::KeyCode::Escape)),
+            ui::ShortcutResolution::action(Message::StopPlayback)
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
