@@ -2153,7 +2153,11 @@ fn playback_shortcut(state: &AppState, press: ui::KeyPress) -> ui::ShortcutResol
     let comment_draft_active = state.draft_note.is_some() || state.reference_draft_note.is_some();
 
     if press == ui::KeyPress::new(ui::KeyCode::Escape) {
-        ui::ShortcutResolution::action(Message::StopPlayback)
+        if let Some(draft) = state.reference_name_draft.as_ref() {
+            ui::ShortcutResolution::action(Message::CancelReferenceTrackName(draft.path.clone()))
+        } else {
+            ui::ShortcutResolution::action(Message::StopPlayback)
+        }
     } else if !comment_draft_active && press == ui::KeyPress::new(ui::KeyCode::N) {
         ui::ShortcutResolution::action(Message::NewNoteAtCurrentTime)
     } else if !comment_draft_active && press == ui::KeyPress::new(ui::KeyCode::Space) {
@@ -11867,8 +11871,6 @@ const SETTINGS_REFERENCE_REIMPORT_LABEL: &str = "Re-import / replace reference t
 const SETTINGS_REFERENCE_REMOVE_LABEL: &str = "Remove reference track";
 const SETTINGS_REFERENCE_RENAME_LABEL: &str = "Rename reference track";
 const SETTINGS_REFERENCE_NAME_INPUT_LABEL: &str = "Reference track display name";
-const SETTINGS_REFERENCE_SAVE_NAME_LABEL: &str = "Save reference track name";
-const SETTINGS_REFERENCE_CANCEL_NAME_LABEL: &str = "Cancel renaming reference track";
 
 static SETTINGS_REFERENCE_REIMPORT_ICON: ui::SvgIconTintCache = ui::SvgIconTintCache::new(
     r#"<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" fill="currentColor">
@@ -12089,22 +12091,9 @@ fn settings_reference_row_with_editing(
         .height(SETTINGS_REFERENCE_ROW_TEXT_HEIGHT)
     };
     let name_action = if editing.is_some() {
-        ui::row([
-            ui::button(SETTINGS_REFERENCE_SAVE_NAME_LABEL)
-                .primary()
-                .message(Message::SaveReferenceTrackName(rename_path.clone()))
-                .key(format!("settings-save-reference-name-{path_key}"))
-                .tooltip(SETTINGS_REFERENCE_SAVE_NAME_LABEL)
-                .height(SETTINGS_REFERENCE_ACTION_HEIGHT),
-            ui::button(SETTINGS_REFERENCE_CANCEL_NAME_LABEL)
-                .subtle()
-                .message(Message::CancelReferenceTrackName(rename_path))
-                .key(format!("settings-cancel-reference-name-{path_key}"))
-                .tooltip(SETTINGS_REFERENCE_CANCEL_NAME_LABEL)
-                .height(SETTINGS_REFERENCE_ACTION_HEIGHT),
-        ])
-        .spacing(6.0)
-        .height(SETTINGS_REFERENCE_ACTION_HEIGHT)
+        ui::spacer()
+            .width(SETTINGS_REFERENCE_ACTION_HEIGHT)
+            .height(SETTINGS_REFERENCE_ACTION_HEIGHT)
     } else {
         ui::icon_button(settings_reference_rename_icon())
             .label(SETTINGS_REFERENCE_RENAME_LABEL)
@@ -14353,15 +14342,16 @@ mod tests {
         LibraryProjectionCache, LibrarySaveAttempt, LiveSpectrogramMode, LoopBounds, LoopSelection,
         LoopSelections, MAIN_SOURCE_MISMATCH_STATUS, Message, NoteAddress, NoteDraft, NoteOwner,
         PairedPlaybackGuard, PendingImportCommit, PersistedNoteDrag, PlannerInsertionTarget,
-        PlaybackSource, REFERENCE_MENU_WIDTH, REFERENCE_SOURCE_MISMATCH_STATUS,
+        PlaybackSource, REFERENCE_MENU_WIDTH, REFERENCE_SOURCE_MISMATCH_STATUS, ReferenceNameDraft,
         ReferenceUnloadState, ResumeTransportCommand, SETTINGS_REFERENCE_ACTION_HEIGHT,
-        SETTINGS_REFERENCE_ROW_METADATA_HEIGHT, SETTINGS_REFERENCE_ROW_TEXT_HEIGHT,
-        SETTINGS_REFERENCE_ROW_TEXT_SPACING, SETTINGS_REFERENCE_ROW_TITLE_HEIGHT,
-        STATUS_BAR_VERSION_WIDTH, SharedLibrary, TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER,
-        TRACK_CARD_LIST_SPACING, TRACK_CARD_SELECTED_CORAL, WAVEFORM_HEIGHT, WaveformDecodeRequest,
-        WaveformMarkerProjectionCache, WaveformMarkerProjectionKey, WorkspaceMode,
-        animation_requested, apply_transport_snapshot, cleanup_reference_transport_failure,
-        current_live_frame_for_source, current_loudness_match_gain_db, current_lufs_meter_value,
+        SETTINGS_REFERENCE_ROW_HEIGHT, SETTINGS_REFERENCE_ROW_METADATA_HEIGHT,
+        SETTINGS_REFERENCE_ROW_TEXT_HEIGHT, SETTINGS_REFERENCE_ROW_TEXT_SPACING,
+        SETTINGS_REFERENCE_ROW_TITLE_HEIGHT, STATUS_BAR_VERSION_WIDTH, SharedLibrary,
+        TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER, TRACK_CARD_LIST_SPACING, TRACK_CARD_SELECTED_CORAL,
+        WAVEFORM_HEIGHT, WaveformDecodeRequest, WaveformMarkerProjectionCache,
+        WaveformMarkerProjectionKey, WorkspaceMode, animation_requested, apply_transport_snapshot,
+        cleanup_reference_transport_failure, current_live_frame_for_source,
+        current_loudness_match_gain_db, current_lufs_meter_value,
         current_reference_lufs_meter_value, decode_result_is_current, enforce_loop,
         ensure_library_projection_cache, ensure_reference_transport_with, favorite_toggle,
         frame_surface_revisions, handle_close_requested, handle_shutdown_with, library_dirty,
@@ -14373,12 +14363,13 @@ mod tests {
         prepared_main_marker_projection, progress_paired_playback_cleanup, project_surface,
         qualified_note_identity_key, reference_decode_result_is_current, reference_dropdown_paths,
         reference_menu_available, reference_output_gain, reference_settings_auxiliary_windows,
-        reference_settings_window_view, refresh_live_spectrogram, refresh_live_spectrograms,
-        resume_transport_command, review_global_controls, review_spectrogram_source,
-        schedule_import, schedule_library_save, schedule_reference_catalog_import,
-        schedule_reference_import, schedule_reference_waveform_decode, schedule_replace,
-        schedule_waveform_decode, seek_synchronized_positions, selected_reference_notes,
-        selected_track, selection_save_debounce_active, settings_reference_row, stage_dropdown,
+        reference_settings_window_view, reference_track_name_editor_id, refresh_live_spectrogram,
+        refresh_live_spectrograms, resume_transport_command, review_global_controls,
+        review_spectrogram_source, schedule_import, schedule_library_save,
+        schedule_reference_catalog_import, schedule_reference_import,
+        schedule_reference_waveform_decode, schedule_replace, schedule_waveform_decode,
+        seek_synchronized_positions, selected_reference_notes, selected_track,
+        selection_save_debounce_active, settings_reference_row, stage_dropdown,
         stage_menu_anchor_from_pointer, stage_menu_popover, start_source_alongside_active,
         transport_command_is_confirmed, update,
     };
@@ -18413,6 +18404,12 @@ mod tests {
                 .map(|draft| draft.value.as_str()),
             Some("Effective reference")
         );
+        let focus_command = context.into_command();
+        assert_eq!(
+            focus_request_id(&focus_command),
+            Some(reference_track_name_editor_id(path.as_path()))
+        );
+        let mut context = ui::UiUpdateContext::default();
         update(
             &mut canceled,
             Message::ReferenceTrackNameChanged {
@@ -18623,8 +18620,9 @@ mod tests {
         struct EditorHarness {
             reference: ReferenceTrack,
             draft: super::ReferenceNameDraft,
+            changed_path: Option<PathBuf>,
             saved_path: Option<PathBuf>,
-            canceled_path: Option<PathBuf>,
+            saved_value: Option<String>,
         }
 
         let editor_bridge = DeclarativeOwnedRuntimeBridge::new(
@@ -18634,8 +18632,9 @@ mod tests {
                     path: path.clone(),
                     value: String::from("Studio reference"),
                 },
+                changed_path: None,
                 saved_path: None,
-                canceled_path: None,
+                saved_value: None,
             },
             |state| {
                 super::settings_reference_row_with_editing(
@@ -18647,38 +18646,95 @@ mod tests {
                 .into_surface()
             },
             |state, message| match message {
-                Message::SaveReferenceTrackName(path) => state.saved_path = Some(path),
-                Message::CancelReferenceTrackName(path) => state.canceled_path = Some(path),
+                Message::ReferenceTrackNameChanged { path, name } => {
+                    state.changed_path = Some(path.clone());
+                    if path == state.draft.path {
+                        state.draft.value = name;
+                    }
+                }
+                Message::SaveReferenceTrackName(path) => {
+                    state.saved_path = Some(path);
+                    state.saved_value = Some(state.draft.value.clone());
+                }
                 _ => {}
             },
         );
         let mut editor_runtime = SurfaceRuntime::new(editor_bridge, Vector2::new(680.0, 64.0));
+        let editor_frame = editor_runtime.frame_with_default_theme();
+        let editor_labels = editor_frame.paint_plan.text_label_strings();
+        assert!(!editor_labels.iter().any(|label| {
+            label == "Save reference track name" || label == "Cancel renaming reference track"
+        }));
         let editor_targets = editor_runtime.automation_target_snapshot().targets;
         let input_target = editor_targets
             .iter()
             .find(|target| target.label.as_deref() == Some("Reference track display name"))
             .expect("reference name input should have an accessible label");
-        let save_target = editor_targets
+        let reimport_target = editor_targets
             .iter()
-            .find(|target| target.label.as_deref() == Some("Save reference track name"))
-            .expect("reference name save should be an automation target");
-        let cancel_target = editor_targets
+            .find(|target| target.label.as_deref() == Some("Re-import / replace reference track"))
+            .expect("reference re-import should remain an automation target while renaming");
+        let remove_target = editor_targets
             .iter()
-            .find(|target| target.label.as_deref() == Some("Cancel renaming reference track"))
-            .expect("reference name cancel should be an automation target");
+            .find(|target| target.label.as_deref() == Some("Remove reference track"))
+            .expect("reference remove should remain an automation target while renaming");
         assert_eq!(input_target.role, AutomationRole::TextInput);
-        assert_eq!(save_target.role, AutomationRole::Button);
-        assert_eq!(cancel_target.role, AutomationRole::Button);
-        assert_ne!(save_target.id, cancel_target.id);
-        editor_runtime
-            .dispatch_primary_click(Point::new(save_target.center.x, save_target.center.y));
-        editor_runtime
-            .dispatch_primary_click(Point::new(cancel_target.center.x, cancel_target.center.y));
+        assert_eq!(input_target.value.as_deref(), Some("Studio reference"));
+        assert!(input_target.interaction_target);
+        assert!(input_target.enabled);
+        assert!(input_target.focusable);
+        assert_eq!(
+            input_target.bounds.height,
+            SETTINGS_REFERENCE_ROW_TITLE_HEIGHT
+        );
+        assert!(input_target.bounds.y >= 0.0);
+        assert!(
+            input_target.bounds.y + input_target.bounds.height
+                <= SETTINGS_REFERENCE_ROW_HEIGHT + 0.01
+        );
+        assert_eq!(reimport_target.role, AutomationRole::Button);
+        assert_eq!(remove_target.role, AutomationRole::Button);
+        assert_eq!(
+            reimport_target.bounds.width,
+            SETTINGS_REFERENCE_ACTION_HEIGHT
+        );
+        assert_eq!(remove_target.bounds.width, SETTINGS_REFERENCE_ACTION_HEIGHT);
+        assert_eq!(
+            reimport_target.bounds.height,
+            SETTINGS_REFERENCE_ACTION_HEIGHT
+        );
+        assert_eq!(
+            remove_target.bounds.height,
+            SETTINGS_REFERENCE_ACTION_HEIGHT
+        );
+        assert!(input_target.tree_index < reimport_target.tree_index);
+        assert!(reimport_target.tree_index < remove_target.tree_index);
+        let input_widget = editor_runtime
+            .widget_at(Point::new(input_target.center.x, input_target.center.y))
+            .expect("reference name input should have a pointer target");
+        editor_runtime.execute_command(Command::focus(input_widget));
+        assert_eq!(editor_runtime.focused_widget(), Some(input_widget));
+        assert_eq!(
+            editor_runtime.dispatch_event(Event::character('x')),
+            Some(input_widget)
+        );
+        assert_eq!(
+            editor_runtime.bridge().state().changed_path,
+            Some(path.clone())
+        );
+        assert_eq!(editor_runtime.bridge().state().draft.value, "x");
+        assert_eq!(
+            editor_runtime.dispatch_event(Event::key_press(ui::WidgetKey::Enter)),
+            Some(input_widget)
+        );
         assert_eq!(
             editor_runtime.bridge().state().saved_path,
             Some(path.clone())
         );
-        assert_eq!(editor_runtime.bridge().state().canceled_path, Some(path));
+        assert_eq!(
+            editor_runtime.bridge().state().saved_value.as_deref(),
+            Some("x")
+        );
     }
 
     #[test]
@@ -18858,6 +18914,23 @@ mod tests {
         assert_eq!(
             playback_shortcut(&state, ui::KeyPress::new(ui::KeyCode::Escape)),
             ui::ShortcutResolution::action(Message::StopPlayback)
+        );
+    }
+
+    #[test]
+    fn playback_shortcut_cancels_reference_name_rename_before_stop_playback() {
+        let path = PathBuf::from("/external/escape-reference.wav");
+        let state = AppState {
+            reference_name_draft: Some(ReferenceNameDraft {
+                path: path.clone(),
+                value: String::from("Draft reference"),
+            }),
+            ..AppState::default()
+        };
+
+        assert_eq!(
+            playback_shortcut(&state, ui::KeyPress::new(ui::KeyCode::Escape)),
+            ui::ShortcutResolution::action(Message::CancelReferenceTrackName(path))
         );
     }
 
