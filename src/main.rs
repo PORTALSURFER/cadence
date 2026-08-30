@@ -21,8 +21,8 @@ use radiant::{
     },
     theme::ThemeTokens,
     widgets::{
-        DragHandleWidget, InteractiveRowWidget, SliderEditBatch, Widget, WidgetCommon, WidgetInput,
-        WidgetOutput,
+        DragHandleWidget, InteractiveRowWidget, SliderEditBatch, TextInputRevision, Widget,
+        WidgetCommon, WidgetInput, WidgetOutput,
     },
 };
 use std::{
@@ -178,7 +178,6 @@ enum Message {
     },
     SaveReferenceTrackName(PathBuf),
     CancelReferenceTrackName(PathBuf),
-    FocusReferenceTrackNameEditor(u64),
     RemoveReferenceTrack(PathBuf),
     SetReferenceTrack {
         track_id: String,
@@ -1006,6 +1005,7 @@ struct LibrarySaveAttempt {
 struct ReferenceNameDraft {
     path: PathBuf,
     value: String,
+    revision: TextInputRevision,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1793,6 +1793,7 @@ struct AppState {
     selection_save_latest: ui::LatestTask,
     selection_save_pending: bool,
     last_save_attempt_id: u64,
+    next_reference_name_revision: u64,
     waveform: Option<audio::WaveformData>,
     waveform_source_ticket: Option<crate::source::VerifiedSourceTicket>,
     main_source_mismatch: Option<PathBuf>,
@@ -1977,6 +1978,7 @@ impl AppState {
             selection_save_latest: ui::LatestTask::new(),
             selection_save_pending: false,
             last_save_attempt_id: 0,
+            next_reference_name_revision: 0,
             waveform: None,
             waveform_source_ticket: None,
             main_source_mismatch: None,
@@ -2143,6 +2145,14 @@ fn allocate_note_draft_nonce(state: &mut AppState) -> u64 {
         .checked_add(1)
         .expect("note draft nonce overflow");
     state.next_note_draft_nonce
+}
+
+fn allocate_reference_name_revision(state: &mut AppState) -> TextInputRevision {
+    state.next_reference_name_revision = state
+        .next_reference_name_revision
+        .checked_add(1)
+        .expect("reference name revision overflow");
+    TextInputRevision::new(state.next_reference_name_revision)
 }
 
 fn active_draft_matches(draft: Option<&NoteDraft>, identity: &NoteDraftIdentity) -> bool {
@@ -4098,10 +4108,6 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
         }
         Message::CancelReferenceTrackName(path) => {
             cancel_reference_track_name(state, context, path);
-        }
-        Message::FocusReferenceTrackNameEditor(editor_id) => {
-            context.focus(editor_id);
-            context.request_repaint();
         }
         Message::DecodeProgress {
             track_id,
@@ -10557,18 +10563,17 @@ fn begin_reference_track_rename(
         context.request_repaint();
         return;
     };
+    let value = reference_track_display_name(reference);
+    let revision = allocate_reference_name_revision(state);
     let editor_id = reference_track_name_editor_id(&path);
     state.reference_name_draft = Some(ReferenceNameDraft {
         path,
-        value: reference_track_display_name(reference),
+        value,
+        revision,
     });
     state.status = String::from("Editing reference track name.");
     context.request_repaint();
     context.focus(editor_id);
-    context.after(
-        Duration::from_millis(1),
-        Message::FocusReferenceTrackNameEditor(editor_id),
-    );
 }
 
 fn update_reference_track_name_draft(
@@ -12056,6 +12061,7 @@ fn settings_reference_row_with_editing(
             ui::text_input(draft.value.clone())
                 .placeholder(SETTINGS_REFERENCE_NAME_INPUT_LABEL)
                 .select_all()
+                .revision(draft.revision)
                 .message_event(move |input| {
                     let submitted = input.is_submitted();
                     let value = input.into_value();
@@ -12069,7 +12075,6 @@ fn settings_reference_row_with_editing(
                     }
                 })
                 .id(input_id)
-                .key(format!("settings-reference-name-{path_key}"))
                 .fill_width()
                 .height(SETTINGS_REFERENCE_ROW_TITLE_HEIGHT),
             ui::text(assignment_label)
@@ -14356,7 +14361,7 @@ mod tests {
         SETTINGS_REFERENCE_ROW_TEXT_HEIGHT, SETTINGS_REFERENCE_ROW_TEXT_SPACING,
         SETTINGS_REFERENCE_ROW_TITLE_HEIGHT, STATUS_BAR_VERSION_WIDTH, SharedLibrary,
         TITLEBAR_TRAFFIC_LIGHT_SAFE_GUTTER, TRACK_CARD_LIST_SPACING, TRACK_CARD_SELECTED_CORAL,
-        WAVEFORM_HEIGHT, WaveformDecodeRequest, WaveformMarkerProjectionCache,
+        TextInputRevision, WAVEFORM_HEIGHT, WaveformDecodeRequest, WaveformMarkerProjectionCache,
         WaveformMarkerProjectionKey, WorkspaceMode, animation_requested, apply_transport_snapshot,
         cleanup_reference_transport_failure, current_live_frame_for_source,
         current_loudness_match_gain_db, current_lufs_meter_value,
@@ -16684,6 +16689,24 @@ mod tests {
         }
     }
 
+    fn focus_request_ids(command: &radiant::runtime::Command<Message>) -> Vec<u64> {
+        match command {
+            radiant::runtime::Command::Focus(id) => vec![*id],
+            radiant::runtime::Command::Batch(commands) => {
+                commands.iter().flat_map(focus_request_ids).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn command_has_timer(command: &radiant::runtime::Command<Message>) -> bool {
+        match command {
+            radiant::runtime::Command::Timer(_) => true,
+            radiant::runtime::Command::Batch(commands) => commands.iter().any(command_has_timer),
+            _ => false,
+        }
+    }
+
     fn scroll_into_view_request(
         command: &radiant::runtime::Command<Message>,
     ) -> Option<(u64, f32, f32, f32, f32)> {
@@ -18384,6 +18407,158 @@ mod tests {
     }
 
     #[test]
+    fn begin_reference_track_rename_emits_one_immediate_focus_without_retry() {
+        let path = PathBuf::from("/external/immediate-focus-reference.wav");
+        let mut state = AppState::default();
+        state.library.reference_tracks.push(ReferenceTrack {
+            path: path.clone(),
+            display_name: Some(String::from("Immediate focus reference")),
+            source_proof: crate::source::SourceProvenance::Unknown,
+            notes: crate::storage::SharedVec::default(),
+        });
+        let mut context = ui::UiUpdateContext::default();
+
+        update(
+            &mut state,
+            Message::RenameReferenceTrack(path.clone()),
+            &mut context,
+        );
+
+        let command = context.into_command();
+        assert_eq!(
+            focus_request_ids(&command),
+            vec![reference_track_name_editor_id(path.as_path())]
+        );
+        assert!(!command_has_timer(&command));
+    }
+
+    #[test]
+    fn reference_name_sessions_use_strictly_increasing_revisions() {
+        let path = PathBuf::from("/external/session-revision-reference.wav");
+        let mut state = AppState::default();
+        state.library.reference_tracks.push(ReferenceTrack {
+            path: path.clone(),
+            display_name: Some(String::from("Session reference")),
+            source_proof: crate::source::SourceProvenance::Unknown,
+            notes: crate::storage::SharedVec::default(),
+        });
+
+        let missing_path = PathBuf::from("/external/missing-reference.wav");
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::RenameReferenceTrack(missing_path),
+            &mut context,
+        );
+        assert_eq!(state.next_reference_name_revision, 0);
+        assert!(state.reference_name_draft.is_none());
+        let _ = context.into_command();
+
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::RenameReferenceTrack(path.clone()),
+            &mut context,
+        );
+        let first_revision = state
+            .reference_name_draft
+            .as_ref()
+            .expect("accepted rename should create a draft")
+            .revision;
+        assert_eq!(first_revision, TextInputRevision::new(1));
+        assert_eq!(state.next_reference_name_revision, 1);
+        let _ = context.into_command();
+
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::ReferenceTrackNameChanged {
+                path: path.clone(),
+                name: String::from("Changed during first session"),
+            },
+            &mut context,
+        );
+        assert_eq!(
+            state
+                .reference_name_draft
+                .as_ref()
+                .expect("the first draft should remain active")
+                .revision,
+            first_revision
+        );
+        assert_eq!(state.next_reference_name_revision, 1);
+
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::CancelReferenceTrackName(path.clone()),
+            &mut context,
+        );
+        assert!(state.reference_name_draft.is_none());
+        let _ = context.into_command();
+
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::RenameReferenceTrack(path.clone()),
+            &mut context,
+        );
+        let second_revision = state
+            .reference_name_draft
+            .as_ref()
+            .expect("reopened rename should create a draft")
+            .revision;
+        assert!(second_revision > first_revision);
+        let _ = context.into_command();
+
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::ReferenceTrackNameChanged {
+                path: path.clone(),
+                name: String::from("Saved session reference"),
+            },
+            &mut context,
+        );
+        update(
+            &mut state,
+            Message::SaveReferenceTrackName(path.clone()),
+            &mut context,
+        );
+        assert!(state.reference_name_draft.is_none());
+        assert_eq!(state.next_reference_name_revision, 2);
+        admit_library_save_for_test(&mut state, &mut context);
+        let attempt = state
+            .save_in_flight
+            .expect("the saved rename should dispatch a save");
+        let _ = context.into_command();
+
+        let mut completion_context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::LibrarySaved {
+                attempt,
+                result: Ok(PersistenceOutcome::Durable),
+            },
+            &mut completion_context,
+        );
+
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::RenameReferenceTrack(path),
+            &mut context,
+        );
+        let third_revision = state
+            .reference_name_draft
+            .as_ref()
+            .expect("reopened rename after save should create a draft")
+            .revision;
+        assert!(third_revision > second_revision);
+        assert_eq!(state.next_reference_name_revision, 3);
+    }
+
+    #[test]
     fn reference_name_reducer_uses_effective_name_and_preserves_cancel_and_validation_state() {
         let path = PathBuf::from("/external/effective-reference.wav");
         let make_state = || {
@@ -18639,6 +18814,7 @@ mod tests {
                 draft: super::ReferenceNameDraft {
                     path: path.clone(),
                     value: String::from("Studio reference"),
+                    revision: TextInputRevision::new(1),
                 },
                 changed_path: None,
                 saved_path: None,
@@ -18687,6 +18863,10 @@ mod tests {
             .find(|target| target.label.as_deref() == Some("Remove reference track"))
             .expect("reference remove should remain an automation target while renaming");
         assert_eq!(input_target.role, AutomationRole::TextInput);
+        assert_eq!(
+            input_target.id.0,
+            reference_track_name_editor_id(path.as_path()).to_string()
+        );
         assert_eq!(input_target.value.as_deref(), Some("Studio reference"));
         assert!(input_target.interaction_target);
         assert!(input_target.enabled);
@@ -18722,6 +18902,48 @@ mod tests {
             .expect("reference name input should have a pointer target");
         editor_runtime.execute_command(Command::focus(input_widget));
         assert_eq!(editor_runtime.focused_widget(), Some(input_widget));
+        assert_eq!(
+            editor_runtime.focused_text_selection(),
+            Some(String::from("Studio reference"))
+        );
+
+        editor_runtime.bridge_mut().state_mut().draft.value = String::from("stale host projection");
+        editor_runtime.refresh();
+        let same_revision_target = editor_runtime
+            .automation_target_snapshot()
+            .targets
+            .into_iter()
+            .find(|target| target.label.as_deref() == Some("Reference track display name"))
+            .expect("same-revision input should remain an automation target");
+        assert_eq!(
+            same_revision_target.value.as_deref(),
+            Some("Studio reference")
+        );
+        assert_eq!(
+            editor_runtime.focused_text_selection(),
+            Some(String::from("Studio reference"))
+        );
+
+        {
+            let state = editor_runtime.bridge_mut().state_mut();
+            state.draft.value = String::from("new session reference");
+            state.draft.revision = TextInputRevision::new(2);
+        }
+        editor_runtime.refresh();
+        let newer_revision_target = editor_runtime
+            .automation_target_snapshot()
+            .targets
+            .into_iter()
+            .find(|target| target.label.as_deref() == Some("Reference track display name"))
+            .expect("new-session input should remain an automation target");
+        assert_eq!(
+            newer_revision_target.value.as_deref(),
+            Some("new session reference")
+        );
+        assert_eq!(
+            editor_runtime.focused_text_selection(),
+            Some(String::from("new session reference"))
+        );
         assert_eq!(
             editor_runtime.dispatch_event(Event::character('x')),
             Some(input_widget)
@@ -18932,6 +19154,7 @@ mod tests {
             reference_name_draft: Some(ReferenceNameDraft {
                 path: path.clone(),
                 value: String::from("Draft reference"),
+                revision: TextInputRevision::new(1),
             }),
             ..AppState::default()
         };
