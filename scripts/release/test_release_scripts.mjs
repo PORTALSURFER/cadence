@@ -780,7 +780,8 @@ test("release build uses verified HEAD and isolates Apple credentials from Cargo
   assert.match(script, /apple_developer_id_application_cert_password="\$\{APPLE_DEVELOPER_ID_APPLICATION_CERT_PASSWORD:-\}"/);
   assert.match(script, /unset \\\n(?:.*\\\n){5}/);
   assert.match(script, /env \\\n(?:        -u APPLE_[^\n]+ \\\n){6}        cargo metadata/);
-  assert.match(script, /env \\\n(?:    -u APPLE_[^\n]+ \\\n){6}    cargo build --target/);
+  assert.equal((script.match(/CADENCE_DISTRIBUTION_BUILD=1/g) ?? []).length, 1);
+  assert.match(script, /env \\\n(?:    -u APPLE_[^\n]+ \\\n){6}    CADENCE_DISTRIBUTION_BUILD=1 \\\n    cargo build --target/);
   assert.match(script, /--executable "\$executable_path"/);
 });
 
