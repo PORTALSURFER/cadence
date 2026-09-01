@@ -518,6 +518,7 @@ env \
     -u APPLE_NOTARY_KEY_ID \
     -u APPLE_NOTARY_ISSUER_ID \
     -u APPLE_CODESIGN_IDENTITY \
+    CADENCE_DISTRIBUTION_BUILD=1 \
     cargo build --target "$target_triple" --release --locked --manifest-path "$project_dir/Cargo.toml"
 "$project_dir/scripts/release/verify_macos_architecture.sh" "$executable_path"
 

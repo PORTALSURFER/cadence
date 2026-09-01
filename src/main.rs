@@ -463,7 +463,20 @@ struct LiveSpectrogramResize {
 }
 
 const LIBRARY_WIDTH: f32 = 252.0;
-const APP_VERSION_LABEL: &str = concat!("v", env!("CARGO_PKG_VERSION"));
+const fn distribution_build_enabled(classification: Option<&str>) -> bool {
+    match classification {
+        Some(value) => value.len() == 1 && value.as_bytes()[0] == b'1',
+        None => false,
+    }
+}
+
+const IS_DISTRIBUTION_BUILD: bool =
+    distribution_build_enabled(option_env!("CADENCE_DISTRIBUTION_BUILD"));
+const APP_VERSION_LABEL: &str = if IS_DISTRIBUTION_BUILD {
+    concat!("v", env!("CARGO_PKG_VERSION"))
+} else {
+    concat!("v", env!("CARGO_PKG_VERSION"), "-dev")
+};
 const STATUS_BAR_VERSION_WIDTH: f32 = 64.0;
 // Keep workspace tabs clear of the native macOS traffic-light controls in the
 // integrated titlebar while leaving the right-side controls right-anchored.
@@ -17644,6 +17657,31 @@ mod tests {
             minimum_version_run.rect
         );
         assert!(!labels.iter().any(|label| label == "NATIVE · RADIANT"));
+    }
+
+    #[test]
+    fn distribution_build_classification_requires_explicit_marker() {
+        assert!(super::distribution_build_enabled(Some("1")));
+        for classification in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("true"),
+            Some("release"),
+            Some("1 "),
+        ] {
+            assert!(!super::distribution_build_enabled(classification));
+        }
+    }
+
+    #[test]
+    fn app_version_label_uses_the_effective_package_version_for_build_kind() {
+        let expected = if super::IS_DISTRIBUTION_BUILD {
+            concat!("v", env!("CARGO_PKG_VERSION"))
+        } else {
+            concat!("v", env!("CARGO_PKG_VERSION"), "-dev")
+        };
+        assert_eq!(APP_VERSION_LABEL, expected);
     }
 
     #[test]
