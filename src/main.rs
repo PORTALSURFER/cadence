@@ -200,7 +200,11 @@ enum Message {
     CancelRemoveTrack,
     TogglePlayback,
     StopPlayback,
-    ToggleLiveSpectrogramMode,
+    ToggleLiveSpectrogramModeMenu,
+    ToggleLiveSpectrogramModeMenuAt {
+        position: Point,
+    },
+    SetLiveSpectrogramMode(LiveSpectrogramMode),
     SetLiveSpectrogramHistoryScale(f32),
     ResizeLiveSpectrogram(ui::DragHandleMessage),
     NewNoteAtCurrentTime,
@@ -393,15 +397,17 @@ enum PlaybackSource {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum LiveSpectrogramMode {
     #[default]
-    Waterfall,
+    Spectrogram,
     Spectrum,
+    None,
 }
 
 impl LiveSpectrogramMode {
-    fn toggled(self) -> Self {
+    const fn label(self) -> &'static str {
         match self {
-            Self::Waterfall => Self::Spectrum,
-            Self::Spectrum => Self::Waterfall,
+            Self::Spectrum => "Spectrum",
+            Self::Spectrogram => "Spectrogram",
+            Self::None => "None",
         }
     }
 }
@@ -492,6 +498,7 @@ const LIVE_PLAYBACK_OVERLAY_KEY: u64 = 0xCAD3_2301;
 const MAIN_LUFS_METER_ID: u64 = 0xCAD3_2103;
 const REFERENCE_LUFS_METER_ID: u64 = 0xCAD3_2104;
 const LIVE_SPECTROGRAM_HEADER_HEIGHT: f32 = 22.0;
+const LIVE_SPECTROGRAM_MODE_SELECTOR_WIDTH: f32 = 112.0;
 const LIVE_SPECTROGRAM_SECTION_SPACING: f32 = 4.0;
 const MAIN_WAVEFORM_HEADER_HEIGHT: f32 = 22.0;
 const LUFS_METER_WIDTH: f32 = 76.0;
@@ -1820,6 +1827,8 @@ struct AppState {
     live_spectrogram: Option<Arc<transport::LiveSpectrogramFrame>>,
     live_spectrogram_revision: u64,
     live_spectrogram_mode: LiveSpectrogramMode,
+    live_spectrogram_mode_menu_open: bool,
+    live_spectrogram_mode_menu_anchor: Option<Point>,
     live_spectrogram_history_scale: f32,
     live_spectrogram_height: f32,
     live_spectrogram_overlay_cache: spectrogram::OverlayGeometryCache,
@@ -2004,7 +2013,9 @@ impl AppState {
             waveform_progress: None,
             live_spectrogram: None,
             live_spectrogram_revision: 0,
-            live_spectrogram_mode: LiveSpectrogramMode::Waterfall,
+            live_spectrogram_mode: LiveSpectrogramMode::Spectrogram,
+            live_spectrogram_mode_menu_open: false,
+            live_spectrogram_mode_menu_anchor: None,
             live_spectrogram_history_scale: spectrogram::DEFAULT_HISTORY_SCALE,
             live_spectrogram_height: spectrogram::HEIGHT,
             live_spectrogram_overlay_cache: spectrogram::OverlayGeometryCache::default(),
@@ -2286,7 +2297,7 @@ fn frame_surface_revisions(state: &mut AppState) -> SurfaceRevisions {
         // The header follows the displayed source while active. Once playback
         // is stopped, preserve the existing all-source final-frame behavior.
         live_spectrogram_presence_revision(state),
-        // Active live Spectrum and Waterfall frames are repainted by the
+        // Active live Spectrum and Spectrogram frames are repainted by the
         // transient overlay. Once playback is stopped, accepted frame
         // revisions must reproject the retained scene so the final analyzer
         // rows are included.
@@ -2411,6 +2422,11 @@ fn paint_live_playback_overlay(
             ratio,
             &theme,
         );
+    }
+
+    if state.live_spectrogram_mode == LiveSpectrogramMode::None {
+        state.live_spectrogram_overlay_cache.clear();
+        return;
     }
 
     let frame = selected_track(state).and_then(|track| {
@@ -2631,6 +2647,7 @@ fn activate_loaded_library(
     state.comment_source_explicit = false;
     close_stage_menu(state);
     close_reference_menu(state);
+    close_live_spectrogram_mode_menu(state);
     close_settings(state);
     state.remove_confirmation_track_id = None;
     reset_transport(state);
@@ -4433,8 +4450,29 @@ fn update(state: &mut AppState, message: Message, context: &mut ui::UiUpdateCont
             refresh_live_spectrograms(state);
             preserve_source_mismatch_status(state);
         }
-        Message::ToggleLiveSpectrogramMode => {
-            state.live_spectrogram_mode = state.live_spectrogram_mode.toggled();
+        Message::ToggleLiveSpectrogramModeMenu => {
+            if state.live_spectrogram_mode_menu_open {
+                close_live_spectrogram_mode_menu(state);
+            } else {
+                state.live_spectrogram_mode_menu_open = true;
+                state.live_spectrogram_mode_menu_anchor =
+                    Some(keyboard_live_spectrogram_mode_menu_anchor());
+            }
+            context.repaint(ui::RepaintScope::Projection);
+        }
+        Message::ToggleLiveSpectrogramModeMenuAt { position } => {
+            if state.live_spectrogram_mode_menu_open {
+                close_live_spectrogram_mode_menu(state);
+            } else {
+                state.live_spectrogram_mode_menu_open = true;
+                state.live_spectrogram_mode_menu_anchor =
+                    Some(live_spectrogram_mode_menu_anchor_from_pointer(position));
+            }
+            context.repaint(ui::RepaintScope::Projection);
+        }
+        Message::SetLiveSpectrogramMode(mode) => {
+            state.live_spectrogram_mode = mode;
+            close_live_spectrogram_mode_menu(state);
             context.repaint(ui::RepaintScope::Projection);
         }
         Message::SetLiveSpectrogramHistoryScale(scale) => {
@@ -10536,12 +10574,18 @@ fn close_reference_menu(state: &mut AppState) {
     state.reference_menu_anchor = None;
 }
 
+fn close_live_spectrogram_mode_menu(state: &mut AppState) {
+    state.live_spectrogram_mode_menu_open = false;
+    state.live_spectrogram_mode_menu_anchor = None;
+}
+
 fn close_settings(state: &mut AppState) {
     state.settings_open = false;
     state.reference_name_draft = None;
 }
 
 fn toggle_settings(state: &mut AppState, context: &mut ui::UiUpdateContext<Message>) {
+    close_live_spectrogram_mode_menu(state);
     if state.settings_open {
         close_settings(state);
     } else {
@@ -10812,6 +10856,7 @@ fn select_track_internal(
     state.loop_selections.clear_all();
     close_stage_menu(state);
     close_reference_menu(state);
+    close_live_spectrogram_mode_menu(state);
     state.remove_confirmation_track_id = None;
     clear_planner_drag(state);
     if let Some(cancellation) = state.waveform_cancellation.as_ref() {
@@ -10908,6 +10953,7 @@ fn set_workspace_mode(
     state.workspace_mode = mode;
     close_stage_menu(state);
     close_reference_menu(state);
+    close_live_spectrogram_mode_menu(state);
     state.remove_confirmation_track_id = None;
     clear_planner_drag(state);
     context.request_repaint();
@@ -11157,6 +11203,11 @@ fn project_surface(state: &AppState) -> ui::View<Message> {
                 .filter(|track| reference_menu_available(state, track))
                 .map(|track| reference_menu_popover(state, track, anchor))
         });
+    let mode_menu = state
+        .live_spectrogram_mode_menu_open
+        .then_some(state.live_spectrogram_mode_menu_anchor)
+        .flatten()
+        .map(|anchor| live_spectrogram_mode_menu_popover(state.live_spectrogram_mode, anchor));
     let workspace_tabs = [WorkspaceMode::Review, WorkspaceMode::Planner]
         .into_iter()
         .map(|mode| {
@@ -11306,7 +11357,8 @@ fn project_surface(state: &AppState) -> ui::View<Message> {
         ui::stack([content]).fill().overlays(
             ui::overlays()
                 .popover_opt(stage_menu)
-                .popover_opt(reference_menu),
+                .popover_opt(reference_menu)
+                .popover_opt(mode_menu),
         ),
     )
     .into_view()
@@ -12624,6 +12676,52 @@ fn live_spectrogram_frame_for_review(
     (source, frame)
 }
 
+fn live_spectrogram_mode_options(
+    selected: LiveSpectrogramMode,
+) -> Vec<ui::DropdownOption<Message>> {
+    [
+        LiveSpectrogramMode::Spectrum,
+        LiveSpectrogramMode::Spectrogram,
+        LiveSpectrogramMode::None,
+    ]
+    .into_iter()
+    .map(|mode| {
+        ui::DropdownOption::new(
+            mode.label(),
+            mode == selected,
+            Message::SetLiveSpectrogramMode(mode),
+        )
+    })
+    .collect()
+}
+
+fn live_spectrogram_mode_menu_anchor_from_pointer(position: Point) -> Point {
+    Point::new(
+        (position.x - LIVE_SPECTROGRAM_MODE_SELECTOR_WIDTH * 0.5).floor(),
+        (position.y + ui::dropdown_trigger_height() * 0.5).floor(),
+    )
+}
+
+fn keyboard_live_spectrogram_mode_menu_anchor() -> Point {
+    Point::new(900.0, 190.0)
+}
+
+fn live_spectrogram_mode_menu_popover(
+    selected: LiveSpectrogramMode,
+    anchor: Point,
+) -> ui::View<Message> {
+    let options = live_spectrogram_mode_options(selected);
+    let size = Vector2::new(
+        LIVE_SPECTROGRAM_MODE_SELECTOR_WIDTH,
+        ui::dropdown_menu_height(options.len()),
+    );
+    anchored_popover_from_parts(AnchoredPopoverParts::below(
+        ui::dropdown_menu(options).key("live-spectrogram-mode-menu"),
+        ui::AnchoredPopoverAnchor::pointer(anchor),
+        size,
+    ))
+}
+
 fn live_spectrogram_section(state: &AppState, track: &storage::Track) -> ui::View<Message> {
     let (source, frame) = live_spectrogram_frame_for_review(state, track);
     let label = frame.as_ref().map_or_else(
@@ -12670,16 +12768,30 @@ fn live_spectrogram_section(state: &AppState, track: &storage::Track) -> ui::Vie
     )
     .id(LIVE_SPECTROGRAM_RESIZE_HANDLE_ID)
     .tooltip("Drag to resize the live spectrogram panel");
-    let spectrum_selected = state.live_spectrogram_mode == LiveSpectrogramMode::Spectrum;
-    let mode_toggle = ui::button("SPECTRUM")
-        .subtle()
-        .active(spectrum_selected)
-        .selected(spectrum_selected)
-        .message(Message::ToggleLiveSpectrogramMode)
-        .key("live-spectrogram-mode-toggle")
-        .tooltip("Toggle live waterfall / spectrum view")
-        .width(82.0)
-        .height(LIVE_SPECTROGRAM_HEADER_HEIGHT);
+    let mode_selector = ui::dropdown_trigger(
+        state.live_spectrogram_mode.label(),
+        state.live_spectrogram_mode_menu_open,
+    )
+    .toggle_message(Message::ToggleLiveSpectrogramModeMenu)
+    .build()
+    .pointer_target(
+        ui::pointer_target(true)
+            .pointer_move(false)
+            .pointer_press(true)
+            .pointer_release(false)
+            .pointer_drop(false)
+            .wheel(false)
+            .filter_map(|message| match message {
+                ui::PointerShieldMessage::PointerPress { position, .. } => {
+                    Some(Message::ToggleLiveSpectrogramModeMenuAt { position })
+                }
+                _ => None,
+            }),
+    )
+    .key("live-spectrogram-mode-selector")
+    .tooltip("Select live analyzer mode")
+    .width(LIVE_SPECTROGRAM_MODE_SELECTOR_WIDTH)
+    .height(LIVE_SPECTROGRAM_HEADER_HEIGHT);
     let history_scale_slider = ui::slider(spectrogram::history_scale_to_normalized(
         state.live_spectrogram_history_scale,
     ))
@@ -12702,7 +12814,7 @@ fn live_spectrogram_section(state: &AppState, track: &storage::Track) -> ui::Vie
             .height(LIVE_SPECTROGRAM_HEADER_HEIGHT)
             .align_text(ui::TextAlign::Right),
         history_scale_slider,
-        mode_toggle,
+        mode_selector,
     ])
     .spacing(8.0)
     .fill_width()
@@ -14370,20 +14482,20 @@ mod tests {
         ensure_library_projection_cache, ensure_reference_transport_with, favorite_toggle,
         frame_surface_revisions, handle_close_requested, handle_shutdown_with, library_dirty,
         library_track_card_height, library_track_title_id, live_frame_matches_current_session,
-        live_spectrogram_display_sample_rate, loop_bounds, main_output_gain,
-        mark_comment_projection_dirty, native_launch_options, note_editor, note_ratio_for_id,
-        owned_tracks_in_stage, paint_live_playback_overlay, planner_insertion_target_is_valid,
-        planner_stage_index, planner_tracks_with_favorites, playback_shortcut,
-        prepared_main_marker_projection, progress_paired_playback_cleanup, project_surface,
-        qualified_note_identity_key, reference_decode_result_is_current, reference_dropdown_paths,
-        reference_menu_available, reference_output_gain, reference_settings_auxiliary_windows,
-        reference_settings_window_view, reference_track_name_editor_id, refresh_live_spectrogram,
-        refresh_live_spectrograms, resume_transport_command, review_global_controls,
-        review_spectrogram_source, schedule_import, schedule_library_save,
-        schedule_reference_catalog_import, schedule_reference_import,
-        schedule_reference_waveform_decode, schedule_replace, schedule_waveform_decode,
-        seek_synchronized_positions, selected_reference_notes, selected_track,
-        selection_save_debounce_active, settings_reference_row, stage_dropdown,
+        live_spectrogram_display_sample_rate, live_spectrogram_mode_options, loop_bounds,
+        main_output_gain, mark_comment_projection_dirty, native_launch_options, note_editor,
+        note_ratio_for_id, owned_tracks_in_stage, paint_live_playback_overlay,
+        planner_insertion_target_is_valid, planner_stage_index, planner_tracks_with_favorites,
+        playback_shortcut, prepared_main_marker_projection, progress_paired_playback_cleanup,
+        project_surface, qualified_note_identity_key, reference_decode_result_is_current,
+        reference_dropdown_paths, reference_menu_available, reference_output_gain,
+        reference_settings_auxiliary_windows, reference_settings_window_view,
+        reference_track_name_editor_id, refresh_live_spectrogram, refresh_live_spectrograms,
+        resume_transport_command, review_global_controls, review_spectrogram_source,
+        schedule_import, schedule_library_save, schedule_reference_catalog_import,
+        schedule_reference_import, schedule_reference_waveform_decode, schedule_replace,
+        schedule_waveform_decode, seek_synchronized_positions, selected_reference_notes,
+        selected_track, selection_save_debounce_active, settings_reference_row, stage_dropdown,
         stage_menu_anchor_from_pointer, stage_menu_popover, start_source_alongside_active,
         transport_command_is_confirmed, update,
     };
@@ -15906,7 +16018,7 @@ mod tests {
     #[test]
     fn active_live_spectrogram_revision_is_paint_only_for_both_modes() {
         for mode in [
-            LiveSpectrogramMode::Waterfall,
+            LiveSpectrogramMode::Spectrogram,
             LiveSpectrogramMode::Spectrum,
         ] {
             let mut state = audition_state(&["main"]);
@@ -16021,7 +16133,7 @@ mod tests {
     #[test]
     fn live_spectrogram_overlay_uses_newest_validated_frame_and_exact_body_layers() {
         for mode in [
-            LiveSpectrogramMode::Waterfall,
+            LiveSpectrogramMode::Spectrogram,
             LiveSpectrogramMode::Spectrum,
         ] {
             let mut state = audition_state(&["main"]);
@@ -16127,7 +16239,7 @@ mod tests {
                 .expect("live spectrogram overlay clip end");
             let body_layers = &primitives[body_clip_start + 1..body_clip_end];
             match mode {
-                LiveSpectrogramMode::Waterfall => assert!(
+                LiveSpectrogramMode::Spectrogram => assert!(
                     body_layers
                         .iter()
                         .any(|primitive| matches!(primitive, PaintPrimitive::FillRectBatch(_)))
@@ -16144,6 +16256,7 @@ mod tests {
                             .any(|primitive| matches!(primitive, PaintPrimitive::StrokePolygon(_)))
                     );
                 }
+                LiveSpectrogramMode::None => unreachable!("None is not painted in this test"),
             }
 
             let body_fill = body_layers
@@ -16356,7 +16469,7 @@ mod tests {
     #[test]
     fn live_spectrogram_final_live_frame_after_natural_stop_advances_retained_projection() {
         for mode in [
-            LiveSpectrogramMode::Waterfall,
+            LiveSpectrogramMode::Spectrogram,
             LiveSpectrogramMode::Spectrum,
         ] {
             let mut state = audition_state(&["main"]);
@@ -16501,24 +16614,79 @@ mod tests {
     }
 
     #[test]
-    fn live_spectrogram_mode_defaults_to_waterfall_and_toggles() {
+    fn live_spectrogram_mode_defaults_to_spectrogram_and_selects_each_mode() {
         let mut state = AppState::default();
         let mut context = ui::UiUpdateContext::default();
 
-        assert_eq!(state.live_spectrogram_mode, LiveSpectrogramMode::Waterfall);
-        update(&mut state, Message::ToggleLiveSpectrogramMode, &mut context);
-        assert_eq!(state.live_spectrogram_mode, LiveSpectrogramMode::Spectrum);
+        assert_eq!(
+            state.live_spectrogram_mode,
+            LiveSpectrogramMode::Spectrogram
+        );
+        update(
+            &mut state,
+            Message::ToggleLiveSpectrogramModeMenu,
+            &mut context,
+        );
+        assert!(state.live_spectrogram_mode_menu_open);
         assert_eq!(
             context.into_command().repaint_scope(),
             Some(RepaintScope::Projection)
         );
 
         let mut context = ui::UiUpdateContext::default();
-        update(&mut state, Message::ToggleLiveSpectrogramMode, &mut context);
-        assert_eq!(state.live_spectrogram_mode, LiveSpectrogramMode::Waterfall);
+        update(
+            &mut state,
+            Message::SetLiveSpectrogramMode(LiveSpectrogramMode::Spectrum),
+            &mut context,
+        );
+        assert_eq!(state.live_spectrogram_mode, LiveSpectrogramMode::Spectrum);
+        assert!(!state.live_spectrogram_mode_menu_open);
         assert_eq!(
             context.into_command().repaint_scope(),
             Some(RepaintScope::Projection)
+        );
+
+        let mut context = ui::UiUpdateContext::default();
+        update(
+            &mut state,
+            Message::SetLiveSpectrogramMode(LiveSpectrogramMode::None),
+            &mut context,
+        );
+        assert_eq!(state.live_spectrogram_mode, LiveSpectrogramMode::None);
+        assert_eq!(
+            context.into_command().repaint_scope(),
+            Some(RepaintScope::Projection)
+        );
+    }
+
+    #[test]
+    fn live_spectrogram_mode_selector_has_exact_order_and_selection_state() {
+        let options = live_spectrogram_mode_options(LiveSpectrogramMode::Spectrogram);
+
+        assert_eq!(
+            options
+                .iter()
+                .map(|option| option.label.to_string())
+                .collect::<Vec<_>>(),
+            vec![
+                String::from("Spectrum"),
+                String::from("Spectrogram"),
+                String::from("None"),
+            ]
+        );
+        assert_eq!(options.iter().filter(|option| option.selected).count(), 1);
+        assert!(options[1].selected);
+        assert_eq!(
+            options[0].message,
+            Message::SetLiveSpectrogramMode(LiveSpectrogramMode::Spectrum)
+        );
+        assert_eq!(
+            options[1].message,
+            Message::SetLiveSpectrogramMode(LiveSpectrogramMode::Spectrogram)
+        );
+        assert_eq!(
+            options[2].message,
+            Message::SetLiveSpectrogramMode(LiveSpectrogramMode::None)
         );
     }
 
@@ -16646,19 +16814,82 @@ mod tests {
     }
 
     #[test]
-    fn live_spectrogram_mode_toggle_is_visible_before_live_frame_exists() {
+    fn live_spectrogram_mode_selector_is_visible_before_live_frame_exists() {
         let state = audition_state(&["main"]);
         let frame = project_surface(&state)
             .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 1100.0));
         let labels = frame.paint_plan.text_label_strings();
 
-        assert!(labels.iter().any(|label| label == "SPECTRUM"));
+        assert!(labels.iter().any(|label| label == "Spectrogram"));
+    }
+
+    #[test]
+    fn live_spectrogram_mode_selector_is_focusable_and_selects_none() {
+        let bridge = DeclarativeOwnedRuntimeBridge::new(
+            audition_state(&["main"]),
+            |state| project_surface(state).into_surface(),
+            |state, message| {
+                update(state, message, &mut ui::UiUpdateContext::default());
+            },
+        );
+        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1180.0, 1_100.0));
+        let frame = runtime.frame(&ThemeTokens::default());
+        let selector_rect = frame
+            .paint_plan
+            .primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                PaintPrimitive::Text(text) if text.text.as_str() == "Spectrogram" => {
+                    Some(text.rect)
+                }
+                _ => None,
+            })
+            .expect("mode selector should paint its selected label");
+        let selector_point = Point::new(
+            selector_rect.min.x + selector_rect.width() * 0.5,
+            selector_rect.min.y + selector_rect.height() * 0.5,
+        );
+        let selector_id = runtime
+            .widget_at(selector_point)
+            .expect("mode selector should remain an interactive target");
+        runtime.execute_command(Command::focus(selector_id));
+        assert_eq!(runtime.focused_widget(), Some(selector_id));
+
+        assert_eq!(
+            runtime.dispatch_event(Event::key_press(ui::WidgetKey::Enter)),
+            Some(selector_id)
+        );
+        assert!(runtime.bridge().state().live_spectrogram_mode_menu_open);
+
+        let frame = runtime.frame(&ThemeTokens::default());
+        let none_rect = frame
+            .paint_plan
+            .primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                PaintPrimitive::Text(text) if text.text.as_str() == "None" => Some(text.rect),
+                _ => None,
+            })
+            .expect("open mode selector should paint the None option");
+        let none_point = Point::new(
+            none_rect.min.x + none_rect.width() * 0.5,
+            none_rect.min.y + none_rect.height() * 0.5,
+        );
+        assert!(runtime.widget_at(none_point).is_some());
+        runtime.dispatch_event(Event::primary_press(none_point));
+        runtime.dispatch_event(Event::primary_release(none_point));
+
+        assert_eq!(
+            runtime.bridge().state().live_spectrogram_mode,
+            LiveSpectrogramMode::None
+        );
+        assert!(!runtime.bridge().state().live_spectrogram_mode_menu_open);
     }
 
     #[test]
     fn live_spectrogram_history_scale_slider_is_present_in_both_modes() {
         for mode in [
-            LiveSpectrogramMode::Waterfall,
+            LiveSpectrogramMode::Spectrogram,
             LiveSpectrogramMode::Spectrum,
         ] {
             let mut state = audition_state(&["main"]);

@@ -138,7 +138,10 @@ impl OverlayGeometryCache {
         bounds: Rect,
         theme: &ThemeTokens,
     ) -> Option<&[PaintPrimitive]> {
-        if !frame.is_valid() || !bounds.has_finite_positive_area() {
+        if mode == crate::LiveSpectrogramMode::None
+            || !frame.is_valid()
+            || !bounds.has_finite_positive_area()
+        {
             self.clear();
             return None;
         }
@@ -876,6 +879,9 @@ impl SpectrogramWidget {
         bounds: Rect,
         theme: &ThemeTokens,
     ) {
+        if self.mode == crate::LiveSpectrogramMode::None {
+            return;
+        }
         if !bounds.has_finite_positive_area() {
             return;
         }
@@ -890,12 +896,13 @@ impl SpectrogramWidget {
                 widget_id: self.common.id,
                 rect: plot,
                 color: match self.mode {
-                    crate::LiveSpectrogramMode::Waterfall => PALETTE[0],
+                    crate::LiveSpectrogramMode::Spectrogram => PALETTE[0],
                     crate::LiveSpectrogramMode::Spectrum => SPECTRUM_PLOT_BACKGROUND,
+                    crate::LiveSpectrogramMode::None => return,
                 },
             }));
             match self.mode {
-                crate::LiveSpectrogramMode::Waterfall => self.append_waterfall(primitives, plot),
+                crate::LiveSpectrogramMode::Spectrogram => self.append_waterfall(primitives, plot),
                 crate::LiveSpectrogramMode::Spectrum => self.append_spectrum(
                     primitives,
                     plot,
@@ -903,6 +910,7 @@ impl SpectrogramWidget {
                     SPECTRUM_AREA_SURFACE_KEY,
                     SPECTRUM_AREA_RENDER_KIND,
                 ),
+                crate::LiveSpectrogramMode::None => return,
             }
             // Both modes consume the same frame, already normalized to the
             // display-only -90..0 dB range with the signed +4.5 dB/octave tilt.
@@ -1188,7 +1196,10 @@ fn append_overlay_primitives(
     theme: &ThemeTokens,
     storage: &mut OverlayGeometryStorage,
 ) {
-    if !frame.is_valid() || !bounds.has_finite_positive_area() {
+    if mode == crate::LiveSpectrogramMode::None
+        || !frame.is_valid()
+        || !bounds.has_finite_positive_area()
+    {
         return;
     }
 
@@ -1207,12 +1218,13 @@ fn append_overlay_primitives(
             widget_id: LIVE_SPECTROGRAM_OVERLAY_WIDGET_ID,
             rect: plot,
             color: match mode {
-                crate::LiveSpectrogramMode::Waterfall => PALETTE[0],
+                crate::LiveSpectrogramMode::Spectrogram => PALETTE[0],
                 crate::LiveSpectrogramMode::Spectrum => SPECTRUM_PLOT_BACKGROUND,
+                crate::LiveSpectrogramMode::None => return,
             },
         }));
         let spectrum_available = match mode {
-            crate::LiveSpectrogramMode::Waterfall => {
+            crate::LiveSpectrogramMode::Spectrogram => {
                 append_overlay_waterfall(
                     frame,
                     plot,
@@ -1231,6 +1243,7 @@ fn append_overlay_primitives(
                 theme,
                 storage,
             ),
+            crate::LiveSpectrogramMode::None => return,
         };
         append_overlay_grid(
             frame,
@@ -1429,11 +1442,21 @@ mod tests {
     }
 
     #[test]
+    fn none_mode_suppresses_retained_analyzer_paint() {
+        let primitives = paint(SpectrogramWidget::new(
+            test_frame(),
+            LiveSpectrogramMode::None,
+        ));
+
+        assert!(primitives.is_empty());
+    }
+
+    #[test]
     fn retained_waterfall_stays_on_its_existing_gpu_contract() {
         let frame = test_frame();
         let primitives = paint(SpectrogramWidget::new(
             Arc::clone(&frame),
-            LiveSpectrogramMode::Waterfall,
+            LiveSpectrogramMode::Spectrogram,
         ));
         let surfaces = gpu_surfaces(&primitives);
         assert_eq!(surfaces.len(), 1);
@@ -1556,7 +1579,7 @@ mod tests {
         let plot = SpectrogramWidget::plot_rect(bounds());
         let primitives = paint(SpectrogramWidget::new_with_scale(
             test_frame(),
-            LiveSpectrogramMode::Waterfall,
+            LiveSpectrogramMode::Spectrogram,
             2.5,
         ));
         let surface = gpu_surfaces(&primitives)
@@ -1769,7 +1792,7 @@ mod tests {
         let bounds = Rect::from_min_size(Point::new(18.0, 24.0), Vector2::new(720.0, 102.0));
         let plot = SpectrogramWidget::plot_rect(bounds);
         for mode in [
-            LiveSpectrogramMode::Waterfall,
+            LiveSpectrogramMode::Spectrogram,
             LiveSpectrogramMode::Spectrum,
         ] {
             let mut primitives = Vec::new();
@@ -1811,7 +1834,7 @@ mod tests {
                 )
             }));
             match mode {
-                LiveSpectrogramMode::Waterfall => assert!(
+                LiveSpectrogramMode::Spectrogram => assert!(
                     body.iter()
                         .any(|primitive| matches!(primitive, PaintPrimitive::FillRectBatch(_)))
                 ),
@@ -1826,6 +1849,7 @@ mod tests {
                             .any(|primitive| matches!(primitive, PaintPrimitive::StrokePolygon(_)))
                     );
                 }
+                LiveSpectrogramMode::None => unreachable!("None is not painted in this test"),
             }
             let grid = body
                 .iter()
@@ -1900,6 +1924,40 @@ mod tests {
     }
 
     #[test]
+    fn none_mode_suppresses_transient_analyzer_paint_and_clears_cache() {
+        let frame = test_frame();
+        let bounds = bounds();
+        let theme = ThemeTokens::default();
+        let mut cache = OverlayGeometryCache::default();
+        let mut primitives = Vec::new();
+
+        paint_overlay_cached(
+            Arc::clone(&frame),
+            LiveSpectrogramMode::Spectrogram,
+            DEFAULT_HISTORY_SCALE,
+            bounds,
+            &mut primitives,
+            &theme,
+            &mut cache,
+        );
+        assert!(!cache.is_empty());
+        primitives.clear();
+
+        paint_overlay_cached(
+            frame,
+            LiveSpectrogramMode::None,
+            DEFAULT_HISTORY_SCALE,
+            bounds,
+            &mut primitives,
+            &theme,
+            &mut cache,
+        );
+
+        assert!(primitives.is_empty());
+        assert!(cache.is_empty());
+    }
+
+    #[test]
     fn overlay_geometry_cache_reuses_and_invalidates_by_stable_inputs() {
         let bounds = bounds();
         let theme = ThemeTokens::default();
@@ -1909,7 +1967,7 @@ mod tests {
 
         paint_overlay_cached(
             Arc::clone(&frame),
-            LiveSpectrogramMode::Waterfall,
+            LiveSpectrogramMode::Spectrogram,
             DEFAULT_HISTORY_SCALE,
             bounds,
             &mut primitives,
@@ -1921,7 +1979,7 @@ mod tests {
         primitives.clear();
         paint_overlay_cached(
             Arc::clone(&frame),
-            LiveSpectrogramMode::Waterfall,
+            LiveSpectrogramMode::Spectrogram,
             DEFAULT_HISTORY_SCALE,
             bounds,
             &mut primitives,
@@ -1970,7 +2028,7 @@ mod tests {
 
         paint_overlay_cached(
             test_frame_revision(1),
-            LiveSpectrogramMode::Waterfall,
+            LiveSpectrogramMode::Spectrogram,
             DEFAULT_HISTORY_SCALE,
             bounds,
             &mut primitives,
@@ -1988,7 +2046,7 @@ mod tests {
 
         paint_overlay_cached(
             test_frame_revision(2),
-            LiveSpectrogramMode::Waterfall,
+            LiveSpectrogramMode::Spectrogram,
             DEFAULT_HISTORY_SCALE,
             bounds,
             &mut primitives,
@@ -2059,7 +2117,7 @@ mod tests {
 
         paint_overlay_cached(
             test_frame_revision(1),
-            LiveSpectrogramMode::Waterfall,
+            LiveSpectrogramMode::Spectrogram,
             DEFAULT_HISTORY_SCALE,
             bounds,
             &mut primitives,
@@ -2078,7 +2136,7 @@ mod tests {
 
         paint_overlay_cached(
             test_frame_revision(2),
-            LiveSpectrogramMode::Waterfall,
+            LiveSpectrogramMode::Spectrogram,
             DEFAULT_HISTORY_SCALE,
             bounds,
             &mut primitives,
@@ -2120,7 +2178,7 @@ mod tests {
         let mut primitives = Vec::new();
         paint_overlay(
             frame,
-            LiveSpectrogramMode::Waterfall,
+            LiveSpectrogramMode::Spectrogram,
             DEFAULT_HISTORY_SCALE,
             bounds,
             &mut primitives,
@@ -2214,7 +2272,7 @@ mod tests {
         );
         let primitives = paint(SpectrogramWidget::new(
             frame,
-            LiveSpectrogramMode::Waterfall,
+            LiveSpectrogramMode::Spectrogram,
         ));
         let surface = gpu_surfaces(&primitives)
             .into_iter()
