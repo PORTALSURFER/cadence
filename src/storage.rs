@@ -439,21 +439,54 @@ impl ReferenceTrack {
 pub enum TrackStage {
     #[serde(rename = "sound-design")]
     Backlog,
-    #[serde(rename = "production")]
-    Production,
+    #[serde(rename = "groove", alias = "production")]
+    Groove,
+    #[serde(rename = "arrangement")]
+    Arrangement,
+    #[serde(rename = "polish")]
+    Polish,
     #[serde(rename = "mixdown")]
     Mixdown,
-    #[serde(rename = "mastering")]
-    Mastering,
+    #[serde(rename = "master", alias = "mastering")]
+    Master,
+    #[serde(rename = "release")]
+    Release,
 }
 
 impl TrackStage {
+    pub const ALL: [Self; 7] = [
+        Self::Backlog,
+        Self::Groove,
+        Self::Arrangement,
+        Self::Polish,
+        Self::Mixdown,
+        Self::Master,
+        Self::Release,
+    ];
+
+    pub const COUNT: usize = Self::ALL.len();
+
     pub const fn label(self) -> &'static str {
         match self {
             Self::Backlog => "Backlog",
-            Self::Production => "Production",
+            Self::Groove => "Groove",
+            Self::Arrangement => "Arrangement",
+            Self::Polish => "Polish",
             Self::Mixdown => "Mixdown",
-            Self::Mastering => "Mastering",
+            Self::Master => "Master",
+            Self::Release => "Release",
+        }
+    }
+
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Backlog => 0,
+            Self::Groove => 1,
+            Self::Arrangement => 2,
+            Self::Polish => 3,
+            Self::Mixdown => 4,
+            Self::Master => 5,
+            Self::Release => 6,
         }
     }
 }
@@ -3368,15 +3401,18 @@ mod tests {
 
     #[test]
     fn stage_labels_and_wire_order_are_stable() {
-        let stages = [
-            TrackStage::Backlog,
-            TrackStage::Production,
-            TrackStage::Mixdown,
-            TrackStage::Mastering,
-        ];
+        let stages = TrackStage::ALL;
         assert_eq!(
             stages.map(TrackStage::label),
-            ["Backlog", "Production", "Mixdown", "Mastering"]
+            [
+                "Backlog",
+                "Groove",
+                "Arrangement",
+                "Polish",
+                "Mixdown",
+                "Master",
+                "Release"
+            ]
         );
         assert_eq!(
             stages
@@ -3385,10 +3421,32 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "\"sound-design\"",
-                "\"production\"",
+                "\"groove\"",
+                "\"arrangement\"",
+                "\"polish\"",
                 "\"mixdown\"",
-                "\"mastering\""
+                "\"master\"",
+                "\"release\""
             ]
+        );
+    }
+
+    #[test]
+    fn legacy_stage_wire_values_load_into_the_renamed_stages() {
+        let production: TrackStage =
+            serde_json::from_str("\"production\"").expect("production should remain readable");
+        let mastering: TrackStage =
+            serde_json::from_str("\"mastering\"").expect("mastering should remain readable");
+
+        assert_eq!(production, TrackStage::Groove);
+        assert_eq!(mastering, TrackStage::Master);
+        assert_eq!(
+            serde_json::to_string(&production).expect("groove should encode"),
+            "\"groove\""
+        );
+        assert_eq!(
+            serde_json::to_string(&mastering).expect("master should encode"),
+            "\"master\""
         );
     }
 
@@ -3569,8 +3627,8 @@ mod tests {
     fn planner_order_normalizes_legacy_and_stale_ids() {
         let mut legacy = Library {
             tracks: vec![
-                planner_test_track("plain", TrackStage::Production, false),
-                planner_test_track("starred", TrackStage::Production, true),
+                planner_test_track("plain", TrackStage::Groove, false),
+                planner_test_track("starred", TrackStage::Groove, true),
             ]
             .into(),
             selected_track_id: None,
@@ -3592,13 +3650,13 @@ mod tests {
 
     #[test]
     fn planner_tracks_preserve_order_semantics_and_first_match_identity() {
-        let mut first_duplicate = planner_test_track("duplicate", TrackStage::Production, false);
+        let mut first_duplicate = planner_test_track("duplicate", TrackStage::Groove, false);
         first_duplicate.title = String::from("first duplicate");
         let mut later_duplicate = planner_test_track("duplicate", TrackStage::Mixdown, true);
         later_duplicate.title = String::from("later duplicate");
         let explicit = Library {
             tracks: vec![
-                planner_test_track("tail", TrackStage::Mastering, false),
+                planner_test_track("tail", TrackStage::Master, false),
                 first_duplicate.clone(),
                 later_duplicate.clone(),
                 planner_test_track("appended", TrackStage::Backlog, false),
@@ -3630,8 +3688,8 @@ mod tests {
 
         let legacy = Library {
             tracks: vec![
-                planner_test_track("plain", TrackStage::Production, false),
-                planner_test_track("favorite", TrackStage::Production, true),
+                planner_test_track("plain", TrackStage::Groove, false),
+                planner_test_track("favorite", TrackStage::Groove, true),
                 first_duplicate,
                 later_duplicate,
             ]
@@ -3661,8 +3719,8 @@ mod tests {
         let mut library = Library {
             tracks: vec![
                 planner_test_track("a", TrackStage::Backlog, false),
-                planner_test_track("b", TrackStage::Production, false),
-                planner_test_track("c", TrackStage::Production, false),
+                planner_test_track("b", TrackStage::Groove, false),
+                planner_test_track("c", TrackStage::Groove, false),
             ]
             .into(),
             selected_track_id: None,
@@ -3671,26 +3729,26 @@ mod tests {
         };
 
         assert!(
-            move_track_to_planner_slot(&mut library, "c", TrackStage::Production, 0)
+            move_track_to_planner_slot(&mut library, "c", TrackStage::Groove, 0)
                 .expect("same-stage move should validate")
         );
         assert_eq!(library.planner_order.as_slice(), ["a", "c", "b"]);
-        assert_eq!(library.tracks[1].stage, TrackStage::Production);
+        assert_eq!(library.tracks[1].stage, TrackStage::Groove);
 
         assert!(
-            move_track_to_planner_slot(&mut library, "a", TrackStage::Production, 2)
+            move_track_to_planner_slot(&mut library, "a", TrackStage::Groove, 2)
                 .expect("cross-stage move should validate")
         );
         assert_eq!(library.planner_order.as_slice(), ["c", "b", "a"]);
-        assert_eq!(library.tracks[0].stage, TrackStage::Production);
+        assert_eq!(library.tracks[0].stage, TrackStage::Groove);
     }
 
     #[test]
     fn planner_move_keeps_unrelated_track_storage_in_place() {
         let mut library = Library {
             tracks: vec![
-                planner_test_track("source", TrackStage::Production, false),
-                planner_test_track("unrelated", TrackStage::Production, false),
+                planner_test_track("source", TrackStage::Groove, false),
+                planner_test_track("unrelated", TrackStage::Groove, false),
             ]
             .into(),
             selected_track_id: None,
@@ -3700,7 +3758,7 @@ mod tests {
         let unrelated_pointer = std::ptr::from_ref(&library.tracks[1]);
 
         assert!(
-            move_track_to_planner_slot(&mut library, "source", TrackStage::Production, 2)
+            move_track_to_planner_slot(&mut library, "source", TrackStage::Groove, 2)
                 .expect("same-stage reorder should validate")
         );
         assert_eq!(library.planner_order.as_slice(), ["unrelated", "source"]);
@@ -3711,10 +3769,10 @@ mod tests {
     fn planner_move_adjusts_target_after_source_and_preserves_order() {
         let mut library = Library {
             tracks: vec![
-                planner_test_track("a", TrackStage::Production, false),
-                planner_test_track("hidden-one", TrackStage::Production, false),
-                planner_test_track("b", TrackStage::Production, false),
-                planner_test_track("hidden-two", TrackStage::Production, false),
+                planner_test_track("a", TrackStage::Groove, false),
+                planner_test_track("hidden-one", TrackStage::Groove, false),
+                planner_test_track("b", TrackStage::Groove, false),
+                planner_test_track("hidden-two", TrackStage::Groove, false),
             ]
             .into(),
             selected_track_id: None,
@@ -3729,7 +3787,7 @@ mod tests {
         };
 
         assert!(
-            move_track_to_planner_slot(&mut library, "a", TrackStage::Production, 2,)
+            move_track_to_planner_slot(&mut library, "a", TrackStage::Groove, 2,)
                 .expect("end target should validate")
         );
         assert_eq!(
@@ -3749,14 +3807,14 @@ mod tests {
     #[test]
     fn planner_move_rejects_stale_slot_without_mutating_library() {
         let mut library = Library {
-            tracks: vec![planner_test_track("a", TrackStage::Production, false)].into(),
+            tracks: vec![planner_test_track("a", TrackStage::Groove, false)].into(),
             selected_track_id: None,
             reference_tracks: Vec::new().into(),
             planner_order: vec![String::from("a")].into(),
         };
         let before = library.clone();
 
-        let error = move_track_to_planner_slot(&mut library, "a", TrackStage::Production, 2)
+        let error = move_track_to_planner_slot(&mut library, "a", TrackStage::Groove, 2)
             .expect_err("a slot beyond the visible list should be rejected");
         assert!(error.contains("no longer available"));
         assert_eq!(library, before);
@@ -3765,18 +3823,18 @@ mod tests {
     #[test]
     fn planner_move_accepts_an_empty_stage_target() {
         let mut library = Library {
-            tracks: vec![planner_test_track("a", TrackStage::Production, false)].into(),
+            tracks: vec![planner_test_track("a", TrackStage::Groove, false)].into(),
             selected_track_id: None,
             reference_tracks: Vec::new().into(),
             planner_order: vec![String::from("a")].into(),
         };
 
         assert!(
-            move_track_to_planner_slot(&mut library, "a", TrackStage::Mastering, 0)
+            move_track_to_planner_slot(&mut library, "a", TrackStage::Master, 0)
                 .expect("an empty stage target should validate")
         );
         assert_eq!(library.planner_order.as_slice(), ["a"]);
-        assert_eq!(library.tracks[0].stage, TrackStage::Mastering);
+        assert_eq!(library.tracks[0].stage, TrackStage::Master);
     }
 
     #[test]
@@ -3945,7 +4003,7 @@ mod tests {
             reference_path,
             size: 0,
             favorite: false,
-            stage: TrackStage::Production,
+            stage: TrackStage::Groove,
             notes: SharedVec::default(),
         };
         let library = Library {

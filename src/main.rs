@@ -1,5 +1,9 @@
+// This comparison binary shares services with the GPUI app, which uses a different subset.
+#![allow(dead_code)]
+
 mod audio;
 mod chrome;
+mod signal_summary;
 mod source;
 mod spectrogram;
 mod storage;
@@ -548,6 +552,7 @@ const TRACK_CARD_LIST_SPACING: f32 = 8.0;
 const REMOVAL_CONFIRMATION_ROW_HEIGHT: f32 = 20.0;
 const LIBRARY_LIST_INSET: f32 = 6.0;
 const PLANNER_STAGE_RAIL_WIDTH: f32 = 4.0;
+const PLANNER_COLUMN_WIDTH: f32 = 220.0;
 const TRACK_CARD_SELECTED_CORAL: ui::Rgba8 = ui::Rgba8::new(233, 88, 67, 255);
 const TRACK_CARD_FAVORITE_FILL_BLEND: f32 = 0.18;
 const PLANNER_DRAG_PREVIEW_CARD_WIDTH: f32 = 300.0;
@@ -1413,7 +1418,7 @@ struct LibraryProjectionCache {
     id_to_library_index: HashMap<String, usize>,
     review_indices: Vec<usize>,
     planner_indices: Vec<usize>,
-    planner_stage_indices: [Vec<usize>; 4],
+    planner_stage_indices: [Vec<usize>; storage::TrackStage::COUNT],
     reference_assignment_counts: HashMap<PathBuf, usize>,
     reference_track_indices: HashMap<PathBuf, usize>,
     comment_projection_revision: Option<u64>,
@@ -1460,7 +1465,7 @@ impl LibraryProjectionCache {
         self.planner_indices.reserve(library.tracks.len());
         for stage in &mut self.planner_stage_indices {
             stage.clear();
-            stage.reserve(library.tracks.len() / 4);
+            stage.reserve(library.tracks.len() / storage::TrackStage::COUNT);
         }
         let mut planner_ids = Vec::with_capacity(library.tracks.len());
         let mut seen = HashSet::with_capacity(library.planner_order.len() + library.tracks.len());
@@ -2111,7 +2116,7 @@ struct AppState {
     planner_drag_pointer: Option<Point>,
     review_library_window: ui::VirtualListWindow,
     reference_settings_window: ui::VirtualListWindow,
-    planner_windows: [ui::VirtualListWindow; 4],
+    planner_windows: [ui::VirtualListWindow; storage::TrackStage::COUNT],
     main_comments_window: ui::VirtualListWindow,
     reference_comments_window: ui::VirtualListWindow,
     audio_import_in_flight: Option<AudioImportRequest>,
@@ -11611,16 +11616,10 @@ fn project_surface(state: &AppState) -> ui::View<Message> {
 }
 
 fn planner_panel(state: &AppState, projection: &LibraryProjectionCache) -> ui::View<Message> {
-    let stages = [
-        storage::TrackStage::Backlog,
-        storage::TrackStage::Production,
-        storage::TrackStage::Mixdown,
-        storage::TrackStage::Mastering,
-    ];
     let drag_source_track_id = state.planner_drag_source_track_id.as_deref();
     let drag_active = drag_source_track_id.is_some();
     let drag_target = state.planner_drag_target.as_ref();
-    let columns = stages.into_iter().map(|stage| {
+    let columns = storage::TrackStage::ALL.into_iter().map(|stage| {
         planner_column(
             stage,
             &state.library,
@@ -11661,7 +11660,8 @@ fn planner_panel(state: &AppState, projection: &LibraryProjectionCache) -> ui::V
         header,
         planner_insertion_clear_target(drag_active, "planner-insertion-clear-header"),
     );
-    let content = ui::column([header, ui::row(columns).spacing(10.0).fill()])
+    let columns = ui::scroll(ui::row(columns).spacing(10.0).fill_height()).fill();
+    let content = ui::column([header, columns])
         .padding(WORKSPACE_PANEL_PADDING)
         .spacing(WORKSPACE_PANEL_SPACING)
         .fill();
@@ -11816,7 +11816,9 @@ fn planner_column(
             ),
         )
     };
-    ui::stack([background, column_content]).fill()
+    ui::stack([background, column_content])
+        .width(PLANNER_COLUMN_WIDTH)
+        .fill_height()
 }
 
 fn planner_card_drop_row(
@@ -11935,9 +11937,12 @@ fn planner_column_heading(stage: storage::TrackStage) -> &'static str {
 const fn planner_column_tone(stage: storage::TrackStage) -> ui::WidgetTone {
     match stage {
         storage::TrackStage::Backlog => ui::WidgetTone::Warning,
-        storage::TrackStage::Production => ui::WidgetTone::Accent,
+        storage::TrackStage::Groove
+        | storage::TrackStage::Arrangement
+        | storage::TrackStage::Polish => ui::WidgetTone::Accent,
         storage::TrackStage::Mixdown => ui::WidgetTone::Success,
-        storage::TrackStage::Mastering => ui::WidgetTone::Danger,
+        storage::TrackStage::Master => ui::WidgetTone::Danger,
+        storage::TrackStage::Release => ui::WidgetTone::Success,
     }
 }
 
@@ -12087,7 +12092,7 @@ fn planner_card_with_key(
 #[cfg(test)]
 struct PlannerTrackProjection<'a> {
     ordered: Vec<&'a storage::Track>,
-    by_stage: [Vec<&'a storage::Track>; 4],
+    by_stage: [Vec<&'a storage::Track>; storage::TrackStage::COUNT],
 }
 
 #[cfg(test)]
@@ -12098,12 +12103,7 @@ impl<'a> PlannerTrackProjection<'a> {
 }
 
 fn planner_stage_index(stage: storage::TrackStage) -> usize {
-    match stage {
-        storage::TrackStage::Backlog => 0,
-        storage::TrackStage::Production => 1,
-        storage::TrackStage::Mixdown => 2,
-        storage::TrackStage::Mastering => 3,
-    }
+    stage.index()
 }
 
 #[cfg(test)]
@@ -12235,24 +12235,19 @@ fn stage_menu_anchor_from_pointer(position: Point) -> Point {
 
 fn stage_dropdown_options(track: &storage::Track) -> Vec<ui::DropdownOption<Message>> {
     let stage_id = track.id.clone();
-    [
-        storage::TrackStage::Backlog,
-        storage::TrackStage::Production,
-        storage::TrackStage::Mixdown,
-        storage::TrackStage::Mastering,
-    ]
-    .into_iter()
-    .map(|stage| {
-        ui::DropdownOption::new(
-            stage.label(),
-            track.stage == stage,
-            Message::SetStage {
-                track_id: stage_id.clone(),
-                stage,
-            },
-        )
-    })
-    .collect()
+    storage::TrackStage::ALL
+        .into_iter()
+        .map(|stage| {
+            ui::DropdownOption::new(
+                stage.label(),
+                track.stage == stage,
+                Message::SetStage {
+                    track_id: stage_id.clone(),
+                    stage,
+                },
+            )
+        })
+        .collect()
 }
 
 fn card_control(
@@ -15089,7 +15084,7 @@ mod tests {
             reference_path: Some(PathBuf::from(format!("/external/{id}-reference.wav"))),
             size: 0,
             favorite: false,
-            stage: TrackStage::Production,
+            stage: TrackStage::Groove,
             notes: crate::storage::SharedVec::default(),
         }
     }
@@ -16013,7 +16008,7 @@ mod tests {
             integrated_lufs: Some(-7.0),
             loudness_profile: Arc::from([]),
             summary: Arc::new(
-                radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                crate::signal_summary::GpuSignalSummary::from_interleaved_samples(
                     &[0.0, 0.5, 0.0, 0.5],
                     4,
                     1,
@@ -20204,7 +20199,7 @@ mod tests {
                 integrated_lufs: Some(-7.0),
                 loudness_profile: std::sync::Arc::from([]),
                 summary: Arc::new(
-                    radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                    crate::signal_summary::GpuSignalSummary::from_interleaved_samples(
                         &[0.1, 0.8, 0.2, 0.4],
                         4,
                         1,
@@ -20257,7 +20252,7 @@ mod tests {
                 integrated_lufs: Some(-7.0),
                 loudness_profile: std::sync::Arc::from([]),
                 summary: Arc::new(
-                    radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                    crate::signal_summary::GpuSignalSummary::from_interleaved_samples(
                         &[0.1, 0.8, 0.2, 0.4],
                         4,
                         1,
@@ -20326,7 +20321,7 @@ mod tests {
             integrated_lufs: Some(-7.0),
             loudness_profile: Arc::from([]),
             summary: Arc::new(
-                radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                crate::signal_summary::GpuSignalSummary::from_interleaved_samples(
                     &[0.1, 0.8, 0.2, 0.4],
                     4,
                     1,
@@ -20638,7 +20633,7 @@ mod tests {
                 integrated_lufs: Some(-7.0),
                 loudness_profile: std::sync::Arc::from([]),
                 summary: Arc::new(
-                    radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                    crate::signal_summary::GpuSignalSummary::from_interleaved_samples(
                         &[0.1, 0.8, 0.2, 0.4],
                         4,
                         2,
@@ -20901,7 +20896,7 @@ mod tests {
                     },
                 ]),
                 summary: Arc::new(
-                    radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                    crate::signal_summary::GpuSignalSummary::from_interleaved_samples(
                         &[0.1, 0.8, 0.2, 0.4],
                         4,
                         2,
@@ -20940,7 +20935,7 @@ mod tests {
                 integrated_lufs: Some(-8.0),
                 loudness_profile: std::sync::Arc::from([]),
                 summary: Arc::new(
-                    radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                    crate::signal_summary::GpuSignalSummary::from_interleaved_samples(
                         &[0.1, 0.8, 0.2, 0.4],
                         4,
                         1,
@@ -20965,7 +20960,7 @@ mod tests {
                     },
                 ]),
                 summary: Arc::new(
-                    radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                    crate::signal_summary::GpuSignalSummary::from_interleaved_samples(
                         &[0.1, 0.8, 0.2, 0.4],
                         4,
                         1,
@@ -21010,7 +21005,7 @@ mod tests {
                 },
             ]),
             summary: Arc::new(
-                radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                crate::signal_summary::GpuSignalSummary::from_interleaved_samples(
                     &[0.1, 0.8, 0.2, 0.4],
                     4,
                     1,
@@ -21158,7 +21153,7 @@ mod tests {
             integrated_lufs: Some(-8.0),
             loudness_profile: std::sync::Arc::from([]),
             summary: Arc::new(
-                radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                crate::signal_summary::GpuSignalSummary::from_interleaved_samples(
                     &[0.1, 0.8, 0.2, 0.4],
                     4,
                     2,
@@ -21225,7 +21220,7 @@ mod tests {
             integrated_lufs: Some(-8.0),
             loudness_profile: std::sync::Arc::from([]),
             summary: Arc::new(
-                radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                crate::signal_summary::GpuSignalSummary::from_interleaved_samples(
                     &[0.1, 0.8, 0.2, 0.4],
                     4,
                     2,
@@ -21288,7 +21283,7 @@ mod tests {
             integrated_lufs: Some(-8.0),
             loudness_profile: std::sync::Arc::from([]),
             summary: Arc::new(
-                radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                crate::signal_summary::GpuSignalSummary::from_interleaved_samples(
                     &[0.1, 0.8, 0.2, 0.4],
                     4,
                     2,
@@ -21559,7 +21554,7 @@ mod tests {
             integrated_lufs: Some(-8.0),
             loudness_profile: std::sync::Arc::from([]),
             summary: Arc::new(
-                radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                crate::signal_summary::GpuSignalSummary::from_interleaved_samples(
                     &[0.1, 0.8, 0.2, 0.4],
                     4,
                     2,
@@ -21683,7 +21678,7 @@ mod tests {
             integrated_lufs: Some(-8.0),
             loudness_profile: std::sync::Arc::from([]),
             summary: Arc::new(
-                radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                crate::signal_summary::GpuSignalSummary::from_interleaved_samples(
                     &[0.1, 0.8, 0.2, 0.4],
                     4,
                     2,
@@ -21775,7 +21770,7 @@ mod tests {
             integrated_lufs: Some(-8.0),
             loudness_profile: std::sync::Arc::from([]),
             summary: Arc::new(
-                radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                crate::signal_summary::GpuSignalSummary::from_interleaved_samples(
                     &[0.1, 0.8, 0.2, 0.4],
                     4,
                     2,
@@ -21869,7 +21864,7 @@ mod tests {
             integrated_lufs: Some(-8.0),
             loudness_profile: std::sync::Arc::from([]),
             summary: Arc::new(
-                radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                crate::signal_summary::GpuSignalSummary::from_interleaved_samples(
                     &[0.1, 0.8, 0.2, 0.4],
                     4,
                     2,
@@ -22637,7 +22632,7 @@ mod tests {
             integrated_lufs: Some(-8.0),
             loudness_profile: std::sync::Arc::from([]),
             summary: Arc::new(
-                radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                crate::signal_summary::GpuSignalSummary::from_interleaved_samples(
                     &[0.1, 0.8, 0.2, 0.4],
                     4,
                     2,
@@ -22720,7 +22715,7 @@ mod tests {
             integrated_lufs: Some(-8.0),
             loudness_profile: std::sync::Arc::from([]),
             summary: Arc::new(
-                radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                crate::signal_summary::GpuSignalSummary::from_interleaved_samples(
                     &[0.1, 0.8, 0.2, 0.4],
                     4,
                     2,
@@ -24556,7 +24551,7 @@ mod tests {
                 integrated_lufs: Some(-7.0),
                 loudness_profile: std::sync::Arc::from([]),
                 summary: Arc::new(
-                    radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                    crate::signal_summary::GpuSignalSummary::from_interleaved_samples(
                         &[0.1, 0.8, 0.2, 0.4],
                         4,
                         1,
@@ -24712,7 +24707,7 @@ mod tests {
             integrated_lufs: Some(-8.0),
             loudness_profile: std::sync::Arc::from([]),
             summary: Arc::new(
-                radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                crate::signal_summary::GpuSignalSummary::from_interleaved_samples(
                     &[0.1, 0.8, 0.2, 0.4],
                     4,
                     2,
@@ -24907,7 +24902,7 @@ mod tests {
             reference_path: Some(reference_path.clone()),
             size: 0,
             favorite: false,
-            stage: TrackStage::Production,
+            stage: TrackStage::Groove,
             notes: vec![Note {
                 id: String::from("main-persisted-note"),
                 time_millis: 500,
@@ -26023,7 +26018,7 @@ mod tests {
                 integrated_lufs: Some(-7.0),
                 loudness_profile: Arc::from([]),
                 summary: Arc::new(
-                    radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                    crate::signal_summary::GpuSignalSummary::from_interleaved_samples(
                         &[0.1, 0.8, 0.2, 0.4],
                         4,
                         1,
@@ -26432,7 +26427,7 @@ mod tests {
             integrated_lufs: Some(-7.0),
             loudness_profile: Arc::from([]),
             summary: Arc::new(
-                radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                crate::signal_summary::GpuSignalSummary::from_interleaved_samples(
                     &[0.1, 0.8, 0.2, 0.4],
                     4,
                     1,
@@ -26700,7 +26695,7 @@ mod tests {
                 integrated_lufs: Some(-7.0),
                 loudness_profile: Arc::from([]),
                 summary: Arc::new(
-                    radiant::runtime::GpuSignalSummary::from_interleaved_samples(
+                    crate::signal_summary::GpuSignalSummary::from_interleaved_samples(
                         &[0.1, 0.8, 0.2, 0.4],
                         4,
                         1,
@@ -28239,7 +28234,11 @@ mod tests {
             integrated_lufs: None,
             loudness_profile: Arc::from([]),
             summary: Arc::new(
-                radiant::runtime::GpuSignalSummary::from_interleaved_samples(&[0.2, 0.4], 2, 1),
+                crate::signal_summary::GpuSignalSummary::from_interleaved_samples(
+                    &[0.2, 0.4],
+                    2,
+                    1,
+                ),
             ),
         };
         let mut state = AppState {
@@ -28786,11 +28785,11 @@ mod tests {
         let tracks = vec![
             track("sound", TrackStage::Backlog),
             track("mix", TrackStage::Mixdown),
-            track("production", TrackStage::Production),
+            track("production", TrackStage::Groove),
         ];
 
-        let production = owned_tracks_in_stage(&tracks, TrackStage::Production);
-        let mastering = owned_tracks_in_stage(&tracks, TrackStage::Mastering);
+        let production = owned_tracks_in_stage(&tracks, TrackStage::Groove);
+        let mastering = owned_tracks_in_stage(&tracks, TrackStage::Master);
 
         assert_eq!(production.len(), 1);
         assert_eq!(production[0].id, "production");
@@ -28814,10 +28813,10 @@ mod tests {
         let library = Library {
             tracks: vec![
                 track("sound", TrackStage::Backlog),
-                track("production", TrackStage::Production),
+                track("production", TrackStage::Groove),
                 track("mix", TrackStage::Mixdown),
-                track("master", TrackStage::Mastering),
-                track("tail", TrackStage::Production),
+                track("master", TrackStage::Master),
+                track("tail", TrackStage::Groove),
             ]
             .into(),
             selected_track_id: None,
@@ -28843,7 +28842,7 @@ mod tests {
         assert!(std::ptr::eq(projection.ordered[0], &library.tracks[2]));
         assert!(std::ptr::eq(projection.ordered[1], &library.tracks[0]));
         assert!(std::ptr::eq(
-            projection.tracks_in_stage(TrackStage::Production)[0],
+            projection.tracks_in_stage(TrackStage::Groove)[0],
             &library.tracks[1]
         ));
         assert_eq!(
@@ -28856,7 +28855,7 @@ mod tests {
         );
         assert_eq!(
             projection
-                .tracks_in_stage(TrackStage::Production)
+                .tracks_in_stage(TrackStage::Groove)
                 .iter()
                 .map(|track| track.id.as_str())
                 .collect::<Vec<_>>(),
@@ -28872,7 +28871,7 @@ mod tests {
         );
         assert_eq!(
             projection
-                .tracks_in_stage(TrackStage::Mastering)
+                .tracks_in_stage(TrackStage::Master)
                 .iter()
                 .map(|track| track.id.as_str())
                 .collect::<Vec<_>>(),
@@ -28886,7 +28885,7 @@ mod tests {
             workspace_mode: WorkspaceMode::Planner,
             ..AppState::default()
         };
-        let stages = [TrackStage::Production, TrackStage::Mixdown];
+        let stages = [TrackStage::Groove, TrackStage::Mixdown];
         state.library.tracks = stages
             .into_iter()
             .enumerate()
@@ -28924,7 +28923,7 @@ mod tests {
         );
         let runtime = SurfaceRuntime::new(bridge, Vector2::new(1_180.0, 720.0));
         let production_window =
-            runtime.bridge().state().planner_windows[planner_stage_index(TrackStage::Production)];
+            runtime.bridge().state().planner_windows[planner_stage_index(TrackStage::Groove)];
         (
             runtime.layout().stats.materialized_nodes,
             production_window.window_len(),
@@ -28970,7 +28969,7 @@ mod tests {
         }
         let _after_frame = runtime.frame_with_default_theme();
         assert!(
-            runtime.bridge().state().planner_windows[planner_stage_index(TrackStage::Production)]
+            runtime.bridge().state().planner_windows[planner_stage_index(TrackStage::Groove)]
                 .viewport_start
                 > 0,
             "the hovered Planner column should advance after wheel input"
@@ -28985,6 +28984,59 @@ mod tests {
             materialized_planner_card_titles(&runtime.frame_with_default_theme()).len()
                 < cards_per_stage * 2,
             "wheel scrolling should continue to use bounded virtual materialization"
+        );
+    }
+
+    #[test]
+    fn planner_horizontal_wheel_reaches_release_at_default_width() {
+        let state = AppState {
+            busy: false,
+            workspace_mode: WorkspaceMode::Planner,
+            ..AppState::default()
+        };
+        let bridge = DeclarativeOwnedCommandRuntimeBridge::new(
+            state,
+            |state| project_surface(state).into_surface(),
+            |state, message| {
+                let mut context = ui::UiUpdateContext::default();
+                update(state, message, &mut context);
+                context.into_command()
+            },
+        );
+        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1_180.0, 900.0));
+        let initial_frame = runtime.frame_with_default_theme();
+        assert!(
+            !initial_frame
+                .paint_plan
+                .contains_text(TrackStage::Release.label()),
+            "Release should begin outside the default-width Planner viewport"
+        );
+        let backlog_heading = initial_frame
+            .paint_plan
+            .first_text_run(TrackStage::Backlog.label())
+            .expect("the first Planner stage should be visible at the default width");
+        let board_viewport = runtime
+            .layout()
+            .viewport_bounds
+            .values()
+            .copied()
+            .find(|viewport| viewport.contains(backlog_heading.rect.center()))
+            .expect("the visible Planner stage should identify the board scroll viewport");
+
+        for _ in 0..8 {
+            runtime.dispatch_event(Event::scroll(
+                board_viewport.center(),
+                Vector2::new(240.0, 0.0),
+            ));
+        }
+        let scrolled_frame = runtime.frame_with_default_theme();
+        let release_heading = scrolled_frame
+            .paint_plan
+            .first_text_run(TrackStage::Release.label())
+            .expect("horizontal wheel input should reveal the Release stage");
+        assert!(
+            board_viewport.contains(release_heading.rect.center()),
+            "the Release heading should be inside the board viewport after scrolling"
         );
     }
 
@@ -29059,13 +29111,13 @@ mod tests {
                     .contains(first_card_point)
                     .then_some((*node_id, *viewport))
             })
-            .expect("the first card should identify the Production scroll container");
+            .expect("the first card should identify the Groove scroll container");
 
         let handle_point =
             planner_drag_handle_point_in_viewport(&initial_frame, production_viewport);
         assert!(
             production_viewport.contains(handle_point),
-            "the Production drag should start from a visible handle"
+            "the Groove drag should start from a visible handle"
         );
 
         runtime.dispatch_event(Event::primary_press(handle_point));
@@ -29099,19 +29151,19 @@ mod tests {
                 production_viewport.center(),
                 Vector2::new(0.0, 120.0),
             ));
-            let window = runtime.bridge().state().planner_windows
-                [planner_stage_index(TrackStage::Production)];
+            let window =
+                runtime.bridge().state().planner_windows[planner_stage_index(TrackStage::Groove)];
             reached_final_rows |= window.window_end == cards_per_stage;
         }
         assert!(
             reached_final_rows,
-            "active drag scrolling should update the Production window through the final rows"
+            "active drag scrolling should update the Groove window through the final rows"
         );
         assert_eq!(runtime.pointer_capture(), Some(captured_handle));
 
         let scrolled_frame = runtime.frame_with_default_theme();
         let scrolled_window =
-            runtime.bridge().state().planner_windows[planner_stage_index(TrackStage::Production)];
+            runtime.bridge().state().planner_windows[planner_stage_index(TrackStage::Groove)];
         assert!(scrolled_window.viewport_start > 0);
         assert!(scrolled_window.viewport_end > scrolled_window.viewport_start);
         assert!(scrolled_window.window_start > 0);
@@ -29144,7 +29196,7 @@ mod tests {
         );
         assert!(
             production_viewport.contains(final_target_point),
-            "the final card's lower half should remain inside the keyed Production viewport"
+            "the final card's lower half should remain inside the keyed Groove viewport"
         );
         let insertion_move =
             runtime.dispatch_pointer_move_deferred_refresh_with_outcome(final_target_point);
@@ -29159,7 +29211,7 @@ mod tests {
         assert_eq!(
             insertion_target,
             PlannerInsertionTarget {
-                stage: TrackStage::Production,
+                stage: TrackStage::Groove,
                 slot: final_slot,
             }
         );
@@ -29181,7 +29233,7 @@ mod tests {
         assert!(runtime.bridge().state().planner_drag_pointer.is_none());
 
         let production_ids = planner_tracks_with_favorites(&runtime.bridge().state().library)
-            .tracks_in_stage(TrackStage::Production)
+            .tracks_in_stage(TrackStage::Groove)
             .iter()
             .map(|track| track.id.clone())
             .collect::<Vec<_>>();
@@ -29194,7 +29246,7 @@ mod tests {
         let resumed_frame = runtime.frame_with_default_theme();
         let resumed_layout = runtime.layout();
         let resumed_window =
-            runtime.bridge().state().planner_windows[planner_stage_index(TrackStage::Production)];
+            runtime.bridge().state().planner_windows[planner_stage_index(TrackStage::Groove)];
         assert!(resumed_window.viewport_start > 0);
         assert!(resumed_window.window_start > 0);
         assert!(resumed_window.window_len() < cards_per_stage);
@@ -29208,7 +29260,7 @@ mod tests {
             (resumed_scroll_viewport.min.x - keyed_scroll_viewport.min.x).abs() <= 0.5
                 && (resumed_scroll_viewport.min.y - keyed_scroll_viewport.min.y).abs() <= 0.5
                 && (resumed_scroll_viewport.width() - keyed_scroll_viewport.width()).abs() <= 0.5,
-            "the keyed Production scroll identity should retain its position and width: actual={resumed_scroll_viewport:?}, before={keyed_scroll_viewport:?}"
+            "the keyed Groove scroll identity should retain its position and width: actual={resumed_scroll_viewport:?}, before={keyed_scroll_viewport:?}"
         );
         let moved_source_rect =
             planner_card_title_rect(&resumed_frame, "planner-card-0", keyed_scroll_viewport);
@@ -29268,7 +29320,7 @@ mod tests {
         assert!(end.contains(total_items - 1));
         assert_eq!(end.window_end, total_items);
         let end_target = PlannerInsertionTarget {
-            stage: TrackStage::Production,
+            stage: TrackStage::Groove,
             slot: end.window_end,
         };
         assert_eq!(end_target.slot, total_items);
@@ -29641,7 +29693,7 @@ mod tests {
             &state.library,
             "missing",
             &PlannerInsertionTarget {
-                stage: TrackStage::Mastering,
+                stage: TrackStage::Master,
                 slot: 0,
             },
         ));
@@ -29658,7 +29710,7 @@ mod tests {
             reference_path: None,
             size: 0,
             favorite: false,
-            stage: TrackStage::Production,
+            stage: TrackStage::Groove,
             notes: crate::storage::SharedVec::default(),
         };
         let mut state = AppState {
@@ -29680,13 +29732,13 @@ mod tests {
         update(
             &mut state,
             Message::PlannerInsertionHovered(PlannerInsertionTarget {
-                stage: TrackStage::Production,
+                stage: TrackStage::Groove,
                 slot: 1,
             }),
             &mut context,
         );
         let middle_frame = project_surface(&state)
-            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 900.0));
+            .view_frame_at_size_with_default_theme(Vector2::new(2_000.0, 900.0));
         let middle_markers = middle_frame
             .paint_plan
             .fill_rects()
@@ -29698,13 +29750,13 @@ mod tests {
         update(
             &mut state,
             Message::PlannerInsertionHovered(PlannerInsertionTarget {
-                stage: TrackStage::Production,
+                stage: TrackStage::Groove,
                 slot: 3,
             }),
             &mut context,
         );
         let end_frame = project_surface(&state)
-            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 900.0));
+            .view_frame_at_size_with_default_theme(Vector2::new(2_000.0, 900.0));
         let end_markers = end_frame
             .paint_plan
             .fill_rects()
@@ -29720,13 +29772,13 @@ mod tests {
         update(
             &mut state,
             Message::PlannerInsertionHovered(PlannerInsertionTarget {
-                stage: TrackStage::Mastering,
+                stage: TrackStage::Master,
                 slot: 0,
             }),
             &mut context,
         );
         let empty_frame = project_surface(&state)
-            .view_frame_at_size_with_default_theme(Vector2::new(1180.0, 900.0));
+            .view_frame_at_size_with_default_theme(Vector2::new(2_000.0, 900.0));
         let empty_markers = empty_frame
             .paint_plan
             .fill_rects()
@@ -29750,7 +29802,7 @@ mod tests {
             reference_path: None,
             size: 0,
             favorite: false,
-            stage: TrackStage::Production,
+            stage: TrackStage::Groove,
             notes: crate::storage::SharedVec::default(),
         };
         let mut state = AppState {
@@ -29787,7 +29839,7 @@ mod tests {
         assert_eq!(
             runtime.bridge().state().planner_drag_target,
             Some(PlannerInsertionTarget {
-                stage: TrackStage::Production,
+                stage: TrackStage::Groove,
                 slot: 2,
             })
         );
@@ -29931,7 +29983,7 @@ mod tests {
             reference_path: None,
             size: 0,
             favorite: false,
-            stage: TrackStage::Production,
+            stage: TrackStage::Groove,
             notes: crate::storage::SharedVec::default(),
         };
         let mut state = AppState {
@@ -29959,18 +30011,39 @@ mod tests {
         ));
         runtime.refresh();
 
-        let empty_column_point = runtime
-            .frame_with_default_theme()
+        let frame = runtime.frame_with_default_theme();
+        let target_stage = TrackStage::Mixdown;
+        let target_heading = frame
             .paint_plan
-            .first_text_run_after_x("No tracks here yet.", 600.0)
-            .expect("an empty column should paint its empty-state text")
+            .first_text_run(super::planner_column_heading(target_stage))
+            .expect("the target stage heading should be visible");
+        let target_column = frame
+            .paint_plan
+            .fill_rects()
+            .find(|fill| {
+                fill.color == ThemeTokens::default().surface_overlay
+                    && fill.rect.min.x <= target_heading.rect.min.x
+                    && fill.rect.min.y <= target_heading.rect.min.y
+                    && fill.rect.max.x >= target_heading.rect.max.x
+                    && fill.rect.max.y >= target_heading.rect.max.y
+            })
+            .expect("the target stage column should have a painted surface")
+            .rect;
+        let empty_column_point = frame
+            .paint_plan
+            .text_runs()
+            .find(|run| {
+                run.text.as_str() == "No tracks here yet."
+                    && target_column.contains(run.rect.center())
+            })
+            .expect("the target stage column should paint its empty-state text")
             .rect
             .center();
         runtime.dispatch_pointer_move_deferred_refresh_with_outcome(empty_column_point);
         assert_eq!(
             runtime.bridge().state().planner_drag_target,
             Some(PlannerInsertionTarget {
-                stage: TrackStage::Mixdown,
+                stage: target_stage,
                 slot: 0,
             })
         );
@@ -29980,7 +30053,7 @@ mod tests {
         assert_eq!(
             runtime.bridge().state().planner_drag_target,
             Some(PlannerInsertionTarget {
-                stage: TrackStage::Mixdown,
+                stage: target_stage,
                 slot: 0,
             }),
             "the whole empty column should retain its slot-0 drop target"
@@ -30007,7 +30080,7 @@ mod tests {
         );
         assert_eq!(
             runtime.bridge().state().library.tracks[0].stage,
-            TrackStage::Mixdown
+            target_stage
         );
         assert_eq!(
             runtime.bridge().state().library.planner_order.as_slice(),
@@ -30235,13 +30308,13 @@ mod tests {
         update(
             &mut state,
             Message::PlannerInsertionDropped(PlannerInsertionTarget {
-                stage: TrackStage::Production,
+                stage: TrackStage::Groove,
                 slot: 0,
             }),
             &mut context,
         );
 
-        assert_eq!(state.library.tracks[0].stage, TrackStage::Production);
+        assert_eq!(state.library.tracks[0].stage, TrackStage::Groove);
         assert_eq!(state.library.planner_order.as_slice(), ["drag"]);
         assert!(state.save_admission_pending);
         admit_library_save_for_test(&mut state, &mut context);
@@ -30267,7 +30340,7 @@ mod tests {
             reference_path: None,
             size: 0,
             favorite: false,
-            stage: TrackStage::Production,
+            stage: TrackStage::Groove,
             notes: crate::storage::SharedVec::default(),
         };
 
@@ -30277,12 +30350,7 @@ mod tests {
             .paint_plan
             .text_label_strings();
 
-        for stage in [
-            TrackStage::Backlog,
-            TrackStage::Production,
-            TrackStage::Mixdown,
-            TrackStage::Mastering,
-        ] {
+        for stage in TrackStage::ALL {
             assert!(
                 labels.iter().any(|label| label == stage.label()),
                 "open stage dropdown must paint {} as an option",
@@ -30302,7 +30370,7 @@ mod tests {
             reference_path: None,
             size: 0,
             favorite: false,
-            stage: TrackStage::Production,
+            stage: TrackStage::Groove,
             notes: crate::storage::SharedVec::default(),
         };
         #[derive(Clone)]
@@ -30352,7 +30420,7 @@ mod tests {
         assert!(
             labels
                 .iter()
-                .any(|label| label == TrackStage::Mastering.label()),
+                .any(|label| label == TrackStage::Master.label()),
             "clicking the trigger should project the anchored menu"
         );
     }
@@ -30368,7 +30436,7 @@ mod tests {
             reference_path: None,
             size: 0,
             favorite: false,
-            stage: TrackStage::Production,
+            stage: TrackStage::Groove,
             notes: crate::storage::SharedVec::default(),
         };
         let track_id = track.id.clone();
@@ -30390,7 +30458,7 @@ mod tests {
         assert!(
             labels
                 .iter()
-                .any(|label| label == TrackStage::Mastering.label()),
+                .any(|label| label == TrackStage::Master.label()),
             "keyboard activation should still project the stage menu"
         );
     }
@@ -30406,7 +30474,7 @@ mod tests {
             reference_path: None,
             size: 0,
             favorite: false,
-            stage: TrackStage::Production,
+            stage: TrackStage::Groove,
             notes: crate::storage::SharedVec::default(),
         };
         #[derive(Clone)]
@@ -30455,7 +30523,7 @@ mod tests {
         assert!(
             labels
                 .iter()
-                .any(|label| label == TrackStage::Mastering.label()),
+                .any(|label| label == TrackStage::Master.label()),
             "focused keyboard activation should project the stage menu"
         );
     }
@@ -30471,7 +30539,7 @@ mod tests {
             reference_path: None,
             size: 0,
             favorite: false,
-            stage: TrackStage::Production,
+            stage: TrackStage::Groove,
             notes: crate::storage::SharedVec::default(),
         };
 
@@ -30508,7 +30576,7 @@ mod tests {
                 .iter()
                 .find_map(|primitive| match primitive {
                     PaintPrimitive::Text(text)
-                        if text.text.as_str() == TrackStage::Production.label()
+                        if text.text.as_str() == TrackStage::Groove.label()
                             && text.rect.min.y > 190.0 =>
                     {
                         Some(text.rect)
@@ -30536,14 +30604,14 @@ mod tests {
                 .iter()
                 .find_map(|primitive| match primitive {
                     PaintPrimitive::Text(text)
-                        if text.text.as_str() == TrackStage::Mastering.label()
+                        if text.text.as_str() == TrackStage::Master.label()
                             && text.rect.min.y > trigger_point.y =>
                     {
                         Some(text.rect)
                     }
                     _ => None,
                 })
-                .expect("opened context menu should paint a mastering option below the trigger");
+                .expect("opened context menu should paint a master option below the trigger");
             let anchor = stage_menu_anchor_from_pointer(trigger_point);
             let menu_surface = dropdown_surface_rect(&frame.paint_plan.primitives, anchor)
                 .expect("opened context menu should paint its surface at the pointer anchor");
@@ -30559,7 +30627,7 @@ mod tests {
             assert!(runtime.bridge().state().stage_menu_track_id.is_none());
             assert_eq!(
                 runtime.bridge().state().library.tracks[0].stage,
-                TrackStage::Mastering
+                TrackStage::Master
             );
             let labels_after_selection = runtime
                 .frame(&ThemeTokens::default())
@@ -30568,7 +30636,7 @@ mod tests {
             assert!(
                 labels_after_selection
                     .iter()
-                    .any(|label| label == TrackStage::Mastering.label()),
+                    .any(|label| label == TrackStage::Master.label()),
                 "selecting a stage should update the trigger label"
             );
         }
@@ -30585,7 +30653,7 @@ mod tests {
             reference_path: None,
             size: 0,
             favorite: false,
-            stage: TrackStage::Production,
+            stage: TrackStage::Groove,
             notes: crate::storage::SharedVec::default(),
         };
         #[derive(Clone)]
@@ -30627,7 +30695,7 @@ mod tests {
             .iter()
             .find_map(|primitive| match primitive {
                 PaintPrimitive::Text(text)
-                    if text.text.as_str() == TrackStage::Mastering.label()
+                    if text.text.as_str() == TrackStage::Master.label()
                         && text.rect.min.x < 400.0
                         && text.rect.min.y > 117.0 =>
                 {
@@ -30655,7 +30723,7 @@ mod tests {
         assert!(
             labels_after_selection
                 .iter()
-                .any(|label| label == TrackStage::Mastering.label()),
+                .any(|label| label == TrackStage::Master.label()),
             "selecting an option should update the trigger label"
         );
         let sound_design_count_after = labels_after_selection
@@ -30680,7 +30748,7 @@ mod tests {
             reference_path: None,
             size: 0,
             favorite: false,
-            stage: TrackStage::Production,
+            stage: TrackStage::Groove,
             notes: crate::storage::SharedVec::default(),
         };
 
@@ -30748,7 +30816,7 @@ mod tests {
             reference_path: Some(first_path.clone()),
             size: 0,
             favorite: false,
-            stage: TrackStage::Production,
+            stage: TrackStage::Groove,
             notes: crate::storage::SharedVec::default(),
         });
         state.library.reference_tracks = vec![
@@ -30984,7 +31052,7 @@ mod tests {
             reference_path: None,
             size: 0,
             favorite: false,
-            stage: TrackStage::Production,
+            stage: TrackStage::Groove,
             notes: crate::storage::SharedVec::default(),
         });
 
@@ -31432,7 +31500,7 @@ mod tests {
         state.remove_confirmation_track_id = Some(String::from("stale-removal"));
         state.planner_drag_source_track_id = Some(selected_id.clone());
         state.planner_drag_target = Some(PlannerInsertionTarget {
-            stage: TrackStage::Production,
+            stage: TrackStage::Groove,
             slot: 1,
         });
         state.planner_drag_pointer = Some(Point::new(80.0, 90.0));
@@ -31638,7 +31706,7 @@ mod tests {
             ..AppState::default()
         };
         let frame = project_surface(&state)
-            .view_frame_at_size_with_default_theme(Vector2::new(1_180.0, 900.0));
+            .view_frame_at_size_with_default_theme(Vector2::new(2_000.0, 900.0));
         let contains = |outer: Rect, inner: Rect| {
             inner.min.x >= outer.min.x
                 && inner.min.y >= outer.min.y
@@ -31662,12 +31730,7 @@ mod tests {
             })
             .expect("Planner should paint its outer board with the raised neutral surface");
 
-        for stage in [
-            TrackStage::Backlog,
-            TrackStage::Production,
-            TrackStage::Mixdown,
-            TrackStage::Mastering,
-        ] {
+        for stage in TrackStage::ALL {
             let heading_label = super::planner_column_heading(stage);
             let heading = frame
                 .paint_plan
@@ -31709,7 +31772,7 @@ mod tests {
             ..AppState::default()
         };
         let frame = project_surface(&state)
-            .view_frame_at_size_with_default_theme(Vector2::new(1_180.0, 900.0));
+            .view_frame_at_size_with_default_theme(Vector2::new(2_000.0, 900.0));
         let contains = |outer: Rect, inner: Rect| {
             inner.min.x >= outer.min.x
                 && inner.min.y >= outer.min.y
@@ -31717,21 +31780,19 @@ mod tests {
                 && inner.max.y <= outer.max.y
         };
 
-        for stage in [
-            TrackStage::Backlog,
-            TrackStage::Production,
-            TrackStage::Mixdown,
-            TrackStage::Mastering,
-        ] {
+        for stage in TrackStage::ALL {
             let heading = frame
                 .paint_plan
                 .first_text_run(super::planner_column_heading(stage))
                 .expect("Planner should paint every stage heading");
             let expected_color = match stage {
                 TrackStage::Backlog => theme.accent_warning,
-                TrackStage::Production => theme.accent_mint,
+                TrackStage::Groove | TrackStage::Arrangement | TrackStage::Polish => {
+                    theme.accent_mint
+                }
                 TrackStage::Mixdown => theme.highlight_cyan,
-                TrackStage::Mastering => theme.accent_danger,
+                TrackStage::Master => theme.accent_danger,
+                TrackStage::Release => theme.highlight_cyan,
             };
             assert_eq!(
                 super::planner_stage_visual_color(stage, &theme),
@@ -31783,7 +31844,7 @@ mod tests {
         starred.favorite = true;
         starred.stage = TrackStage::Backlog;
         let mut unstarred = audition_track("unstarred-track");
-        unstarred.stage = TrackStage::Production;
+        unstarred.stage = TrackStage::Groove;
         let mut state = AppState {
             busy: false,
             ..AppState::default()
@@ -32657,9 +32718,9 @@ mod tests {
     fn all_track_card_contexts_paint_shared_chrome_and_selection_states() {
         let mut favorite = audition_track("favorite-track-card");
         favorite.favorite = true;
-        favorite.stage = TrackStage::Production;
+        favorite.stage = TrackStage::Groove;
         let mut selected = audition_track("selected-track-card");
-        selected.stage = TrackStage::Production;
+        selected.stage = TrackStage::Groove;
         let mut state = AppState {
             busy: false,
             ..AppState::default()
@@ -32844,7 +32905,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing {label:?} control bounds"))
         };
         let title_bounds = control_bounds(&track_id);
-        let stage_bounds = control_bounds("Production");
+        let stage_bounds = control_bounds("Groove");
         for (label, bounds) in [("title", title_bounds), ("stage", stage_bounds)] {
             assert!(
                 (bounds.min.x - card_bounds.min.x - super::TRACK_CARD_CONTENT_INSET).abs() < 0.01,

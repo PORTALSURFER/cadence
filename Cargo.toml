@@ -3,11 +3,27 @@ name = "cadence-native"
 version = "0.1.9"
 edition = "2024"
 publish = false
-description = "Native Cadence track review workspace built with Radiant"
+description = "Native Cadence track review workspace built with GPUI"
+autobins = false
+default-run = "cadence-native"
+
+[[bin]]
+name = "cadence-native"
+path = "src/gpui_main.rs"
+
+[[bin]]
+name = "cadence-radiant-legacy"
+path = "src/main.rs"
+required-features = ["radiant-legacy"]
+
+[features]
+default = []
+radiant-legacy = ["dep:radiant"]
 
 [dependencies]
 ebur128 = "0.1.10"
-radiant = { git = "https://github.com/PORTALSURFER/radiant", rev = "1678f918feb721a0187ddd4b262695e3068f8d28" }
+radiant = { git = "https://github.com/PORTALSURFER/radiant", rev = "1678f918feb721a0187ddd4b262695e3068f8d28", optional = true }
+gpui = { version = "=0.2.2", default-features = false, features = ["font-kit", "macos-blade"] }
 libc = "0.2.189"
 rfd = "0.16.0"
 rodio = { version = "0.22.2", features = ["symphonia-all"] }

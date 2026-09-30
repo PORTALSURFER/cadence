@@ -5,6 +5,7 @@
 //! normalized review position back to the Cadence reducer.
 
 use crate::audio::WaveformData;
+
 use radiant::{
     gui::types::{Point, Rect, Rgba8},
     layout::LayoutOutput,
@@ -183,7 +184,7 @@ pub enum WaveformSource {
 struct DisplayBarLevelsCache {
     source: WaveformSource,
     generation: u64,
-    summary: Arc<radiant::runtime::GpuSignalSummary>,
+    summary: Arc<crate::signal_summary::GpuSignalSummary>,
     bar_count: usize,
     levels: Arc<[f32]>,
 }
@@ -483,7 +484,7 @@ struct WaveformWidget {
     timeline: TimelineSurface,
     source: WaveformSource,
     generation: u64,
-    summary: Arc<radiant::runtime::GpuSignalSummary>,
+    summary: Arc<crate::signal_summary::GpuSignalSummary>,
     display_bar_levels_cache: RefCell<Option<DisplayBarLevelsCache>>,
     #[cfg(test)]
     display_bar_levels_miss_count: Cell<usize>,
@@ -1434,7 +1435,7 @@ fn visible_bounds(bounds: Rect, visible_ratio: Option<f32>) -> Rect {
 }
 
 fn display_bar_levels(
-    summary: &radiant::runtime::GpuSignalSummary,
+    summary: &crate::signal_summary::GpuSignalSummary,
     bar_count: usize,
 ) -> Arc<[f32]> {
     let bar_count = bar_count.max(1);
@@ -1708,9 +1709,10 @@ pub fn millis_for_ratio(ratio: f32, duration_millis: u64) -> u64 {
 mod tests {
     use super::*;
     use crate::audio::WaveformData;
+    use crate::signal_summary::GpuSignalSummary;
     use radiant::{
         gui::types::{Point, Rect},
-        runtime::{GpuSignalSummary, PaintPrimitive},
+        runtime::PaintPrimitive,
         theme::ThemeTokens,
         widgets::{Widget, WidgetInput},
     };
@@ -1724,11 +1726,13 @@ mod tests {
             render_frames: 48_000,
             integrated_lufs: Some(-7.0),
             loudness_profile: Arc::from([]),
-            summary: Arc::new(GpuSignalSummary::from_interleaved_samples(
-                &[0.1, 0.8, 0.2, 0.4],
-                4,
-                1,
-            )),
+            summary: Arc::new(
+                crate::signal_summary::GpuSignalSummary::from_interleaved_samples(
+                    &[0.1, 0.8, 0.2, 0.4],
+                    4,
+                    1,
+                ),
+            ),
         }
     }
 

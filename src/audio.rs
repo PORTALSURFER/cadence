@@ -2,10 +2,9 @@
 //!
 //! This module owns only bounded waveform analysis data. Native audition
 //! playback is kept in the separate host-controlled transport module; this
-//! decoder never performs output-device work on the Radiant UI path.
+//! decoder never performs output-device work on a UI path.
 
 use ebur128::{Channel as LoudnessChannel, EbuR128, Mode};
-use radiant::runtime::{GpuSignalSummary, GpuSignalSummaryBucket, GpuSignalSummaryLevel};
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
@@ -26,6 +25,7 @@ use symphonia::core::{
     probe::Hint,
 };
 
+use crate::signal_summary::{GpuSignalSummary, GpuSignalSummaryBucket, GpuSignalSummaryLevel};
 use crate::source::{
     self, AudioSourceProof, SourceFileStamp, VerifiedSourceFile, VerifiedSourceTicket,
 };
@@ -1707,7 +1707,7 @@ mod tests {
         resample_unknown_buckets, resample_unknown_buckets_counted, summary_from_peaks,
         validate_declared_frame_count, write_waveform_cache_if_unchanged,
     };
-    use radiant::runtime::GpuSignalSummary;
+    use crate::signal_summary::GpuSignalSummary;
     #[cfg(unix)]
     use std::{ffi::CString, os::unix::ffi::OsStrExt};
     use std::{
