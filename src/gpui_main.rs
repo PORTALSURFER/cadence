@@ -2,6 +2,7 @@ mod assets;
 #[allow(dead_code)] // Retain the tested native domain APIs during UI migration.
 mod audio;
 mod controller;
+mod feedback_package;
 mod gui;
 mod live_visual;
 #[cfg(target_os = "macos")]

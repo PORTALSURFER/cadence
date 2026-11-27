@@ -9,7 +9,7 @@
 	<key>CFBundleIconFile</key>
 	<string>Cadence.icns</string>
 	<key>CFBundleIdentifier</key>
-	<string>org.portalsurfer.cadence</string>
+	<string>audio.fromvoid.cadence</string>
 	<key>CFBundleName</key>
 	<string>Cadence</string>
 	<key>CFBundlePackageType</key>

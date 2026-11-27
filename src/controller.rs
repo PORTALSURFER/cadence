@@ -29,6 +29,8 @@ impl Source {
 #[derive(Clone, Debug)]
 pub enum ImportKind {
     Main,
+    ExternalReview,
+    FeedbackPackage,
     AddRevision(String),
     Relink(String, Option<String>),
     #[allow(dead_code)]
@@ -43,12 +45,21 @@ enum Work {
     Barrier(Arc<AtomicBool>),
     Save(u64, Library),
     Import(Library, Vec<PathBuf>, ImportKind),
+    ExportFeedback {
+        library: Library,
+        track_id: String,
+        revision_id: Option<String>,
+        reviewer: String,
+        summary: Option<String>,
+        destination: PathBuf,
+    },
     Decode(u64, Source, PathBuf, SourceProvenance),
 }
 enum Event {
     Loaded(Result<Library, String>),
     Saved(u64, Result<storage::PersistenceOutcome, String>),
-    Imported(Result<(Library, Option<String>), String>),
+    Imported(Result<(Library, Option<String>, Option<String>), String>),
+    FeedbackExported(Result<PathBuf, String>),
     Decoded(u64, Source, Result<audio::DecodedAudioFile, String>),
 }
 
@@ -144,8 +155,10 @@ pub struct Controller {
     pub library: Library,
     pub ready: bool,
     pub importing: bool,
+    pub exporting: bool,
     pub error: Option<String>,
     pub warning: Option<String>,
+    pub notice: Option<String>,
     pub generation: u64,
     pub decoded: [Option<audio::DecodedAudioFile>; 2],
     pub analyzing: [bool; 2],
@@ -193,6 +206,7 @@ impl Controller {
                         Work::Import(mut library, paths, kind) => {
                             let mut errors = Vec::new();
                             let mut warnings = Vec::new();
+                            let mut notices = Vec::new();
                             let total_paths = paths.len();
                             for path in paths {
                                 let filename = path
@@ -200,14 +214,80 @@ impl Controller {
                                     .and_then(|n| n.to_str())
                                     .unwrap_or("audio file")
                                     .to_string();
+                                if matches!(
+                                    kind,
+                                    ImportKind::FeedbackPackage
+                                        | ImportKind::Main
+                                        | ImportKind::ExternalReview
+                                ) && crate::feedback_package::is_feedback_package_path(&path)
+                                {
+                                    match storage::import_feedback_package(library.clone(), &path) {
+                                        Ok(saved) => {
+                                            library = saved.value.0;
+                                            match saved.value.1 {
+                                                storage::FeedbackImportResult::MergedIntoExisting {
+                                                    reviewer,
+                                                    added_notes,
+                                                    skipped_duplicates,
+                                                    ..
+                                                } => {
+                                                    if added_notes > 0 {
+                                                        notices.push(format!(
+                                                            "Merged {added_notes} feedback {} from {reviewer} onto matching bounce.",
+                                                            if added_notes == 1 { "comment" } else { "comments" }
+                                                        ));
+                                                    } else if skipped_duplicates > 0 {
+                                                        notices.push(format!(
+                                                            "Feedback from {reviewer} was already imported ({skipped_duplicates} duplicate {} skipped).",
+                                                            if skipped_duplicates == 1 { "comment" } else { "comments" }
+                                                        ));
+                                                    } else {
+                                                        notices.push(format!(
+                                                            "Matched feedback package from {reviewer} to existing bounce."
+                                                        ));
+                                                    }
+                                                }
+                                                storage::FeedbackImportResult::ImportedWithAudio {
+                                                    reviewer,
+                                                    added_notes,
+                                                    ..
+                                                } => {
+                                                    notices.push(format!(
+                                                        "Imported feedback track from {reviewer} with {added_notes} {}.",
+                                                        if added_notes == 1 { "comment" } else { "comments" }
+                                                    ));
+                                                }
+                                            }
+                                            if let Some(w) = saved.outcome.durability_warning() {
+                                                warnings.push(w);
+                                            }
+                                        }
+                                        Err(e) => errors.push(e),
+                                    }
+                                    continue;
+                                } else if matches!(kind, ImportKind::FeedbackPackage) {
+                                    errors.push(format!(
+                                        "{filename} is not a .{} feedback package.",
+                                        crate::feedback_package::FEEDBACK_PACKAGE_EXTENSION
+                                    ));
+                                    continue;
+                                }
                                 let decoded = analysis_cache.decode(&path, None, || false);
                                 match decoded {
                                     Ok(decoded) => match &kind {
-                                        ImportKind::Main => {
-                                            match storage::import_bounce_into_library(
-                                                library.clone(),
-                                                decoded,
-                                            ) {
+                                        ImportKind::Main | ImportKind::ExternalReview => {
+                                            let res = if matches!(kind, ImportKind::ExternalReview) {
+                                                storage::import_external_bounce_into_library(
+                                                    library.clone(),
+                                                    decoded,
+                                                )
+                                            } else {
+                                                storage::import_bounce_into_library(
+                                                    library.clone(),
+                                                    decoded,
+                                                )
+                                            };
+                                            match res {
                                                 Ok(saved) => {
                                                     library = saved.value.0;
                                                     match saved.value.1 {
@@ -233,6 +313,7 @@ impl Controller {
                                                 Err(e) => errors.push(e),
                                             }
                                         }
+                                        ImportKind::FeedbackPackage => {}
                                         ImportKind::AddRevision(id) => {
                                             match storage::add_revision_to_track(
                                                 library.clone(),
@@ -364,8 +445,28 @@ impl Controller {
                             } else {
                                 Some(warnings.join("\n"))
                             };
-                            Event::Imported(Ok((library, warning)))
+                            let notice = if notices.is_empty() {
+                                None
+                            } else {
+                                Some(notices.join("\n"))
+                            };
+                            Event::Imported(Ok((library, warning, notice)))
                         }
+                        Work::ExportFeedback {
+                            library,
+                            track_id,
+                            revision_id,
+                            reviewer,
+                            summary,
+                            destination,
+                        } => Event::FeedbackExported(storage::export_track_feedback_package(
+                            &library,
+                            &track_id,
+                            revision_id.as_deref(),
+                            &reviewer,
+                            summary.as_deref(),
+                            &destination,
+                        )),
                         Work::Decode(generation, src, path, expected) => {
                             let result = analysis_cache.decode(&path, Some(&expected), || {
                                 worker_epoch.load(Ordering::Acquire) != generation
@@ -383,8 +484,10 @@ impl Controller {
             library: Library::default(),
             ready: false,
             importing: false,
+            exporting: false,
             error: None,
             warning: None,
+            notice: None,
             generation: 0,
             decoded: [None, None],
             analyzing: [false, false],
@@ -556,11 +659,27 @@ impl Controller {
                 Event::Imported(result) => {
                     self.importing = false;
                     match result {
-                        Ok((lib, warning)) => {
+                        Ok((lib, warning, notice)) => {
                             self.library = lib;
                             self.saved_revision = self.revision;
                             self.warning = warning;
+                            if notice.is_some() {
+                                self.notice = notice;
+                            }
                             self.load_selected();
+                        }
+                        Err(e) => self.error = Some(e),
+                    }
+                }
+                Event::FeedbackExported(result) => {
+                    self.exporting = false;
+                    match result {
+                        Ok(path) => {
+                            self.error = None;
+                            self.notice = Some(format!(
+                                "Saved feedback package: {}",
+                                path.display()
+                            ));
                         }
                         Err(e) => self.error = Some(e),
                     }
@@ -887,6 +1006,8 @@ impl Controller {
                 time_millis: time,
                 body: body.trim().into(),
                 done: false,
+                author: None,
+                package_id: None,
             });
         }
         notes.as_mut_vec().sort_by_key(|n| n.time_millis);
@@ -1066,6 +1187,63 @@ impl Controller {
             Err(e) => self.error = Some(e),
         }
     }
+    pub fn toggle_external(&mut self, track_id: &str) -> bool {
+        if !self.can_edit() {
+            return false;
+        }
+        let next = match self.library.tracks.iter().find(|t| t.id == track_id) {
+            Some(track) => !track.external,
+            None => return false,
+        };
+        match storage::set_track_external(&mut self.library, track_id, next) {
+            Ok(changed) => {
+                if changed {
+                    self.persist();
+                }
+                true
+            }
+            Err(e) => {
+                self.error = Some(e);
+                false
+            }
+        }
+    }
+    pub fn export_feedback(
+        &mut self,
+        track_id: String,
+        revision_id: Option<String>,
+        reviewer: String,
+        summary: Option<String>,
+        destination: PathBuf,
+    ) -> bool {
+        if !self.can_edit() {
+            return false;
+        }
+        if self.exporting {
+            self.error = Some("Wait for the current feedback export to finish.".into());
+            return false;
+        }
+        let reviewer = reviewer.trim().to_owned();
+        if reviewer.is_empty() {
+            self.error = Some("Enter your name before exporting feedback.".into());
+            return false;
+        }
+        if let Ok(true) = storage::set_reviewer_name(&mut self.library, &reviewer) {
+            self.persist();
+        }
+        self.exporting = true;
+        self.error = None;
+        self.notice = None;
+        self.send(Work::ExportFeedback {
+            library: self.library.clone(),
+            track_id,
+            revision_id,
+            reviewer,
+            summary,
+            destination,
+        });
+        true
+    }
 }
 trait MulRatio {
     fn mul_f32(self, r: f32) -> u64;
@@ -1092,8 +1270,10 @@ mod tests {
                 library,
                 ready: true,
                 importing: false,
+                exporting: false,
                 error: None,
                 warning: None,
+                notice: None,
                 generation: 4,
                 decoded: [None, None],
                 analyzing: [false, false],
@@ -1232,18 +1412,21 @@ mod tests {
                 time_millis: 10,
                 body: "Before".into(),
                 done: false,
+                ..Default::default()
             },
             Note {
                 id: "dragged".into(),
                 time_millis: 40,
                 body: "Old text".into(),
                 done: false,
+                ..Default::default()
             },
             Note {
                 id: "last".into(),
                 time_millis: 80,
                 body: "After".into(),
                 done: false,
+                ..Default::default()
             },
         ]
         .into();
@@ -1422,6 +1605,7 @@ mod tests {
                     time_millis: 30,
                     body: "Dylan note on b1".into(),
                     done: false,
+                    ..Default::default()
                 }]
                 .into(),
                 feedback_note: Some("Heard by Dylan".into()),
@@ -1453,5 +1637,52 @@ mod tests {
         assert_eq!(core.library.tracks[0].notes.len(), 1);
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn toggle_external_and_export_feedback_dispatch_worker_and_persist_reviewer() {
+        let (mut core, jobs, events) = isolated();
+        assert!(!core.library.tracks[0].external);
+        assert!(core.toggle_external("one"));
+        assert!(core.library.tracks[0].external);
+        assert!(matches!(jobs.try_recv().unwrap(), Work::Save(1, _)));
+
+        assert!(!core.export_feedback(
+            "one".into(),
+            None,
+            "   ".into(),
+            None,
+            PathBuf::from("/tmp/out.cadence-feedback"),
+        ));
+        assert!(!core.exporting);
+
+        assert!(core.export_feedback(
+            "one".into(),
+            None,
+            "Wanja".into(),
+            Some("Tighten drop".into()),
+            PathBuf::from("/tmp/out.cadence-feedback"),
+        ));
+        assert!(core.exporting);
+        assert_eq!(core.library.reviewer_name.as_deref(), Some("Wanja"));
+        assert!(matches!(jobs.try_recv().unwrap(), Work::Save(2, _)));
+        assert!(matches!(
+            jobs.try_recv().unwrap(),
+            Work::ExportFeedback { reviewer, .. } if reviewer == "Wanja"
+        ));
+
+        events
+            .send(Event::FeedbackExported(Ok(PathBuf::from(
+                "/tmp/out.cadence-feedback",
+            ))))
+            .unwrap();
+        core.poll();
+        assert!(!core.exporting);
+        assert!(
+            core.notice
+                .as_deref()
+                .unwrap()
+                .contains("/tmp/out.cadence-feedback")
+        );
     }
 }

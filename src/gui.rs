@@ -125,6 +125,12 @@ enum Mode {
     Tracks,
     References,
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LibraryScope {
+    All,
+    Own,
+    External,
+}
 #[derive(Clone, PartialEq, Eq)]
 enum Confirmation {
     Track(String),
@@ -145,6 +151,7 @@ enum Modal {
     Assign(String),
     EditTrack(String),
     AssignToTrack(String),
+    ShareFeedback(String),
     References,
     TagGroup,
     Group(Option<String>),
@@ -179,6 +186,11 @@ enum Command {
     ResolveCollisionKeep(String, String),
     ResolveCollisionReplace(String, String),
     ResolveCollisionSplit(String, String),
+    LibraryScope(LibraryScope),
+    TogglePlannerExternal,
+    ToggleExternal(String),
+    ShareFeedback(String),
+    ExportFeedbackConfirm,
     RemoveTrack(String),
     Assign(String),
     ToggleTag(String, String),
@@ -269,6 +281,8 @@ pub struct Cadence {
     pub core: Controller,
     library_scroll: UniformListScrollHandle,
     mode: Mode,
+    library_scope: LibraryScope,
+    planner_show_external: bool,
     focus: FocusHandle,
     modal_focus: FocusHandle,
     modal_start: FocusHandle,
@@ -295,6 +309,8 @@ pub struct Cadence {
     track_title_input: Entity<InputState>,
     next_action_input: Entity<InputState>,
     revision_feedback_input: Entity<InputState>,
+    reviewer_name_input: Entity<InputState>,
+    feedback_summary_input: Entity<InputState>,
     edit_track_focus_next_action: bool,
     volume: Entity<SliderState>,
     group_filter: Option<String>,
@@ -340,6 +356,11 @@ impl Cadence {
         let revision_feedback_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("e.g. Heard by Dylan — tighten intro 4 bars")
         });
+        let reviewer_name_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Your name (e.g. Wanja)"));
+        let feedback_summary_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Optional overall summary note for recipient…")
+        });
         let volume = cx.new(|_| {
             SliderState::new()
                 .min(0.0)
@@ -360,6 +381,8 @@ impl Cadence {
             &track_title_input,
             &next_action_input,
             &revision_feedback_input,
+            &reviewer_name_input,
+            &feedback_summary_input,
         ] {
             subscriptions.push(cx.subscribe_in(
                 input,
@@ -387,6 +410,19 @@ impl Cadence {
                 },
             ));
         }
+        for input in [&reviewer_name_input, &feedback_summary_input] {
+            subscriptions.push(cx.subscribe_in(
+                input,
+                window,
+                |this, _, event: &InputEvent, window, cx| {
+                    if matches!(event, InputEvent::PressEnter { .. })
+                        && matches!(this.modal, Some(Modal::ShareFeedback(_)))
+                    {
+                        this.act(Command::ExportFeedbackConfirm, window, cx);
+                    }
+                },
+            ));
+        }
         subscriptions.push(cx.subscribe(&volume, |this, _, event: &SliderEvent, cx| {
             let SliderEvent::Change(value) = event;
             this.core.volume = value.start();
@@ -407,7 +443,7 @@ impl Cadence {
         let weak = cx.entity().downgrade();
         window.on_window_should_close(cx, move |_, cx| {
             weak.update(cx, |this, cx| {
-                if this.core.importing || this.core.dirty() {
+                if this.core.importing || this.core.exporting || this.core.dirty() {
                     this.closing = true;
                     this.core.error = Some(
                         "Finishing library save before closing. Retry if saving failed.".into(),
@@ -443,7 +479,11 @@ impl Cadence {
                         if changed || gpu_changed {
                             cx.notify();
                         }
-                        if this.closing && !this.core.dirty() && !this.core.importing {
+                        if this.closing
+                            && !this.core.dirty()
+                            && !this.core.importing
+                            && !this.core.exporting
+                        {
                             cx.quit();
                         }
                     })
@@ -458,6 +498,8 @@ impl Cadence {
             core: Controller::new(),
             library_scroll: UniformListScrollHandle::new(),
             mode: Mode::Review,
+            library_scope: LibraryScope::All,
+            planner_show_external: false,
             focus,
             modal_focus: cx.focus_handle().tab_stop(false),
             modal_start: cx.focus_handle().tab_index(-1).tab_stop(false),
@@ -484,6 +526,8 @@ impl Cadence {
             track_title_input,
             next_action_input,
             revision_feedback_input,
+            reviewer_name_input,
+            feedback_summary_input,
             edit_track_focus_next_action: false,
             volume,
             group_filter: Some("tasks".into()),
@@ -514,14 +558,20 @@ impl Cadence {
         let prompt = match &kind {
             ImportKind::Relink(_, _) => "Locate moved audio file to relink",
             ImportKind::AddRevision(_) => "Choose bounce revision audio file(s)",
-            _ => "Choose audio files",
+            ImportKind::ExternalReview => "Choose external audio file(s) for review",
+            ImportKind::FeedbackPackage => "Choose .cadence-feedback package(s) to import",
+            _ => "Choose audio files or .cadence-feedback packages",
         };
         let picker = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
             multiple: matches!(
                 kind,
-                ImportKind::Main | ImportKind::Catalog | ImportKind::AddRevision(_)
+                ImportKind::Main
+                    | ImportKind::ExternalReview
+                    | ImportKind::FeedbackPackage
+                    | ImportKind::Catalog
+                    | ImportKind::AddRevision(_)
             ),
             prompt: Some(prompt.into()),
         });
@@ -529,6 +579,38 @@ impl Cadence {
             Ok(Ok(Some(paths))) => {
                 let _ = entity.update(cx, |this, cx| {
                     this.core.import(paths, kind);
+                    cx.notify();
+                });
+            }
+            Ok(Err(error)) => {
+                let _ = entity.update(cx, |this, cx| {
+                    this.core.error = Some(error.to_string());
+                    cx.notify();
+                });
+            }
+            _ => {}
+        })
+        .detach();
+    }
+    fn pick_feedback_export(
+        &mut self,
+        track_id: String,
+        revision_id: Option<String>,
+        reviewer: String,
+        summary: Option<String>,
+        suggested_name: String,
+        cx: &mut Context<Self>,
+    ) {
+        let default_dir = std::env::var_os("HOME")
+            .map(|home| PathBuf::from(home).join("Desktop"))
+            .filter(|dir| dir.is_dir())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let picker = cx.prompt_for_new_path(&default_dir, Some(&suggested_name));
+        cx.spawn(async move |entity, cx| match picker.await {
+            Ok(Ok(Some(dest))) => {
+                let _ = entity.update(cx, |this, cx| {
+                    this.core
+                        .export_feedback(track_id, revision_id, reviewer, summary, dest);
                     cx.notify();
                 });
             }
@@ -561,6 +643,7 @@ impl Cadence {
             Command::SaveGroup
                 | Command::SaveNote
                 | Command::SaveTrackDetails
+                | Command::ExportFeedbackConfirm
                 | Command::Confirm
                 | Command::ToggleTag(_, _)
         );
@@ -744,6 +827,81 @@ impl Cadence {
             }
             Command::ResolveCollisionSplit(track_id, collision_id) => {
                 self.core.resolve_collision_split(&track_id, &collision_id);
+            }
+            Command::LibraryScope(scope) => {
+                self.library_scope = scope;
+            }
+            Command::TogglePlannerExternal => {
+                self.planner_show_external = !self.planner_show_external;
+            }
+            Command::ToggleExternal(id) => {
+                self.core.toggle_external(&id);
+            }
+            Command::ShareFeedback(id) => {
+                if let Some(track) = self
+                    .core
+                    .library
+                    .tracks
+                    .iter()
+                    .find(|t| t.id == id)
+                    .cloned()
+                {
+                    let reviewer = self.core.library.reviewer_name.clone().unwrap_or_default();
+                    let summary = track
+                        .active_revision()
+                        .and_then(|r| r.feedback_note.clone())
+                        .unwrap_or_default();
+                    Self::set_input(&self.reviewer_name_input, reviewer, window, cx);
+                    Self::set_input(&self.feedback_summary_input, summary, window, cx);
+                    self.modal = Some(Modal::ShareFeedback(id));
+                }
+            }
+            Command::ExportFeedbackConfirm => {
+                if let Some(Modal::ShareFeedback(track_id)) = self.modal.clone() {
+                    let reviewer = self
+                        .reviewer_name_input
+                        .read(cx)
+                        .value()
+                        .trim()
+                        .to_string();
+                    if reviewer.is_empty() {
+                        self.core.error = Some("Enter your name before exporting feedback.".into());
+                    } else if let Some(track) = self
+                        .core
+                        .library
+                        .tracks
+                        .iter()
+                        .find(|t| t.id == track_id)
+                        .cloned()
+                    {
+                        let summary_text = self
+                            .feedback_summary_input
+                            .read(cx)
+                            .value()
+                            .trim()
+                            .to_string();
+                        let summary = if summary_text.is_empty() {
+                            None
+                        } else {
+                            Some(summary_text)
+                        };
+                        let suggested = crate::feedback_package::suggested_package_filename(
+                            &track.title,
+                            &track.active_build_label(),
+                            &reviewer,
+                        );
+                        self.core.error = None;
+                        self.modal = None;
+                        self.pick_feedback_export(
+                            track_id,
+                            track.active_revision_id,
+                            reviewer,
+                            summary,
+                            suggested,
+                            cx,
+                        );
+                    }
+                }
             }
             Command::RemoveTrack(id) => self.modal = Some(Modal::Confirm(Confirmation::Track(id))),
             Command::Assign(id) => self.modal = Some(Modal::Assign(id)),
@@ -1090,6 +1248,7 @@ impl Cadence {
             Command::DismissError => {
                 self.core.error = None;
                 self.core.warning = None;
+                self.core.notice = None;
             }
         }
         if self.modal != previous_modal {
@@ -1109,6 +1268,15 @@ impl Cadence {
                                 .update(cx, |input, cx| input.focus(window, cx));
                         } else {
                             self.track_title_input
+                                .update(cx, |input, cx| input.focus(window, cx));
+                        }
+                    }
+                    Some(Modal::ShareFeedback(_)) => {
+                        if self.reviewer_name_input.read(cx).value().trim().is_empty() {
+                            self.reviewer_name_input
+                                .update(cx, |input, cx| input.focus(window, cx));
+                        } else {
+                            self.feedback_summary_input
                                 .update(cx, |input, cx| input.focus(window, cx));
                         }
                     }
@@ -1704,6 +1872,23 @@ impl Cadence {
                                 }
                             })),
                     )
+                    .when(track.external, |d| {
+                        d.child(
+                            div()
+                                .px(px(5.))
+                                .h(px(16.))
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .bg(rgb(SURFACE_ALT))
+                                .border_1()
+                                .border_color(rgb(BORDER_STRONG))
+                                .text_color(rgb(MUTED))
+                                .font_family(MONO)
+                                .text_size(px(9.))
+                                .child("EXT"),
+                        )
+                    })
                     .when(missing, |d| {
                         d.child(
                             div()
@@ -1980,6 +2165,8 @@ impl Cadence {
                     time_millis: draft.time,
                     body: String::new(),
                     done: false,
+                    author: None,
+                    package_id: None,
                 });
             }
         }
@@ -2903,24 +3090,49 @@ impl Cadence {
                             })),
                     )
                     .child(
-                        self.key_control(SharedString::from(format!("note-body-{id}")), cx)
-                            .ml(px(120.))
+                        div()
+                            .ml(px(110.))
                             .mr(px(80.))
                             .flex_1()
                             .min_w_0()
-                            .h(px(18.))
-                            .line_height(px(18.))
-                            .text_size(px(13.))
-                            .truncate()
-                            .text_color(rgb(if note.done { MUTED } else { TEXT }))
-                            .cursor_pointer()
-                            .child(note.body.replace(['\n', '\r'], " "))
-                            .on_click(cx.listener({
-                                let id = id.clone();
-                                move |this, _, window, cx| {
-                                    this.act(Command::EditNote(src, id.clone()), window, cx)
-                                }
-                            })),
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .when_some(note.author.clone(), |d, author| {
+                                d.child(
+                                    div()
+                                        .px(px(5.))
+                                        .h(px(16.))
+                                        .flex_shrink_0()
+                                        .flex()
+                                        .items_center()
+                                        .bg(rgb(ACTIVE_BG))
+                                        .border_1()
+                                        .border_color(rgb(ACCENT_DIM))
+                                        .font_family(MONO)
+                                        .text_size(px(9.))
+                                        .text_color(rgb(ACCENT_TEXT))
+                                        .child(author.to_uppercase()),
+                                )
+                            })
+                            .child(
+                                self.key_control(SharedString::from(format!("note-body-{id}")), cx)
+                                    .flex_1()
+                                    .min_w_0()
+                                    .h(px(18.))
+                                    .line_height(px(18.))
+                                    .text_size(px(13.))
+                                    .truncate()
+                                    .text_color(rgb(if note.done { MUTED } else { TEXT }))
+                                    .cursor_pointer()
+                                    .child(note.body.replace(['\n', '\r'], " "))
+                                    .on_click(cx.listener({
+                                        let id = id.clone();
+                                        move |this, _, window, cx| {
+                                            this.act(Command::EditNote(src, id.clone()), window, cx)
+                                        }
+                                    })),
+                            ),
                     )
                     .child(
                         div()
@@ -3117,8 +3329,18 @@ impl Cadence {
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap(px(8.))
+                    .child(self.control(
+                        "review-toggle-external",
+                        if track.external { "External" } else { "Own" },
+                        Command::ToggleExternal(id.clone()),
+                        0.,
+                        track.external,
+                        false,
+                        cx,
+                    ))
                     .child(self.button(
                         "review-edit-details",
                         "Edit details",
@@ -3155,7 +3377,18 @@ impl Cadence {
                         false,
                         false,
                         cx,
-                    )),
+                    ))
+                    .when(!missing, |d| {
+                        d.child(self.control(
+                            "review-share-feedback",
+                            "Share feedback",
+                            Command::ShareFeedback(id.clone()),
+                            0.,
+                            false,
+                            false,
+                            cx,
+                        ))
+                    }),
             );
 
         let mut rev_pills = Vec::new();
@@ -3346,13 +3579,14 @@ impl Cadence {
         strip.into_any_element()
     }
     fn review(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let ids = self
+        let external_count = self
             .core
             .library
             .tracks
             .iter()
-            .map(|t| t.id.clone())
-            .collect::<Vec<_>>();
+            .filter(|t| t.external)
+            .count();
+        let ids = review_library_ids(&self.core.library, self.library_scope);
         let cards = self
             .cards_list("library-scroll", ids, None, cx)
             .track_scroll(self.library_scroll.clone());
@@ -3367,7 +3601,7 @@ impl Cadence {
             .rounded(px(0.))
             .flex()
             .flex_col()
-            .gap(px(16.))
+            .gap(px(12.))
             .child(
                 div()
                     .h(px(40.))
@@ -3402,6 +3636,67 @@ impl Cadence {
                             })),
                     ),
             )
+            .child(
+                div()
+                    .flex()
+                    .gap(px(6.))
+                    .child(
+                        div().flex_1().child(self.control(
+                            "import-external-review",
+                            "+ Review",
+                            Command::Import(ImportKind::ExternalReview),
+                            0.,
+                            false,
+                            false,
+                            cx,
+                        )),
+                    )
+                    .child(
+                        div().flex_1().child(self.control(
+                            "import-feedback-pkg",
+                            "Import pkg",
+                            Command::Import(ImportKind::FeedbackPackage),
+                            0.,
+                            false,
+                            false,
+                            cx,
+                        )),
+                    ),
+            )
+            .when(external_count > 0, |d| {
+                d.child(
+                    div()
+                        .flex()
+                        .gap(px(6.))
+                        .child(self.control(
+                            "scope-all",
+                            "All",
+                            Command::LibraryScope(LibraryScope::All),
+                            0.,
+                            self.library_scope == LibraryScope::All,
+                            false,
+                            cx,
+                        ))
+                        .child(self.control(
+                            "scope-own",
+                            "Own",
+                            Command::LibraryScope(LibraryScope::Own),
+                            0.,
+                            self.library_scope == LibraryScope::Own,
+                            false,
+                            cx,
+                        ))
+                        .child(self.control(
+                            "scope-ext",
+                            format!("Ext ({external_count})"),
+                            Command::LibraryScope(LibraryScope::External),
+                            0.,
+                            self.library_scope == LibraryScope::External,
+                            false,
+                            cx,
+                        )),
+                )
+            })
             .child(cards.flex_1().min_h_0());
         let _scroll_scope = self.scroll_scope("review-workspace");
         let mut workspace = div()
@@ -3449,15 +3744,41 @@ impl Cadence {
                             .text_color(rgb(TEXT_BRIGHT))
                             .child("Start with a track."),
                     )
-                    .child(div().mt(px(40.)).child(self.control(
-                        "empty-import",
-                        "+ Import audio",
-                        Command::Import(ImportKind::Main),
-                        164.,
-                        false,
-                        true,
-                        cx,
-                    ))),
+                    .child(
+                        div()
+                            .mt(px(36.))
+                            .flex()
+                            .flex_wrap()
+                            .justify_center()
+                            .gap(px(10.))
+                            .child(self.control(
+                                "empty-import",
+                                "+ Import audio",
+                                Command::Import(ImportKind::Main),
+                                164.,
+                                false,
+                                true,
+                                cx,
+                            ))
+                            .child(self.control(
+                                "empty-import-external",
+                                "Import for review",
+                                Command::Import(ImportKind::ExternalReview),
+                                164.,
+                                false,
+                                false,
+                                cx,
+                            ))
+                            .child(self.control(
+                                "empty-import-feedback",
+                                "Import feedback pkg",
+                                Command::Import(ImportKind::FeedbackPackage),
+                                172.,
+                                false,
+                                false,
+                                cx,
+                            )),
+                    ),
             );
         }
         div()
@@ -3470,6 +3791,13 @@ impl Cadence {
             .into_any_element()
     }
     fn planner(&self, cx: &mut Context<Self>) -> AnyElement {
+        let external_count = self
+            .core
+            .library
+            .tracks
+            .iter()
+            .filter(|t| t.external)
+            .count();
         let stages = [
             TrackStage::Backlog,
             TrackStage::Production,
@@ -3478,11 +3806,7 @@ impl Cadence {
         ];
         let mut columns = Vec::new();
         for (i, stage) in stages.into_iter().enumerate() {
-            let ids = storage::planner_tracks(&self.core.library)
-                .into_iter()
-                .filter(|t| t.stage == stage)
-                .map(|t| t.id.clone())
-                .collect::<Vec<_>>();
+            let ids = planner_stage_ids(&self.core.library, stage, self.planner_show_external);
             let count = ids.len();
             let cards = self.cards_list(
                 SharedString::from(format!("column-scroll-{i}")),
@@ -3539,11 +3863,51 @@ impl Cadence {
             );
         }
         div()
-            .flex()
             .flex_1()
             .min_h_0()
-            .gap(px(32.))
-            .children(columns)
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .when(external_count > 0, |d| {
+                d.child(
+                    div()
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .px(px(12.))
+                        .py(px(6.))
+                        .bg(rgb(SURFACE))
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .child(caption(if self.planner_show_external {
+                            format!("Showing {external_count} external review track(s) in Planner")
+                        } else {
+                            format!("{external_count} external review track(s) hidden from personal Planner")
+                        }))
+                        .child(self.control(
+                            "planner-toggle-external",
+                            if self.planner_show_external {
+                                "Hide external".to_string()
+                            } else {
+                                format!("Show external ({external_count})")
+                            },
+                            Command::TogglePlannerExternal,
+                            0.,
+                            self.planner_show_external,
+                            false,
+                            cx,
+                        )),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .gap(px(32.))
+                    .children(columns),
+            )
             .into_any_element()
     }
     fn manager_ids(&self, cx: &Context<Self>) -> Vec<String> {
@@ -4957,6 +5321,7 @@ impl Cadence {
             Modal::Assign(_) => "Track tags",
             Modal::EditTrack(_) => "Track details",
             Modal::AssignToTrack(_) => "Assign bounce to track",
+            Modal::ShareFeedback(_) => "Share feedback package",
             Modal::References => "Reference track",
             Modal::TagGroup => "Tag group",
             Modal::Group(_) => "Tag group",
@@ -5220,6 +5585,54 @@ impl Cadence {
                         Command::AssignToTrack(source_id.clone(), target.id.clone()),
                         cx,
                     ));
+                }
+            }
+            Modal::ShareFeedback(track_id) => {
+                if let Some(track) = self.core.library.tracks.iter().find(|t| t.id == track_id) {
+                    let note_count = track.notes.len();
+                    let build = track.active_build_label();
+                    body = body
+                        .child(
+                            div()
+                                .p(px(10.))
+                                .bg(rgb(WELL))
+                                .border_1()
+                                .border_color(rgb(BORDER))
+                                .font_family(MONO)
+                                .text_size(px(10.))
+                                .text_color(rgb(MUTED))
+                                .child(format!(
+                                    "Bundles {} ({}) + {} timestamped {} into one self-contained .cadence-feedback file. Recipients can drag-and-drop it into Cadence.",
+                                    track.title,
+                                    build,
+                                    note_count,
+                                    if note_count == 1 { "comment" } else { "comments" }
+                                )),
+                        )
+                        .child(field(
+                            "Your name (shown on comments for the recipient)",
+                            self.watched_input(&self.reviewer_name_input, cx),
+                        ))
+                        .child(field(
+                            "Overall feedback summary (optional)",
+                            self.watched_input(&self.feedback_summary_input, cx),
+                        ))
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .gap_2()
+                                .child(self.button("cancel-share-feedback", "Cancel", Command::Cancel, cx))
+                                .child(self.control(
+                                    "confirm-share-feedback",
+                                    "Save package…",
+                                    Command::ExportFeedbackConfirm,
+                                    132.,
+                                    false,
+                                    true,
+                                    cx,
+                                )),
+                        );
                 }
             }
             Modal::References => {
@@ -5720,7 +6133,49 @@ impl Render for Cadence {
             root = root.child(bar);
         }
         if self.core.importing {
-            root = root.child(div().text_color(rgb(MUTED)).child("Importing audio…"));
+            root = root.child(div().text_color(rgb(MUTED)).child("Importing…"));
+        }
+        if self.core.exporting {
+            root = root.child(
+                div()
+                    .text_color(rgb(MUTED))
+                    .child("Exporting feedback package…"),
+            );
+        }
+        if self.core.error.is_none()
+            && self.core.warning.is_none()
+            && let Some(notice) = self.core.notice.clone()
+        {
+            let bar = div()
+                .relative()
+                .flex()
+                .items_center()
+                .gap_3()
+                .p_3()
+                .pl(px(14.))
+                .bg(rgb(SURFACE))
+                .border_1()
+                .border_color(rgb(BORDER_STRONG))
+                .rounded(px(0.))
+                .text_color(rgb(TEXT_BRIGHT))
+                .child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top_0()
+                        .bottom_0()
+                        .w(px(2.))
+                        .bg(rgb(TEXT_BRIGHT)),
+                )
+                .child(div().flex_1().child(notice))
+                .child(self.icon_button(
+                    "dismiss-notice",
+                    IconName::Close,
+                    "Dismiss message",
+                    Command::DismissError,
+                    cx,
+                ));
+            root = root.child(bar);
         }
         root = root.child(content);
         if let Some(editor) = self.note_editor(window, cx) {
@@ -5844,7 +6299,7 @@ impl Render for Cadence {
             cx.listener(|this, _: &CloseOverlay, window, cx| this.act(Command::Cancel, window, cx)),
         )
         .on_action(cx.listener(|this, _: &Quit, _, cx| {
-            if this.core.dirty() || this.core.importing {
+            if this.core.dirty() || this.core.importing || this.core.exporting {
                 this.closing = true;
             } else {
                 cx.quit();
@@ -5903,6 +6358,29 @@ fn field(label: &'static str, element: impl IntoElement) -> AnyElement {
         .child(div().text_color(rgb(MUTED)).text_size(px(12.)).child(label))
         .child(element)
         .into_any_element()
+}
+fn review_library_ids(library: &storage::Library, scope: LibraryScope) -> Vec<String> {
+    library
+        .tracks
+        .iter()
+        .filter(|t| match scope {
+            LibraryScope::All => true,
+            LibraryScope::Own => !t.external,
+            LibraryScope::External => t.external,
+        })
+        .map(|t| t.id.clone())
+        .collect()
+}
+fn planner_stage_ids(
+    library: &storage::Library,
+    stage: TrackStage,
+    include_external: bool,
+) -> Vec<String> {
+    storage::planner_tracks(library)
+        .into_iter()
+        .filter(|t| t.stage == stage && (include_external || !t.external))
+        .map(|t| t.id.clone())
+        .collect()
 }
 fn timestamp(ms: u64) -> String {
     format!("{:02}:{:02}", ms / 60000, (ms / 1000) % 60)
@@ -6329,6 +6807,7 @@ mod ui_tests {
                 time_millis: 10_000,
                 body: String::from("Check DJ outro bars"),
                 done: false,
+                ..Default::default()
             }]
             .into(),
             ..Default::default()
@@ -6348,5 +6827,50 @@ mod ui_tests {
         track.next_action.clear();
         track.notes[0].done = true;
         assert_eq!(track.display_next_action(), None);
+    }
+
+    #[test]
+    fn external_tracks_hide_from_personal_planner_by_default_and_filter_in_review_library() {
+        let library = crate::storage::Library {
+            tracks: vec![
+                crate::storage::Track {
+                    id: String::from("own-1"),
+                    title: String::from("My Track"),
+                    stage: crate::storage::TrackStage::Production,
+                    external: false,
+                    ..Default::default()
+                },
+                crate::storage::Track {
+                    id: String::from("ext-1"),
+                    title: String::from("Friend Demo"),
+                    stage: crate::storage::TrackStage::Production,
+                    external: true,
+                    ..Default::default()
+                },
+            ]
+            .into(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            super::planner_stage_ids(&library, crate::storage::TrackStage::Production, false),
+            vec!["own-1"]
+        );
+        assert_eq!(
+            super::planner_stage_ids(&library, crate::storage::TrackStage::Production, true),
+            vec!["own-1", "ext-1"]
+        );
+        assert_eq!(
+            super::review_library_ids(&library, super::LibraryScope::All),
+            vec!["own-1", "ext-1"]
+        );
+        assert_eq!(
+            super::review_library_ids(&library, super::LibraryScope::Own),
+            vec!["own-1"]
+        );
+        assert_eq!(
+            super::review_library_ids(&library, super::LibraryScope::External),
+            vec!["ext-1"]
+        );
     }
 }

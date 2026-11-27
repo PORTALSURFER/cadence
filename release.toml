@@ -36,13 +36,14 @@ CADENCE_DISTRIBUTION_BUILD = "1"
 name = "Cadence.app"
 binary = "target/release/cadence-native"
 executable_name = "Cadence"
-bundle_id = "org.portalsurfer.cadence"
+bundle_id = "audio.fromvoid.cadence"
 display_name = "Cadence"
 icon = "assets/Cadence.icns"
 
 [macos.app.info_plist]
 LSApplicationCategoryType = "public.app-category.music"
 NSHighResolutionCapable = true
+NSHumanReadableCopyright = "fromvoid"
 
 [macos.signing]
 enabled = true
@@ -74,7 +75,7 @@ remote = "origin"
 
 [github]
 enabled = true
-repo = "PORTALSURFER/cadence"
+repo = "fromvoid-audio/cadence"
 title = "Cadence {tag}"
 draft = false
 generate_notes = true

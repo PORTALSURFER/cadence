@@ -4,6 +4,13 @@ All notable Cadence releases are documented here.
 
 ## Unreleased
 
+## 0.3.0
+
+- Add self-contained `.cadence-feedback` package sharing bundling `feedback.json` (reviewer name, optional summary, SHA-256 audio proof, timestamped comments) and the reviewed audio bounce with streaming CRC-32 and SHA-256 integrity checks.
+- Support smart SHA-256 feedback import: drag-and-drop or pick a `.cadence-feedback` package to merge attributed reviewer comments onto a matching local bounce in place (idempotently, without duplicating cards or copying audio) or extract bundled audio into local `shared-audio/` storage when new.
+- Add an External / For Review track flag (`EXT` badge, `+ Review` import, `External / Own` toggle, and `All / Own / Ext` Review library filter) kept out of personal Planner columns by default with a `Show external (N)` toggle, plus terminal reviewer attribution badges on imported comments.
+- Move repository and macOS bundle identity to `fromvoid-audio/cadence` (`audio.fromvoid.cadence`).
+
 ## 0.2.0
 
 - Group dropped `<BATCH><SLOT>_b<BUILD>[__<track-title>]` bounces by batch + slot (uppercase batches `A–Z`, `AA`…, slot `0–9`, lowercase `b` and legacy uppercase `B`, zero-padded build normalization, and untitled files) with highest numeric build current regardless of drop order, without renaming source audio on disk.

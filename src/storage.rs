@@ -396,6 +396,8 @@ pub struct Library {
     pub planner_order: SharedVec<String>,
     #[serde(default)]
     pub tags: crate::tags::TagBook,
+    #[serde(default)]
+    pub reviewer_name: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -581,6 +583,8 @@ pub struct Track {
     pub current_revision_id: Option<String>,
     #[serde(default)]
     pub collisions: SharedVec<BounceCollision>,
+    #[serde(default)]
+    pub external: bool,
 }
 
 impl Default for Track {
@@ -602,6 +606,7 @@ impl Default for Track {
             active_revision_id: None,
             current_revision_id: None,
             collisions: SharedVec::default(),
+            external: false,
         }
     }
 }
@@ -752,12 +757,16 @@ impl TrackStage {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Note {
     pub id: String,
     pub time_millis: u64,
     pub body: String,
     pub done: bool,
+    #[serde(default)]
+    pub author: Option<String>,
+    #[serde(default)]
+    pub package_id: Option<String>,
 }
 
 /// The compact, source-proofed portion of a decoded import that is retained
@@ -1519,6 +1528,7 @@ fn apply_bounce_import_to_library(
         active_revision_id: Some(rev_id.clone()),
         current_revision_id: Some(rev_id.clone()),
         collisions: SharedVec::default(),
+        external: false,
     });
     BounceImportOutcome::CreatedTrack {
         track_id: id,
@@ -1861,6 +1871,7 @@ pub fn resolve_collision_import_as_new_track(
         active_revision_id: Some(rev_id.clone()),
         current_revision_id: Some(rev_id),
         collisions: SharedVec::default(),
+        external: false,
     });
     normalize_planner_order(library);
     library.selected_track_id = Some(new_id.clone());
@@ -1935,6 +1946,407 @@ pub fn set_revision_feedback_note(
     }
     rev.feedback_note = value;
     Ok(true)
+}
+
+/// Set or clear the user's remembered reviewer name used when exporting feedback packages.
+pub fn set_reviewer_name(library: &mut Library, name: &str) -> Result<bool, String> {
+    let trimmed = name.trim();
+    let next = if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    };
+    if library.reviewer_name == next {
+        return Ok(false);
+    }
+    library.reviewer_name = next;
+    Ok(true)
+}
+
+/// Toggle whether a track is an external track imported for giving feedback
+/// (kept out of personal Planner columns by default).
+pub fn set_track_external(
+    library: &mut Library,
+    track_id: &str,
+    external: bool,
+) -> Result<bool, String> {
+    let track = library
+        .tracks
+        .find_mut(|track| track.id == track_id)
+        .ok_or_else(|| String::from("That track is no longer in the library."))?;
+    if track.external == external {
+        return Ok(false);
+    }
+    track.external = external;
+    Ok(true)
+}
+
+/// Import a bounce from someone else marked as `external = true` for giving feedback.
+pub fn import_external_bounce_into_library(
+    library: Library,
+    decoded: crate::audio::DecodedAudioFile,
+) -> Result<Persisted<(Library, BounceImportOutcome)>, String> {
+    import_external_bounce_into_library_at(library, decoded, &library_path())
+}
+
+fn import_external_bounce_into_library_at(
+    mut library: Library,
+    decoded: crate::audio::DecodedAudioFile,
+    library_path: &Path,
+) -> Result<Persisted<(Library, BounceImportOutcome)>, String> {
+    let path = decoded.path().to_path_buf();
+    validate_audio_path(&path)?;
+    ensure_decoded_audio_unchanged(&decoded)?;
+    let metadata = fs::metadata(&path)
+        .map_err(|error| format!("Could not inspect {}: {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("{} is not a file", path.display()));
+    }
+    ensure_decoded_audio_unchanged(&decoded)?;
+
+    let mut occupied = occupied_track_ids(&library);
+    let outcome = apply_bounce_import_to_library(
+        &mut library,
+        path,
+        metadata.len(),
+        decoded.source_proof().clone(),
+        &mut occupied,
+    );
+    if let BounceImportOutcome::CreatedTrack { ref track_id, .. } = outcome
+        && let Some(track) = library.tracks.find_mut(|t| &t.id == track_id)
+    {
+        track.external = true;
+    }
+    normalize_planner_order(&mut library);
+    library.selected_track_id = Some(outcome.track_id().to_owned());
+    ensure_decoded_audio_unchanged(&decoded)?;
+    let persistence = persist_library_at(&library, library_path)?;
+    Ok(Persisted::new((library, outcome), persistence))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FeedbackImportResult {
+    MergedIntoExisting {
+        track_id: String,
+        revision_id: String,
+        reviewer: String,
+        added_notes: usize,
+        skipped_duplicates: usize,
+    },
+    ImportedWithAudio {
+        track_id: String,
+        revision_id: String,
+        reviewer: String,
+        added_notes: usize,
+        extracted_audio_path: PathBuf,
+    },
+}
+
+impl FeedbackImportResult {
+    pub fn track_id(&self) -> &str {
+        match self {
+            Self::MergedIntoExisting { track_id, .. }
+            | Self::ImportedWithAudio { track_id, .. } => track_id,
+        }
+    }
+}
+
+/// Export one track revision together with its audio file and timestamped comments
+/// as a self-contained `.cadence-feedback` package.
+pub fn export_track_feedback_package(
+    library: &Library,
+    track_id: &str,
+    revision_id: Option<&str>,
+    reviewer: &str,
+    summary: Option<&str>,
+    destination: &Path,
+) -> Result<PathBuf, String> {
+    let track = library
+        .tracks
+        .iter()
+        .find(|t| t.id == track_id)
+        .ok_or_else(|| String::from("That track is no longer in the library."))?;
+
+    let (source_path, original_name, expected_proof, build, build_label, notes, rev_feedback) =
+        if let Some(rev) = revision_id
+            .and_then(|rid| track.revisions.iter().find(|r| r.id == rid))
+            .or_else(|| track.active_revision())
+        {
+            (
+                rev.path.as_path(),
+                rev.original_name.as_str(),
+                rev.source_proof.verified_proof(),
+                rev.build,
+                rev.label.clone(),
+                rev.notes.as_slice(),
+                rev.feedback_note.as_deref(),
+            )
+        } else {
+            let parsed = parse_bounce_filename(Path::new(&track.original_name))
+                .or_else(|| parse_bounce_filename(&track.path));
+            (
+                track.path.as_path(),
+                track.original_name.as_str(),
+                track.source_proof.verified_proof(),
+                parsed.as_ref().map(|p| p.build),
+                track.active_build_label(),
+                track.notes.as_slice(),
+                None,
+            )
+        };
+
+    let shared_notes = notes
+        .iter()
+        .map(|n| crate::feedback_package::SharedNote {
+            id: n.id.clone(),
+            time_millis: n.time_millis,
+            body: n.body.clone(),
+            done: n.done,
+            author: n.author.clone(),
+        })
+        .collect::<Vec<_>>();
+    let effective_summary = summary
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or(rev_feedback);
+
+    crate::feedback_package::export_feedback_package(
+        crate::feedback_package::ExportPackageRequest {
+            reviewer,
+            summary: effective_summary,
+            track_title: &track.title,
+            group_key: track.effective_group_key().as_deref(),
+            build,
+            build_label: &build_label,
+            original_name,
+            source_path,
+            expected_proof,
+            notes: shared_notes,
+        },
+        destination,
+    )
+}
+
+/// Import a self-contained `.cadence-feedback` package into the library.
+///
+/// - If any track/revision already owns the exact audio SHA-256 + byte length,
+///   merges the reviewer's attributed notes onto that exact revision in place
+///   without duplicating the track or copying the audio.
+/// - Otherwise verifies and extracts the bundled audio into local `shared-audio/`
+///   storage, imports the track (marked external unless grouped onto an existing
+///   track), and attaches all attributed notes.
+pub fn import_feedback_package(
+    library: Library,
+    package_path: &Path,
+) -> Result<Persisted<(Library, FeedbackImportResult)>, String> {
+    import_feedback_package_at(
+        library,
+        package_path,
+        &library_path(),
+        &shared_audio_directory(),
+    )
+}
+
+fn import_feedback_package_at(
+    mut library: Library,
+    package_path: &Path,
+    library_path: &Path,
+    shared_audio_dir: &Path,
+) -> Result<Persisted<(Library, FeedbackImportResult)>, String> {
+    let inspected = crate::feedback_package::inspect_feedback_package(package_path)?;
+    let manifest = &inspected.manifest;
+
+    // 1. Look for an existing track + revision with matching verified AudioSourceProof.
+    let matched = find_revision_by_source_proof(&library, &manifest.source_proof);
+    if let Some((track_id, matched_rev_id)) = matched {
+        // Verify bundled audio integrity before trusting any manifest comments.
+        crate::feedback_package::verify_bundled_audio(package_path, &inspected)?;
+        let (revision_id, added_notes, skipped_duplicates) = merge_manifest_into_track(
+            &mut library,
+            &track_id,
+            matched_rev_id.as_deref(),
+            manifest,
+        )?;
+        library.selected_track_id = Some(track_id.clone());
+        let outcome = persist_library_at(&library, library_path)?;
+        return Ok(Persisted::new(
+            (
+                library,
+                FeedbackImportResult::MergedIntoExisting {
+                    track_id,
+                    revision_id,
+                    reviewer: manifest.reviewer.clone(),
+                    added_notes,
+                    skipped_duplicates,
+                },
+            ),
+            outcome,
+        ));
+    }
+
+    // 2. Audio not present locally: verify & extract bundled audio, decode to confirm
+    // playability, import into library, and attach attributed notes.
+    let extracted_path =
+        crate::feedback_package::extract_verified_audio(package_path, &inspected, shared_audio_dir)?;
+    let decoded = crate::audio::decode_audio_file(&extracted_path)
+        .map_err(|err| format!("Bundled audio could not be decoded: {err}"))?;
+    if decoded.source_proof() != &manifest.source_proof {
+        return Err(String::from(
+            "Extracted audio proof does not match the feedback package manifest.",
+        ));
+    }
+    let metadata = fs::metadata(&extracted_path)
+        .map_err(|err| format!("Could not inspect extracted audio: {err}"))?;
+
+    let mut occupied = occupied_track_ids(&library);
+    let import_outcome = apply_bounce_import_to_library(
+        &mut library,
+        extracted_path.clone(),
+        metadata.len(),
+        decoded.source_proof().clone(),
+        &mut occupied,
+    );
+    let track_id = import_outcome.track_id().to_owned();
+    let created_new = matches!(import_outcome, BounceImportOutcome::CreatedTrack { .. });
+    if created_new
+        && let Some(track) = library.tracks.find_mut(|t| t.id == track_id)
+    {
+        if !manifest.track_title.trim().is_empty() {
+            track.title = manifest.track_title.trim().to_owned();
+        }
+        track.external = true;
+    }
+
+    let target_rev_id = match &import_outcome {
+        BounceImportOutcome::CreatedTrack { revision_id, .. }
+        | BounceImportOutcome::AddedRevision { revision_id, .. }
+        | BounceImportOutcome::DuplicateIgnored { revision_id, .. } => Some(revision_id.clone()),
+        BounceImportOutcome::CollisionFlagged { .. } => None,
+    };
+    let (revision_id, added_notes, _) = merge_manifest_into_track(
+        &mut library,
+        &track_id,
+        target_rev_id.as_deref(),
+        manifest,
+    )?;
+
+    normalize_planner_order(&mut library);
+    library.selected_track_id = Some(track_id.clone());
+    let persistence = persist_library_at(&library, library_path)?;
+    Ok(Persisted::new(
+        (
+            library,
+            FeedbackImportResult::ImportedWithAudio {
+                track_id,
+                revision_id,
+                reviewer: manifest.reviewer.clone(),
+                added_notes,
+                extracted_audio_path: extracted_path,
+            },
+        ),
+        persistence,
+    ))
+}
+
+fn find_revision_by_source_proof(
+    library: &Library,
+    proof: &crate::source::AudioSourceProof,
+) -> Option<(String, Option<String>)> {
+    for track in &library.tracks {
+        if let Some(rev) = track
+            .revisions
+            .iter()
+            .find(|r| r.source_proof.verified_proof() == Some(proof))
+        {
+            return Some((track.id.clone(), Some(rev.id.clone())));
+        }
+        if track.source_proof.verified_proof() == Some(proof) {
+            return Some((track.id.clone(), track.active_revision_id.clone()));
+        }
+    }
+    None
+}
+
+fn merge_manifest_into_track(
+    library: &mut Library,
+    track_id: &str,
+    revision_id: Option<&str>,
+    manifest: &crate::feedback_package::FeedbackManifest,
+) -> Result<(String, usize, usize), String> {
+    let track = library
+        .tracks
+        .find_mut(|t| t.id == track_id)
+        .ok_or_else(|| String::from("That track is no longer in the library."))?;
+    ensure_track_revisions_initialized(track);
+
+    let target_id = revision_id
+        .map(str::to_owned)
+        .or_else(|| track.active_revision_id.clone())
+        .or_else(|| track.current_revision_id.clone())
+        .ok_or_else(|| String::from("Could not locate target revision for feedback merge."))?;
+
+    let rev = track
+        .revisions
+        .iter_mut()
+        .find(|r| r.id == target_id)
+        .ok_or_else(|| String::from("Target revision is no longer on the track."))?;
+
+    let mut added = 0_usize;
+    let mut skipped = 0_usize;
+    for shared in &manifest.notes {
+        let dedupe_key = format!("{}:{}", manifest.package_id, shared.id);
+        if rev
+            .notes
+            .iter()
+            .any(|existing| existing.package_id.as_deref() == Some(dedupe_key.as_str()))
+        {
+            skipped += 1;
+            continue;
+        }
+        let body = shared.body.trim();
+        if body.is_empty() {
+            continue;
+        }
+        let note_id = allocate_note_id(&rev.notes);
+        let author = shared
+            .author
+            .as_deref()
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .unwrap_or(manifest.reviewer.trim())
+            .to_owned();
+        rev.notes.push(Note {
+            id: note_id,
+            time_millis: shared.time_millis,
+            body: body.to_owned(),
+            done: shared.done,
+            author: Some(author),
+            package_id: Some(dedupe_key),
+        });
+        added += 1;
+    }
+    rev.notes.as_mut_vec().sort_by_key(|n| n.time_millis);
+
+    if let Some(summary) = manifest
+        .summary
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let entry = format!("{}: {summary}", manifest.reviewer.trim());
+        match &mut rev.feedback_note {
+            Some(existing) if existing.contains(&entry) => {}
+            Some(existing) if !existing.trim().is_empty() => {
+                existing.push_str(" · ");
+                existing.push_str(&entry);
+            }
+            slot => *slot = Some(entry),
+        }
+    }
+
+    track.active_revision_id = Some(target_id.clone());
+    sync_track_from_active_revision(track);
+    Ok((target_id, added, skipped))
 }
 
 /// Replace the source file for one existing track while preserving its stable
@@ -3159,7 +3571,11 @@ fn app_data_directory() -> PathBuf {
         .join(".local/share/cadence")
 }
 
-fn validate_audio_path(path: &Path) -> Result<(), String> {
+pub fn shared_audio_directory() -> PathBuf {
+    app_data_directory().join("shared-audio")
+}
+
+pub(crate) fn validate_audio_path(path: &Path) -> Result<(), String> {
     let extension = path
         .extension()
         .and_then(|extension| extension.to_str())
@@ -3262,6 +3678,7 @@ mod tests {
                     time_millis: 900,
                     body: String::from("Compare the low-end tail."),
                     done: false,
+                    ..Default::default()
                 }]
                 .into(),
                 ..Default::default()
@@ -3277,12 +3694,14 @@ mod tests {
                     time_millis: 1_100,
                     body: String::from("Check the reference vocal."),
                     done: true,
+                    ..Default::default()
                 }]
                 .into(),
             }]
             .into(),
             planner_order: vec![String::from("track-1")].into(),
             tags: Default::default(),
+            reviewer_name: None,
         }
     }
 
@@ -4550,12 +4969,14 @@ mod tests {
                     time_millis: 900,
                     body: String::from("Compare the low-end tail."),
                     done: false,
+                    ..Default::default()
                 }]
                 .into(),
             }]
             .into(),
             planner_order: Vec::new().into(),
             tags: Default::default(),
+            reviewer_name: None,
         };
 
         let (index, removed) = remove_track(&mut library, "track-1").expect("track should exist");
@@ -4587,6 +5008,7 @@ mod tests {
             reference_tracks: Vec::new().into(),
             planner_order: Vec::new().into(),
             tags: Default::default(),
+            ..Default::default()
         };
 
         assert_eq!(
@@ -4621,6 +5043,7 @@ mod tests {
             reference_tracks: Vec::new().into(),
             planner_order: Vec::new().into(),
             tags: Default::default(),
+            reviewer_name: None,
         };
 
         assert!(
@@ -4662,6 +5085,7 @@ mod tests {
             reference_tracks: Vec::new().into(),
             planner_order: Vec::new().into(),
             tags: Default::default(),
+            ..Default::default()
         };
         normalize_planner_order(&mut legacy);
         assert_eq!(legacy.planner_order.as_slice(), ["starred", "plain"]);
@@ -4700,6 +5124,7 @@ mod tests {
             ]
             .into(),
             tags: Default::default(),
+            ..Default::default()
         };
         let projected = planner_tracks(&explicit);
 
@@ -4727,6 +5152,7 @@ mod tests {
             reference_tracks: Vec::new().into(),
             planner_order: Vec::new().into(),
             tags: Default::default(),
+            ..Default::default()
         };
         let legacy_projected = planner_tracks(&legacy);
         assert_eq!(
@@ -4757,6 +5183,7 @@ mod tests {
             reference_tracks: Vec::new().into(),
             planner_order: vec![String::from("a"), String::from("b"), String::from("c")].into(),
             tags: Default::default(),
+            ..Default::default()
         };
 
         assert!(
@@ -4786,6 +5213,7 @@ mod tests {
             reference_tracks: Vec::new().into(),
             planner_order: vec![String::from("source"), String::from("unrelated")].into(),
             tags: Default::default(),
+            ..Default::default()
         };
         let unrelated_pointer = std::ptr::from_ref(&library.tracks[1]);
 
@@ -4817,6 +5245,7 @@ mod tests {
             ]
             .into(),
             tags: Default::default(),
+            ..Default::default()
         };
 
         assert!(
@@ -4845,6 +5274,7 @@ mod tests {
             reference_tracks: Vec::new().into(),
             planner_order: vec![String::from("a")].into(),
             tags: Default::default(),
+            ..Default::default()
         };
         let before = library.clone();
 
@@ -4862,6 +5292,7 @@ mod tests {
             reference_tracks: Vec::new().into(),
             planner_order: vec![String::from("a")].into(),
             tags: Default::default(),
+            ..Default::default()
         };
 
         assert!(
@@ -4890,6 +5321,7 @@ mod tests {
                     time_millis: 1_250,
                     body: String::from("Recheck the vocal entrance."),
                     done: false,
+                    ..Default::default()
                 }]
                 .into(),
                 ..Default::default()
@@ -4899,6 +5331,7 @@ mod tests {
             reference_tracks: Vec::new().into(),
             planner_order: Vec::new().into(),
             tags: Default::default(),
+            reviewer_name: None,
         };
 
         replace_track_metadata(
@@ -5031,6 +5464,7 @@ mod tests {
             time_millis: 250,
             body: String::from("Keep this note on the catalog entry."),
             done: false,
+            ..Default::default()
         };
         let track = |id: &str, reference_path: Option<PathBuf>| Track {
             id: id.to_owned(),
@@ -5075,6 +5509,7 @@ mod tests {
             ]
             .into(),
             tags: Default::default(),
+            ..Default::default()
         };
         persist_library_at(&library, &library_path).expect("original library should persist");
 
@@ -5167,12 +5602,14 @@ mod tests {
                     time_millis: 100,
                     body: String::from("Keep this note."),
                     done: false,
+                    ..Default::default()
                 }]
                 .into(),
             }]
             .into(),
             planner_order: vec![String::from("owner")].into(),
             tags: Default::default(),
+            reviewer_name: None,
         };
         persist_library_at(&library, &library_path).expect("original library should persist");
         let original_bytes = fs::read(&library_path).expect("original snapshot should read");
@@ -5213,6 +5650,7 @@ mod tests {
             time_millis: 100,
             body: String::from("Preserve across a same-path re-import."),
             done: true,
+            ..Default::default()
         };
         let library = Library {
             tracks: vec![Track {
@@ -5241,6 +5679,7 @@ mod tests {
             .into(),
             planner_order: vec![String::from("owner")].into(),
             tags: Default::default(),
+            reviewer_name: None,
         };
         persist_library_at(&library, &library_path).expect("original library should persist");
 
@@ -5318,6 +5757,7 @@ mod tests {
             .into(),
             planner_order: vec![String::from("owner")].into(),
             tags: Default::default(),
+            reviewer_name: None,
         };
         persist_library_at(&library, &library_path).expect("original library should persist");
         let original_bytes = fs::read(&library_path).expect("original snapshot should read");
@@ -5389,6 +5829,7 @@ mod tests {
             time_millis: 125,
             body: String::from("keep this note"),
             done: false,
+            ..Default::default()
         }]
         .into();
         let mut library = Library {
@@ -5416,6 +5857,7 @@ mod tests {
             .into(),
             planner_order: vec![String::from("owner")].into(),
             tags: Default::default(),
+            reviewer_name: None,
         };
 
         let selected =
@@ -5498,12 +5940,14 @@ mod tests {
             time_millis: 10,
             body: String::from("preserve main bytes"),
             done: true,
+            ..Default::default()
         };
         let reference_note = Note {
             id: String::from("reference-note"),
             time_millis: 20,
             body: String::from("preserve reference bytes"),
             done: false,
+            ..Default::default()
         };
         let mut library = Library {
             tracks: vec![Track {
@@ -5530,6 +5974,7 @@ mod tests {
             .into(),
             planner_order: vec![String::from("owner")].into(),
             tags: Default::default(),
+            reviewer_name: None,
         };
         persist_library_at(&library, &library_path).expect("unknown library should persist");
 
@@ -5592,12 +6037,14 @@ mod tests {
                     time_millis: 1,
                     body: String::from("keep"),
                     done: true,
+                    ..Default::default()
                 }]
                 .into(),
             }]
             .into(),
             planner_order: vec![String::from("owner")].into(),
             tags: Default::default(),
+            reviewer_name: None,
         };
         persist_library_at(&library, &library_path).expect("original library should persist");
         let original_bytes = fs::read(&library_path).expect("original snapshot should read");
@@ -5717,6 +6164,7 @@ mod tests {
                     time_millis: 1_250,
                     body: String::from("Check the kick tail."),
                     done: false,
+                    ..Default::default()
                 }]
                 .into(),
                 ..Default::default()
@@ -5726,6 +6174,7 @@ mod tests {
             reference_tracks: Vec::new().into(),
             planner_order: Vec::new().into(),
             tags: Default::default(),
+            reviewer_name: None,
         };
         let encoded = serde_json::to_string(&library).expect("library should encode");
         assert!(encoded.contains(r#""stage":"mixdown""#));
@@ -5813,6 +6262,7 @@ mod tests {
             reference_tracks: Vec::new().into(),
             planner_order: Vec::new().into(),
             tags: Default::default(),
+            reviewer_name: None,
         };
 
         normalize_reference_tracks(&mut library);
@@ -5848,6 +6298,7 @@ mod tests {
             reference_tracks: Vec::new().into(),
             planner_order: Vec::new().into(),
             tags: Default::default(),
+            reviewer_name: None,
         };
 
         ensure_reference_track(&mut library, reference_path.clone());
@@ -5893,6 +6344,7 @@ mod tests {
                         time_millis: 100,
                         body: String::from("Discard with the catalog entry."),
                         done: false,
+                        ..Default::default()
                     }]
                     .into(),
                 },
@@ -5906,6 +6358,7 @@ mod tests {
             .into(),
             planner_order: Vec::new().into(),
             tags: Default::default(),
+            ..Default::default()
         };
 
         assert_eq!(
@@ -5955,6 +6408,7 @@ mod tests {
                         time_millis: 100,
                         body: String::from("First reference only."),
                         done: false,
+                        ..Default::default()
                     }]
                     .into(),
                 },
@@ -5967,6 +6421,7 @@ mod tests {
                         time_millis: 200,
                         body: String::from("Second reference only."),
                         done: false,
+                        ..Default::default()
                     }]
                     .into(),
                 },
@@ -5974,6 +6429,7 @@ mod tests {
             .into(),
             planner_order: Vec::new().into(),
             tags: Default::default(),
+            reviewer_name: None,
         };
 
         assert!(
@@ -6007,6 +6463,7 @@ mod tests {
                     time_millis: 1_250,
                     body: String::from("Keep the vocal entrance."),
                     done: false,
+                    ..Default::default()
                 }]
                 .into(),
                 ..Default::default()
@@ -6016,6 +6473,7 @@ mod tests {
             reference_tracks: Vec::new().into(),
             planner_order: Vec::new().into(),
             tags: Default::default(),
+            reviewer_name: None,
         };
 
         set_reference_track_metadata(
@@ -6307,6 +6765,7 @@ mod tests {
             time_millis: 12_500,
             body: String::from("Kick dips at drop"),
             done: false,
+            ..Default::default()
         });
         sync_active_revision_notes(&mut library, &track_id);
 
@@ -6325,6 +6784,7 @@ mod tests {
             time_millis: 45_000,
             body: String::from("Outro transition smoother"),
             done: false,
+            ..Default::default()
         });
         sync_active_revision_notes(&mut library, &track_id);
         let b2_rev_id = library.tracks[0].active_revision_id.clone().unwrap();
@@ -6416,6 +6876,7 @@ mod tests {
                     time_millis: 5_000,
                     body: format!("Baseline note for {name}"),
                     done: false,
+                    ..Default::default()
                 });
             sync_active_revision_notes(&mut library, &id);
         }
@@ -6461,5 +6922,158 @@ mod tests {
             Some("Heard by Dylan — extend DJ exit")
         );
         assert_eq!(a2_b1.notes.len(), 1);
+    }
+
+    #[test]
+    fn feedback_package_exports_merges_by_sha256_extracts_when_new_and_is_idempotent() {
+        let reviewer_dir = TestDirectory::new();
+        let owner_dir = TestDirectory::new();
+        let recipient_dir = TestDirectory::new();
+
+        // 1. Reviewer (Wanja) imports someone else's WAV as an external track, adds comments, and exports package.
+        let (friend_wav, decoded) =
+            write_decoded_bounce(&reviewer_dir.path, "A1_b2__club-tool.wav", 2400);
+        let reviewer_lib_path = reviewer_dir.path.join("library.json");
+        let saved = import_external_bounce_into_library_at(
+            Library::default(),
+            decoded,
+            &reviewer_lib_path,
+        )
+        .expect("external import should succeed");
+        let mut reviewer_lib = saved.value.0;
+        let reviewer_track_id = saved.value.1.track_id().to_owned();
+        assert!(reviewer_lib.tracks[0].external);
+        reviewer_lib.tracks[0].notes.push(Note {
+            id: String::from("rev-n1"),
+            time_millis: 15_000,
+            body: String::from("Sub drops 2dB at the break"),
+            done: false,
+            ..Default::default()
+        });
+        sync_active_revision_notes(&mut reviewer_lib, &reviewer_track_id);
+
+        let pkg_path = reviewer_dir.path.join("club-tool-review.cadence-feedback");
+        let exported = export_track_feedback_package(
+            &reviewer_lib,
+            &reviewer_track_id,
+            None,
+            "Wanja",
+            Some("Strong groove, check the break transition"),
+            &pkg_path,
+        )
+        .expect("export feedback package should succeed");
+        assert_eq!(exported, pkg_path);
+        assert!(friend_wav.is_file(), "source audio must never be moved or renamed");
+
+        // 2. Owner (Dylan) ALREADY has the exact same bounce under a different filename/path + personal notes.
+        let owner_lib_path = owner_dir.path.join("library.json");
+        let owner_shared_dir = owner_dir.path.join("shared-audio");
+        let (_, owner_decoded) =
+            write_decoded_bounce(&owner_dir.path, "my_local_master_copy.wav", 2400);
+        let owner_saved =
+            import_bounce_into_library_at(Library::default(), owner_decoded, &owner_lib_path)
+                .expect("owner import");
+        let mut owner_lib = owner_saved.value.0;
+        let owner_track_id = owner_saved.value.1.track_id().to_owned();
+        owner_lib.tracks[0].notes.push(Note {
+            id: String::from("own-n1"),
+            time_millis: 5_000,
+            body: String::from("My own intro note"),
+            done: false,
+            ..Default::default()
+        });
+        sync_active_revision_notes(&mut owner_lib, &owner_track_id);
+
+        let merged = import_feedback_package_at(
+            owner_lib,
+            &exported,
+            &owner_lib_path,
+            &owner_shared_dir,
+        )
+        .expect("SHA-256 merge should succeed");
+        let (owner_lib, result) = merged.value;
+        match result {
+            FeedbackImportResult::MergedIntoExisting {
+                track_id,
+                reviewer,
+                added_notes,
+                skipped_duplicates,
+                ..
+            } => {
+                assert_eq!(track_id, owner_track_id);
+                assert_eq!(reviewer, "Wanja");
+                assert_eq!(added_notes, 1);
+                assert_eq!(skipped_duplicates, 0);
+            }
+            other => panic!("expected MergedIntoExisting, got {other:?}"),
+        }
+        assert_eq!(owner_lib.tracks.len(), 1, "must not duplicate owner track");
+        assert!(!owner_lib.tracks[0].external, "owner track stays own");
+        assert!(!owner_shared_dir.exists(), "must not copy audio when matched locally");
+        assert_eq!(owner_lib.tracks[0].notes.len(), 2);
+        assert_eq!(owner_lib.tracks[0].notes[0].author, None);
+        assert_eq!(owner_lib.tracks[0].notes[1].author.as_deref(), Some("Wanja"));
+        assert_eq!(owner_lib.tracks[0].notes[1].time_millis, 15_000);
+        assert!(
+            owner_lib.tracks[0]
+                .active_revision()
+                .unwrap()
+                .feedback_note
+                .as_deref()
+                .unwrap()
+                .contains("Wanja: Strong groove, check the break transition")
+        );
+
+        // Re-importing the exact same package is idempotent (0 duplicates added).
+        let reimported = import_feedback_package_at(
+            owner_lib,
+            &exported,
+            &owner_lib_path,
+            &owner_shared_dir,
+        )
+        .expect("idempotent re-import should succeed");
+        assert!(matches!(
+            reimported.value.1,
+            FeedbackImportResult::MergedIntoExisting {
+                added_notes: 0,
+                skipped_duplicates: 1,
+                ..
+            }
+        ));
+        assert_eq!(reimported.value.0.tracks[0].notes.len(), 2);
+
+        // 3. Fresh recipient without the audio locally extracts the bundled audio and marks external.
+        let recipient_lib_path = recipient_dir.path.join("library.json");
+        let recipient_shared_dir = recipient_dir.path.join("shared-audio");
+        let imported = import_feedback_package_at(
+            Library::default(),
+            &exported,
+            &recipient_lib_path,
+            &recipient_shared_dir,
+        )
+        .expect("fresh recipient import should extract bundled audio");
+        let (recipient_lib, result) = imported.value;
+        match result {
+            FeedbackImportResult::ImportedWithAudio {
+                reviewer,
+                added_notes,
+                extracted_audio_path,
+                ..
+            } => {
+                assert_eq!(reviewer, "Wanja");
+                assert_eq!(added_notes, 1);
+                assert!(extracted_audio_path.is_file());
+            }
+            other => panic!("expected ImportedWithAudio, got {other:?}"),
+        }
+        assert_eq!(recipient_lib.tracks.len(), 1);
+        assert!(recipient_lib.tracks[0].external);
+        assert_eq!(recipient_lib.tracks[0].notes.len(), 1);
+        assert_eq!(recipient_lib.tracks[0].notes[0].author.as_deref(), Some("Wanja"));
+
+        // Reload survives relaunch.
+        let reloaded = load_library_at(&recipient_lib_path).expect("relaunch load");
+        assert_eq!(reloaded.tracks[0].notes[0].author.as_deref(), Some("Wanja"));
+        assert!(reloaded.tracks[0].external);
     }
 }
