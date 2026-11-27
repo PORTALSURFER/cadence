@@ -1,0 +1,80 @@
+# release.toml — declarative release configuration for `ship`
+#
+# Quick usage:
+#   ship                                      # dry-run next patch release
+#   ship minor                                # dry-run next minor release
+#   ship -x                                   # bump patch, test, build, sign, notarize, tag, push, GitHub Release
+#   ship --local -x                           # build, sign & notarize local .dmg + .zip into [dist].dir
+
+[project]
+name = "cadence"
+tag_prefix = "v"
+
+[version]
+source = "cargo"
+path = "Cargo.toml"
+
+[dist]
+dir = "dist"
+per_version_dir = true
+
+[checks]
+commands = [
+  ["cargo", "test", "--bin", "cadence-native", "--locked"],
+  ["cargo", "clippy", "--bin", "cadence-native", "--tests", "--", "-D", "warnings"],
+]
+
+[build]
+commands = [
+  ["cargo", "build", "--release", "--bin", "cadence-native"],
+]
+
+[build.env]
+CADENCE_DISTRIBUTION_BUILD = "1"
+
+[macos.app]
+name = "Cadence.app"
+binary = "target/release/cadence-native"
+executable_name = "Cadence"
+bundle_id = "org.portalsurfer.cadence"
+display_name = "Cadence"
+icon = "assets/Cadence.icns"
+
+[macos.app.info_plist]
+LSApplicationCategoryType = "public.app-category.music"
+NSHighResolutionCapable = true
+
+[macos.signing]
+enabled = true
+# Public certificate SHA-1 selector for macOS Keychain (never a secret).
+# Overridable via SHIP_SIGNING_IDENTITY or gitignored .ship.local.toml.
+identity = "4EDF56A7ADD0B4786C2EEE23A50D61620BCE7E4E"
+identity_env = "SHIP_SIGNING_IDENTITY"
+team_id = "DKTKQ8U5T8"
+hardened_runtime = true
+timestamp = true
+# Uses macOS Keychain profile for Apple notarization and stapling.
+notarize = true
+notary_profile = "capture-release"
+notary_profile_env = "SHIP_NOTARY_PROFILE"
+
+[package]
+formats = ["dmg", "zip"]
+name_template = "{name}-{version}-{os}-{arch}"
+dmg_volume_name = "Cadence {version}"
+checksums = true
+
+[git]
+require_clean = true
+branch = "main"
+commit_message = "release: {tag}"
+tag_message = "Release {tag}"
+push = true
+remote = "origin"
+
+[github]
+enabled = true
+repo = "PORTALSURFER/cadence"
+title = "Cadence {tag}"
+draft = false
+generate_notes = true

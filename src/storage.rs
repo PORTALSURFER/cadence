@@ -394,6 +394,8 @@ pub struct Library {
     pub reference_tracks: SharedEntityVec<ReferenceTrack>,
     #[serde(default)]
     pub planner_order: SharedVec<String>,
+    #[serde(default)]
+    pub tags: crate::tags::TagBook,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -405,6 +407,152 @@ pub struct ReferenceTrack {
     pub source_proof: crate::source::SourceProvenance,
     #[serde(default)]
     pub notes: SharedVec<Note>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BounceRevision {
+    pub id: String,
+    #[serde(default)]
+    pub build: Option<u32>,
+    pub label: String,
+    pub original_name: String,
+    pub path: PathBuf,
+    #[serde(default)]
+    pub source_proof: crate::source::SourceProvenance,
+    pub size: u64,
+    #[serde(default)]
+    pub notes: SharedVec<Note>,
+    #[serde(default)]
+    pub feedback_note: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BounceCollision {
+    pub id: String,
+    pub build: u32,
+    pub label: String,
+    pub original_name: String,
+    pub path: PathBuf,
+    #[serde(default)]
+    pub source_proof: crate::source::SourceProvenance,
+    pub size: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParsedBounceFilename {
+    pub batch: String,
+    pub slot: u8,
+    pub group_key: String,
+    pub build: u32,
+    pub title: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BounceImportOutcome {
+    CreatedTrack {
+        track_id: String,
+        revision_id: String,
+    },
+    AddedRevision {
+        track_id: String,
+        revision_id: String,
+        promoted_current: bool,
+    },
+    DuplicateIgnored {
+        track_id: String,
+        revision_id: String,
+    },
+    CollisionFlagged {
+        track_id: String,
+        collision_id: String,
+        build: u32,
+    },
+}
+
+impl BounceImportOutcome {
+    pub fn track_id(&self) -> &str {
+        match self {
+            Self::CreatedTrack { track_id, .. }
+            | Self::AddedRevision { track_id, .. }
+            | Self::DuplicateIgnored { track_id, .. }
+            | Self::CollisionFlagged { track_id, .. } => track_id,
+        }
+    }
+}
+
+/// Parse `<BATCH><SLOT>_b<BUILD>[__<track-title>].<audio extension>`.
+///
+/// - `<BATCH>`: one or more uppercase ASCII letters (`A`–`Z`, `AA`, `AB`, ...)
+/// - `<SLOT>`: single ASCII digit `0`–`9`
+/// - `_b` or legacy `_B` followed by a positive numeric build (leading zeros ignored)
+/// - optional `__<track-title>` suffix; untitled files are valid
+/// - audio file extension must be one of `AUDIO_EXTENSIONS`
+pub fn parse_bounce_filename(path: &Path) -> Option<ParsedBounceFilename> {
+    validate_audio_path(path).ok()?;
+    let stem = path.file_stem()?.to_str()?;
+    let bytes = stem.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() && bytes[i].is_ascii_uppercase() {
+        i += 1;
+    }
+    if i == 0 || i >= bytes.len() {
+        return None;
+    }
+    let batch = stem[..i].to_string();
+
+    if !bytes[i].is_ascii_digit() {
+        return None;
+    }
+    let slot = bytes[i] - b'0';
+    i += 1;
+
+    if i + 2 >= bytes.len() || bytes[i] != b'_' || !matches!(bytes[i + 1], b'b' | b'B') {
+        return None;
+    }
+    i += 2;
+
+    let build_start = i;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == build_start {
+        return None;
+    }
+    let build = stem[build_start..i].parse::<u32>().ok()?;
+    if build == 0 {
+        return None;
+    }
+
+    let title = if i == bytes.len() {
+        None
+    } else if stem[i..].starts_with("__") {
+        let raw = &stem[i + 2..];
+        let cleaned = clean_title_fragment(raw);
+        if cleaned.is_empty() {
+            None
+        } else {
+            Some(cleaned)
+        }
+    } else {
+        return None;
+    };
+
+    let group_key = format!("{batch}{slot}");
+    Some(ParsedBounceFilename {
+        batch,
+        slot,
+        group_key,
+        build,
+        title,
+    })
+}
+
+fn clean_title_fragment(raw: &str) -> String {
+    raw.replace(['_', '-'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -421,11 +569,137 @@ pub struct Track {
     pub favorite: bool,
     pub stage: TrackStage,
     pub notes: SharedVec<Note>,
+    #[serde(default)]
+    pub group_key: Option<String>,
+    #[serde(default)]
+    pub next_action: String,
+    #[serde(default)]
+    pub revisions: SharedVec<BounceRevision>,
+    #[serde(default)]
+    pub active_revision_id: Option<String>,
+    #[serde(default)]
+    pub current_revision_id: Option<String>,
+    #[serde(default)]
+    pub collisions: SharedVec<BounceCollision>,
+}
+
+impl Default for Track {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            title: String::new(),
+            original_name: String::new(),
+            path: PathBuf::new(),
+            source_proof: crate::source::SourceProvenance::Unknown,
+            reference_path: None,
+            size: 0,
+            favorite: false,
+            stage: TrackStage::Backlog,
+            notes: SharedVec::default(),
+            group_key: None,
+            next_action: String::new(),
+            revisions: SharedVec::default(),
+            active_revision_id: None,
+            current_revision_id: None,
+            collisions: SharedVec::default(),
+        }
+    }
 }
 
 impl Track {
     pub fn source_provenance(&self) -> &crate::source::SourceProvenance {
         &self.source_proof
+    }
+
+    pub fn effective_group_key(&self) -> Option<String> {
+        self.group_key.clone().or_else(|| {
+            parse_bounce_filename(Path::new(&self.original_name))
+                .or_else(|| parse_bounce_filename(&self.path))
+                .map(|parsed| parsed.group_key)
+        })
+    }
+
+    pub fn current_revision(&self) -> Option<&BounceRevision> {
+        if let Some(id) = self.current_revision_id.as_deref()
+            && let Some(rev) = self.revisions.iter().find(|rev| rev.id == id)
+        {
+            return Some(rev);
+        }
+        self.revisions.first()
+    }
+
+    pub fn active_revision(&self) -> Option<&BounceRevision> {
+        if let Some(id) = self.active_revision_id.as_deref()
+            && let Some(rev) = self.revisions.iter().find(|rev| rev.id == id)
+        {
+            return Some(rev);
+        }
+        self.current_revision()
+    }
+
+    pub fn current_build_label(&self) -> String {
+        if let Some(rev) = self.current_revision() {
+            return rev.label.clone();
+        }
+        if let Some(parsed) = parse_bounce_filename(Path::new(&self.original_name))
+            .or_else(|| parse_bounce_filename(&self.path))
+        {
+            return format!("b{}", parsed.build);
+        }
+        String::from("v1")
+    }
+
+    pub fn active_build_label(&self) -> String {
+        if let Some(rev) = self.active_revision() {
+            return rev.label.clone();
+        }
+        self.current_build_label()
+    }
+
+    pub fn current_bounce_badge(&self) -> String {
+        let build = self.current_build_label();
+        match self.effective_group_key() {
+            Some(group_key) => format!("{group_key} · {build}"),
+            None => build,
+        }
+    }
+
+    pub fn is_viewing_prior_build(&self) -> bool {
+        match (
+            self.active_revision_id.as_deref(),
+            self.current_revision_id.as_deref(),
+        ) {
+            (Some(active), Some(current)) => active != current,
+            _ => false,
+        }
+    }
+
+    pub fn revision_count(&self) -> usize {
+        self.revisions.len().max(1)
+    }
+
+    pub fn is_source_missing(&self) -> bool {
+        !self.path.as_os_str().is_empty() && !self.path.is_file()
+    }
+
+    pub fn display_next_action(&self) -> Option<String> {
+        let trimmed = self.next_action.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+        let open_note = self
+            .current_revision()
+            .map(|rev| rev.notes.as_slice())
+            .unwrap_or(self.notes.as_slice())
+            .iter()
+            .find(|note| !note.done)?;
+        let body = open_note.body.replace(['\n', '\r'], " ");
+        let body = body.trim();
+        if body.is_empty() {
+            None
+        } else {
+            Some(body.to_string())
+        }
     }
 }
 
@@ -437,56 +711,43 @@ impl ReferenceTrack {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TrackStage {
-    #[serde(rename = "sound-design")]
+    #[serde(rename = "sound-design", alias = "backlog")]
     Backlog,
-    #[serde(rename = "groove", alias = "production")]
-    Groove,
-    #[serde(rename = "arrangement")]
-    Arrangement,
-    #[serde(rename = "polish")]
-    Polish,
+    #[serde(
+        rename = "production",
+        alias = "groove",
+        alias = "arrangement",
+        alias = "polish"
+    )]
+    Production,
     #[serde(rename = "mixdown")]
     Mixdown,
-    #[serde(rename = "master", alias = "mastering")]
-    Master,
-    #[serde(rename = "release")]
-    Release,
+    #[serde(rename = "mastering", alias = "master", alias = "release")]
+    Mastering,
 }
 
 impl TrackStage {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 4] = [
         Self::Backlog,
-        Self::Groove,
-        Self::Arrangement,
-        Self::Polish,
+        Self::Production,
         Self::Mixdown,
-        Self::Master,
-        Self::Release,
+        Self::Mastering,
     ];
-
     pub const COUNT: usize = Self::ALL.len();
-
     pub const fn label(self) -> &'static str {
         match self {
             Self::Backlog => "Backlog",
-            Self::Groove => "Groove",
-            Self::Arrangement => "Arrangement",
-            Self::Polish => "Polish",
+            Self::Production => "Production",
             Self::Mixdown => "Mixdown",
-            Self::Master => "Master",
-            Self::Release => "Release",
+            Self::Mastering => "Mastering",
         }
     }
-
     pub const fn index(self) -> usize {
         match self {
             Self::Backlog => 0,
-            Self::Groove => 1,
-            Self::Arrangement => 2,
-            Self::Polish => 3,
-            Self::Mixdown => 4,
-            Self::Master => 5,
-            Self::Release => 6,
+            Self::Production => 1,
+            Self::Mixdown => 2,
+            Self::Mastering => 3,
         }
     }
 }
@@ -596,6 +857,7 @@ impl BatchImportReport {
 /// the same note ID may appear on a main track and a reference track (or on
 /// two different owners) without becoming ambiguous.
 pub fn validate_library_identity(library: &Library) -> Result<(), String> {
+    library.tags.validate()?;
     let mut track_ids = HashSet::with_capacity(library.tracks.len());
     for track in &library.tracks {
         if !track_ids.insert(track.id.as_str()) {
@@ -605,8 +867,38 @@ pub fn validate_library_identity(library: &Library) -> Result<(), String> {
             ));
         }
         validate_note_ids(&format!("track '{}'", track.id), &track.notes)?;
+        let mut revision_ids = HashSet::with_capacity(track.revisions.len());
+        for revision in &track.revisions {
+            if !revision_ids.insert(revision.id.as_str()) {
+                return Err(format!(
+                    "duplicate bounce revision ID '{}' in track '{}'; remove or rename one of the duplicates before continuing",
+                    revision.id, track.id
+                ));
+            }
+            validate_note_ids(
+                &format!("track '{}' revision '{}'", track.id, revision.id),
+                &revision.notes,
+            )?;
+        }
+        let mut collision_ids = HashSet::with_capacity(track.collisions.len());
+        for collision in &track.collisions {
+            if !collision_ids.insert(collision.id.as_str()) {
+                return Err(format!(
+                    "duplicate bounce collision ID '{}' in track '{}'; remove or rename one of the duplicates before continuing",
+                    collision.id, track.id
+                ));
+            }
+        }
     }
 
+    if library
+        .tags
+        .assignments
+        .keys()
+        .any(|id| !track_ids.contains(id.as_str()))
+    {
+        return Err("A tag assignment points to a missing track".into());
+    }
     let mut reference_paths = HashSet::with_capacity(library.reference_tracks.len());
     for reference in &library.reference_tracks {
         if !reference_paths.insert(reference.path.as_path()) {
@@ -650,6 +942,18 @@ pub fn allocate_track_id(library: &Library) -> String {
 pub fn allocate_note_id(notes: &[Note]) -> String {
     allocate_id("note", unique_id(), |candidate| {
         notes.iter().any(|note| note.id == candidate)
+    })
+}
+
+pub fn allocate_revision_id(revisions: &[BounceRevision]) -> String {
+    allocate_id("rev", unique_id(), |candidate| {
+        revisions.iter().any(|rev| rev.id == candidate)
+    })
+}
+
+fn allocate_collision_id(collisions: &[BounceCollision]) -> String {
+    allocate_id("col", unique_id(), |candidate| {
+        collisions.iter().any(|col| col.id == candidate)
     })
 }
 
@@ -888,7 +1192,108 @@ pub fn import_into_library(
 
 #[allow(dead_code)]
 fn import_into_library_at(
+    library: Library,
+    decoded: crate::audio::DecodedAudioFile,
+    library_path: &Path,
+) -> Result<Persisted<Library>, String> {
+    let persisted = import_bounce_into_library_at(library, decoded, library_path)?;
+    Ok(Persisted::new(persisted.value.0, persisted.outcome))
+}
+
+/// Import one decoded bounce into the library, grouping `<BATCH><SLOT>_b<BUILD>`
+/// files onto the same track by batch + slot without renaming source audio.
+pub fn import_bounce_into_library(
+    library: Library,
+    decoded: crate::audio::DecodedAudioFile,
+) -> Result<Persisted<(Library, BounceImportOutcome)>, String> {
+    import_bounce_into_library_at(library, decoded, &library_path())
+}
+
+fn import_bounce_into_library_at(
     mut library: Library,
+    decoded: crate::audio::DecodedAudioFile,
+    library_path: &Path,
+) -> Result<Persisted<(Library, BounceImportOutcome)>, String> {
+    let path = decoded.path().to_path_buf();
+    validate_audio_path(&path)?;
+    ensure_decoded_audio_unchanged(&decoded)?;
+    let metadata = fs::metadata(&path)
+        .map_err(|error| format!("Could not inspect {}: {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("{} is not a file", path.display()));
+    }
+    ensure_decoded_audio_unchanged(&decoded)?;
+
+    let mut occupied = occupied_track_ids(&library);
+    let outcome = apply_bounce_import_to_library(
+        &mut library,
+        path,
+        metadata.len(),
+        decoded.source_proof().clone(),
+        &mut occupied,
+    );
+    normalize_planner_order(&mut library);
+    library.selected_track_id = Some(outcome.track_id().to_owned());
+    ensure_decoded_audio_unchanged(&decoded)?;
+    let persistence = persist_library_at(&library, library_path)?;
+    Ok(Persisted::new((library, outcome), persistence))
+}
+
+/// Manually attach any decoded audio file as a revision of an existing track,
+/// preserving the track's stage, next action, and prior builds' notes.
+pub fn add_revision_to_track(
+    library: Library,
+    track_id: &str,
+    decoded: crate::audio::DecodedAudioFile,
+) -> Result<Persisted<(Library, BounceImportOutcome)>, String> {
+    add_revision_to_track_at(library, track_id, decoded, &library_path())
+}
+
+fn add_revision_to_track_at(
+    mut library: Library,
+    track_id: &str,
+    decoded: crate::audio::DecodedAudioFile,
+    library_path: &Path,
+) -> Result<Persisted<(Library, BounceImportOutcome)>, String> {
+    let path = decoded.path().to_path_buf();
+    validate_audio_path(&path)?;
+    ensure_decoded_audio_unchanged(&decoded)?;
+    let metadata = fs::metadata(&path)
+        .map_err(|error| format!("Could not inspect {}: {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("{} is not a file", path.display()));
+    }
+    ensure_decoded_audio_unchanged(&decoded)?;
+
+    let outcome = attach_bounce_to_existing_track(
+        &mut library,
+        track_id,
+        path,
+        metadata.len(),
+        decoded.source_proof().clone(),
+        None,
+    )?;
+    library.selected_track_id = Some(track_id.to_owned());
+    ensure_decoded_audio_unchanged(&decoded)?;
+    let persistence = persist_library_at(&library, library_path)?;
+    Ok(Persisted::new((library, outcome), persistence))
+}
+
+/// Relink a moved or renamed audio file for one revision in place without
+/// duplicating the track card or losing timestamped notes or build history.
+pub fn relink_track_revision(
+    library: Library,
+    track_id: &str,
+    revision_id: Option<&str>,
+    decoded: crate::audio::DecodedAudioFile,
+) -> Result<Persisted<Library>, String> {
+    relink_track_revision_at(library, track_id, revision_id, decoded, &library_path())
+}
+
+fn relink_track_revision_at(
+    mut library: Library,
+    track_id: &str,
+    revision_id: Option<&str>,
     decoded: crate::audio::DecodedAudioFile,
     library_path: &Path,
 ) -> Result<Persisted<Library>, String> {
@@ -902,38 +1307,634 @@ fn import_into_library_at(
     }
     ensure_decoded_audio_unchanged(&decoded)?;
 
-    let original_name = path
-        .file_name()
+    let original_name = file_name_string(&path);
+    let track = library
+        .tracks
+        .find_mut(|track| track.id == track_id)
+        .ok_or_else(|| String::from("That track is no longer in the library."))?;
+    ensure_track_revisions_initialized(track);
+    let target_rev_id = revision_id
+        .map(str::to_owned)
+        .or_else(|| track.active_revision_id.clone())
+        .or_else(|| track.current_revision_id.clone())
+        .ok_or_else(|| String::from("That bounce revision is no longer on the track."))?;
+    let rev = track
+        .revisions
+        .iter_mut()
+        .find(|rev| rev.id == target_rev_id)
+        .ok_or_else(|| String::from("That bounce revision is no longer on the track."))?;
+    rev.path = path;
+    rev.original_name = original_name;
+    rev.size = metadata.len();
+    rev.source_proof = crate::source::SourceProvenance::Verified(decoded.source_proof().clone());
+    sync_track_from_active_revision(track);
+    library.selected_track_id = Some(track_id.to_owned());
+    ensure_decoded_audio_unchanged(&decoded)?;
+    let outcome = persist_library_at(&library, library_path)?;
+    Ok(Persisted::new(library, outcome))
+}
+
+fn file_name_string(path: &Path) -> String {
+    path.file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("Untitled track")
-        .to_string();
+        .to_string()
+}
+
+fn fallback_track_title(path: &Path) -> String {
     let title = path
         .file_stem()
         .and_then(|name| name.to_str())
         .unwrap_or("Untitled track")
         .replace(['_', '-'], " ");
-    let id = allocate_track_id(&library);
+    if title.trim().is_empty() {
+        String::from("Untitled track")
+    } else {
+        title
+    }
+}
+
+fn ensure_track_revisions_initialized(track: &mut Track) {
+    if !track.revisions.is_empty() {
+        if track.current_revision_id.is_none() {
+            sort_and_select_current_revision(track);
+        }
+        if track.active_revision_id.is_none() {
+            track.active_revision_id = track.current_revision_id.clone();
+        }
+        return;
+    }
+    let parsed = parse_bounce_filename(Path::new(&track.original_name))
+        .or_else(|| parse_bounce_filename(&track.path));
+    if track.group_key.is_none() {
+        track.group_key = parsed.as_ref().map(|p| p.group_key.clone());
+    }
+    let rev_id = allocate_revision_id(&[]);
+    let (build, label) = match parsed {
+        Some(p) => (Some(p.build), format!("b{}", p.build)),
+        None => (None, String::from("v1")),
+    };
+    track.revisions.push(BounceRevision {
+        id: rev_id.clone(),
+        build,
+        label,
+        original_name: track.original_name.clone(),
+        path: track.path.clone(),
+        source_proof: track.source_proof.clone(),
+        size: track.size,
+        notes: track.notes.clone(),
+        feedback_note: None,
+    });
+    track.current_revision_id = Some(rev_id.clone());
+    track.active_revision_id = Some(rev_id);
+}
+
+fn sync_track_from_active_revision(track: &mut Track) {
+    let active = track
+        .active_revision_id
+        .as_deref()
+        .and_then(|id| track.revisions.iter().find(|rev| rev.id == id))
+        .or_else(|| track.current_revision())
+        .cloned();
+    if let Some(rev) = active {
+        track.active_revision_id = Some(rev.id);
+        track.path = rev.path;
+        track.original_name = rev.original_name;
+        track.source_proof = rev.source_proof;
+        track.size = rev.size;
+        track.notes = rev.notes;
+    }
+}
+
+/// Mirror mutations made to `track.notes` onto the active `BounceRevision`
+/// so switching builds never loses timestamped feedback.
+pub fn sync_active_revision_notes(library: &mut Library, track_id: &str) {
+    let Some(track) = library.tracks.find_mut(|track| track.id == track_id) else {
+        return;
+    };
+    if track.revisions.is_empty() {
+        return;
+    }
+    let notes = track.notes.clone();
+    let active_id = track
+        .active_revision_id
+        .clone()
+        .or_else(|| track.current_revision_id.clone());
+    if let Some(active_id) = active_id
+        && let Some(rev) = track.revisions.iter_mut().find(|rev| rev.id == active_id)
+    {
+        rev.notes = notes;
+    }
+}
+
+fn sort_and_select_current_revision(track: &mut Track) {
+    track
+        .revisions
+        .as_mut_vec()
+        .sort_by(|left, right| match (left.build, right.build) {
+            (Some(a), Some(b)) => b.cmp(&a),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        });
+    if let Some(highest) = track.revisions.first() {
+        track.current_revision_id = Some(highest.id.clone());
+    }
+}
+
+fn next_unnumbered_label(revisions: &[BounceRevision]) -> String {
+    let mut n = revisions.len() + 1;
+    loop {
+        let candidate = format!("v{n}");
+        if !revisions.iter().any(|rev| rev.label == candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+fn apply_bounce_import_to_library(
+    library: &mut Library,
+    path: PathBuf,
+    size: u64,
+    source_proof: crate::source::AudioSourceProof,
+    occupied_track_ids: &mut HashSet<String>,
+) -> BounceImportOutcome {
+    let parsed = parse_bounce_filename(&path);
+    if let Some(ref parsed) = parsed
+        && let Some(existing_id) = library
+            .tracks
+            .iter()
+            .find(|track| track.effective_group_key().as_deref() == Some(parsed.group_key.as_str()))
+            .map(|track| track.id.clone())
+    {
+        return attach_bounce_to_existing_track(
+            library,
+            &existing_id,
+            path,
+            size,
+            source_proof,
+            None,
+        )
+        .expect("matched track exists in library");
+    }
+
+    let original_name = file_name_string(&path);
+    let title = match &parsed {
+        Some(p) => p.title.clone().unwrap_or_else(|| p.group_key.clone()),
+        None => fallback_track_title(&path),
+    };
+    let id = allocate_track_id_from_occupied(occupied_track_ids);
+    let rev_id = allocate_revision_id(&[]);
+    let (build, label) = match &parsed {
+        Some(p) => (Some(p.build), format!("b{}", p.build)),
+        None => (None, String::from("v1")),
+    };
+    let proof_state = crate::source::SourceProvenance::Verified(source_proof);
+    let revision = BounceRevision {
+        id: rev_id.clone(),
+        build,
+        label,
+        original_name: original_name.clone(),
+        path: path.clone(),
+        source_proof: proof_state.clone(),
+        size,
+        notes: SharedVec::default(),
+        feedback_note: None,
+    };
     library.tracks.push(Track {
         id: id.clone(),
-        title: if title.trim().is_empty() {
-            String::from("Untitled track")
-        } else {
-            title
-        },
+        title,
         original_name,
         path,
-        source_proof: crate::source::SourceProvenance::Verified(decoded.source_proof().clone()),
+        source_proof: proof_state,
         reference_path: None,
-        size: metadata.len(),
+        size,
         favorite: false,
         stage: TrackStage::Backlog,
         notes: SharedVec::default(),
+        group_key: parsed.map(|p| p.group_key),
+        next_action: String::new(),
+        revisions: vec![revision].into(),
+        active_revision_id: Some(rev_id.clone()),
+        current_revision_id: Some(rev_id.clone()),
+        collisions: SharedVec::default(),
     });
-    normalize_planner_order(&mut library);
-    library.selected_track_id = Some(id);
-    ensure_decoded_audio_unchanged(&decoded)?;
-    let outcome = persist_library_at(&library, library_path)?;
-    Ok(Persisted::new(library, outcome))
+    BounceImportOutcome::CreatedTrack {
+        track_id: id,
+        revision_id: rev_id,
+    }
+}
+
+fn attach_bounce_to_existing_track(
+    library: &mut Library,
+    track_id: &str,
+    path: PathBuf,
+    size: u64,
+    source_proof: crate::source::AudioSourceProof,
+    initial_notes: Option<SharedVec<Note>>,
+) -> Result<BounceImportOutcome, String> {
+    let parsed = parse_bounce_filename(&path);
+    let original_name = file_name_string(&path);
+    let track = library
+        .tracks
+        .find_mut(|track| track.id == track_id)
+        .ok_or_else(|| String::from("That track is no longer in the library."))?;
+    ensure_track_revisions_initialized(track);
+
+    // Sync any direct legacy mutations on `track.notes` into the active revision first.
+    if let Some(active_id) = track.active_revision_id.clone()
+        && let Some(active_rev) = track.revisions.iter_mut().find(|rev| rev.id == active_id)
+    {
+        active_rev.notes = track.notes.clone();
+    }
+
+    if let Some(ref p) = parsed {
+        if track.group_key.is_none() {
+            track.group_key = Some(p.group_key.clone());
+        }
+        if let Some(ref parsed_title) = p.title
+            && track.group_key.as_deref() == Some(track.title.as_str())
+        {
+            track.title = parsed_title.clone();
+        }
+        if let Some(existing) = track.revisions.iter().find(|rev| rev.build == Some(p.build)) {
+            let same_source = match existing.source_proof.verified_proof() {
+                Some(existing_proof) => existing_proof == &source_proof,
+                None => existing.path == path && existing.size == size,
+            };
+            if same_source {
+                return Ok(BounceImportOutcome::DuplicateIgnored {
+                    track_id: track.id.clone(),
+                    revision_id: existing.id.clone(),
+                });
+            }
+            let proof_state = crate::source::SourceProvenance::Verified(source_proof);
+            if let Some(existing_col) = track.collisions.iter().find(|col| {
+                col.build == p.build
+                    && (col.source_proof == proof_state || col.path == path)
+            }) {
+                return Ok(BounceImportOutcome::CollisionFlagged {
+                    track_id: track.id.clone(),
+                    collision_id: existing_col.id.clone(),
+                    build: p.build,
+                });
+            }
+            let collision_id = allocate_collision_id(&track.collisions);
+            track.collisions.push(BounceCollision {
+                id: collision_id.clone(),
+                build: p.build,
+                label: format!("b{}", p.build),
+                original_name,
+                path,
+                source_proof: proof_state,
+                size,
+            });
+            return Ok(BounceImportOutcome::CollisionFlagged {
+                track_id: track.id.clone(),
+                collision_id,
+                build: p.build,
+            });
+        }
+    } else if let Some(existing) = track.revisions.iter().find(|rev| {
+        rev.source_proof
+            .verified_proof()
+            .is_some_and(|proof| proof == &source_proof)
+            && rev.path == path
+    }) {
+        return Ok(BounceImportOutcome::DuplicateIgnored {
+            track_id: track.id.clone(),
+            revision_id: existing.id.clone(),
+        });
+    }
+
+    let prev_current = track.current_revision_id.clone();
+    let rev_id = allocate_revision_id(&track.revisions);
+    let (build, label) = match &parsed {
+        Some(p) => (Some(p.build), format!("b{}", p.build)),
+        None => (None, next_unnumbered_label(&track.revisions)),
+    };
+    let revision = BounceRevision {
+        id: rev_id.clone(),
+        build,
+        label,
+        original_name,
+        path,
+        source_proof: crate::source::SourceProvenance::Verified(source_proof),
+        size,
+        notes: initial_notes.unwrap_or_default(),
+        feedback_note: None,
+    };
+    if build.is_some() {
+        track.revisions.push(revision);
+        sort_and_select_current_revision(track);
+        let promoted_current = track.current_revision_id.as_deref() == Some(rev_id.as_str())
+            && prev_current.as_deref() != Some(rev_id.as_str());
+        if promoted_current || track.active_revision_id.is_none() {
+            track.active_revision_id = Some(rev_id.clone());
+        }
+        sync_track_from_active_revision(track);
+        Ok(BounceImportOutcome::AddedRevision {
+            track_id: track.id.clone(),
+            revision_id: rev_id,
+            promoted_current,
+        })
+    } else {
+        // Manually assigned unnumbered bounce: append and select it for immediate review.
+        // If no numbered builds exist, make it current too; otherwise highest numbered build stays current.
+        let has_numbered = track.revisions.iter().any(|rev| rev.build.is_some());
+        if has_numbered {
+            track.revisions.push(revision);
+        } else {
+            track.revisions.insert(0, revision);
+            track.current_revision_id = Some(rev_id.clone());
+        }
+        let promoted_current = !has_numbered;
+        track.active_revision_id = Some(rev_id.clone());
+        sync_track_from_active_revision(track);
+        Ok(BounceImportOutcome::AddedRevision {
+            track_id: track.id.clone(),
+            revision_id: rev_id,
+            promoted_current,
+        })
+    }
+}
+
+/// Switch the active bounce revision loaded in Review for one track.
+pub fn select_track_revision(
+    library: &mut Library,
+    track_id: &str,
+    revision_id: &str,
+) -> Result<bool, String> {
+    let track = library
+        .tracks
+        .find_mut(|track| track.id == track_id)
+        .ok_or_else(|| String::from("That track is no longer in the library."))?;
+    ensure_track_revisions_initialized(track);
+    if !track.revisions.iter().any(|rev| rev.id == revision_id) {
+        return Err(String::from("That bounce revision is no longer on the track."));
+    }
+    // Preserve any active notes before switching.
+    if let Some(active_id) = track.active_revision_id.clone()
+        && let Some(active_rev) = track.revisions.iter_mut().find(|rev| rev.id == active_id)
+    {
+        active_rev.notes = track.notes.clone();
+    }
+    if track.active_revision_id.as_deref() == Some(revision_id) {
+        sync_track_from_active_revision(track);
+        return Ok(false);
+    }
+    track.active_revision_id = Some(revision_id.to_owned());
+    sync_track_from_active_revision(track);
+    Ok(true)
+}
+
+/// Manually assign an existing standalone track into another track as a bounce revision.
+pub fn assign_standalone_track_as_revision(
+    library: &mut Library,
+    source_track_id: &str,
+    target_track_id: &str,
+) -> Result<BounceImportOutcome, String> {
+    if source_track_id == target_track_id {
+        return Err(String::from("Choose a different track to assign this bounce to."));
+    }
+    let source = library
+        .tracks
+        .iter()
+        .find(|track| track.id == source_track_id)
+        .cloned()
+        .ok_or_else(|| String::from("That source track is no longer in the library."))?;
+    if !library.tracks.iter().any(|track| track.id == target_track_id) {
+        return Err(String::from("That target track is no longer in the library."));
+    }
+    let mut staged = library.clone();
+    let proof = source.source_proof.verified_proof().cloned();
+    let outcome = if let Some(proof) = proof {
+        attach_bounce_to_existing_track(
+            &mut staged,
+            target_track_id,
+            source.path.clone(),
+            source.size,
+            proof,
+            Some(source.notes.clone()),
+        )?
+    } else {
+        // Legacy track without verified proof: attach directly as an unnumbered revision.
+        let target = staged
+            .tracks
+            .find_mut(|track| track.id == target_track_id)
+            .ok_or_else(|| String::from("That target track is no longer in the library."))?;
+        ensure_track_revisions_initialized(target);
+        let rev_id = allocate_revision_id(&target.revisions);
+        let label = next_unnumbered_label(&target.revisions);
+        let has_numbered = target.revisions.iter().any(|rev| rev.build.is_some());
+        let rev = BounceRevision {
+            id: rev_id.clone(),
+            build: None,
+            label,
+            original_name: source.original_name.clone(),
+            path: source.path.clone(),
+            source_proof: source.source_proof.clone(),
+            size: source.size,
+            notes: source.notes.clone(),
+            feedback_note: None,
+        };
+        if has_numbered {
+            target.revisions.push(rev);
+        } else {
+            target.revisions.insert(0, rev);
+            target.current_revision_id = Some(rev_id.clone());
+        }
+        target.active_revision_id = Some(rev_id.clone());
+        sync_track_from_active_revision(target);
+        BounceImportOutcome::AddedRevision {
+            track_id: target.id.clone(),
+            revision_id: rev_id,
+            promoted_current: !has_numbered,
+        }
+    };
+    let _ = remove_track(&mut staged, source_track_id)?;
+    staged.selected_track_id = Some(target_track_id.to_owned());
+    normalize_planner_order(&mut staged);
+    validate_library_identity(&staged)?;
+    *library = staged;
+    Ok(outcome)
+}
+
+/// Dismiss a flagged build collision while keeping the existing build untouched.
+pub fn resolve_collision_keep_existing(
+    library: &mut Library,
+    track_id: &str,
+    collision_id: &str,
+) -> Result<(), String> {
+    let track = library
+        .tracks
+        .find_mut(|track| track.id == track_id)
+        .ok_or_else(|| String::from("That track is no longer in the library."))?;
+    let before = track.collisions.len();
+    track.collisions.retain(|col| col.id != collision_id);
+    if track.collisions.len() == before {
+        return Err(String::from("That collision is no longer pending."));
+    }
+    Ok(())
+}
+
+/// Intentionally replace the colliding build revision with the flagged file,
+/// preserving track stage, next action, and other builds' notes.
+pub fn resolve_collision_replace_build(
+    library: &mut Library,
+    track_id: &str,
+    collision_id: &str,
+) -> Result<(), String> {
+    let track = library
+        .tracks
+        .find_mut(|track| track.id == track_id)
+        .ok_or_else(|| String::from("That track is no longer in the library."))?;
+    let col_idx = track
+        .collisions
+        .iter()
+        .position(|col| col.id == collision_id)
+        .ok_or_else(|| String::from("That collision is no longer pending."))?;
+    let collision = track.collisions.remove(col_idx);
+    ensure_track_revisions_initialized(track);
+    let rev = track
+        .revisions
+        .iter_mut()
+        .find(|rev| rev.build == Some(collision.build))
+        .ok_or_else(|| String::from("The conflicting build is no longer on this track."))?;
+    rev.path = collision.path;
+    rev.original_name = collision.original_name;
+    rev.size = collision.size;
+    rev.source_proof = collision.source_proof;
+    rev.notes.clear();
+    sync_track_from_active_revision(track);
+    Ok(())
+}
+
+/// Import a flagged collision as its own standalone track without modifying the
+/// existing build on the original track.
+pub fn resolve_collision_import_as_new_track(
+    library: &mut Library,
+    track_id: &str,
+    collision_id: &str,
+) -> Result<String, String> {
+    let collision = {
+        let track = library
+            .tracks
+            .find_mut(|track| track.id == track_id)
+            .ok_or_else(|| String::from("That track is no longer in the library."))?;
+        let col_idx = track
+            .collisions
+            .iter()
+            .position(|col| col.id == collision_id)
+            .ok_or_else(|| String::from("That collision is no longer pending."))?;
+        track.collisions.remove(col_idx)
+    };
+    let new_id = allocate_track_id(library);
+    let rev_id = allocate_revision_id(&[]);
+    let title = fallback_track_title(&collision.path);
+    let revision = BounceRevision {
+        id: rev_id.clone(),
+        build: Some(collision.build),
+        label: collision.label,
+        original_name: collision.original_name.clone(),
+        path: collision.path.clone(),
+        source_proof: collision.source_proof.clone(),
+        size: collision.size,
+        notes: SharedVec::default(),
+        feedback_note: None,
+    };
+    library.tracks.push(Track {
+        id: new_id.clone(),
+        title,
+        original_name: collision.original_name,
+        path: collision.path,
+        source_proof: collision.source_proof,
+        reference_path: None,
+        size: collision.size,
+        favorite: false,
+        stage: TrackStage::Backlog,
+        notes: SharedVec::default(),
+        group_key: None,
+        next_action: String::new(),
+        revisions: vec![revision].into(),
+        active_revision_id: Some(rev_id.clone()),
+        current_revision_id: Some(rev_id),
+        collisions: SharedVec::default(),
+    });
+    normalize_planner_order(library);
+    library.selected_track_id = Some(new_id.clone());
+    Ok(new_id)
+}
+
+/// Edit a track's readable title without changing its `group_key` or splitting builds.
+pub fn set_track_title(library: &mut Library, track_id: &str, title: &str) -> Result<bool, String> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err(String::from("Track title cannot be empty."));
+    }
+    let track = library
+        .tracks
+        .find_mut(|track| track.id == track_id)
+        .ok_or_else(|| String::from("That track is no longer in the library."))?;
+    if track.title == title {
+        return Ok(false);
+    }
+    track.title = title.to_owned();
+    Ok(true)
+}
+
+/// Set or clear a track's single Planner next action. Persists across new builds and relaunch.
+pub fn set_track_next_action(
+    library: &mut Library,
+    track_id: &str,
+    next_action: &str,
+) -> Result<bool, String> {
+    let next_action = next_action.trim();
+    let track = library
+        .tracks
+        .find_mut(|track| track.id == track_id)
+        .ok_or_else(|| String::from("That track is no longer in the library."))?;
+    if track.next_action == next_action {
+        return Ok(false);
+    }
+    track.next_action = next_action.to_owned();
+    Ok(true)
+}
+
+/// Record or clear a short per-build feedback note (e.g. "Heard by Dylan") on one revision.
+pub fn set_revision_feedback_note(
+    library: &mut Library,
+    track_id: &str,
+    revision_id: Option<&str>,
+    note: &str,
+) -> Result<bool, String> {
+    let note = note.trim();
+    let value = if note.is_empty() {
+        None
+    } else {
+        Some(note.to_owned())
+    };
+    let track = library
+        .tracks
+        .find_mut(|track| track.id == track_id)
+        .ok_or_else(|| String::from("That track is no longer in the library."))?;
+    ensure_track_revisions_initialized(track);
+    let target_id = revision_id
+        .map(str::to_owned)
+        .or_else(|| track.active_revision_id.clone())
+        .or_else(|| track.current_revision_id.clone())
+        .ok_or_else(|| String::from("That bounce revision is no longer on the track."))?;
+    let rev = track
+        .revisions
+        .iter_mut()
+        .find(|rev| rev.id == target_id)
+        .ok_or_else(|| String::from("That bounce revision is no longer on the track."))?;
+    if rev.feedback_note == value {
+        return Ok(false);
+    }
+    rev.feedback_note = value;
+    Ok(true)
 }
 
 /// Replace the source file for one existing track while preserving its stable
@@ -1192,35 +2193,14 @@ fn apply_main_track_import(
     metadata: fs::Metadata,
     occupied_track_ids: &mut HashSet<String>,
 ) -> Result<(), String> {
-    let path = candidate.path.clone();
-    let original_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("Untitled track")
-        .to_string();
-    let title = path
-        .file_stem()
-        .and_then(|name| name.to_str())
-        .unwrap_or("Untitled track")
-        .replace(['_', '-'], " ");
-    let id = allocate_track_id_from_occupied(occupied_track_ids);
-    library.tracks.push(Track {
-        id: id.clone(),
-        title: if title.trim().is_empty() {
-            String::from("Untitled track")
-        } else {
-            title
-        },
-        original_name,
-        path,
-        source_proof: crate::source::SourceProvenance::Verified(candidate.source_proof),
-        reference_path: None,
-        size: metadata.len(),
-        favorite: false,
-        stage: TrackStage::Backlog,
-        notes: SharedVec::default(),
-    });
-    library.selected_track_id = Some(id);
+    let outcome = apply_bounce_import_to_library(
+        library,
+        candidate.path,
+        metadata.len(),
+        candidate.source_proof,
+        occupied_track_ids,
+    );
+    library.selected_track_id = Some(outcome.track_id().to_owned());
     Ok(())
 }
 
@@ -1586,7 +2566,12 @@ pub fn bind_main_source_proof(
     if track.source_provenance().verified_proof().is_some() {
         return Err(String::from("The main source is already bound to a proof."));
     }
-    track.source_proof = crate::source::SourceProvenance::Verified(source_proof);
+    track.source_proof = crate::source::SourceProvenance::Verified(source_proof.clone());
+    if let Some(active_id) = track.active_revision_id.clone()
+        && let Some(rev) = track.revisions.iter_mut().find(|rev| rev.id == active_id)
+    {
+        rev.source_proof = crate::source::SourceProvenance::Verified(source_proof);
+    }
     Ok(())
 }
 
@@ -1658,11 +2643,20 @@ fn replace_track_metadata_with_proof(
     } else {
         title
     };
-    track.original_name = original_name;
-    track.path = path;
-    track.source_proof = crate::source::SourceProvenance::from_optional(source_proof);
+    track.original_name = original_name.clone();
+    track.path = path.clone();
+    track.source_proof = crate::source::SourceProvenance::from_optional(source_proof.clone());
     track.size = size;
     track.notes.clear();
+    if let Some(active_id) = track.active_revision_id.clone()
+        && let Some(rev) = track.revisions.iter_mut().find(|rev| rev.id == active_id)
+    {
+        rev.original_name = original_name;
+        rev.path = path;
+        rev.source_proof = crate::source::SourceProvenance::from_optional(source_proof);
+        rev.size = size;
+        rev.notes.clear();
+    }
     Ok(())
 }
 
@@ -1673,6 +2667,7 @@ pub fn remove_track(library: &mut Library, track_id: &str) -> Result<(usize, Tra
         .position(|track| track.id == track_id)
         .ok_or_else(|| String::from("That track is no longer in the library."))?;
     let removed = library.tracks.remove(index);
+    library.tags.assignments.remove(track_id);
     library.planner_order.retain(|id| id != track_id);
     Ok((index, removed))
 }
@@ -2142,6 +3137,13 @@ pub fn waveform_cache_path(source: &Path, proof: &crate::source::AudioSourceProo
 }
 
 fn app_data_directory() -> PathBuf {
+    // Isolate local review and automation from the user's active library.
+    if let Some(directory) = env::var_os("CADENCE_DATA_DIR")
+        && !directory.is_empty()
+    {
+        return PathBuf::from(directory);
+    }
+
     #[cfg(target_os = "macos")]
     if let Some(home) = env::var_os("HOME") {
         return PathBuf::from(home).join("Library/Application Support/Cadence");
@@ -2262,6 +3264,7 @@ mod tests {
                     done: false,
                 }]
                 .into(),
+                ..Default::default()
             }]
             .into(),
             selected_track_id: Some(String::from("track-1")),
@@ -2279,6 +3282,7 @@ mod tests {
             }]
             .into(),
             planner_order: vec![String::from("track-1")].into(),
+            tags: Default::default(),
         }
     }
 
@@ -3401,53 +4405,69 @@ mod tests {
 
     #[test]
     fn stage_labels_and_wire_order_are_stable() {
-        let stages = TrackStage::ALL;
         assert_eq!(
-            stages.map(TrackStage::label),
-            [
-                "Backlog",
-                "Groove",
-                "Arrangement",
-                "Polish",
-                "Mixdown",
-                "Master",
-                "Release"
-            ]
+            TrackStage::ALL.map(TrackStage::label),
+            ["Backlog", "Production", "Mixdown", "Mastering"]
         );
         assert_eq!(
-            stages
+            TrackStage::ALL
                 .into_iter()
-                .map(|stage| serde_json::to_string(&stage).expect("stage should encode"))
+                .map(|stage| serde_json::to_string(&stage).unwrap())
                 .collect::<Vec<_>>(),
             [
                 "\"sound-design\"",
-                "\"groove\"",
-                "\"arrangement\"",
-                "\"polish\"",
+                "\"production\"",
                 "\"mixdown\"",
-                "\"master\"",
-                "\"release\""
+                "\"mastering\""
             ]
         );
     }
 
     #[test]
-    fn legacy_stage_wire_values_load_into_the_renamed_stages() {
-        let production: TrackStage =
-            serde_json::from_str("\"production\"").expect("production should remain readable");
-        let mastering: TrackStage =
-            serde_json::from_str("\"mastering\"").expect("mastering should remain readable");
-
-        assert_eq!(production, TrackStage::Groove);
-        assert_eq!(mastering, TrackStage::Master);
+    fn seven_stage_libraries_migrate_without_losing_tracks() {
+        let stages = [
+            "sound-design",
+            "groove",
+            "arrangement",
+            "polish",
+            "mixdown",
+            "master",
+            "release",
+        ];
+        let expected = [
+            TrackStage::Backlog,
+            TrackStage::Production,
+            TrackStage::Production,
+            TrackStage::Production,
+            TrackStage::Mixdown,
+            TrackStage::Mastering,
+            TrackStage::Mastering,
+        ];
+        let tracks: Vec<_> = stages
+            .iter()
+            .enumerate()
+            .map(|(i, stage)| {
+                let mut value = serde_json::to_value(planner_test_track(
+                    &format!("track-{i}"),
+                    TrackStage::Backlog,
+                    false,
+                ))
+                .unwrap();
+                value["stage"] = serde_json::Value::String((*stage).into());
+                value
+            })
+            .collect();
+        let value = serde_json::json!({"tracks": tracks, "selected_track_id": "track-3", "reference_tracks": []});
+        let library: Library = serde_json::from_value(value).unwrap();
+        assert_eq!(library.tracks.len(), stages.len());
+        assert_eq!(library.selected_track_id.as_deref(), Some("track-3"));
         assert_eq!(
-            serde_json::to_string(&production).expect("groove should encode"),
-            "\"groove\""
+            library.tracks.iter().map(|t| t.stage).collect::<Vec<_>>(),
+            expected
         );
-        assert_eq!(
-            serde_json::to_string(&mastering).expect("master should encode"),
-            "\"master\""
-        );
+        let saved = serde_json::to_value(&library).unwrap();
+        assert_eq!(saved["tracks"][3]["stage"], "production");
+        assert_eq!(saved["tracks"][6]["stage"], "mastering");
     }
 
     #[test]
@@ -3517,6 +4537,7 @@ mod tests {
                 favorite: false,
                 stage: TrackStage::Backlog,
                 notes: SharedVec::default(),
+                ..Default::default()
             }]
             .into(),
             selected_track_id: Some(String::from("track-1")),
@@ -3534,6 +4555,7 @@ mod tests {
             }]
             .into(),
             planner_order: Vec::new().into(),
+            tags: Default::default(),
         };
 
         let (index, removed) = remove_track(&mut library, "track-1").expect("track should exist");
@@ -3557,12 +4579,14 @@ mod tests {
             favorite: false,
             stage: TrackStage::Backlog,
             notes: SharedVec::default(),
+            ..Default::default()
         };
         let library = Library {
             tracks: vec![track("track-2"), track("track-3")].into(),
             selected_track_id: None,
             reference_tracks: Vec::new().into(),
             planner_order: Vec::new().into(),
+            tags: Default::default(),
         };
 
         assert_eq!(
@@ -3590,11 +4614,13 @@ mod tests {
                 favorite: false,
                 stage: TrackStage::Backlog,
                 notes: SharedVec::default(),
+                ..Default::default()
             }]
             .into(),
             selected_track_id: Some(String::from("track-1")),
             reference_tracks: Vec::new().into(),
             planner_order: Vec::new().into(),
+            tags: Default::default(),
         };
 
         assert!(
@@ -3620,6 +4646,7 @@ mod tests {
             favorite,
             stage,
             notes: SharedVec::default(),
+            ..Default::default()
         }
     }
 
@@ -3627,13 +4654,14 @@ mod tests {
     fn planner_order_normalizes_legacy_and_stale_ids() {
         let mut legacy = Library {
             tracks: vec![
-                planner_test_track("plain", TrackStage::Groove, false),
-                planner_test_track("starred", TrackStage::Groove, true),
+                planner_test_track("plain", TrackStage::Production, false),
+                planner_test_track("starred", TrackStage::Production, true),
             ]
             .into(),
             selected_track_id: None,
             reference_tracks: Vec::new().into(),
             planner_order: Vec::new().into(),
+            tags: Default::default(),
         };
         normalize_planner_order(&mut legacy);
         assert_eq!(legacy.planner_order.as_slice(), ["starred", "plain"]);
@@ -3650,13 +4678,13 @@ mod tests {
 
     #[test]
     fn planner_tracks_preserve_order_semantics_and_first_match_identity() {
-        let mut first_duplicate = planner_test_track("duplicate", TrackStage::Groove, false);
+        let mut first_duplicate = planner_test_track("duplicate", TrackStage::Production, false);
         first_duplicate.title = String::from("first duplicate");
         let mut later_duplicate = planner_test_track("duplicate", TrackStage::Mixdown, true);
         later_duplicate.title = String::from("later duplicate");
         let explicit = Library {
             tracks: vec![
-                planner_test_track("tail", TrackStage::Master, false),
+                planner_test_track("tail", TrackStage::Mastering, false),
                 first_duplicate.clone(),
                 later_duplicate.clone(),
                 planner_test_track("appended", TrackStage::Backlog, false),
@@ -3671,6 +4699,7 @@ mod tests {
                 String::from("tail"),
             ]
             .into(),
+            tags: Default::default(),
         };
         let projected = planner_tracks(&explicit);
 
@@ -3688,8 +4717,8 @@ mod tests {
 
         let legacy = Library {
             tracks: vec![
-                planner_test_track("plain", TrackStage::Groove, false),
-                planner_test_track("favorite", TrackStage::Groove, true),
+                planner_test_track("plain", TrackStage::Production, false),
+                planner_test_track("favorite", TrackStage::Production, true),
                 first_duplicate,
                 later_duplicate,
             ]
@@ -3697,6 +4726,7 @@ mod tests {
             selected_track_id: None,
             reference_tracks: Vec::new().into(),
             planner_order: Vec::new().into(),
+            tags: Default::default(),
         };
         let legacy_projected = planner_tracks(&legacy);
         assert_eq!(
@@ -3719,46 +4749,48 @@ mod tests {
         let mut library = Library {
             tracks: vec![
                 planner_test_track("a", TrackStage::Backlog, false),
-                planner_test_track("b", TrackStage::Groove, false),
-                planner_test_track("c", TrackStage::Groove, false),
+                planner_test_track("b", TrackStage::Production, false),
+                planner_test_track("c", TrackStage::Production, false),
             ]
             .into(),
             selected_track_id: None,
             reference_tracks: Vec::new().into(),
             planner_order: vec![String::from("a"), String::from("b"), String::from("c")].into(),
+            tags: Default::default(),
         };
 
         assert!(
-            move_track_to_planner_slot(&mut library, "c", TrackStage::Groove, 0)
+            move_track_to_planner_slot(&mut library, "c", TrackStage::Production, 0)
                 .expect("same-stage move should validate")
         );
         assert_eq!(library.planner_order.as_slice(), ["a", "c", "b"]);
-        assert_eq!(library.tracks[1].stage, TrackStage::Groove);
+        assert_eq!(library.tracks[1].stage, TrackStage::Production);
 
         assert!(
-            move_track_to_planner_slot(&mut library, "a", TrackStage::Groove, 2)
+            move_track_to_planner_slot(&mut library, "a", TrackStage::Production, 2)
                 .expect("cross-stage move should validate")
         );
         assert_eq!(library.planner_order.as_slice(), ["c", "b", "a"]);
-        assert_eq!(library.tracks[0].stage, TrackStage::Groove);
+        assert_eq!(library.tracks[0].stage, TrackStage::Production);
     }
 
     #[test]
     fn planner_move_keeps_unrelated_track_storage_in_place() {
         let mut library = Library {
             tracks: vec![
-                planner_test_track("source", TrackStage::Groove, false),
-                planner_test_track("unrelated", TrackStage::Groove, false),
+                planner_test_track("source", TrackStage::Production, false),
+                planner_test_track("unrelated", TrackStage::Production, false),
             ]
             .into(),
             selected_track_id: None,
             reference_tracks: Vec::new().into(),
             planner_order: vec![String::from("source"), String::from("unrelated")].into(),
+            tags: Default::default(),
         };
         let unrelated_pointer = std::ptr::from_ref(&library.tracks[1]);
 
         assert!(
-            move_track_to_planner_slot(&mut library, "source", TrackStage::Groove, 2)
+            move_track_to_planner_slot(&mut library, "source", TrackStage::Production, 2)
                 .expect("same-stage reorder should validate")
         );
         assert_eq!(library.planner_order.as_slice(), ["unrelated", "source"]);
@@ -3769,10 +4801,10 @@ mod tests {
     fn planner_move_adjusts_target_after_source_and_preserves_order() {
         let mut library = Library {
             tracks: vec![
-                planner_test_track("a", TrackStage::Groove, false),
-                planner_test_track("hidden-one", TrackStage::Groove, false),
-                planner_test_track("b", TrackStage::Groove, false),
-                planner_test_track("hidden-two", TrackStage::Groove, false),
+                planner_test_track("a", TrackStage::Production, false),
+                planner_test_track("hidden-one", TrackStage::Production, false),
+                planner_test_track("b", TrackStage::Production, false),
+                planner_test_track("hidden-two", TrackStage::Production, false),
             ]
             .into(),
             selected_track_id: None,
@@ -3784,10 +4816,11 @@ mod tests {
                 String::from("hidden-two"),
             ]
             .into(),
+            tags: Default::default(),
         };
 
         assert!(
-            move_track_to_planner_slot(&mut library, "a", TrackStage::Groove, 2,)
+            move_track_to_planner_slot(&mut library, "a", TrackStage::Production, 2,)
                 .expect("end target should validate")
         );
         assert_eq!(
@@ -3807,14 +4840,15 @@ mod tests {
     #[test]
     fn planner_move_rejects_stale_slot_without_mutating_library() {
         let mut library = Library {
-            tracks: vec![planner_test_track("a", TrackStage::Groove, false)].into(),
+            tracks: vec![planner_test_track("a", TrackStage::Production, false)].into(),
             selected_track_id: None,
             reference_tracks: Vec::new().into(),
             planner_order: vec![String::from("a")].into(),
+            tags: Default::default(),
         };
         let before = library.clone();
 
-        let error = move_track_to_planner_slot(&mut library, "a", TrackStage::Groove, 2)
+        let error = move_track_to_planner_slot(&mut library, "a", TrackStage::Production, 2)
             .expect_err("a slot beyond the visible list should be rejected");
         assert!(error.contains("no longer available"));
         assert_eq!(library, before);
@@ -3823,18 +4857,19 @@ mod tests {
     #[test]
     fn planner_move_accepts_an_empty_stage_target() {
         let mut library = Library {
-            tracks: vec![planner_test_track("a", TrackStage::Groove, false)].into(),
+            tracks: vec![planner_test_track("a", TrackStage::Production, false)].into(),
             selected_track_id: None,
             reference_tracks: Vec::new().into(),
             planner_order: vec![String::from("a")].into(),
+            tags: Default::default(),
         };
 
         assert!(
-            move_track_to_planner_slot(&mut library, "a", TrackStage::Master, 0)
+            move_track_to_planner_slot(&mut library, "a", TrackStage::Mastering, 0)
                 .expect("an empty stage target should validate")
         );
         assert_eq!(library.planner_order.as_slice(), ["a"]);
-        assert_eq!(library.tracks[0].stage, TrackStage::Master);
+        assert_eq!(library.tracks[0].stage, TrackStage::Mastering);
     }
 
     #[test]
@@ -3857,11 +4892,13 @@ mod tests {
                     done: false,
                 }]
                 .into(),
+                ..Default::default()
             }]
             .into(),
             selected_track_id: Some(String::from("track-1")),
             reference_tracks: Vec::new().into(),
             planner_order: Vec::new().into(),
+            tags: Default::default(),
         };
 
         replace_track_metadata(
@@ -3955,6 +4992,7 @@ mod tests {
             favorite: false,
             stage: TrackStage::Backlog,
             notes: SharedVec::default(),
+            ..Default::default()
         });
         library.planner_order.push(String::from("track-2"));
         library.selected_track_id = Some(String::from("track-2"));
@@ -4003,8 +5041,9 @@ mod tests {
             reference_path,
             size: 0,
             favorite: false,
-            stage: TrackStage::Groove,
+            stage: TrackStage::Production,
             notes: SharedVec::default(),
+            ..Default::default()
         };
         let library = Library {
             tracks: vec![
@@ -4035,6 +5074,7 @@ mod tests {
                 String::from("second"),
             ]
             .into(),
+            tags: Default::default(),
         };
         persist_library_at(&library, &library_path).expect("original library should persist");
 
@@ -4112,6 +5152,7 @@ mod tests {
                 favorite: false,
                 stage: TrackStage::Backlog,
                 notes: SharedVec::default(),
+                ..Default::default()
             }]
             .into(),
             selected_track_id: Some(String::from("owner")),
@@ -4131,6 +5172,7 @@ mod tests {
             }]
             .into(),
             planner_order: vec![String::from("owner")].into(),
+            tags: Default::default(),
         };
         persist_library_at(&library, &library_path).expect("original library should persist");
         let original_bytes = fs::read(&library_path).expect("original snapshot should read");
@@ -4184,6 +5226,7 @@ mod tests {
                 favorite: false,
                 stage: TrackStage::Backlog,
                 notes: SharedVec::default(),
+                ..Default::default()
             }]
             .into(),
             selected_track_id: Some(String::from("owner")),
@@ -4197,6 +5240,7 @@ mod tests {
             }]
             .into(),
             planner_order: vec![String::from("owner")].into(),
+            tags: Default::default(),
         };
         persist_library_at(&library, &library_path).expect("original library should persist");
 
@@ -4253,6 +5297,7 @@ mod tests {
                 favorite: false,
                 stage: TrackStage::Backlog,
                 notes: SharedVec::default(),
+                ..Default::default()
             }]
             .into(),
             selected_track_id: Some(String::from("owner")),
@@ -4272,6 +5317,7 @@ mod tests {
             ]
             .into(),
             planner_order: vec![String::from("owner")].into(),
+            tags: Default::default(),
         };
         persist_library_at(&library, &library_path).expect("original library should persist");
         let original_bytes = fs::read(&library_path).expect("original snapshot should read");
@@ -4357,6 +5403,7 @@ mod tests {
                 favorite: false,
                 stage: TrackStage::Backlog,
                 notes: SharedVec::default(),
+                ..Default::default()
             }]
             .into(),
             selected_track_id: Some(String::from("owner")),
@@ -4368,6 +5415,7 @@ mod tests {
             }]
             .into(),
             planner_order: vec![String::from("owner")].into(),
+            tags: Default::default(),
         };
 
         let selected =
@@ -4469,6 +5517,7 @@ mod tests {
                 favorite: true,
                 stage: TrackStage::Mixdown,
                 notes: vec![main_note.clone()].into(),
+                ..Default::default()
             }]
             .into(),
             selected_track_id: Some(String::from("owner")),
@@ -4480,6 +5529,7 @@ mod tests {
             }]
             .into(),
             planner_order: vec![String::from("owner")].into(),
+            tags: Default::default(),
         };
         persist_library_at(&library, &library_path).expect("unknown library should persist");
 
@@ -4527,6 +5577,7 @@ mod tests {
                 favorite: false,
                 stage: TrackStage::Backlog,
                 notes: SharedVec::default(),
+                ..Default::default()
             }]
             .into(),
             selected_track_id: Some(String::from("owner")),
@@ -4546,6 +5597,7 @@ mod tests {
             }]
             .into(),
             planner_order: vec![String::from("owner")].into(),
+            tags: Default::default(),
         };
         persist_library_at(&library, &library_path).expect("original library should persist");
         let original_bytes = fs::read(&library_path).expect("original snapshot should read");
@@ -4667,11 +5719,13 @@ mod tests {
                     done: false,
                 }]
                 .into(),
+                ..Default::default()
             }]
             .into(),
             selected_track_id: Some(String::from("track-1")),
             reference_tracks: Vec::new().into(),
             planner_order: Vec::new().into(),
+            tags: Default::default(),
         };
         let encoded = serde_json::to_string(&library).expect("library should encode");
         assert!(encoded.contains(r#""stage":"mixdown""#));
@@ -4752,11 +5806,13 @@ mod tests {
                 favorite: false,
                 stage: TrackStage::Backlog,
                 notes: SharedVec::default(),
+                ..Default::default()
             }]
             .into(),
             selected_track_id: Some(String::from("track-1")),
             reference_tracks: Vec::new().into(),
             planner_order: Vec::new().into(),
+            tags: Default::default(),
         };
 
         normalize_reference_tracks(&mut library);
@@ -4785,11 +5841,13 @@ mod tests {
                 favorite: false,
                 stage: TrackStage::Backlog,
                 notes: SharedVec::default(),
+                ..Default::default()
             }]
             .into(),
             selected_track_id: Some(String::from("track-1")),
             reference_tracks: Vec::new().into(),
             planner_order: Vec::new().into(),
+            tags: Default::default(),
         };
 
         ensure_reference_track(&mut library, reference_path.clone());
@@ -4815,6 +5873,7 @@ mod tests {
             favorite: false,
             stage: TrackStage::Backlog,
             notes: SharedVec::default(),
+            ..Default::default()
         };
         let mut library = Library {
             tracks: vec![
@@ -4846,6 +5905,7 @@ mod tests {
             ]
             .into(),
             planner_order: Vec::new().into(),
+            tags: Default::default(),
         };
 
         assert_eq!(
@@ -4881,6 +5941,7 @@ mod tests {
                 favorite: false,
                 stage: TrackStage::Backlog,
                 notes: SharedVec::default(),
+                ..Default::default()
             }]
             .into(),
             selected_track_id: Some(String::from("track-1")),
@@ -4912,6 +5973,7 @@ mod tests {
             ]
             .into(),
             planner_order: Vec::new().into(),
+            tags: Default::default(),
         };
 
         assert!(
@@ -4947,11 +6009,13 @@ mod tests {
                     done: false,
                 }]
                 .into(),
+                ..Default::default()
             }]
             .into(),
             selected_track_id: Some(String::from("track-1")),
             reference_tracks: Vec::new().into(),
             planner_order: Vec::new().into(),
+            tags: Default::default(),
         };
 
         set_reference_track_metadata(
@@ -4970,5 +6034,432 @@ mod tests {
         assert_eq!(track.notes.len(), 1);
         assert!(track.favorite);
         assert_eq!(track.stage, TrackStage::Mixdown);
+    }
+
+    fn distinct_pcm_wav(amplitude: i16) -> Vec<u8> {
+        let samples = vec![amplitude; 80];
+        let data_len = (samples.len() * 2) as u32;
+        let mut bytes = Vec::from(*b"RIFF");
+        bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&8_000_u32.to_le_bytes());
+        bytes.extend_from_slice(&16_000_u32.to_le_bytes());
+        bytes.extend_from_slice(&2_u16.to_le_bytes());
+        bytes.extend_from_slice(&16_u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_len.to_le_bytes());
+        for sample in samples {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn write_decoded_bounce(
+        directory: &Path,
+        filename: &str,
+        amplitude: i16,
+    ) -> (PathBuf, crate::audio::DecodedAudioFile) {
+        let path = directory.join(filename);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create bounce parent directory");
+        }
+        fs::write(&path, distinct_pcm_wav(amplitude)).expect("write bounce fixture");
+        let decoded = crate::audio::decode_audio_file(&path).expect("decode bounce fixture");
+        (path, decoded)
+    }
+
+    #[test]
+    fn parse_bounce_filename_handles_canonical_legacy_multi_letter_untitled_and_invalid() {
+        let a1 = parse_bounce_filename(Path::new("/bounces/A1_b1__track-title.wav"))
+            .expect("canonical titled bounce should parse");
+        assert_eq!(a1.batch, "A");
+        assert_eq!(a1.slot, 1);
+        assert_eq!(a1.group_key, "A1");
+        assert_eq!(a1.build, 1);
+        assert_eq!(a1.title.as_deref(), Some("track title"));
+
+        let untitled = parse_bounce_filename(Path::new("A1_b2.wav"))
+            .expect("untitled canonical bounce should parse");
+        assert_eq!(untitled.group_key, "A1");
+        assert_eq!(untitled.build, 2);
+        assert_eq!(untitled.title, None);
+
+        let multi_letter = parse_bounce_filename(Path::new("AA1_b1.wav"))
+            .expect("multi-letter batch should parse");
+        assert_eq!(multi_letter.batch, "AA");
+        assert_eq!(multi_letter.slot, 1);
+        assert_eq!(multi_letter.group_key, "AA1");
+        assert_eq!(multi_letter.build, 1);
+
+        let legacy_padded = parse_bounce_filename(Path::new("A1_B02.wav"))
+            .expect("legacy uppercase B with zero padding should parse");
+        assert_eq!(legacy_padded.group_key, "A1");
+        assert_eq!(legacy_padded.build, 2);
+        assert_eq!(legacy_padded.build, untitled.build);
+
+        let legacy_titled = parse_bounce_filename(Path::new("A1_B2__new-title.wav"))
+            .expect("legacy titled bounce should parse");
+        assert_eq!(legacy_titled.build, 2);
+        assert_eq!(legacy_titled.title.as_deref(), Some("new title"));
+
+        let slot_zero = parse_bounce_filename(Path::new("AB0_b10.flac"))
+            .expect("slot 0 and multi-digit build should parse");
+        assert_eq!(slot_zero.group_key, "AB0");
+        assert_eq!(slot_zero.build, 10);
+
+        for invalid in [
+            "a1_b1.wav",
+            "A10_b1.wav",
+            "A1_b0.wav",
+            "A1_b00.wav",
+            "A1_b2_extra.wav",
+            "my-demo-song.wav",
+            "A1_b1.txt",
+        ] {
+            assert!(
+                parse_bounce_filename(Path::new(invalid)).is_none(),
+                "{invalid} must not match bounce convention"
+            );
+        }
+    }
+
+    #[test]
+    fn drop_order_grouping_keeps_highest_build_current_and_never_renames_audio() {
+        for reverse in [false, true] {
+            let directory = TestDirectory::new();
+            let library_path = directory.path.join("library.json");
+            let mut files = vec![
+                write_decoded_bounce(&directory.path, "A1_b10.wav", 1000),
+                write_decoded_bounce(&directory.path, "A2_b1.wav", 2000),
+                write_decoded_bounce(&directory.path, "AA1_b1.wav", 3000),
+                write_decoded_bounce(&directory.path, "A1_B2__new-title.wav", 4000),
+            ];
+            if reverse {
+                files.reverse();
+            }
+
+            let mut library = Library::default();
+            for (_, decoded) in &files {
+                let saved = import_bounce_into_library_at(library, decoded.clone(), &library_path)
+                    .expect("import should succeed");
+                library = saved.value.0;
+            }
+
+            assert_eq!(library.tracks.len(), 3);
+            let a1 = library
+                .tracks
+                .iter()
+                .find(|t| t.group_key.as_deref() == Some("A1"))
+                .expect("A1 track should exist");
+            assert_eq!(a1.revisions.len(), 2);
+            assert_eq!(a1.current_build_label(), "b10");
+            assert_eq!(a1.active_build_label(), "b10");
+            assert_eq!(a1.title, "new title");
+            let a1_id = a1.id.clone();
+
+            // Title edits never split the track on subsequent builds.
+            assert!(set_track_title(&mut library, &a1_id, "Custom Arrangement").unwrap());
+            let (_, b11) = write_decoded_bounce(&directory.path, "A1_b11__other-name.wav", 5000);
+            let saved = import_bounce_into_library_at(library, b11, &library_path)
+                .expect("b11 import should succeed");
+            library = saved.value.0;
+            assert_eq!(library.tracks.len(), 3);
+            let a1 = library
+                .tracks
+                .iter()
+                .find(|t| t.group_key.as_deref() == Some("A1"))
+                .expect("A1 track should remain unified");
+            assert_eq!(a1.title, "Custom Arrangement");
+            assert_eq!(a1.revisions.len(), 3);
+            assert_eq!(a1.current_build_label(), "b11");
+
+            // Source audio files on disk are never renamed.
+            for (path, _) in &files {
+                assert!(path.is_file(), "source file {} must stay in place", path.display());
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_redrop_is_ignored_and_conflicting_build_flags_collision_without_overwrite() {
+        let directory = TestDirectory::new();
+        let library_path = directory.path.join("library.json");
+        let (path_b2, b2) = write_decoded_bounce(&directory.path, "A1_b2.wav", 1200);
+        let saved = import_bounce_into_library_at(Library::default(), b2, &library_path)
+            .expect("initial b2 import should succeed");
+        let mut library = saved.value.0;
+        let track_id = saved.value.1.track_id().to_owned();
+
+        // Identical bytes under legacy padded name A1_B02.wav -> ignored duplicate.
+        let (_, b02_same) = write_decoded_bounce(&directory.path, "A1_B02.wav", 1200);
+        let saved = import_bounce_into_library_at(library, b02_same, &library_path)
+            .expect("duplicate drop should succeed cleanly");
+        library = saved.value.0;
+        assert!(matches!(
+            saved.value.1,
+            BounceImportOutcome::DuplicateIgnored { .. }
+        ));
+        assert_eq!(library.tracks[0].revisions.len(), 1);
+        assert!(library.tracks[0].collisions.is_empty());
+
+        // Different bytes under A1_B02.wav -> collision flagged, original b2 preserved.
+        let (conflict_path, b02_conflict) =
+            write_decoded_bounce(&directory.path, "conflict/A1_B02.wav", 9500);
+        let saved = import_bounce_into_library_at(library, b02_conflict, &library_path)
+            .expect("collision drop should flag without error");
+        library = saved.value.0;
+        let collision_id = match saved.value.1 {
+            BounceImportOutcome::CollisionFlagged {
+                collision_id,
+                build,
+                ..
+            } => {
+                assert_eq!(build, 2);
+                collision_id
+            }
+            other => panic!("expected CollisionFlagged, got {other:?}"),
+        };
+        assert_eq!(library.tracks[0].path, path_b2);
+        assert_eq!(library.tracks[0].revisions.len(), 1);
+        assert_eq!(library.tracks[0].collisions.len(), 1);
+
+        // Keep existing dismisses collision without changing b2.
+        let mut kept = library.clone();
+        resolve_collision_keep_existing(&mut kept, &track_id, &collision_id).unwrap();
+        assert!(kept.tracks[0].collisions.is_empty());
+        assert_eq!(kept.tracks[0].path, path_b2);
+
+        // Replace build updates b2 intentionally.
+        let mut replaced = library.clone();
+        resolve_collision_replace_build(&mut replaced, &track_id, &collision_id).unwrap();
+        assert!(replaced.tracks[0].collisions.is_empty());
+        assert_eq!(replaced.tracks[0].path, conflict_path);
+
+        // Import as separate track leaves original b2 untouched and creates a new track.
+        let mut split = library.clone();
+        let new_id =
+            resolve_collision_import_as_new_track(&mut split, &track_id, &collision_id).unwrap();
+        assert!(split.tracks[0].collisions.is_empty());
+        assert_eq!(split.tracks[0].path, path_b2);
+        assert_eq!(split.tracks.len(), 2);
+        assert_eq!(split.tracks[1].id, new_id);
+        assert_eq!(split.tracks[1].path, conflict_path);
+    }
+
+    #[test]
+    fn manual_assignment_attaches_non_matching_files_to_existing_track() {
+        let directory = TestDirectory::new();
+        let library_path = directory.path.join("library.json");
+        let (_, a1_b1) = write_decoded_bounce(&directory.path, "A1_b1__starter.wav", 1000);
+        let saved = import_bounce_into_library_at(Library::default(), a1_b1, &library_path)
+            .expect("import A1");
+        let mut library = saved.value.0;
+        let a1_id = library.tracks[0].id.clone();
+        set_track_stage(&mut library, &a1_id, TrackStage::Production).unwrap();
+        set_track_next_action(&mut library, &a1_id, "Tighten snare").unwrap();
+
+        // Direct attach of a non-matching filename via add_revision_to_track.
+        let (rough_path, rough) = write_decoded_bounce(&directory.path, "rough-mix.wav", 2200);
+        let saved = add_revision_to_track_at(library, &a1_id, rough, &library_path)
+            .expect("manual attach should succeed");
+        library = saved.value.0;
+        assert_eq!(library.tracks.len(), 1);
+        assert_eq!(library.tracks[0].revisions.len(), 2);
+        assert_eq!(library.tracks[0].stage, TrackStage::Production);
+        assert_eq!(library.tracks[0].next_action, "Tighten snare");
+        assert!(rough_path.is_file());
+
+        // Standalone non-matching track can also be manually assigned into A1.
+        let (_, standalone) = write_decoded_bounce(&directory.path, "extra-take.wav", 3300);
+        let saved = import_bounce_into_library_at(library, standalone, &library_path)
+            .expect("standalone import should succeed");
+        library = saved.value.0;
+        assert_eq!(library.tracks.len(), 2);
+        let standalone_id = library.tracks[1].id.clone();
+        assign_standalone_track_as_revision(&mut library, &standalone_id, &a1_id)
+            .expect("manual assignment from standalone should succeed");
+        assert_eq!(library.tracks.len(), 1);
+        assert_eq!(library.tracks[0].revisions.len(), 3);
+        assert_eq!(library.tracks[0].stage, TrackStage::Production);
+        assert_eq!(library.tracks[0].next_action, "Tighten snare");
+    }
+
+    #[test]
+    fn per_build_notes_stage_next_action_and_relink_survive_relaunch() {
+        let directory = TestDirectory::new();
+        let library_path = directory.path.join("library.json");
+        let (_, b1) = write_decoded_bounce(&directory.path, "A1_b1__groove.wav", 1500);
+        let saved = import_bounce_into_library_at(Library::default(), b1, &library_path)
+            .expect("import b1");
+        let mut library = saved.value.0;
+        let track_id = library.tracks[0].id.clone();
+        let b1_rev_id = library.tracks[0].active_revision_id.clone().unwrap();
+
+        set_track_stage(&mut library, &track_id, TrackStage::Mixdown).unwrap();
+        set_track_next_action(&mut library, &track_id, "Trim intro by 4 bars").unwrap();
+        set_revision_feedback_note(&mut library, &track_id, Some(&b1_rev_id), "Heard by Dylan")
+            .unwrap();
+        library.tracks[0].notes.push(Note {
+            id: String::from("note-b1"),
+            time_millis: 12_500,
+            body: String::from("Kick dips at drop"),
+            done: false,
+        });
+        sync_active_revision_notes(&mut library, &track_id);
+
+        // Adding b2 preserves stage and next action, keeps b1 notes on b1.
+        let (b2_path, b2) = write_decoded_bounce(&directory.path, "A1_b2__groove.wav", 2500);
+        let saved = import_bounce_into_library_at(library, b2, &library_path).expect("import b2");
+        library = saved.value.0;
+        assert_eq!(library.tracks.len(), 1);
+        assert_eq!(library.tracks[0].stage, TrackStage::Mixdown);
+        assert_eq!(library.tracks[0].next_action, "Trim intro by 4 bars");
+        assert_eq!(library.tracks[0].current_build_label(), "b2");
+        assert!(library.tracks[0].notes.is_empty());
+
+        library.tracks[0].notes.push(Note {
+            id: String::from("note-b2"),
+            time_millis: 45_000,
+            body: String::from("Outro transition smoother"),
+            done: false,
+        });
+        sync_active_revision_notes(&mut library, &track_id);
+        let b2_rev_id = library.tracks[0].active_revision_id.clone().unwrap();
+
+        // Switching to b1 shows b1's notes at their original timestamp and Dylan feedback note.
+        assert!(select_track_revision(&mut library, &track_id, &b1_rev_id).unwrap());
+        assert!(library.tracks[0].is_viewing_prior_build());
+        assert_eq!(library.tracks[0].notes.len(), 1);
+        assert_eq!(library.tracks[0].notes[0].time_millis, 12_500);
+        assert_eq!(
+            library.tracks[0]
+                .active_revision()
+                .unwrap()
+                .feedback_note
+                .as_deref(),
+            Some("Heard by Dylan")
+        );
+
+        // Switch back to b2, move b2 on disk, confirm missing-source state, relink in place.
+        assert!(select_track_revision(&mut library, &track_id, &b2_rev_id).unwrap());
+        let moved_path = directory.path.join("moved/A1_b2__groove.wav");
+        fs::create_dir_all(moved_path.parent().unwrap()).unwrap();
+        fs::rename(&b2_path, &moved_path).unwrap();
+        assert!(library.tracks[0].is_source_missing());
+
+        let moved_decoded =
+            crate::audio::decode_audio_file(&moved_path).expect("decode moved bounce");
+        let relinked = relink_track_revision_at(
+            library,
+            &track_id,
+            Some(&b2_rev_id),
+            moved_decoded,
+            &library_path,
+        )
+        .expect("relink should succeed");
+        assert_eq!(relinked.tracks.len(), 1, "relink must not duplicate the card");
+        assert!(!relinked.tracks[0].is_source_missing());
+        assert_eq!(relinked.tracks[0].path, moved_path);
+        assert_eq!(relinked.tracks[0].notes.len(), 1);
+        assert_eq!(relinked.tracks[0].notes[0].id, "note-b2");
+        assert_eq!(relinked.tracks[0].revisions.len(), 2);
+
+        // Reload from disk (relaunch) and verify everything survives.
+        let reloaded = load_library_at(&library_path).expect("relaunch load should succeed");
+        let track = &reloaded.tracks[0];
+        assert_eq!(track.stage, TrackStage::Mixdown);
+        assert_eq!(track.next_action, "Trim intro by 4 bars");
+        assert_eq!(track.path, moved_path);
+        assert_eq!(track.current_build_label(), "b2");
+        assert_eq!(track.revisions.len(), 2);
+        let rev_b1 = track
+            .revisions
+            .iter()
+            .find(|r| r.build == Some(1))
+            .expect("b1 history preserved");
+        assert_eq!(rev_b1.notes.len(), 1);
+        assert_eq!(rev_b1.notes[0].time_millis, 12_500);
+        assert_eq!(rev_b1.feedback_note.as_deref(), Some("Heard by Dylan"));
+    }
+
+    #[test]
+    fn five_track_baseline_and_two_bounce_dylan_round_survive_relaunch() {
+        let directory = TestDirectory::new();
+        let library_path = directory.path.join("library.json");
+        let fixtures = [
+            ("A1_b1__opener.wav", 1000_i16, TrackStage::Backlog, "Cut 8-bar intro"),
+            ("A2_b1__peak.wav", 2000, TrackStage::Production, "Check break energy with Dylan"),
+            ("A3_b1__bridge.wav", 3000, TrackStage::Mixdown, "Tame 250Hz mud"),
+            ("A4_b1__roller.wav", 4000, TrackStage::Production, "Bring hats up 1dB"),
+            ("A5_b1__closer.wav", 5000, TrackStage::Mastering, "Final loudness pass"),
+        ];
+
+        let mut library = Library::default();
+        for (name, amp, stage, action) in fixtures {
+            let (_, decoded) = write_decoded_bounce(&directory.path, name, amp);
+            let saved =
+                import_bounce_into_library_at(library, decoded, &library_path).expect("import");
+            library = saved.value.0;
+            let id = saved.value.1.track_id().to_owned();
+            set_track_stage(&mut library, &id, stage).unwrap();
+            set_track_next_action(&mut library, &id, action).unwrap();
+            library
+                .tracks
+                .find_mut(|t| t.id == id)
+                .unwrap()
+                .notes
+                .push(Note {
+                    id: format!("n-{id}"),
+                    time_millis: 5_000,
+                    body: format!("Baseline note for {name}"),
+                    done: false,
+                });
+            sync_active_revision_notes(&mut library, &id);
+        }
+
+        // Two-bounce Dylan feedback round on A2.
+        let a2_id = library
+            .tracks
+            .iter()
+            .find(|t| t.group_key.as_deref() == Some("A2"))
+            .unwrap()
+            .id
+            .clone();
+        set_revision_feedback_note(&mut library, &a2_id, None, "Heard by Dylan — extend DJ exit")
+            .unwrap();
+        let (_, a2_b2) = write_decoded_bounce(&directory.path, "A2_b2__peak.wav", 2600);
+        let saved =
+            import_bounce_into_library_at(library, a2_b2, &library_path).expect("import A2_b2");
+        library = saved.value.0;
+        set_track_next_action(&mut library, &a2_id, "Verify 16-bar DJ outro after Dylan notes")
+            .unwrap();
+        persist_library_at(&library, &library_path).expect("persist five-track baseline");
+
+        let reloaded = load_library_at(&library_path).expect("relaunch load");
+        assert_eq!(reloaded.tracks.len(), 5);
+        for track in &reloaded.tracks {
+            assert!(!track.next_action.is_empty());
+            assert!(!track.is_source_missing());
+        }
+        let a2 = reloaded
+            .tracks
+            .iter()
+            .find(|t| t.group_key.as_deref() == Some("A2"))
+            .unwrap();
+        assert_eq!(a2.current_build_label(), "b2");
+        assert_eq!(a2.revisions.len(), 2);
+        assert_eq!(
+            a2.next_action,
+            "Verify 16-bar DJ outro after Dylan notes"
+        );
+        let a2_b1 = a2.revisions.iter().find(|r| r.build == Some(1)).unwrap();
+        assert_eq!(
+            a2_b1.feedback_note.as_deref(),
+            Some("Heard by Dylan — extend DJ exit")
+        );
+        assert_eq!(a2_b1.notes.len(), 1);
     }
 }

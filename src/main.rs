@@ -7,6 +7,7 @@ mod signal_summary;
 mod source;
 mod spectrogram;
 mod storage;
+mod tags;
 mod transport;
 mod waveform;
 
@@ -11937,12 +11938,9 @@ fn planner_column_heading(stage: storage::TrackStage) -> &'static str {
 const fn planner_column_tone(stage: storage::TrackStage) -> ui::WidgetTone {
     match stage {
         storage::TrackStage::Backlog => ui::WidgetTone::Warning,
-        storage::TrackStage::Groove
-        | storage::TrackStage::Arrangement
-        | storage::TrackStage::Polish => ui::WidgetTone::Accent,
+        storage::TrackStage::Production => ui::WidgetTone::Accent,
         storage::TrackStage::Mixdown => ui::WidgetTone::Success,
-        storage::TrackStage::Master => ui::WidgetTone::Danger,
-        storage::TrackStage::Release => ui::WidgetTone::Success,
+        storage::TrackStage::Mastering => ui::WidgetTone::Danger,
     }
 }
 
@@ -15084,7 +15082,7 @@ mod tests {
             reference_path: Some(PathBuf::from(format!("/external/{id}-reference.wav"))),
             size: 0,
             favorite: false,
-            stage: TrackStage::Groove,
+            stage: TrackStage::Production,
             notes: crate::storage::SharedVec::default(),
         }
     }
@@ -20072,6 +20070,7 @@ mod tests {
             }]
             .into(),
             planner_order: Vec::new().into(),
+            tags: Default::default(),
         };
         let mut state = AppState {
             busy: true,
@@ -24902,7 +24901,7 @@ mod tests {
             reference_path: Some(reference_path.clone()),
             size: 0,
             favorite: false,
-            stage: TrackStage::Groove,
+            stage: TrackStage::Production,
             notes: vec![Note {
                 id: String::from("main-persisted-note"),
                 time_millis: 500,
@@ -28785,11 +28784,11 @@ mod tests {
         let tracks = vec![
             track("sound", TrackStage::Backlog),
             track("mix", TrackStage::Mixdown),
-            track("production", TrackStage::Groove),
+            track("production", TrackStage::Production),
         ];
 
-        let production = owned_tracks_in_stage(&tracks, TrackStage::Groove);
-        let mastering = owned_tracks_in_stage(&tracks, TrackStage::Master);
+        let production = owned_tracks_in_stage(&tracks, TrackStage::Production);
+        let mastering = owned_tracks_in_stage(&tracks, TrackStage::Mastering);
 
         assert_eq!(production.len(), 1);
         assert_eq!(production[0].id, "production");
@@ -28813,10 +28812,10 @@ mod tests {
         let library = Library {
             tracks: vec![
                 track("sound", TrackStage::Backlog),
-                track("production", TrackStage::Groove),
+                track("production", TrackStage::Production),
                 track("mix", TrackStage::Mixdown),
-                track("master", TrackStage::Master),
-                track("tail", TrackStage::Groove),
+                track("master", TrackStage::Mastering),
+                track("tail", TrackStage::Production),
             ]
             .into(),
             selected_track_id: None,
@@ -28828,6 +28827,7 @@ mod tests {
                 String::from("sound"),
             ]
             .into(),
+            tags: Default::default(),
         };
 
         let projection = planner_tracks_with_favorites(&library);
@@ -28842,7 +28842,7 @@ mod tests {
         assert!(std::ptr::eq(projection.ordered[0], &library.tracks[2]));
         assert!(std::ptr::eq(projection.ordered[1], &library.tracks[0]));
         assert!(std::ptr::eq(
-            projection.tracks_in_stage(TrackStage::Groove)[0],
+            projection.tracks_in_stage(TrackStage::Production)[0],
             &library.tracks[1]
         ));
         assert_eq!(
@@ -28855,7 +28855,7 @@ mod tests {
         );
         assert_eq!(
             projection
-                .tracks_in_stage(TrackStage::Groove)
+                .tracks_in_stage(TrackStage::Production)
                 .iter()
                 .map(|track| track.id.as_str())
                 .collect::<Vec<_>>(),
@@ -28871,7 +28871,7 @@ mod tests {
         );
         assert_eq!(
             projection
-                .tracks_in_stage(TrackStage::Master)
+                .tracks_in_stage(TrackStage::Mastering)
                 .iter()
                 .map(|track| track.id.as_str())
                 .collect::<Vec<_>>(),
@@ -28885,7 +28885,7 @@ mod tests {
             workspace_mode: WorkspaceMode::Planner,
             ..AppState::default()
         };
-        let stages = [TrackStage::Groove, TrackStage::Mixdown];
+        let stages = [TrackStage::Production, TrackStage::Mixdown];
         state.library.tracks = stages
             .into_iter()
             .enumerate()
@@ -28923,7 +28923,7 @@ mod tests {
         );
         let runtime = SurfaceRuntime::new(bridge, Vector2::new(1_180.0, 720.0));
         let production_window =
-            runtime.bridge().state().planner_windows[planner_stage_index(TrackStage::Groove)];
+            runtime.bridge().state().planner_windows[planner_stage_index(TrackStage::Production)];
         (
             runtime.layout().stats.materialized_nodes,
             production_window.window_len(),
@@ -28969,7 +28969,7 @@ mod tests {
         }
         let _after_frame = runtime.frame_with_default_theme();
         assert!(
-            runtime.bridge().state().planner_windows[planner_stage_index(TrackStage::Groove)]
+            runtime.bridge().state().planner_windows[planner_stage_index(TrackStage::Production)]
                 .viewport_start
                 > 0,
             "the hovered Planner column should advance after wheel input"
@@ -28988,7 +28988,7 @@ mod tests {
     }
 
     #[test]
-    fn planner_horizontal_wheel_reaches_release_at_default_width() {
+    fn planner_horizontal_wheel_reaches_mastering_at_narrow_width() {
         let state = AppState {
             busy: false,
             workspace_mode: WorkspaceMode::Planner,
@@ -29003,14 +29003,8 @@ mod tests {
                 context.into_command()
             },
         );
-        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1_180.0, 900.0));
+        let mut runtime = SurfaceRuntime::new(bridge, Vector2::new(1_040.0, 900.0));
         let initial_frame = runtime.frame_with_default_theme();
-        assert!(
-            !initial_frame
-                .paint_plan
-                .contains_text(TrackStage::Release.label()),
-            "Release should begin outside the default-width Planner viewport"
-        );
         let backlog_heading = initial_frame
             .paint_plan
             .first_text_run(TrackStage::Backlog.label())
@@ -29030,13 +29024,13 @@ mod tests {
             ));
         }
         let scrolled_frame = runtime.frame_with_default_theme();
-        let release_heading = scrolled_frame
+        let mastering_heading = scrolled_frame
             .paint_plan
-            .first_text_run(TrackStage::Release.label())
-            .expect("horizontal wheel input should reveal the Release stage");
+            .first_text_run(TrackStage::Mastering.label())
+            .expect("horizontal wheel input should reveal the Mastering stage");
         assert!(
-            board_viewport.contains(release_heading.rect.center()),
-            "the Release heading should be inside the board viewport after scrolling"
+            board_viewport.contains(mastering_heading.rect.center()),
+            "the Mastering heading should be inside the board viewport after scrolling"
         );
     }
 
@@ -29151,8 +29145,8 @@ mod tests {
                 production_viewport.center(),
                 Vector2::new(0.0, 120.0),
             ));
-            let window =
-                runtime.bridge().state().planner_windows[planner_stage_index(TrackStage::Groove)];
+            let window = runtime.bridge().state().planner_windows
+                [planner_stage_index(TrackStage::Production)];
             reached_final_rows |= window.window_end == cards_per_stage;
         }
         assert!(
@@ -29163,7 +29157,7 @@ mod tests {
 
         let scrolled_frame = runtime.frame_with_default_theme();
         let scrolled_window =
-            runtime.bridge().state().planner_windows[planner_stage_index(TrackStage::Groove)];
+            runtime.bridge().state().planner_windows[planner_stage_index(TrackStage::Production)];
         assert!(scrolled_window.viewport_start > 0);
         assert!(scrolled_window.viewport_end > scrolled_window.viewport_start);
         assert!(scrolled_window.window_start > 0);
@@ -29211,7 +29205,7 @@ mod tests {
         assert_eq!(
             insertion_target,
             PlannerInsertionTarget {
-                stage: TrackStage::Groove,
+                stage: TrackStage::Production,
                 slot: final_slot,
             }
         );
@@ -29233,7 +29227,7 @@ mod tests {
         assert!(runtime.bridge().state().planner_drag_pointer.is_none());
 
         let production_ids = planner_tracks_with_favorites(&runtime.bridge().state().library)
-            .tracks_in_stage(TrackStage::Groove)
+            .tracks_in_stage(TrackStage::Production)
             .iter()
             .map(|track| track.id.clone())
             .collect::<Vec<_>>();
@@ -29246,7 +29240,7 @@ mod tests {
         let resumed_frame = runtime.frame_with_default_theme();
         let resumed_layout = runtime.layout();
         let resumed_window =
-            runtime.bridge().state().planner_windows[planner_stage_index(TrackStage::Groove)];
+            runtime.bridge().state().planner_windows[planner_stage_index(TrackStage::Production)];
         assert!(resumed_window.viewport_start > 0);
         assert!(resumed_window.window_start > 0);
         assert!(resumed_window.window_len() < cards_per_stage);
@@ -29320,7 +29314,7 @@ mod tests {
         assert!(end.contains(total_items - 1));
         assert_eq!(end.window_end, total_items);
         let end_target = PlannerInsertionTarget {
-            stage: TrackStage::Groove,
+            stage: TrackStage::Production,
             slot: end.window_end,
         };
         assert_eq!(end_target.slot, total_items);
@@ -29693,7 +29687,7 @@ mod tests {
             &state.library,
             "missing",
             &PlannerInsertionTarget {
-                stage: TrackStage::Master,
+                stage: TrackStage::Mastering,
                 slot: 0,
             },
         ));
@@ -29710,7 +29704,7 @@ mod tests {
             reference_path: None,
             size: 0,
             favorite: false,
-            stage: TrackStage::Groove,
+            stage: TrackStage::Production,
             notes: crate::storage::SharedVec::default(),
         };
         let mut state = AppState {
@@ -29732,7 +29726,7 @@ mod tests {
         update(
             &mut state,
             Message::PlannerInsertionHovered(PlannerInsertionTarget {
-                stage: TrackStage::Groove,
+                stage: TrackStage::Production,
                 slot: 1,
             }),
             &mut context,
@@ -29750,7 +29744,7 @@ mod tests {
         update(
             &mut state,
             Message::PlannerInsertionHovered(PlannerInsertionTarget {
-                stage: TrackStage::Groove,
+                stage: TrackStage::Production,
                 slot: 3,
             }),
             &mut context,
@@ -29772,7 +29766,7 @@ mod tests {
         update(
             &mut state,
             Message::PlannerInsertionHovered(PlannerInsertionTarget {
-                stage: TrackStage::Master,
+                stage: TrackStage::Mastering,
                 slot: 0,
             }),
             &mut context,
@@ -29802,7 +29796,7 @@ mod tests {
             reference_path: None,
             size: 0,
             favorite: false,
-            stage: TrackStage::Groove,
+            stage: TrackStage::Production,
             notes: crate::storage::SharedVec::default(),
         };
         let mut state = AppState {
@@ -29839,7 +29833,7 @@ mod tests {
         assert_eq!(
             runtime.bridge().state().planner_drag_target,
             Some(PlannerInsertionTarget {
-                stage: TrackStage::Groove,
+                stage: TrackStage::Production,
                 slot: 2,
             })
         );
@@ -29983,7 +29977,7 @@ mod tests {
             reference_path: None,
             size: 0,
             favorite: false,
-            stage: TrackStage::Groove,
+            stage: TrackStage::Production,
             notes: crate::storage::SharedVec::default(),
         };
         let mut state = AppState {
@@ -30308,13 +30302,13 @@ mod tests {
         update(
             &mut state,
             Message::PlannerInsertionDropped(PlannerInsertionTarget {
-                stage: TrackStage::Groove,
+                stage: TrackStage::Production,
                 slot: 0,
             }),
             &mut context,
         );
 
-        assert_eq!(state.library.tracks[0].stage, TrackStage::Groove);
+        assert_eq!(state.library.tracks[0].stage, TrackStage::Production);
         assert_eq!(state.library.planner_order.as_slice(), ["drag"]);
         assert!(state.save_admission_pending);
         admit_library_save_for_test(&mut state, &mut context);
@@ -30340,7 +30334,7 @@ mod tests {
             reference_path: None,
             size: 0,
             favorite: false,
-            stage: TrackStage::Groove,
+            stage: TrackStage::Production,
             notes: crate::storage::SharedVec::default(),
         };
 
@@ -30370,7 +30364,7 @@ mod tests {
             reference_path: None,
             size: 0,
             favorite: false,
-            stage: TrackStage::Groove,
+            stage: TrackStage::Production,
             notes: crate::storage::SharedVec::default(),
         };
         #[derive(Clone)]
@@ -30420,7 +30414,7 @@ mod tests {
         assert!(
             labels
                 .iter()
-                .any(|label| label == TrackStage::Master.label()),
+                .any(|label| label == TrackStage::Mastering.label()),
             "clicking the trigger should project the anchored menu"
         );
     }
@@ -30436,7 +30430,7 @@ mod tests {
             reference_path: None,
             size: 0,
             favorite: false,
-            stage: TrackStage::Groove,
+            stage: TrackStage::Production,
             notes: crate::storage::SharedVec::default(),
         };
         let track_id = track.id.clone();
@@ -30458,7 +30452,7 @@ mod tests {
         assert!(
             labels
                 .iter()
-                .any(|label| label == TrackStage::Master.label()),
+                .any(|label| label == TrackStage::Mastering.label()),
             "keyboard activation should still project the stage menu"
         );
     }
@@ -30474,7 +30468,7 @@ mod tests {
             reference_path: None,
             size: 0,
             favorite: false,
-            stage: TrackStage::Groove,
+            stage: TrackStage::Production,
             notes: crate::storage::SharedVec::default(),
         };
         #[derive(Clone)]
@@ -30523,7 +30517,7 @@ mod tests {
         assert!(
             labels
                 .iter()
-                .any(|label| label == TrackStage::Master.label()),
+                .any(|label| label == TrackStage::Mastering.label()),
             "focused keyboard activation should project the stage menu"
         );
     }
@@ -30539,7 +30533,7 @@ mod tests {
             reference_path: None,
             size: 0,
             favorite: false,
-            stage: TrackStage::Groove,
+            stage: TrackStage::Production,
             notes: crate::storage::SharedVec::default(),
         };
 
@@ -30576,7 +30570,7 @@ mod tests {
                 .iter()
                 .find_map(|primitive| match primitive {
                     PaintPrimitive::Text(text)
-                        if text.text.as_str() == TrackStage::Groove.label()
+                        if text.text.as_str() == TrackStage::Production.label()
                             && text.rect.min.y > 190.0 =>
                     {
                         Some(text.rect)
@@ -30604,7 +30598,7 @@ mod tests {
                 .iter()
                 .find_map(|primitive| match primitive {
                     PaintPrimitive::Text(text)
-                        if text.text.as_str() == TrackStage::Master.label()
+                        if text.text.as_str() == TrackStage::Mastering.label()
                             && text.rect.min.y > trigger_point.y =>
                     {
                         Some(text.rect)
@@ -30627,7 +30621,7 @@ mod tests {
             assert!(runtime.bridge().state().stage_menu_track_id.is_none());
             assert_eq!(
                 runtime.bridge().state().library.tracks[0].stage,
-                TrackStage::Master
+                TrackStage::Mastering
             );
             let labels_after_selection = runtime
                 .frame(&ThemeTokens::default())
@@ -30636,7 +30630,7 @@ mod tests {
             assert!(
                 labels_after_selection
                     .iter()
-                    .any(|label| label == TrackStage::Master.label()),
+                    .any(|label| label == TrackStage::Mastering.label()),
                 "selecting a stage should update the trigger label"
             );
         }
@@ -30653,7 +30647,7 @@ mod tests {
             reference_path: None,
             size: 0,
             favorite: false,
-            stage: TrackStage::Groove,
+            stage: TrackStage::Production,
             notes: crate::storage::SharedVec::default(),
         };
         #[derive(Clone)]
@@ -30695,7 +30689,7 @@ mod tests {
             .iter()
             .find_map(|primitive| match primitive {
                 PaintPrimitive::Text(text)
-                    if text.text.as_str() == TrackStage::Master.label()
+                    if text.text.as_str() == TrackStage::Mastering.label()
                         && text.rect.min.x < 400.0
                         && text.rect.min.y > 117.0 =>
                 {
@@ -30723,7 +30717,7 @@ mod tests {
         assert!(
             labels_after_selection
                 .iter()
-                .any(|label| label == TrackStage::Master.label()),
+                .any(|label| label == TrackStage::Mastering.label()),
             "selecting an option should update the trigger label"
         );
         let sound_design_count_after = labels_after_selection
@@ -30748,7 +30742,7 @@ mod tests {
             reference_path: None,
             size: 0,
             favorite: false,
-            stage: TrackStage::Groove,
+            stage: TrackStage::Production,
             notes: crate::storage::SharedVec::default(),
         };
 
@@ -30816,7 +30810,7 @@ mod tests {
             reference_path: Some(first_path.clone()),
             size: 0,
             favorite: false,
-            stage: TrackStage::Groove,
+            stage: TrackStage::Production,
             notes: crate::storage::SharedVec::default(),
         });
         state.library.reference_tracks = vec![
@@ -31052,7 +31046,7 @@ mod tests {
             reference_path: None,
             size: 0,
             favorite: false,
-            stage: TrackStage::Groove,
+            stage: TrackStage::Production,
             notes: crate::storage::SharedVec::default(),
         });
 
@@ -31500,7 +31494,7 @@ mod tests {
         state.remove_confirmation_track_id = Some(String::from("stale-removal"));
         state.planner_drag_source_track_id = Some(selected_id.clone());
         state.planner_drag_target = Some(PlannerInsertionTarget {
-            stage: TrackStage::Groove,
+            stage: TrackStage::Production,
             slot: 1,
         });
         state.planner_drag_pointer = Some(Point::new(80.0, 90.0));
@@ -31787,12 +31781,9 @@ mod tests {
                 .expect("Planner should paint every stage heading");
             let expected_color = match stage {
                 TrackStage::Backlog => theme.accent_warning,
-                TrackStage::Groove | TrackStage::Arrangement | TrackStage::Polish => {
-                    theme.accent_mint
-                }
+                TrackStage::Production => theme.accent_mint,
                 TrackStage::Mixdown => theme.highlight_cyan,
-                TrackStage::Master => theme.accent_danger,
-                TrackStage::Release => theme.highlight_cyan,
+                TrackStage::Mastering => theme.accent_danger,
             };
             assert_eq!(
                 super::planner_stage_visual_color(stage, &theme),
@@ -31844,7 +31835,7 @@ mod tests {
         starred.favorite = true;
         starred.stage = TrackStage::Backlog;
         let mut unstarred = audition_track("unstarred-track");
-        unstarred.stage = TrackStage::Groove;
+        unstarred.stage = TrackStage::Production;
         let mut state = AppState {
             busy: false,
             ..AppState::default()
@@ -32718,9 +32709,9 @@ mod tests {
     fn all_track_card_contexts_paint_shared_chrome_and_selection_states() {
         let mut favorite = audition_track("favorite-track-card");
         favorite.favorite = true;
-        favorite.stage = TrackStage::Groove;
+        favorite.stage = TrackStage::Production;
         let mut selected = audition_track("selected-track-card");
-        selected.stage = TrackStage::Groove;
+        selected.stage = TrackStage::Production;
         let mut state = AppState {
             busy: false,
             ..AppState::default()
@@ -32905,7 +32896,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing {label:?} control bounds"))
         };
         let title_bounds = control_bounds(&track_id);
-        let stage_bounds = control_bounds("Groove");
+        let stage_bounds = control_bounds("Production");
         for (label, bounds) in [("title", title_bounds), ("stage", stage_bounds)] {
             assert!(
                 (bounds.min.x - card_bounds.min.x - super::TRACK_CARD_CONTENT_INSET).abs() < 0.01,

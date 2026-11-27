@@ -1,5 +1,8 @@
 .DS_Store
+.ship.local.toml
 /target/
-/artifacts/screenshots/
+/artifacts/
+/design/
 /dist/
 /release-output/
+/reference/518273463_10161446757502187_1442287631254353146_n.jpg

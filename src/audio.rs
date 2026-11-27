@@ -265,6 +265,77 @@ pub fn load_waveform_cache(path: &Path, cache_path: &Path) -> Option<CachedWavef
     cached.into_waveform(path)
 }
 
+/// Rehydrate a complete decoded-analysis value from a persistent cache when
+/// the caller's recorded proof still matches the current source. A changed
+/// stamp is re-hashed before cached analysis can be reused, so same-path file
+/// replacement cannot publish stale waveform data.
+pub(crate) fn load_decoded_audio_cache(
+    path: &Path,
+    cache_path: &Path,
+    expected_proof: &AudioSourceProof,
+    should_cancel: impl Fn() -> bool,
+) -> Result<Option<DecodedAudioFile>, String> {
+    if should_cancel() {
+        return Err(String::from("cancelled"));
+    }
+    let Some(hit) = load_waveform_cache(path, cache_path) else {
+        return Ok(None);
+    };
+    if hit.ticket().proof() != expected_proof {
+        return Ok(None);
+    }
+
+    let current_stamp = source::stamp_file(path).map_err(|error| error.to_string())?;
+    let ticket = if hit.ticket().stamp() == current_stamp {
+        let ticket =
+            VerifiedSourceTicket::new(path.to_path_buf(), expected_proof.clone(), current_stamp)?;
+        ticket
+            .validate_current(&should_cancel)
+            .map_err(|error| error.to_string())?;
+        ticket
+    } else {
+        let verified =
+            source::open_and_hash(path, &should_cancel).map_err(|error| error.to_string())?;
+        if verified.proof() != expected_proof {
+            return Err(format!(
+                "Audio source changed since import: {}",
+                path.display()
+            ));
+        }
+        let ticket = verified.ticket();
+        if should_cancel() {
+            return Err(String::from("cancelled"));
+        }
+        let _ = write_waveform_cache_if_unchanged_with_cancellation(
+            path,
+            cache_path,
+            &ticket,
+            hit.waveform(),
+            &should_cancel,
+        );
+        ticket
+    };
+    if should_cancel() {
+        return Err(String::from("cancelled"));
+    }
+    ticket
+        .validate_current(&should_cancel)
+        .map_err(|error| error.to_string())?;
+    let fingerprint = waveform_cache_fingerprint(path).ok_or_else(|| {
+        format!(
+            "Could not inspect {} after waveform cache lookup",
+            path.display()
+        )
+    })?;
+    Ok(Some(DecodedAudioFile {
+        path: path.to_path_buf(),
+        fingerprint,
+        source_proof: ticket.proof().clone(),
+        source_stamp: ticket.stamp(),
+        waveform: hit.waveform().clone(),
+    }))
+}
+
 fn read_bounded_waveform_cache(mut reader: impl Read) -> Option<Vec<u8>> {
     let mut contents = Vec::new();
     reader
@@ -378,6 +449,21 @@ pub fn write_waveform_cache_if_unchanged(
     ticket: &VerifiedSourceTicket,
     waveform: &WaveformData,
 ) -> Result<(), String> {
+    write_waveform_cache_if_unchanged_with_cancellation(path, cache_path, ticket, waveform, || {
+        false
+    })
+}
+
+pub(crate) fn write_waveform_cache_if_unchanged_with_cancellation(
+    path: &Path,
+    cache_path: &Path,
+    ticket: &VerifiedSourceTicket,
+    waveform: &WaveformData,
+    should_cancel: impl Fn() -> bool,
+) -> Result<(), String> {
+    if should_cancel() {
+        return Err(String::from("cancelled"));
+    }
     if ticket.path() != path {
         return Err(format!(
             "Source ticket path does not match waveform cache path {}",
@@ -393,6 +479,9 @@ pub fn write_waveform_cache_if_unchanged(
     let cached = CachedWaveform::from_waveform(path, ticket.clone(), waveform);
     let encoded = serde_json::to_vec(&cached)
         .map_err(|error| format!("Could not encode waveform cache: {error}"))?;
+    if should_cancel() {
+        return Err(String::from("cancelled"));
+    }
     let directory = cache_path
         .parent()
         .ok_or_else(|| format!("No parent directory for {}", cache_path.display()))?;
@@ -421,6 +510,10 @@ pub fn write_waveform_cache_if_unchanged(
             "Source changed while writing {}; skipping waveform cache",
             path.display()
         ));
+    }
+    if should_cancel() {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(String::from("cancelled"));
     }
     if let Err(error) = fs::rename(&temporary_path, cache_path) {
         let _ = fs::remove_file(&temporary_path);
@@ -1701,11 +1794,12 @@ mod tests {
         LoudnessAccumulator, LoudnessPoint, MAX_DISPLAY_BUCKETS, MAX_LOUDNESS_MATCH_DB,
         MAX_LOUDNESS_PROFILE_POINTS, MAX_WAVEFORM_CACHE_BYTES, PeakBucket, PeakMeasurement,
         PeakReducer, PeakWindow, ResampledPeak, WaveformData, decode_audio_file,
-        decode_waveform_with_progress_and_cancellation, linear_gain_for_db, load_waveform_cache,
-        loudness_at_position, loudness_channel_map, loudness_match_gain_db, preview_progress,
-        preview_waveform, progressive_preview, read_bounded_waveform_cache,
-        resample_unknown_buckets, resample_unknown_buckets_counted, summary_from_peaks,
-        validate_declared_frame_count, write_waveform_cache_if_unchanged,
+        decode_waveform_with_progress_and_cancellation, linear_gain_for_db,
+        load_decoded_audio_cache, load_waveform_cache, loudness_at_position, loudness_channel_map,
+        loudness_match_gain_db, preview_progress, preview_waveform, progressive_preview,
+        read_bounded_waveform_cache, resample_unknown_buckets, resample_unknown_buckets_counted,
+        summary_from_peaks, validate_declared_frame_count, write_waveform_cache_if_unchanged,
+        write_waveform_cache_if_unchanged_with_cancellation,
     };
     use crate::signal_summary::GpuSignalSummary;
     #[cfg(unix)]
@@ -1797,6 +1891,88 @@ mod tests {
         assert!(write_waveform_cache_if_unchanged(&source, &cache, &ticket, &waveform).is_err());
         assert!(load_waveform_cache(&source, &cache).is_some());
 
+        fs::remove_dir_all(root).expect("remove cache test directory");
+    }
+
+    #[test]
+    fn decoded_cache_hit_reuses_analysis_and_rejects_changed_missing_or_corrupt_sources() {
+        let root = std::env::temp_dir().join(format!(
+            "cadence-decoded-cache-hit-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock should be after the epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create cache test directory");
+        let source_path = root.join("source.wav");
+        let cache_path = root.join("waveform.json");
+        fs::write(&source_path, b"source bytes").expect("write source fixture");
+        let verified =
+            crate::source::open_and_hash(&source_path, || false).expect("hash source fixture");
+        let proof = verified.proof().clone();
+        let ticket = verified.ticket();
+        let waveform = WaveformData {
+            sample_rate: 48_000,
+            channels: 1,
+            duration_millis: 100,
+            render_frames: 2,
+            integrated_lufs: Some(-12.0),
+            loudness_profile: Arc::from([]),
+            summary: Arc::new(summary_from_peaks(&[rms_peak(0.25), rms_peak(0.5)])),
+        };
+        let cancelled_cache = root.join("cancelled.json");
+        let cancel_checks = std::cell::Cell::new(0);
+        let cancelled = write_waveform_cache_if_unchanged_with_cancellation(
+            &source_path,
+            &cancelled_cache,
+            &ticket,
+            &waveform,
+            || {
+                let check = cancel_checks.get();
+                cancel_checks.set(check + 1);
+                check == 2
+            },
+        );
+        assert_eq!(
+            cancelled.expect_err("the write should be cancelled"),
+            "cancelled"
+        );
+        assert!(
+            !cancelled_cache.exists(),
+            "cancelled analysis is not published"
+        );
+        write_waveform_cache_if_unchanged(&source_path, &cache_path, &ticket, &waveform)
+            .expect("write analysis cache");
+
+        let cached = load_decoded_audio_cache(&source_path, &cache_path, &proof, || false)
+            .expect("cache lookup should succeed")
+            .expect("unchanged source should use cache");
+        assert_eq!(cached.waveform(), &waveform);
+
+        assert_eq!(
+            load_decoded_audio_cache(&source_path, &cache_path, &proof, || true)
+                .expect_err("cancelled lookup should stop"),
+            "cancelled"
+        );
+        fs::write(&source_path, b"replacement bytes").expect("replace source fixture");
+        assert!(
+            load_decoded_audio_cache(&source_path, &cache_path, &proof, || false)
+                .expect_err("changed source must be rejected")
+                .contains("changed since import")
+        );
+
+        fs::write(&source_path, b"source bytes").expect("restore source fixture");
+        fs::remove_file(&source_path).expect("remove source fixture");
+        assert!(load_decoded_audio_cache(&source_path, &cache_path, &proof, || false).is_err());
+
+        fs::write(&source_path, b"source bytes").expect("restore source fixture");
+        fs::write(&cache_path, b"broken json").expect("corrupt cache fixture");
+        assert!(
+            load_decoded_audio_cache(&source_path, &cache_path, &proof, || false)
+                .expect("corrupt cache falls back to analysis")
+                .is_none()
+        );
         fs::remove_dir_all(root).expect("remove cache test directory");
     }
 

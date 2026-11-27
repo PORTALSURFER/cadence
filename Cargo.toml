@@ -1,6 +1,6 @@
 [package]
 name = "cadence-native"
-version = "0.1.9"
+version = "0.2.0"
 edition = "2024"
 publish = false
 description = "Native Cadence track review workspace built with GPUI"
@@ -23,7 +23,14 @@ radiant-legacy = ["dep:radiant"]
 [dependencies]
 ebur128 = "0.1.10"
 radiant = { git = "https://github.com/PORTALSURFER/radiant", rev = "1678f918feb721a0187ddd4b262695e3068f8d28", optional = true }
-gpui = { version = "=0.2.2", default-features = false, features = ["font-kit", "macos-blade"] }
+# Use GPUI's native macOS Metal renderer with runtime_shaders instead of
+# macos-blade; gpui 0.2.2's blade_renderer over-releases CAMetalLayer on
+# backing-property changes when moving windows across monitors.
+gpui = { version = "=0.2.2", default-features = false, features = ["font-kit", "runtime_shaders"] }
+gpui-component = "=0.5.1"
+gpui-component-assets = "=0.5.1"
+image = { version = "=0.25.10", default-features = false }
+anyhow = "1"
 libc = "0.2.189"
 rfd = "0.16.0"
 rodio = { version = "0.22.2", features = ["symphonia-all"] }
@@ -32,6 +39,12 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.10.9"
 symphonia = { version = "0.5.5", features = ["all"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "=0.10.0"
+core-video = { version = "=0.4.3", features = ["metal"] }
+metal = "=0.29.0"
+objc = "=0.2.7"
 
 [patch.crates-io]
 vello = { git = "https://github.com/PORTALSURFER/vello.git", rev = "a08d1c11641908414e5e273d18e50f0f367095a1" }

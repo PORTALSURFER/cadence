@@ -1,11 +1,6 @@
 name: Cadence release
 
 on:
-  push:
-    tags:
-      - "v*.*.*"
-  schedule:
-    - cron: "17 2 * * *"
   workflow_dispatch:
     inputs:
       channel:
